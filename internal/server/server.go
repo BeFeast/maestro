@@ -250,6 +250,12 @@ type supervisorDecisionInfo struct {
 	QueueAnalysis     *state.SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
 	Queue             *supervisorQueueInfo           `json:"queue,omitempty"`
 	ApprovalID        string                         `json:"approval_id,omitempty"`
+
+	RecommendationID string                           `json:"recommendation_id,omitempty"`
+	FirstSeenAt      time.Time                        `json:"first_seen_at,omitempty"`
+	LastSeenAt       time.Time                        `json:"last_seen_at,omitempty"`
+	SeenCount        int                              `json:"seen_count,omitempty"`
+	Disposition      *state.RecommendationDisposition `json:"disposition,omitempty"`
 }
 
 type supervisorActionInfo struct {
@@ -623,6 +629,11 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 	return &supervisorDecisionInfo{
 		ID:                decision.ID,
 		CreatedAt:         decision.CreatedAt,
+		RecommendationID:  decision.RecommendationID,
+		FirstSeenAt:       decision.FirstSeenAt,
+		LastSeenAt:        decision.LastSeenAt,
+		SeenCount:         decision.SeenCount,
+		Disposition:       decision.Disposition,
 		Project:           decision.Project,
 		Mode:              decision.Mode,
 		PolicyRule:        decision.PolicyRule,

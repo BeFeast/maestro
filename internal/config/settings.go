@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // Fleet-controllable settings: the cost/LLM control knobs (#839) that an
@@ -82,6 +83,22 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			YAMLPath: []string{"supervisor", "always_consult_llm"},
 			Kind:     SettingKindBool,
 			Value:    func(c *Config) string { return strconv.FormatBool(c.Supervisor.AlwaysConsultLLM) },
+		},
+		{
+			Key:      "supervisor.unchanged_decision_window_seconds",
+			YAMLPath: []string{"supervisor", "unchanged_decision_window_seconds"},
+			Kind:     SettingKindInt,
+			Value: func(c *Config) string {
+				return strconv.FormatInt(int64(c.Supervisor.EffectiveUnchangedDecisionWindow()/time.Second), 10)
+			},
+		},
+		{
+			Key:      "supervisor.recommendation_ttl_seconds",
+			YAMLPath: []string{"supervisor", "recommendation_ttl_seconds"},
+			Kind:     SettingKindInt,
+			Value: func(c *Config) string {
+				return strconv.FormatInt(int64(c.Supervisor.EffectiveRecommendationTTL()/time.Second), 10)
+			},
 		},
 		{
 			Key:      "supervisor.spec_groom.enabled",

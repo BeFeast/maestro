@@ -1525,14 +1525,19 @@ function workerActuallyRunning(worker) {
 export function supervisorDecisionsFromProject(project, now) {
   const latest = project.supervisor?.latest;
   if (!latest) return [];
-  const created = parseTimestamp(latest.created_at);
-  if (!created) return [];
+  const lastSeen = parseTimestamp(latest.last_seen_at || latest.created_at);
+  if (!lastSeen) return [];
   return [{
-    t: created,
+    t: lastSeen,
     verb: latest.recommended_action || latest.status || "decision",
     note: latest.summary || latest.operator_sentence || "",
     conf: Number(latest.confidence || 0),
     warn: project.needsAttention > 0 || project.operatorState?.kind === "monitoring_pr",
+    recommendationId: String(latest.recommendation_id || ""),
+    firstSeen: parseTimestamp(latest.first_seen_at || latest.created_at),
+    lastSeen,
+    seenCount: Math.max(1, Number(latest.seen_count || 1)),
+    disposition: latest.disposition || null,
   }];
 }
 
