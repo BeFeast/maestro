@@ -2048,6 +2048,7 @@ func (e *Engine) detectPromptStuckStates() []state.SupervisorStuckState {
 		{name: "bug_prompt", path: e.cfg.BugPrompt},
 		{name: "enhancement_prompt", path: e.cfg.EnhancementPrompt},
 		{name: "pipeline.planner.prompt", path: e.cfg.Pipeline.Planner.Prompt},
+		{name: "pipeline.advisor.prompt", path: e.cfg.Pipeline.Advisor.Prompt},
 		{name: "pipeline.validator.prompt", path: e.cfg.Pipeline.Validator.Prompt},
 	}
 	for i, path := range e.cfg.PromptSections {

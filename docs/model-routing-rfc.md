@@ -30,7 +30,7 @@ Every lever that influences which backend/model/effort a worker runs on lives in
 | `routing.router_prompt` | router prompt template | `internal/config/config.go:789` |
 | `routing.task_type_backends` | `task_type → backend`, used **only** when `mode: auto` | `internal/config/config.go:790` |
 | `routing.{planner,implementation,validator}_backend` | per-role backend overrides | `internal/config/config.go:794-796` |
-| `pipeline.{planner,implementer,validator}.{backend,effort}` | the *other* per-role backend/effort overrides (implement phase + `effort:` added in #841) | `internal/config/config.go` (`PipelineConfig`/`RoleConfig`) |
+| `pipeline.{planner,advisor,implementer,validator}.{backend,effort}` | the phase-pipeline role overrides (Advisor is optional and review-only) | `internal/config/config.go` (`PipelineConfig`/`RoleConfig`) |
 | `supervisor.review_repair.{backend,model,effort}` | backend used when a green PR is held on blocking review findings | `internal/config/config.go:543-548` |
 
 A subtle but load-bearing fact, with one backend-specific exception: for the
@@ -158,7 +158,7 @@ code:
   `roleBackend` at `:136-148`). **This function has no non-test callers** — it is
   exercised only by `internal/router/resolve_test.go`. It is dead code on the
   dispatch path.
-- `pipeline.{planner,implementer,validator}.backend` is consumed by
+- `pipeline.{planner,advisor,implementer,validator}.backend` is consumed by
   `pipeline.BackendForPhase` (`internal/pipeline/pipeline.go`), which **is** wired
   into the dispatch loop for pipeline phases. Since #841 the implement phase
   carries its own `pipeline.implementer.backend` (empty falls back to
@@ -176,6 +176,10 @@ code:
       enabled: true
       backend: fable      # strong model plans
       effort: xhigh
+    advisor:
+      enabled: true
+      backend: codex      # independent bounded plan review
+      effort: high
     implementer:
       backend: codex      # cheap model executes the mechanical implement phase
       effort: low
@@ -189,8 +193,8 @@ code:
   still win — the per-phase effort is skipped when the flag is already present.
 
 So the "per-role backend" that actually runs is the `pipeline.*` one, and only
-for the phases of the opt-in 3-phase pipeline (`pipeline.enabled` /
-`pipeline:full` label). The `routing.*_backend` fields parse and validate but
+for the phases of the opt-in phase pipeline (`pipeline.enabled`,
+`pipeline:full`, or `pipeline:advised`). The `routing.*_backend` fields parse and validate but
 never affect a worker. Per-phase config is orthogonal to `routing.mode` — it is
 phase config, not issue routing.
 

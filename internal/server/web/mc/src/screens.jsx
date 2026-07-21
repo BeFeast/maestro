@@ -19,6 +19,7 @@ import {
   isApprovalActionMergePR,
   isExecutionSkippedApproval,
   manualFollowupForApproval,
+  mapAdvisor,
   postFleetAction,
   postFleetApproval,
   postProjectApproval,
@@ -1381,6 +1382,51 @@ function AttributionTimeline({ attribution, now }) {
   );
 }
 
+export function AdvisorReviewSection({ advisor }) {
+  if (!advisor) return null;
+  const reviews = Array.isArray(advisor.reviews) ? advisor.reviews : [];
+  const tone = advisor.terminalReason && !advisor.bypassed ? "stuck" : advisor.bypassed ? "watch" : advisor.verdict === "PLAN_APPROVED" ? "ok" : "info";
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Advisor plan gate</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", borderLeft: `2px solid var(--${tone === "stuck" ? "stuck" : tone === "watch" ? "watch" : tone === "ok" ? "ok" : "accent"})` }}>
+        <div className="row gap-2" style={{ alignItems: "center", flexWrap: "wrap" }}>
+          <Pill tone={tone} noDot>{advisor.verdict || advisor.phase || "pending"}</Pill>
+          <span className="mono" style={{ fontSize: 11 }}>
+            plan v{advisor.planVersion || "—"} · round {advisor.reviewRound || "—"}/{advisor.maxReviewRounds || "—"}
+          </span>
+          <span className="mono dim" style={{ fontSize: 10.5 }}>
+            {[advisor.backend, advisor.model].filter(Boolean).join(" · ") || "backend/model pending"}
+          </span>
+        </div>
+        {advisor.terminalReason && (
+          <div className="mono mt-2" style={{ fontSize: 11, color: advisor.bypassed ? "var(--watch)" : "var(--stuck)" }}>
+            terminal: {advisor.terminalReason}{advisor.bypassed ? " · explicitly bypassed" : " · failed closed"}
+          </div>
+        )}
+        {advisor.unresolvedFindings && (
+          <pre className="mono mt-2" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 11, color: "var(--fg-1)", marginBottom: 0 }}>
+            {advisor.unresolvedFindings}
+          </pre>
+        )}
+        {reviews.length > 0 && (
+          <details className="mt-2">
+            <summary className="mono dim" style={{ fontSize: 10.5, cursor: "pointer" }}>{reviews.length} review record{reviews.length === 1 ? "" : "s"}</summary>
+            {reviews.map((review, index) => (
+              <div key={`${review.planVersion}-${review.reviewRound}-${index}`} style={{ borderTop: index === 0 ? "none" : "1px solid var(--border-1)", paddingTop: 6, marginTop: 6 }}>
+                <div className="mono dim" style={{ fontSize: 10.5 }}>
+                  v{review.planVersion} · round {review.reviewRound} · {review.verdict || "no verdict"}{review.terminalReason ? ` · ${review.terminalReason}` : ""}
+                </div>
+                {review.findings && <pre className="mono" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 10.5, marginBottom: 0 }}>{review.findings}</pre>}
+              </div>
+            ))}
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function BackendDriftSection({ drift }) {
   if (!drift) return null;
   return (
@@ -1582,6 +1628,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
             attribution={detail?.worker?.attribution || worker.attribution}
             now={now}
           />
+          <AdvisorReviewSection advisor={mapAdvisor(detail?.worker) || worker.advisor} />
           <BackendDriftSection drift={detail?.worker?.backendDrift || worker.backendDrift} />
 
           <div className="drawer-sec" ref={logRef}>
@@ -2577,6 +2624,7 @@ function RoutingTierList({ tiers }) {
 function PipelineOverrideList({ pipeline }) {
   const roles = [
     ["planner", pipeline?.planner],
+    ["advisor", pipeline?.advisor],
     ["implementer", pipeline?.implementer],
     ["validator", pipeline?.validator],
   ].filter(([, role]) => role?.backend || role?.effort || role?.enabled);
@@ -2592,6 +2640,15 @@ function PipelineOverrideList({ pipeline }) {
           </strong>
         </div>
       ))}
+      {pipeline?.advisor?.enabled && pipeline?.advisorReviewRounds > 0 && (
+        <div className="kv">
+          <span className="mono">advisor budget</span>
+          <strong className="mono">
+            {pipeline.advisorReviewRounds} round{pipeline.advisorReviewRounds === 1 ? "" : "s"}
+            {pipeline.advisorBestEffort ? " · best effort" : " · fail closed"}
+          </strong>
+        </div>
+      )}
     </div>
   );
 }
