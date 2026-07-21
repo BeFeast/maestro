@@ -2547,18 +2547,9 @@ func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *s
 	if !closed {
 		return false
 	}
-	if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed during retry backoff", sess.IssueNumber)) {
-		log.Printf("[orch] worker %s retry invalidated: issue #%d is closed, but a merge delivery/outcome gate is still pending", slotName, sess.IssueNumber)
+	if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
 		return true
 	}
-	log.Printf("[orch] worker %s retry invalidated: issue #%d is closed — marking done instead of respawning", slotName, sess.IssueNumber)
-	sess.NextRetryAt = nil
-	sess.RetryHoldReason = ""
-	sess.Status = state.StatusDone
-	now := time.Now().UTC()
-	sess.FinishedAt = &now
-	state.MarkWorkerEnded(sess, now)
-	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 	if o.notifier != nil {
 		o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — issue already closed", sess.IssueNumber, sess.IssueTitle)
 	}
@@ -3996,18 +3987,10 @@ func (o *Orchestrator) reconcilePushedBranch(s *state.State, slotName string, se
 	if closed, closedErr := o.isIssueClosed(sess.IssueNumber); closedErr != nil {
 		log.Printf("[orch] reconcile: could not check issue #%d state for %s: %v — proceeding with auto-create", sess.IssueNumber, slotName, closedErr)
 	} else if closed {
-		if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed after worker exit", sess.IssueNumber)) {
-			log.Printf("[orch] reconcile: %s held out of done because a merge delivery/outcome gate is pending", slotName)
+		if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
+			log.Printf("[orch] reconcile: %s issue-closed teardown deferred; not auto-creating a PR", slotName)
 			return true
 		}
-		o.updateTokensUsedFromWorkerLog(slotName, sess)
-		sess.PID = 0
-		sess.TmuxSession = ""
-		sess.Status = state.StatusDone
-		now := time.Now().UTC()
-		sess.FinishedAt = &now
-		state.MarkWorkerEnded(sess, now)
-		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 		log.Printf("[orch] reconcile: %s running->done (issue #%d closed; not auto-creating a PR; %s)",
 			slotName, sess.IssueNumber, reasons)
 		if o.notifier != nil {
@@ -4086,6 +4069,72 @@ func terminalReconcileDue(sess *state.Session, now time.Time) bool {
 	return now.Sub(*sess.LastTerminalReconcileAt) >= terminalReconcileInterval
 }
 
+// reconcileClosedIssueSession applies GitHub's authoritative terminal issue
+// lifecycle without consulting delivery or runtime-outcome gates. Those gates
+// remain project-level facts (and their history/approvals remain durable), but
+// they must never keep a closed issue actionable or revive worker controls.
+func (o *Orchestrator) reconcileClosedIssueSession(s *state.State, slotName string, sess *state.Session, now time.Time) bool {
+	if s == nil || sess == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	previous := sess.Status
+	if sess.PRNumber <= 0 {
+		if prNumber, err := o.mergedPRForDoneLikeSession(sess); err != nil {
+			log.Printf("[orch] issue #%d is closed; merged PR audit identity could not be refreshed: %v", sess.IssueNumber, err)
+		} else if prNumber > 0 {
+			sess.PRNumber = prNumber
+		}
+	}
+	if sess.Status == state.StatusRunning || sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued || sess.PID > 0 || strings.TrimSpace(sess.TmuxSession) != "" || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		if err := o.stopWorker(slotName, sess); err != nil {
+			log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
+			// A surviving process-lease receipt proves teardown is not complete.
+			// Preserve the nonterminal session and retry next cycle rather than
+			// reporting done while its isolated process may still be running.
+			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+				return false
+			}
+		}
+	}
+	sess.Status = state.StatusDone
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.RetryHoldReason = ""
+	sess.RestartCheckpointAt = nil
+	sess.ReleasedForRedispatch = true
+	sess.IssueClosedAt = &now
+	sess.LastTerminalReconcileAt = &now
+	if sess.FinishedAt == nil {
+		sess.FinishedAt = &now
+	}
+	state.MarkWorkerEnded(sess, now)
+	if o.cfg != nil {
+		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+	}
+
+	reason := fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", sess.IssueNumber)
+	for _, approval := range s.StaleIssueApprovalsForClosedIssue(sess.IssueNumber, now, reason) {
+		log.Printf("[orch] reconciled moot approval %s after issue #%d closed", approval.ID, sess.IssueNumber)
+		if o.cfg != nil && o.approvalsBinding.UseSQLite() {
+			binding := o.approvalsBinding
+			binding.StateDir = o.cfg.StateDir
+			binding.Repo = o.repo
+			binding.Project = o.repo
+			if err := approvalstore.ReconcileMoot(binding, approval.ID, now, reason); err != nil {
+				log.Printf("[orch] approval %s closed-issue mirror to SQLite failed (JSON will retry on later reconciliation): %v", approval.ID, err)
+			}
+		}
+	}
+	log.Printf("[orch] issue #%d closed, transitioning session %s from %s to done; merged PR/deployment history retained", sess.IssueNumber, slotName, previous)
+	return true
+}
+
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle (shared per-cycle, #794)
@@ -4100,6 +4149,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
+		// GitHub issue closure is terminal external truth for every nonterminal
+		// session status, including code_landed. Check it before PR, delivery,
+		// outcome, retry, or worker reconciliation so none of those independent
+		// facts can keep the issue lifecycle artificially open.
+		if !state.IsTerminal(sess.Status) {
+			closed, err := o.isIssueClosed(sess.IssueNumber)
+			if err != nil {
+				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
+			} else if closed {
+				o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC())
+				continue
+			}
+		}
 		// NextRetryAt is meaningful only while a dead session is queued for an
 		// in-place respawn. A pr_open session already owns its canonical PR and
 		// has no pending process start; retaining an expired retry marker there
@@ -4164,7 +4226,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			// Once the forge proves the issue closed, release that lease so Fleet
 			// diagnostics do not retain a permanent active claim. A later explicit
 			// issue reopen is then eligible by design.
-			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && (!sess.ReleasedForRedispatch || sess.IssueClosedAt == nil) {
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
 					remoteReconcileFailed = true
@@ -4172,15 +4234,16 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					remoteReconcileSucceeded = true
 					if closed {
-						sess.ReleasedForRedispatch = true
-						log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+						if !o.reconcileClosedIssueSession(s, slotName, sess, now) {
+							remoteReconcileFailed = true
+						}
 					}
 				}
 			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
-			if remoteReconcileDue && sess.Status != state.StatusDone {
+			if remoteReconcileDue && sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded {
 				done := false
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
@@ -4189,19 +4252,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					remoteReconcileSucceeded = true
 					if closed {
-						if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-							log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-							done = true
-						}
+						done = true
 					}
 				}
 				if done {
-					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-					sess.Status = state.StatusDone
-					if sess.FinishedAt == nil {
-						now := time.Now().UTC()
-						sess.FinishedAt = &now
-						state.MarkWorkerEnded(sess, now)
+					if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
+						remoteReconcileFailed = true
 					}
 				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					merged, err := o.isPRMerged(sess.PRNumber)
@@ -4249,33 +4305,8 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			continue
 		}
 
-		// Check if issue is closed for pr_open/queued sessions —
-		// free the worker slot when the issue no longer needs work (#187).
-		if sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued {
-			closed, err := o.isIssueClosed(sess.IssueNumber)
-			if err != nil {
-				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-			} else if closed {
-				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-					continue
-				}
-				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				if err := o.stopWorker(slotName, sess); err != nil {
-					log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
-					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
-						continue
-					}
-				}
-				sess.Status = state.StatusDone
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
-				continue
-			}
-		}
-
-		// Check if issue is now closed (only for running sessions)
+		// Running-session lifecycle and process reconciliation. Closed issues
+		// were handled by the authoritative check at the top of this loop.
 		if sess.Status == state.StatusRunning {
 			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
 				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
@@ -4291,28 +4322,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				}
 				continue
 			}
-			closed, err := o.isIssueClosed(sess.IssueNumber)
-			if err != nil {
-				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-			} else if closed {
-				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-					continue
-				}
-				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
-				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				if err := o.stopWorker(slotName, sess); err != nil {
-					log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
-					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
-						continue
-					}
-				}
-				sess.Status = state.StatusDone
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
-				continue
-			}
-
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
 				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
@@ -4895,8 +4904,10 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				log.Printf("[orch] no open PR found for branch %s (slot %s), but merge state is unavailable: %v — preserving session for retry", sess.Branch, slotName, mergedErr)
 				continue
 			}
+			closed := false
 			if !merged {
-				closed, closedErr := o.isIssueClosed(sess.IssueNumber)
+				var closedErr error
+				closed, closedErr = o.isIssueClosed(sess.IssueNumber)
 				if closedErr != nil {
 					log.Printf("[orch] no open PR found for branch %s (slot %s), but issue state is unavailable: %v — preserving session for retry", sess.Branch, slotName, closedErr)
 					continue
@@ -4906,7 +4917,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					continue
 				}
 			}
-			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge/closed outcome confirmed", sess.Branch, slotName)
+			if closed {
+				o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC())
+				continue
+			}
+			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge outcome confirmed", sess.Branch, slotName)
 			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
 				if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					o.markCodeLanded(sess, sess.PRNumber)
@@ -8018,9 +8033,6 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !o.canTreatIssueDoneForQueue(s, issueNumber, "closed issue") {
-			return false, "issue closed but outcome health is not verified", nil
-		}
 		return true, "issue closed", nil
 	}
 

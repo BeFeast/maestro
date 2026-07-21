@@ -6013,7 +6013,7 @@ func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t
 	}
 }
 
-func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails(t *testing.T) {
+func TestCheckSessions_ClosedMergedIssueBecomesDoneWhileProjectOutcomeFails(t *testing.T) {
 	now := time.Now().UTC()
 	o := &Orchestrator{
 		cfg: &config.Config{
@@ -6049,8 +6049,11 @@ func TestCheckSessions_ClosedMergedIssueRemainsCodeLandedWhenProjectOutcomeFails
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-10"]
-	if sess.Status != state.StatusCodeLanded || sess.PRNumber != 77 {
-		t.Fatalf("session = status %q PR #%d, want code_landed PR #77 until live verification passes", sess.Status, sess.PRNumber)
+	if sess.Status != state.StatusDone || sess.PRNumber != 77 || sess.IssueClosedAt == nil {
+		t.Fatalf("session = status %q PR #%d closed_at=%v, want terminal done with merged PR #77 retained", sess.Status, sess.PRNumber, sess.IssueClosedAt)
+	}
+	if s.OutcomeHealth == nil || s.OutcomeHealth.State != outcome.HealthFailing {
+		t.Fatalf("project outcome = %+v, want independently failing outcome retained", s.OutcomeHealth)
 	}
 }
 

@@ -321,6 +321,7 @@ type Session struct {
 	OperatorGateRequiredAction      string            `json:"operator_gate_required_action,omitempty"`      // concise operator action needed to clear OperatorGateName
 	LastClosedPRNumber              int               `json:"last_closed_pr_number,omitempty"`              // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
 	ReleasedForRedispatch           bool              `json:"released_for_redispatch,omitempty"`            // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
+	IssueClosedAt                   *time.Time        `json:"issue_closed_at,omitempty"`                    // authoritative GitHub issue closure observed by standing reconciliation; keeps external lifecycle truth separate from deployment/outcome history
 	LastTerminalReconcileAt         *time.Time        `json:"last_terminal_reconcile_at,omitempty"`         // #940: last successful authoritative issue/PR reconciliation for a terminal session. Bounds historical forge polling while preserving the 10-minute hands-off SLA across daemon restarts
 	CheckpointFile                  string            `json:"checkpoint_file,omitempty"`                    // path to CHECKPOINT.md saved at soft token threshold
 	RestartCheckpointAt             *time.Time        `json:"restart_checkpoint_at,omitempty"`              // #877/#966: set when the daemon deliberately checkpoints this still-running worker on shutdown. A non-nil value tells the next daemon to adopt the same surviving isolated PID/worktree, or resume the same logical session in place if the worker exited, exactly once. Cleared on successful adoption/resume so it cannot duplicate.
@@ -421,6 +422,9 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAttention {
 	if sess == nil {
 		return SessionAttention{}
+	}
+	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
+		return SessionAttention{Reason: "Issue is closed on GitHub; the session is terminal and retained only for audit."}
 	}
 	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
 		return SessionAttention{
@@ -644,6 +648,9 @@ func SessionDisplayStatusFor(sess *Session, alive *bool) string {
 func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string {
 	if sess == nil {
 		return ""
+	}
+	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
+		return string(StatusDone)
 	}
 	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
 		return string(DisplayTokenBudgetExceeded)
@@ -3633,6 +3640,60 @@ func (s *State) MarkCloseIssueApprovalsStaleForVerifiedIssue(issueNumber int, no
 	return count
 }
 
+// StaleIssueApprovalsForClosedIssue retires every still-actionable approval
+// whose side effect is scoped to an issue GitHub already reports closed.
+// Deployment approvals are intentionally excluded: deploying or verifying the
+// merged project revision is independent project/outcome work and remains
+// auditable/actionable after the issue lifecycle has ended.
+func (s *State) StaleIssueApprovalsForClosedIssue(issueNumber int, now time.Time, reason string) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", issueNumber)
+	}
+	var staled []Approval
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action == ApprovalActionDeployProject || !s.approvalTargetsIssue(approval, issueNumber) {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			s.markApprovalStale(approval, now, reason)
+			staled = append(staled, *approval)
+		}
+	}
+	return staled
+}
+
+func (s *State) approvalTargetsIssue(approval *Approval, issueNumber int) bool {
+	if approval == nil || approval.Target == nil || issueNumber <= 0 {
+		return false
+	}
+	target := approval.Target
+	if target.Issue == issueNumber {
+		return true
+	}
+	for _, candidate := range target.Issues {
+		if candidate.Issue == issueNumber {
+			return true
+		}
+	}
+	for slot, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber {
+			continue
+		}
+		if target.Session != "" && target.Session == slot {
+			return true
+		}
+		if target.Issue <= 0 && target.PR > 0 && target.PR == sess.PRNumber {
+			return true
+		}
+	}
+	return false
+}
+
 func closeIssueApprovalTargetsIssue(approval *Approval, issueNumber int) bool {
 	if approval == nil || approval.Target == nil || issueNumber <= 0 {
 		return false
@@ -4748,6 +4809,9 @@ func SessionChangedAt(sess *Session) time.Time {
 	changedAt := sess.StartedAt
 	if sess.FinishedAt != nil && sess.FinishedAt.After(changedAt) {
 		changedAt = *sess.FinishedAt
+	}
+	if sess.IssueClosedAt != nil && sess.IssueClosedAt.After(changedAt) {
+		changedAt = *sess.IssueClosedAt
 	}
 	if !sess.LastOutputChangedAt.IsZero() && sess.LastOutputChangedAt.After(changedAt) {
 		changedAt = sess.LastOutputChangedAt

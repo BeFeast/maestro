@@ -205,11 +205,8 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if worker.RuntimeSeconds <= 0 {
 		t.Fatalf("worker runtime_seconds = %d, want positive runtime", worker.RuntimeSeconds)
 	}
-	if len(worker.Actions) != 5 {
-		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
-	}
-	for _, action := range worker.Actions {
-		assertFleetReadOnlyAction(t, action)
+	if len(worker.Actions) != 0 {
+		t.Fatalf("terminal worker actions = %d, want none", len(worker.Actions))
 	}
 	if len(one.Actions) != 3 {
 		t.Fatalf("project actions = %d, want 3", len(one.Actions))
@@ -2090,6 +2087,30 @@ func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 	})
 	if drift.Kind != "outcome_drift" || !contains(drift.Summary, "failing") {
 		t.Fatalf("drift operator state = %+v, want runtime outcome drift", drift)
+	}
+
+	closedAt := now.Add(-time.Hour)
+	openTargetDrift := buildFleetProjectOperatorState(fleetProjectState{
+		Name: "RuntimeWithHistory",
+		Repo: "owner/runtime-with-history",
+		Outcome: outcome.Status{
+			Configured:  true,
+			Goal:        "Runtime is healthy",
+			HealthState: outcome.HealthFailing,
+		},
+		closedIssueOutcomes: []fleetClosedIssueOutcome{{IssueNumber: 5, PRNumber: 33, ClosedAt: closedAt}},
+		Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{
+			CreatedAt:         now,
+			Summary:           "Issue #6 runtime verification is still failing.",
+			RecommendedAction: "check_outcome_health",
+			Target:            &state.SupervisorTarget{Issue: 6, PR: 34, Session: "runtime-6"},
+		}},
+	})
+	if openTargetDrift.IssueNumber != 6 || openTargetDrift.PRNumber != 34 || openTargetDrift.Session != "runtime-6" {
+		t.Fatalf("open-target drift = %+v, want current issue #6 target retained", openTargetDrift)
+	}
+	if contains(openTargetDrift.Summary, "Issue #5 is closed") || !contains(openTargetDrift.Summary, "Issue #6") {
+		t.Fatalf("open-target drift summary = %q, want current target wording without unrelated closed history", openTargetDrift.Summary)
 	}
 
 	blocked := buildFleetProjectOperatorState(fleetProjectState{
@@ -5152,6 +5173,117 @@ func TestFleetAPIIncludesCloseCandidatesAndBatchAction(t *testing.T) {
 	}
 	if !batch.RequiresApproval || len(batch.Issues) != 1 || batch.Issues[0].Issue != 7 {
 		t.Fatalf("batch action = %+v, want one approval-gated issue target", batch)
+	}
+}
+
+func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	closedAt := now.Add(-time.Minute)
+	finishedAt := now.Add(-2 * time.Hour)
+	deployedAt := now.Add(-90 * time.Minute)
+	st := state.NewState()
+	st.LastMergeAt = now.Add(-3 * time.Hour)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now.Add(-30 * time.Minute),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "public health check failed",
+	}
+	st.Sessions["txc-17"] = &state.Session{
+		IssueNumber:           5,
+		IssueTitle:            "Closed delivery",
+		Status:                state.StatusDone,
+		PRNumber:              33,
+		StartedAt:             now.Add(-4 * time.Hour),
+		FinishedAt:            &finishedAt,
+		IssueClosedAt:         &closedAt,
+		DeploymentFinishedAt:  &deployedAt,
+		ReleasedForRedispatch: true,
+		OperatorGateName:      "stale gate",
+		WorkerOutcome:         string(state.DisplayTokenBudgetExceeded),
+	}
+	st.Approvals = []state.Approval{{
+		ID:        "deploy-33",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+		Action:    state.ApprovalActionDeployProject,
+		Status:    state.ApprovalStatusPending,
+		Target:    &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		Summary:   "Deploy PR #33 for issue #5",
+		Delivery: &state.DeliveryPayload{
+			Project: "owner/repo", Repo: "owner/repo", Issue: 5, PR: 33,
+			MergedSHA: "1111111111111111111111111111111111111111",
+		},
+	}}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "stale-merge-decision",
+		CreatedAt:         now.Add(-10 * time.Minute),
+		Summary:           "Review PR #33 before issue #5 can be closed.",
+		RecommendedAction: config.SupervisorActionMergePR,
+		Target:            &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		ProjectState:      state.SupervisorProjectState{OpenPRs: 1, OpenIssues: 1},
+		StuckStates: []state.SupervisorStuckState{{
+			Code:              "failing_checks",
+			Severity:          "blocked",
+			Summary:           "PR #33 has failing checks.",
+			RecommendedAction: "Repair PR #33.",
+			Target:            &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		}},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	cfg := &config.Config{
+		Repo:        "owner/repo",
+		StateDir:    dir,
+		MaxParallel: 2,
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "the public service is healthy",
+			HealthcheckCommand:  "check-public-service",
+			PassRequiredForDone: boolPtr(true),
+			RequiresDeploy:      true,
+		},
+	}
+	fleet := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false)
+	resp := fleet.snapshot()
+	project := findFleetProject(t, resp.Projects, "Project")
+	worker := findFleetWorker(t, resp.Workers, "txc-17")
+
+	if worker.Status != string(state.StatusDone) || worker.NeedsAttention || worker.IssueClosedAt == "" || len(worker.Actions) != 0 {
+		t.Fatalf("closed worker projection = %+v, want terminal historical row without actions", worker)
+	}
+	if contains(worker.StatusReason, "before the issue can be closed") || contains(worker.StatusReason, "PR #33 is open") || contains(worker.NextAction, "close the issue") {
+		t.Fatalf("closed worker retained stale lifecycle copy: reason=%q next=%q", worker.StatusReason, worker.NextAction)
+	}
+	if project.NeedsAttention != 0 || len(project.Attention) != 0 || len(resp.Attention) != 0 {
+		t.Fatalf("closed issue leaked into attention: project=%d project_rows=%d fleet_rows=%d", project.NeedsAttention, len(project.Attention), len(resp.Attention))
+	}
+	if project.PRGates != 0 || project.CapacityUsed != 0 || project.CapacityBlockedByGates != 0 || project.PRsOpen != 0 {
+		t.Fatalf("closed merged PR leaked into gate/capacity counts: gates=%d used=%d blocked=%d prs_open=%d", project.PRGates, project.CapacityUsed, project.CapacityBlockedByGates, project.PRsOpen)
+	}
+	if len(project.IssueClaims) != 0 || len(project.CloseCandidates) != 0 {
+		t.Fatalf("closed issue retained claim/close control: claims=%+v close=%+v", project.IssueClaims, project.CloseCandidates)
+	}
+	if project.OperatorState.Kind != "outcome_drift" || !contains(project.OperatorState.Summary, "Issue #5 is closed; project outcome remains unverified") {
+		t.Fatalf("project outcome warning = %+v", project.OperatorState)
+	}
+	if project.OperatorState.IssueNumber != 0 || project.OperatorState.PRNumber != 0 || project.OperatorState.Session != "" {
+		t.Fatalf("project outcome warning retained issue/worker target: %+v", project.OperatorState)
+	}
+	approval := findFleetApproval(t, resp.Approvals, "deploy-33")
+	if approval.IssueNumber != 0 || approval.Session != "" || approval.PRNumber != 33 || !contains(approval.Summary, "Issue #5 is closed") {
+		t.Fatalf("delivery approval was not projected at project scope: %+v", approval)
+	}
+	if approval.Delivery == nil || approval.Delivery.Issue != 0 {
+		t.Fatalf("delivery API payload retained closed issue target: %+v", approval.Delivery)
+	}
+	if resp.OperatorBrief.IssueNumber != 0 || resp.OperatorBrief.Session != "" || resp.NextAction == nil || resp.NextAction.IssueNumber != 0 {
+		t.Fatalf("global brief/next action retained closed issue target: brief=%+v next=%+v", resp.OperatorBrief, resp.NextAction)
+	}
+	if contains(resp.OperatorBrief.Sentence, "on issue #5") {
+		t.Fatalf("global brief still targets the closed issue: %q", resp.OperatorBrief.Sentence)
 	}
 }
 

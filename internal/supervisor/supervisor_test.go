@@ -3180,7 +3180,7 @@ func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
 	}
 }
 
-func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing.T) {
+func TestOrderedQueueIssueDone_ClosedIssueAdvancesDespiteFailingOutcome(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{
 		DesiredOutcome:      "Live app works",
@@ -3200,11 +3200,11 @@ func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing
 	if err != nil {
 		t.Fatalf("orderedQueueIssueDone: %v", err)
 	}
-	if done {
-		t.Fatalf("done = true, want false while outcome is failing")
+	if !done {
+		t.Fatalf("done = false, want true because GitHub issue closure is terminal")
 	}
-	if !strings.Contains(reason, "outcome health is not verified") {
-		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	if !strings.Contains(reason, "issue is closed") {
+		t.Fatalf("reason = %q, want closed-issue reason", reason)
 	}
 }
 

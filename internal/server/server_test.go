@@ -1600,6 +1600,17 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 	}
 }
 
+func TestWorkerActionAffordances_MergedAndClosedSessionsHaveNoLifecycleControls(t *testing.T) {
+	for _, status := range []state.SessionStatus{state.StatusCodeLanded, state.StatusDone} {
+		actions := workerActionAffordances(false, "/api/v1/actions", sessionInfo{
+			Slot: "slot-merged", IssueNumber: 42, PRNumber: 867, Status: string(status),
+		})
+		if len(actions) != 0 {
+			t.Fatalf("status %s actions = %+v, want no merge/restart/close lifecycle controls", status, actions)
+		}
+	}
+}
+
 func TestHandleStateProjectBlockedKeepsAttentionForOpenPR(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{Repo: "test/repo", MaxParallel: 1, StateDir: dir}

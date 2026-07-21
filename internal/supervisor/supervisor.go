@@ -2382,9 +2382,6 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !e.canTreatIssueDoneForOutcome(st) {
-			return false, "issue is closed but outcome health is not verified", nil
-		}
 		return true, "issue is closed", nil
 	}
 

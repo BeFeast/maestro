@@ -1375,6 +1375,16 @@ type fleetManagementHome struct {
 	VaultPath string `json:"vault_path,omitempty"`
 }
 
+// fleetClosedIssueOutcome is request-local reconciliation context. It is not a
+// new API shape: the public worker row already exposes status=done and
+// issue_closed_at. Fleet uses this private index to retire stale supervisor/PR
+// projections while keeping a project-scoped outcome warning visible.
+type fleetClosedIssueOutcome struct {
+	IssueNumber int
+	PRNumber    int
+	ClosedAt    time.Time
+}
+
 type fleetProjectState struct {
 	Name string `json:"name"`
 	Repo string `json:"repo"`
@@ -1462,6 +1472,8 @@ type fleetProjectState struct {
 	// background refresher has not yet produced its first result.
 	ProjectBoard *fleetProjectBoard `json:"project_board,omitempty"`
 	Error        string             `json:"error,omitempty"`
+
+	closedIssueOutcomes []fleetClosedIssueOutcome
 
 	// SupervisorPulse exposes the data the header verdict card uses to
 	// render a positive liveness signal (issue #531): the last-cycle
@@ -1891,6 +1903,7 @@ type fleetWorkerState struct {
 	StartedAt              string `json:"started_at"`
 	WorkerGeneration       uint64 `json:"worker_generation,omitempty"`
 	FinishedAt             string `json:"finished_at,omitempty"`
+	IssueClosedAt          string `json:"issue_closed_at,omitempty"`
 	WorkerEndedAt          string `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string `json:"pr_opened_at,omitempty"`
 	NextRetryAt            string `json:"next_retry_at,omitempty"`
@@ -4303,6 +4316,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.RestartRequiredReason = st.RestartRequiredReason
 	item.Paused = st.PauseActive()
 	item.PausedAt = st.PausedAt
+	item.closedIssueOutcomes = fleetClosedIssueOutcomes(st)
 	item.CloseCandidates = fleetCloseCandidates(item, st)
 	if len(item.CloseCandidates) > 0 {
 		item.Actions = append(item.Actions, closeIssueBatchControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, item.CloseCandidates))
@@ -4339,6 +4353,11 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
+	if item.Supervisor.Latest != nil && fleetTargetWasClosed(item, item.Supervisor.Latest.Target, item.Supervisor.Latest.CreatedAt) {
+		// The decision remains in the audit timeline, but its issue-scoped queue
+		// projection is obsolete as soon as GitHub closure is reconciled.
+		item.QueueSnapshot = nil
+	}
 	item.DispatchHold = fleetDispatchHoldFromState(st.DispatchHold)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
@@ -4641,7 +4660,7 @@ func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetClo
 	alreadyClosed := fleetIssuesCoveredByExecutedCloseApproval(st)
 	candidates := make([]fleetCloseCandidate, 0)
 	for slot, sess := range st.Sessions {
-		if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.Status != state.StatusDone {
+		if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.Status != state.StatusDone || sess.IssueClosedAt != nil {
 			continue
 		}
 		if alreadyClosed[sess.IssueNumber] {
@@ -4663,6 +4682,57 @@ func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetClo
 		return candidates[i].PRNumber < candidates[j].PRNumber
 	})
 	return candidates
+}
+
+func fleetClosedIssueOutcomes(st *state.State) []fleetClosedIssueOutcome {
+	if st == nil {
+		return nil
+	}
+	out := make([]fleetClosedIssueOutcome, 0)
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.Status != state.StatusDone || sess.IssueNumber <= 0 || sess.IssueClosedAt == nil {
+			continue
+		}
+		out = append(out, fleetClosedIssueOutcome{
+			IssueNumber: sess.IssueNumber,
+			PRNumber:    sess.PRNumber,
+			ClosedAt:    sess.IssueClosedAt.UTC(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ClosedAt.Equal(out[j].ClosedAt) {
+			return out[i].ClosedAt.After(out[j].ClosedAt)
+		}
+		if out[i].IssueNumber != out[j].IssueNumber {
+			return out[i].IssueNumber < out[j].IssueNumber
+		}
+		return out[i].PRNumber < out[j].PRNumber
+	})
+	return out
+}
+
+func fleetTargetWasClosed(project fleetProjectState, target *state.SupervisorTarget, observedAt time.Time) bool {
+	if target == nil {
+		return false
+	}
+	for _, closed := range project.closedIssueOutcomes {
+		matches := target.Issue > 0 && target.Issue == closed.IssueNumber
+		if !matches && target.Issue <= 0 && target.PR > 0 {
+			matches = target.PR == closed.PRNumber
+		}
+		if !matches {
+			continue
+		}
+		return observedAt.IsZero() || !closed.ClosedAt.Before(observedAt.UTC())
+	}
+	return false
+}
+
+func latestFleetClosedIssueOutcome(project fleetProjectState) (fleetClosedIssueOutcome, bool) {
+	if len(project.closedIssueOutcomes) == 0 {
+		return fleetClosedIssueOutcome{}, false
+	}
+	return project.closedIssueOutcomes[0], true
 }
 
 func fleetCloseCandidateTargets(candidates []fleetCloseCandidate) []state.SupervisorIssueTarget {
@@ -5192,6 +5262,9 @@ func fleetDispatchFailureOperatorState(project fleetProjectState) (fleetOperator
 	if latest == nil {
 		return fleetOperatorState{}, false
 	}
+	if fleetTargetWasClosed(project, latest.Target, latest.CreatedAt) {
+		return fleetOperatorState{}, false
+	}
 	if strings.TrimSpace(latest.Status) != "failed" && strings.TrimSpace(latest.ErrorClass) == "" {
 		return fleetOperatorState{}, false
 	}
@@ -5240,12 +5313,20 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 	}
 	if latest := project.Supervisor.Latest; latest != nil {
 		if strings.TrimSpace(latest.RecommendedAction) == "check_outcome_health" {
+			summary := firstNonEmpty(latest.Summary, "Runtime outcome health needs verification.")
+			targetClosed := fleetTargetWasClosed(project, latest.Target, latest.CreatedAt)
+			if targetClosed {
+				summary = fleetOutcomeDriftSummary(project, summary)
+			}
 			operator := fleetOperatorState{
 				Kind:       "outcome_drift",
 				Tone:       "attention",
 				Label:      "Outcome drift",
-				Summary:    firstNonEmpty(latest.Summary, "Runtime outcome health needs verification."),
+				Summary:    summary,
 				NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
+			}
+			if targetClosed {
+				return operator, true
 			}
 			return applyFleetOperatorTarget(project, operator, latest.Target), true
 		}
@@ -5253,12 +5334,20 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 			if stuck.Code != state.StuckNoOutcomeProgress {
 				continue
 			}
+			summary := firstNonEmpty(stuck.Summary, "Runtime outcome health has not caught up with merged PRs.")
+			targetClosed := fleetTargetWasClosed(project, stuck.Target, latest.CreatedAt)
+			if targetClosed {
+				summary = fleetOutcomeDriftSummary(project, summary)
+			}
 			operator := fleetOperatorState{
 				Kind:       "outcome_drift",
 				Tone:       "attention",
 				Label:      "Outcome drift",
-				Summary:    firstNonEmpty(stuck.Summary, "Runtime outcome health has not caught up with merged PRs."),
+				Summary:    summary,
 				NextAction: firstNonEmpty(stuck.RecommendedAction, project.Outcome.NextAction),
+			}
+			if targetClosed {
+				return operator, true
 			}
 			return applyFleetOperatorTarget(project, operator, stuck.Target), true
 		}
@@ -5282,9 +5371,19 @@ func fleetOutcomeHealthState(project fleetProjectState, health string) fleetOper
 		Kind:       "outcome_drift",
 		Tone:       "attention",
 		Label:      "Outcome drift",
-		Summary:    fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal),
+		Summary:    fleetOutcomeDriftSummary(project, fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal)),
 		NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
 	}
+}
+
+func fleetOutcomeDriftSummary(project fleetProjectState, fallback string) string {
+	closed, ok := latestFleetClosedIssueOutcome(project)
+	if !ok {
+		return fallback
+	}
+	health := strings.ReplaceAll(firstNonEmpty(project.Outcome.HealthState, outcome.HealthUnknown), "_", " ")
+	goal := firstNonEmpty(project.Outcome.Goal, project.Outcome.DesiredOutcome, "the configured runtime outcome")
+	return fmt.Sprintf("Issue #%d is closed; project outcome remains unverified (runtime health is %s) for %s.", closed.IssueNumber, health, goal)
 }
 
 // fleetMeteredBackendOperatorState surfaces the #838 metered-backend refusal as
@@ -5313,6 +5412,9 @@ func fleetMeteredBackendOperatorState(project fleetProjectState) (fleetOperatorS
 func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorState, bool) {
 	latest := project.Supervisor.Latest
 	if latest == nil {
+		return fleetOperatorState{}, false
+	}
+	if fleetTargetWasClosed(project, latest.Target, latest.CreatedAt) {
 		return fleetOperatorState{}, false
 	}
 	action := strings.TrimSpace(latest.RecommendedAction)
@@ -5537,6 +5639,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		StartedAt:                 worker.StartedAt,
 		WorkerGeneration:          worker.WorkerGeneration,
 		FinishedAt:                worker.FinishedAt,
+		IssueClosedAt:             worker.IssueClosedAt,
 		WorkerEndedAt:             worker.WorkerEndedAt,
 		PROpenedAt:                worker.PROpenedAt,
 		NextRetryAt:               worker.NextRetryAt,
@@ -5573,6 +5676,17 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		}
 	}
 	issue, pr, session, sessionStatus := fleetApprovalTarget(st, approval.Target)
+	closedIssue := 0
+	if approval.Action == state.ApprovalActionDeployProject {
+		closedIssue = fleetClosedIssueForApproval(st, issue, pr, session)
+		if closedIssue > 0 {
+			// Keep the durable approval payload untouched, but project it as
+			// project/deployment work rather than an action on a closed issue.
+			issue = 0
+			session = ""
+			sessionStatus = string(state.StatusDone)
+		}
+	}
 	createdAt := approval.CreatedAt.UTC()
 	updatedAt := approval.UpdatedAt.UTC()
 	if updatedAt.IsZero() {
@@ -5605,11 +5719,47 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		createdAt:         createdAt,
 		updatedAt:         updatedAt,
 	}
+	if closedIssue > 0 {
+		if item.Target != nil {
+			target := *item.Target
+			target.Issue = 0
+			target.Session = ""
+			target.Issues = nil
+			item.Target = &target
+		}
+		if item.Delivery != nil {
+			item.Delivery.Issue = 0
+		}
+		item.Summary = fmt.Sprintf("Issue #%d is closed; deployment/outcome work for merged PR #%d remains project-scoped (approval status: %s).", closedIssue, pr, approval.Status)
+	}
 	if approval.Status == state.ApprovalStatusPending {
 		item.PastSLA = approvalPastSLA(&item, now)
 	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
 	return item
+}
+
+func fleetClosedIssueForApproval(st *state.State, issue, pr int, session string) int {
+	if st == nil {
+		return 0
+	}
+	if session = strings.TrimSpace(session); session != "" {
+		if sess := st.Sessions[session]; sess != nil && sess.Status == state.StatusDone && sess.IssueClosedAt != nil {
+			return sess.IssueNumber
+		}
+	}
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.Status != state.StatusDone || sess.IssueClosedAt == nil {
+			continue
+		}
+		if issue > 0 && sess.IssueNumber == issue {
+			return sess.IssueNumber
+		}
+		if issue <= 0 && pr > 0 && sess.PRNumber == pr {
+			return sess.IssueNumber
+		}
+	}
+	return 0
 }
 
 // safeFleetDeliveryPayload returns an API-safe copy of the strict delivery
@@ -6113,8 +6263,28 @@ func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
 		}
 	}
 	if latest := projectState.SupervisorLatest; latest != nil {
-		if latest.ProjectState.OpenPRs > count {
-			count = latest.ProjectState.OpenPRs
+		reported := latest.ProjectState.OpenPRs
+		// A supervisor snapshot can predate the standing closed-issue
+		// reconciliation. Remove each reconciled merged PR from that stale
+		// aggregate so Fleet never keeps calling it open until the next
+		// supervisor write; unrelated open PRs remain represented.
+		seenClosedPRs := make(map[int]struct{})
+		if st != nil {
+			for _, sess := range st.Sessions {
+				if sess == nil || sess.PRNumber <= 0 || sess.IssueClosedAt == nil || sess.IssueClosedAt.Before(latest.CreatedAt) {
+					continue
+				}
+				if _, seen := seenClosedPRs[sess.PRNumber]; seen {
+					continue
+				}
+				seenClosedPRs[sess.PRNumber] = struct{}{}
+				if reported > 0 {
+					reported--
+				}
+			}
+		}
+		if reported > count {
+			count = reported
 		}
 	}
 	return count
