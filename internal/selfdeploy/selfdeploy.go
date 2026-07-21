@@ -383,6 +383,7 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 		"--units", strings.Join(cfg.SelfDeploy.EffectiveUnits(), ","),
 		"--result-file", ResultPath(cfg.StateDir),
 		"--timeout-seconds", strconv.Itoa(timeoutSec),
+		"--restart-timeout-seconds", strconv.Itoa(cfg.SelfDeploy.EffectiveRestartTimeoutSeconds()),
 		"--pr", strconv.Itoa(prNumber),
 		// #716: select the systemd unit scope inside the script. Default "user"
 		// keeps the pre-migration behavior; "system" restarts system units via

@@ -7,6 +7,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 )
 
 // repoFile reads a file relative to the repo root (internal/selfdeploy -> ../..).
@@ -263,4 +264,43 @@ func TestApplyUnitsRollbackRestoresExistingUnit(t *testing.T) {
 		"rollback_units",
 		`[[ "$(cat ` + shellQuote(dest) + `)" == *"OLD UNIT v1"* ]] || { echo "rollback did not restore the prior unit"; exit 1; }`,
 	}, "\n"))
+}
+
+// #966: the blocking systemctl restart step has its own drain-sized budget. A
+// wedged restart must return a specific Fleet-unavailable diagnosis instead of
+// hiding under the much larger overall deploy timeout.
+func TestRestartUnitsReportsBoundedDrainBudgetOverrun(t *testing.T) {
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	stubDir := t.TempDir()
+	writeExec(t, filepath.Join(stubDir, "systemctl"), "#!/bin/bash\nsleep 30\n")
+
+	script := repoFile(t, "scripts", "self-deploy.sh")
+	harness := strings.Join([]string{
+		"set -euo pipefail",
+		"PATH=" + shellQuote(stubDir) + ":$PATH",
+		`log() { :; }`,
+		`SCOPE="user"`,
+		`UNIT_LIST=(maestro.service)`,
+		`RESTART_FAIL_DETAIL=""`,
+		`RESTART_TIMED_OUT=0`,
+		extractShellFunc(t, script, "restart_units"),
+		`if restart_units 1; then echo "restart unexpectedly succeeded" >&2; exit 1; fi`,
+		`(( RESTART_TIMED_OUT == 1 )) || { echo "restart timeout flag not set" >&2; exit 1; }`,
+		`[[ "$RESTART_FAIL_DETAIL" == *"bounded drain/restart budget"* ]] || { echo "missing bounded-budget diagnosis: $RESTART_FAIL_DETAIL" >&2; exit 1; }`,
+		`[[ "$RESTART_FAIL_DETAIL" == *"Fleet may be unavailable"* ]] || { echo "missing Fleet impact: $RESTART_FAIL_DETAIL" >&2; exit 1; }`,
+	}, "\n")
+
+	started := time.Now()
+	out, err := exec.Command("bash", "-c", harness).CombinedOutput()
+	if err != nil {
+		t.Fatalf("restart timeout harness failed: %v\n%s", err, out)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Fatalf("restart helper waited %v, want the 1s restart budget rather than the deploy timeout", elapsed)
+	}
+	if !strings.Contains(script, `if (( RESTART_TIMED_OUT )); then`) || !strings.Contains(script, `fail_restart_timeout "$RESTART_FAIL_DETAIL"`) {
+		t.Fatal("timed-out restart must report immediately without entering the 10-minute rollback restart path")
+	}
 }

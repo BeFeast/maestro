@@ -507,6 +507,11 @@ type SelfDeployConfig struct {
 	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
 	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
 	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+	// RestartTimeoutSeconds bounds only the blocking systemctl restart step. It is
+	// deliberately much smaller than TimeoutMinutes so Fleet unavailability is
+	// reported shortly after the daemon's bounded drain, not hidden under the
+	// overall build/deploy budget (#966).
+	RestartTimeoutSeconds int `yaml:"restart_timeout_seconds"`
 
 	// #722: minimum interval between self-deploy triggers. The deploy restarts
 	// the run-loop's own unit, so a burst of merges — or a run-loop restarted by
@@ -593,6 +598,19 @@ func (c SelfDeployConfig) EffectiveTimeoutMinutes() int {
 		return c.TimeoutMinutes
 	}
 	return 30
+}
+
+// DefaultSelfDeployRestartTimeoutSeconds covers the daemon's default four-minute
+// whole-shutdown deadline plus a fixed 30-second process-start grace. Keep this
+// separate from the 30-minute build/deploy timeout: a blocked restart means Fleet
+// is unavailable and must surface promptly (#966).
+const DefaultSelfDeployRestartTimeoutSeconds = 270
+
+func (c SelfDeployConfig) EffectiveRestartTimeoutSeconds() int {
+	if c.RestartTimeoutSeconds > 0 {
+		return c.RestartTimeoutSeconds
+	}
+	return DefaultSelfDeployRestartTimeoutSeconds
 }
 
 // EffectiveMinIntervalMinutes returns the debounce window between self-deploy
