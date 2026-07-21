@@ -3200,6 +3200,27 @@ func strSliceEqual(a, b []string) bool {
 	return true
 }
 
+// checkpointDrainDeathForRestart marks one explicit unexpected process-loss
+// transition as resumable while the session is still running. The caller must
+// invoke it before changing Status to Dead, and only the daemon's persisted
+// in-process shutdown drain qualifies: a generic operator drain can overlap an
+// ordinary crash and must not override its terminal or retry policy (#967).
+func checkpointDrainDeathForRestart(s *state.State, sess *state.Session, at time.Time) bool {
+	if s == nil || sess == nil || sess.Status != state.StatusRunning || !s.ShutdownDrainActive() {
+		return false
+	}
+	worktree := strings.TrimSpace(sess.Worktree)
+	if worktree == "" {
+		return false
+	}
+	if _, err := os.Stat(worktree); err != nil {
+		return false
+	}
+	stamp := at.UTC()
+	sess.RestartCheckpointAt = &stamp
+	return true
+}
+
 // reconcileRunningSessions self-heals stale "running" sessions.
 // If a session is marked running but either its PID is dead/missing OR its tmux session
 // is missing, the session is transitioned to a terminal state.
@@ -3567,24 +3588,20 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		// the first recovery when max_retries_per_issue is 1.
 		unexpectedRetryAllowed := strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess)
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		now := time.Now().UTC()
+		// #967: preserve recovery intent while this is still known to be the
+		// explicit process/tmux-gone path. Inferring the cause later from a dead
+		// session's FinishedAt would also revive ordinary provider failures and
+		// scheduled retries that happened during drain.
+		if checkpointDrainDeathForRestart(s, sess, now) {
+			log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
+		}
 		sess.Status = state.StatusDead
 		sess.PID = 0
 		sess.TmuxSession = ""
-		now := time.Now().UTC()
 		sess.FinishedAt = &now
 		state.MarkWorkerEnded(sess, now)
-		// #967: during graceful drain the daemon shutdown pass may run only
-		// after this flow has already persisted running->dead. Stamp the same
-		// resumable identity here while the cause is still known. Dead markers
-		// are held while drain remains active and consumed by the replacement
-		// daemon, preserving this exact slot/worktree without a new dispatch.
-		if s.DrainActive() && strings.TrimSpace(sess.Worktree) != "" {
-			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
-				stamp := now
-				sess.RestartCheckpointAt = &stamp
-				log.Printf("[orch] reconcile: %s died during drain — retained worktree marked for exact in-place restart resume", slotName)
-			}
-		} else if unexpectedRetryAllowed {
+		if !s.DrainActive() && unexpectedRetryAllowed {
 			if _, statErr := os.Stat(sess.Worktree); statErr == nil {
 				// Unexpected process loss used to become an unscheduled dead
 				// session. Dead sessions are outside the material-progress watchdog,

@@ -163,6 +163,11 @@ func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	if flows != 1 {
 		t.Fatalf("flows = %d, want 1 (duplicate flow identity skipped)", flows)
 	}
+	// The single deduped flow's run loop is launched as a goroutine by
+	// startFlow, so it may not have incremented started yet when waitForFleet
+	// returns. Wait for it to reach 1; startFlow ran exactly once, so it can
+	// never exceed 1 (avoids a race where a 0 read spuriously fails).
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 })
 	if got := atomic.LoadInt64(&run.started); got != 1 {
 		t.Fatalf("run loops started = %d, want 1", got)
 	}

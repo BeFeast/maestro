@@ -868,7 +868,11 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 			log.Printf("[daemon] drain: load state for flow %q (%s) failed: %v", names[i], dir, err)
 			continue
 		}
-		s.SetSpawnDrain(time.Now().UTC())
+		// Record that this drain is part of an actual daemon shutdown. The
+		// orchestrator uses this persisted cause marker to preserve only a
+		// shutdown-interrupted process loss across restart; a standalone
+		// `maestro drain` must not revive an unrelated crash (#967).
+		s.SetShutdownDrain(time.Now().UTC())
 		if err := state.Save(dir, s); err != nil {
 			log.Printf("[daemon] drain: set drain flag for flow %q (%s) failed: %v", names[i], dir, err)
 			continue
