@@ -26,6 +26,7 @@ import (
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/mirrorstore"
+	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/server/web"
@@ -396,6 +397,9 @@ type EmergencySwitch interface {
 // satisfies it. nil disables the alert (the switch still flips).
 type EmergencyNotifier interface {
 	Sendf(format string, args ...any)
+	// Alert fans a classified alert to the ntfy transport when configured
+	// (#1018); a no-op when ntfy is not set up.
+	Alert(class notify.AlertClass, key, title, body string) error
 }
 
 // FleetProjectStore is the write side of the daemon's config store that the
@@ -2251,10 +2255,17 @@ func (s *FleetServer) handleFleetEmergency(w http.ResponseWriter, r *http.Reques
 	// sends exactly one alert — the daemon's watch loop only logs the per-flow
 	// journal confirmation.
 	if n := s.liveEmergencyNotifier(); n != nil {
+		var msg string
 		if st.Active() {
-			n.Sendf("%s", st.ActivationMessage())
+			msg = st.ActivationMessage()
 		} else {
-			n.Sendf("%s", emergencystore.ResumeMessage(emergencystore.State{Level: level}, st))
+			msg = emergencystore.ResumeMessage(emergencystore.State{Level: level}, st)
+		}
+		n.Sendf("%s", msg)
+		// Fan the notify_red-grade alert to ntfy (#1018); dedup keeps a repeated
+		// identical emergency state from re-notifying.
+		if err := n.Alert(notify.AlertEmergency, "emergency", "maestro emergency", msg); err != nil {
+			log.Printf("[fleet] ntfy emergency alert failed: %v", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, emergencyStateToWire(st))
