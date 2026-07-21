@@ -4427,11 +4427,23 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 			}
 		case state.StatusDone:
 			// A terminal peer is authoritative only when it owns the issue's
-			// delivered PR and this attempt was explicitly reconciled as a
-			// duplicate. Do not hide a genuine failed follow-up merely because
-			// an older session for the issue once completed.
+			// delivered PR and has not been released back for redispatch. It
+			// supersedes this terminal attempt when any of:
+			//   - the attempt was explicitly reconciled as a duplicate dispatch;
+			//   - the attempt was (re)dispatched after the canonical PR merged
+			//     — a stale duplicate of already-delivered work; or
+			//   - the canonical session is simply a *later* session than this
+			//     attempt (#976). Two older failed attempts (A, B) must not
+			//     resurface as operator_state once a later session (C) delivered
+			//     the same still-open/blocked issue.
+			// Do not hide a genuine failed follow-up that started *after* an
+			// older completion for the issue: that ordering is left to the
+			// started-after-completion / released-for-redispatch guards, so a
+			// genuinely regressed later session surfaces instead of a predecessor.
 			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
-				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" || fleetSessionStartedAfterCanonicalCompletion(candidate, peer)) {
+				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" ||
+					fleetSessionStartedAfterCanonicalCompletion(candidate, peer) ||
+					fleetSessionPrecededLaterAuthoritative(candidate, peer)) {
 				return peer, true
 			}
 		}
@@ -4481,6 +4493,22 @@ func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInf
 	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
 	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
 	return startErr == nil && finishErr == nil && !started.Before(finished)
+}
+
+// fleetSessionPrecededLaterAuthoritative reports whether the terminal candidate
+// is an older predecessor of the authoritative session — i.e. the authoritative
+// session started strictly after the candidate. Both StartedAt values must
+// parse; an unknown ordering is never treated as "superseded" so a follow-up
+// whose timing cannot be established is preserved as actionable state rather
+// than hidden behind a peer (#976). This is the invariant that keeps two older
+// failed attempts from resurfacing once a later session became authoritative.
+func fleetSessionPrecededLaterAuthoritative(candidate, authoritative sessionInfo) bool {
+	predecessorStart, predErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
+	authoritativeStart, authErr := time.Parse(time.RFC3339, strings.TrimSpace(authoritative.StartedAt))
+	if predErr != nil || authErr != nil {
+		return false
+	}
+	return authoritativeStart.After(predecessorStart)
 }
 
 func backendDriftRestartControlAction(readOnly bool, endpoint, target string, workers, skipped []controlActionWorkerTarget) controlAction {
