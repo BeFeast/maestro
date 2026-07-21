@@ -9,6 +9,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // materialProgressConfigRefreshCap bounds how long a live config edit can take
@@ -104,6 +105,18 @@ func RunMaterialProgressEvaluator(ctx context.Context, name string, getCfg func(
 			}
 			if _, err := EvaluateGateFailureStreaksOnce(cfg, time.Now().UTC()); err != nil {
 				log.Printf("[%s] gate-fail-streak evaluation failed (will retry): %v", logPrefix, err)
+			}
+			// #977: reap orphan container-client wrappers on the watchdog
+			// interval. A `docker run` verification wrapper whose owning worker
+			// died lingers parentless (PPID=1) after its named container exits;
+			// it is a zombie, not active work, and must not be counted as
+			// progress. Host-global and idempotent — a non-empty report is
+			// logged for operator evidence; liveSessions is nil because the
+			// parentless-wrapper + terminal-container signal already spares any
+			// genuinely active verification command.
+			if report := worker.ReapOrphanContainerWrappers(nil); !report.Empty() {
+				log.Printf("[%s] reaped orphan container-client wrappers: killed=%v removed_containers=%v",
+					logPrefix, report.KilledWrappers, report.RemovedContainers)
 			}
 		}
 		if wait <= 0 {
