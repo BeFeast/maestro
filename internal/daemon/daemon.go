@@ -51,17 +51,13 @@ const (
 	// that operator CRUD (config-store add/rm/edit) is reflected quickly, long
 	// enough that polling SQLite is negligible.
 	DefaultWatchStoreInterval = 15 * time.Second
-	// DefaultDrainTimeout bounds the graceful in-process drain the daemon runs on
-	// SIGTERM (#761, single-service cutover): it sets SpawnDrain on every flow so
-	// no new workers are claimed, then waits for in-flight workers to finish. It
-	// is deliberately UNDER the unit's TimeoutStopSec (6min) with room to spare so
-	// the drain finishes AND the post-drain shutdown restart-checkpoint pass
-	// (#877) still completes before systemd escalates to SIGKILL. At 4m it leaves
-	// ~2min of the stop window for stopAll + checkpoint I/O — a 5m drain left only
-	// ~1min, which a slow flow shutdown or many state dirs could exhaust, letting
-	// SIGKILL land before the resumable markers were saved (#877 review comment 1).
-	// The 4m still covers the vast majority of in-flight workers; a longer-running
-	// worker is checkpointed and resumed in place rather than waited on (#817).
+	// DefaultDrainTimeout bounds the ENTIRE graceful SIGTERM shutdown (#761,
+	// #966): SpawnDrain propagation, the in-flight worker wait, flow joins,
+	// restart markers, and process handoff all fit inside four minutes. The command
+	// reserves a small tail inside this budget for teardown, and maestro.service's
+	// longer TimeoutStopSec remains only a systemd backstop. A longer-running
+	// isolated worker is checkpointed/adopted across restart rather than waited on
+	// indefinitely (#817, #891).
 	DefaultDrainTimeout = 4 * time.Minute
 	// DefaultEmergencyWatchInterval is how often the daemon re-reads the
 	// fleet-wide EMERGENCY STOP switch from the unified DB (#840). It is short so
@@ -114,6 +110,41 @@ var shutdownCheckpointBudget = 60 * time.Second
 // tests can exercise the retry path deterministically.
 var restartCheckpointRetries = 5
 
+// checkpointFn writes the best-effort CHECKPOINT.md context blob for one
+// in-flight session and returns its path. It defaults to worker.SaveCheckpoint,
+// which shells out to git; a var so tests can inject a fast or deliberately
+// wedged stub. It is called through saveCheckpointWithin so a git invocation
+// contending with a live worker's index.lock cannot hang the shutdown pass past
+// the drain deadline (#966).
+var checkpointFn = worker.SaveCheckpoint
+
+// saveCheckpointWithin runs checkpointFn but abandons it if it does not return
+// within budget. Checkpoint capture shells out to git against worktrees that are
+// still owned by surviving workers, so it must not be allowed to defeat the same
+// global shutdown deadline as a wedged flow callback (#966). The marker is
+// persisted before this helper runs; the abandoned goroutine is harmless and is
+// reaped when the process exits. A non-positive budget skips the optional capture
+// entirely (timedOut=true).
+func saveCheckpointWithin(sess *state.Session, budget time.Duration) (path string, err error, timedOut bool) {
+	if budget <= 0 {
+		return "", nil, true
+	}
+	type result struct {
+		path string
+		err  error
+	}
+	ch := make(chan result, 1)
+	go func() { p, e := checkpointFn(sess); ch <- result{p, e} }()
+	timer := time.NewTimer(budget)
+	defer timer.Stop()
+	select {
+	case r := <-ch:
+		return r.path, r.err, false
+	case <-timer.C:
+		return "", nil, true
+	}
+}
+
 // ConfigLoader yields the set of project configs the daemon supervises. It is
 // satisfied by *configstore.Store; tests inject an in-memory fake so the
 // daemon's lifecycle can be exercised without a real SQLite store.
@@ -162,6 +193,10 @@ type Options struct {
 	// WatchStoreInterval is the diff-loop / reload poll cadence; clamped to
 	// DefaultWatchStoreInterval when non-positive.
 	WatchStoreInterval time.Duration
+	// DrainTimeout is the daemon command's configured whole-shutdown budget. It
+	// is also forwarded to centralized self-deploy so the helper's restart-only
+	// timeout tracks a non-default --drain-timeout (#966).
+	DrainTimeout time.Duration
 
 	// ApprovalsStore selects the store backing the fleet approve/reject
 	// endpoint (#759): "json" (default) keeps the legacy per-project JSON
@@ -212,6 +247,14 @@ type Options struct {
 type Daemon struct {
 	store ConfigLoader
 	opts  Options
+
+	// shutdownDeadline is the absolute deadline established by the daemon signal
+	// handler for the whole graceful shutdown. Drain, flow joins, restart
+	// checkpointing, and HTTP teardown all share it, so work after the worker
+	// drain cannot extend a systemd restart past the advertised budget (#966).
+	shutdownMu        sync.RWMutex
+	shutdownDeadline  time.Time
+	shutdownStateDirs []string
 
 	// projectStore is store viewed as a configwatch.ProjectStore — non-nil only
 	// when the store supports per-project Load + ProjectsFingerprint, which the
@@ -281,6 +324,48 @@ type Daemon struct {
 	materialProgressLoop func(ctx context.Context, name string, getCfg func() *config.Config)
 }
 
+// SetShutdownDeadline records the absolute deadline for the current daemon
+// shutdown. Repeated calls may shorten but never extend it, so a forced/second
+// shutdown request cannot accidentally grant teardown more time (#966).
+func (d *Daemon) SetShutdownDeadline(deadline time.Time) {
+	if deadline.IsZero() {
+		return
+	}
+	d.shutdownMu.Lock()
+	if d.shutdownDeadline.IsZero() || deadline.Before(d.shutdownDeadline) {
+		d.shutdownDeadline = deadline
+	}
+	d.shutdownMu.Unlock()
+}
+
+func (d *Daemon) shutdownDeadlineOr(fallback time.Time) time.Time {
+	d.shutdownMu.RLock()
+	deadline := d.shutdownDeadline
+	d.shutdownMu.RUnlock()
+	if deadline.IsZero() {
+		return fallback
+	}
+	return deadline
+}
+
+func (d *Daemon) rememberShutdownStateDirs(dirs []string) {
+	if len(dirs) == 0 {
+		return
+	}
+	d.shutdownMu.Lock()
+	seen := make(map[string]bool, len(d.shutdownStateDirs)+len(dirs))
+	for _, dir := range d.shutdownStateDirs {
+		seen[dir] = true
+	}
+	for _, dir := range dirs {
+		if dir != "" && !seen[dir] {
+			d.shutdownStateDirs = append(d.shutdownStateDirs, dir)
+			seen[dir] = true
+		}
+	}
+	d.shutdownMu.Unlock()
+}
+
 // New constructs a Daemon that loads projects from store on Run.
 //
 // Non-positive intervals are clamped to the package defaults with a loud warn
@@ -301,6 +386,9 @@ func New(store ConfigLoader, opts Options) *Daemon {
 	if opts.WatchStore && opts.WatchStoreInterval <= 0 {
 		log.Printf("[daemon] watch-store-interval %s is not positive; clamping to default %s", opts.WatchStoreInterval, DefaultWatchStoreInterval)
 		opts.WatchStoreInterval = DefaultWatchStoreInterval
+	}
+	if opts.DrainTimeout <= 0 {
+		opts.DrainTimeout = DefaultDrainTimeout
 	}
 	d := &Daemon{
 		store: store,
@@ -580,19 +668,29 @@ func (d *Daemon) Run(ctx context.Context) error {
 	select {
 	case <-ctx.Done():
 		drainWatch()
+		// A SIGTERM-driven shutdown installs one absolute deadline before ctx is
+		// cancelled. Other embedders/tests that cancel directly keep the historical
+		// bounded stop + checkpoint allowance.
+		deadline := d.shutdownDeadlineOr(time.Now().Add(shutdownFlowTimeout + shutdownCheckpointBudget))
 		// Snapshot flow state dirs before stopAll clears the flow registry, then
 		// checkpoint any worker still in-flight so it resumes exactly once after
 		// the restart instead of a false running->dead (#877).
 		dirs := d.flowStateDirs()
-		d.stopAll()
-		d.checkpointInFlightForRestart(time.Now().Add(shutdownCheckpointBudget), dirs)
+		d.checkpointInFlightForRestart(checkpointDeadline(deadline), dirs)
+		d.stopAllUntil(deadline)
 		// Don't block indefinitely on fleet server shutdown: the server's
-		// Shutdown goroutine has a 5s timeout, but bound the read so a
-		// pathological case never keeps the process alive (#817).
+		// Shutdown goroutine has a 5s timeout, but the read shares the same global
+		// shutdown deadline so it cannot extend a restart (#817, #966).
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return nil
+		}
+		timer := time.NewTimer(remaining)
+		defer timer.Stop()
 		select {
 		case err := <-fleetErr:
 			return err
-		case <-time.After(shutdownFlowTimeout):
+		case <-timer.C:
 			return nil
 		}
 	case err := <-fleetErr:
@@ -600,9 +698,10 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// successful bind (rare; the bind failure itself was already handled by
 		// Listen above). Flows are legitimately running, so drain them.
 		drainWatch()
+		deadline := d.shutdownDeadlineOr(time.Now().Add(shutdownFlowTimeout + shutdownCheckpointBudget))
 		dirs := d.flowStateDirs()
-		d.stopAll()
-		d.checkpointInFlightForRestart(time.Now().Add(shutdownCheckpointBudget), dirs)
+		d.checkpointInFlightForRestart(checkpointDeadline(deadline), dirs)
+		d.stopAllUntil(deadline)
 		if err != nil {
 			log.Printf("[daemon] fleet server failed on %s:%d: %v", d.opts.Host, d.opts.Port, err)
 			return err
@@ -610,6 +709,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 		<-ctx.Done()
 		return nil
 	}
+}
+
+func checkpointDeadline(shutdownDeadline time.Time) time.Time {
+	now := time.Now()
+	budget := shutdownCheckpointBudget
+	if !shutdownDeadline.IsZero() {
+		remaining := time.Until(shutdownDeadline)
+		// CHECKPOINT.md is optional; keep at least half of the remaining global
+		// tail available for flow detach logs and HTTP/process handoff (#966).
+		if half := remaining / 2; half < budget {
+			budget = half
+		}
+	}
+	if budget < 0 {
+		budget = 0
+	}
+	return now.Add(budget)
 }
 
 // wireApprovalExecutor gives a fleet project the same in-process approval
@@ -823,6 +939,16 @@ func (d *Daemon) Fleet() *server.FleetServer {
 // so an operator can force shutdown. Non-positive timeout clamps to
 // DefaultDrainTimeout.
 func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
+	if timeout <= 0 {
+		timeout = DefaultDrainTimeout
+	}
+	d.DrainUntil(ctx, time.Now().Add(timeout))
+}
+
+// DrainUntil is Drain with an absolute deadline. The signal path uses it so
+// time spent setting drain flags is part of the same global shutdown budget as
+// the worker wait and post-drain teardown (#966).
+func (d *Daemon) DrainUntil(ctx context.Context, deadline time.Time) {
 	// Fail fast on GitHub rate limits from here on (#797): the flows keep
 	// polling while the drain waits for in-flight workers, and a rate-limited
 	// window at that moment must degrade to failed cycles — not minutes of
@@ -830,9 +956,10 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 	// 2026-07-02: a 0-worker drain stretched past 20 minutes).
 	github.BeginShutdown()
 
-	if timeout <= 0 {
-		timeout = DefaultDrainTimeout
+	if deadline.IsZero() {
+		deadline = time.Now().Add(DefaultDrainTimeout)
 	}
+	started := time.Now()
 
 	// Snapshot the live flows' state dirs under the lock. Dedup on StateDir so a
 	// (degenerate) repeated dir is drained once; the flows map is already keyed
@@ -854,6 +981,11 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 		names = append(names, flow.name)
 	}
 	d.mu.Unlock()
+	// Preserve this pre-cancel snapshot. Once the parent daemon context is
+	// cancelled, responsive flows deregister immediately; reconstructing dirs
+	// from the live registry in Run teardown would then miss their still-running
+	// isolated workers and fail to checkpoint them (#966).
+	d.rememberShutdownStateDirs(dirs)
 	if len(dirs) == 0 {
 		return
 	}
@@ -879,12 +1011,17 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 		}
 		requested++
 	}
-	log.Printf("[daemon] drain: requested on %d/%d flow(s) — no new workers; waiting up to %s for in-flight workers to finish", requested, len(dirs), timeout)
+	remaining := time.Until(deadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	log.Printf("[daemon] drain: requested on %d/%d flow(s) — no new workers; waiting up to %s more for in-flight workers to finish", requested, len(dirs), remaining.Round(time.Millisecond))
 
 	// Phase 2: wait for in-flight workers to finish across every flow.
-	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(drainPollInterval)
 	defer ticker.Stop()
+	deadlineTimer := time.NewTimer(remaining)
+	defer deadlineTimer.Stop()
 	lastReported := -1
 	for {
 		running := 0
@@ -903,13 +1040,18 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 			log.Printf("[daemon] drain: complete — no in-flight workers remain")
 			return
 		}
-		if !time.Now().Before(deadline) {
-			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with shutdown", timeout, running)
+		select {
+		case <-deadlineTimer.C:
+			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with bounded shutdown", time.Since(started).Round(time.Millisecond), running)
 			return
+		default:
 		}
 		select {
 		case <-ctx.Done():
 			log.Printf("[daemon] drain: aborted (forced shutdown) with %d worker(s) still running", running)
+			return
+		case <-deadlineTimer.C:
+			log.Printf("[daemon] drain: timed out after %s with %d worker(s) still running; proceeding with bounded shutdown", time.Since(started).Round(time.Millisecond), running)
 			return
 		case <-ticker.C:
 		}
@@ -922,7 +1064,6 @@ func (d *Daemon) Drain(ctx context.Context, timeout time.Duration) {
 // states to scan.
 func (d *Daemon) flowStateDirs() []string {
 	d.mu.Lock()
-	defer d.mu.Unlock()
 	dirs := make([]string, 0, len(d.flows))
 	seen := make(map[string]bool, len(d.flows))
 	for _, flow := range d.flows {
@@ -930,6 +1071,18 @@ func (d *Daemon) flowStateDirs() []string {
 			continue
 		}
 		dir := strings.TrimSpace(flow.cfg.StateDir)
+		if dir == "" || seen[dir] {
+			continue
+		}
+		seen[dir] = true
+		dirs = append(dirs, dir)
+	}
+	d.mu.Unlock()
+
+	d.shutdownMu.RLock()
+	remembered := append([]string(nil), d.shutdownStateDirs...)
+	d.shutdownMu.RUnlock()
+	for _, dir := range remembered {
 		if dir == "" || seen[dir] {
 			continue
 		}
@@ -944,19 +1097,15 @@ func (d *Daemon) flowStateDirs() []string {
 // that makes a self-deploy/operator restart honor drain semantics even when a
 // worker did not finish within the drain window.
 //
-// Timing: with KillMode=mixed (maestro.service) the worker tmux servers keep
-// running while the daemon drains, so the drain genuinely waits for live
-// workers. Any worker still running when the daemon finally exits is reaped by
-// systemd's cgroup-wide SIGKILL once the main process is gone. Without a
-// checkpoint the next daemon would observe a dead pid on a session still marked
-// "running" and mark it running->dead over a surviving dirty worktree — the
-// exact 2026-07-12 failure. Here, instead, each such session is snapshotted to a
-// CHECKPOINT.md and stamped with RestartCheckpointAt; the next daemon's
-// reconcile resumes the SAME logical session in place exactly once.
+// Timing: isolated worker scopes survive maestro.service while the daemon drains
+// and restarts (#891). The marker lets the replacement daemon prove the restart
+// was deliberate and either adopt that same surviving PID/worktree or, for a
+// legacy/non-isolated worker that did exit, resume the same logical session in
+// place exactly once. CHECKPOINT.md remains best-effort diagnostic context.
 //
-// It runs AFTER stopAll, so the flows are quiescent — but stopAll abandons a flow
-// whose RunOnce cycle outruns shutdownFlowTimeout, so a still-live flow can Save
-// concurrently with this pass. It therefore does its Load/stamp/Save with a
+// It runs after daemon-context cancellation but BEFORE waiting on stopAll, so a
+// non-returning flow cannot consume the deadline before markers are durable. A
+// still-finishing RunOnce may Save concurrently, so this pass does Load/stamp/Save with a
 // retry-on-conflict loop (checkpointDir): a lost 3-way merge reloads and
 // re-evaluates, so the marker is never dropped and a late flow save is never
 // clobbered (#877 review comment 2). dirs must be captured (flowStateDirs) before
@@ -969,26 +1118,40 @@ func (d *Daemon) flowStateDirs() []string {
 // completes even under stop-window pressure (#877 review comment 1).
 func (d *Daemon) checkpointInFlightForRestart(deadline time.Time, dirs []string) {
 	now := time.Now().UTC()
+	type contextPass struct {
+		dir    string
+		state  *state.State
+		marked []string
+	}
+	contexts := make([]contextPass, 0, len(dirs))
+	// First sweep: persist markers across EVERY flow before any optional git
+	// capture can consume the remaining shutdown budget (#966).
 	for _, dir := range dirs {
-		d.checkpointDirForRestart(dir, now, deadline)
+		s, marked := d.checkpointDirForRestart(dir, now)
+		if len(marked) > 0 {
+			contexts = append(contexts, contextPass{dir: dir, state: s, marked: marked})
+		}
+	}
+	// Second sweep: add best-effort context only after all correctness markers
+	// are durable. A wedged capture can no longer starve another flow's marker.
+	for _, pass := range contexts {
+		d.saveRestartCheckpointContext(pass.dir, pass.state, pass.marked, deadline)
 	}
 }
 
-// checkpointDirForRestart stamps resumable markers for the in-flight workers of
-// one flow's state dir, retrying on a lost 3-way merge (ErrStateConflict) so a
-// concurrent save from a timed-out-but-still-running flow neither drops the
-// marker nor overwrites the flow's fresher session state (#877 review comment 2).
-// Generated CHECKPOINT.md paths are memoised across retries so a merge conflict
-// never re-runs the git-heavy context capture.
-func (d *Daemon) checkpointDirForRestart(dir string, now, deadline time.Time) {
-	generated := map[string]string{} // slot -> CHECKPOINT.md path, reused across retries
+// checkpointDirForRestart stamps every correctness-critical resumable marker
+// before attempting any best-effort CHECKPOINT.md capture. A single wedged git
+// call must never consume the global shutdown tail and leave later workers
+// unmarked (#966). The marker save retries on a lost 3-way merge so a still-live,
+// detached flow neither drops the marker nor has fresher state overwritten.
+func (d *Daemon) checkpointDirForRestart(dir string, now time.Time) (*state.State, []string) {
 	for attempt := 0; attempt < restartCheckpointRetries; attempt++ {
 		s, err := state.Load(dir)
 		if err != nil {
 			log.Printf("[daemon] restart-checkpoint: load state %s failed: %v", dir, err)
-			return
+			return nil, nil
 		}
-		changed := false
+		marked := make([]string, 0)
 		for slot, sess := range s.Sessions {
 			if sess == nil || sess.Status != state.StatusRunning {
 				continue
@@ -1009,40 +1172,57 @@ func (d *Daemon) checkpointDirForRestart(dir string, now, deadline time.Time) {
 			if _, statErr := os.Stat(sess.Worktree); statErr != nil {
 				continue
 			}
-			// Best-effort context blob, capped by the shutdown budget: the marker
-			// below is what prevents the false running->dead, so under deadline
-			// pressure (many in-flight workers) skip the git-heavy capture and
-			// stamp the marker alone (#877 review comment 1). Memoised so a merge
-			// retry does not regenerate it.
-			if cp, ok := generated[slot]; ok {
-				sess.CheckpointFile = cp
-			} else if time.Now().Before(deadline) {
-				if cp, cpErr := worker.SaveCheckpoint(sess); cpErr != nil {
-					log.Printf("[daemon] restart-checkpoint: save checkpoint for %s (issue #%d) failed: %v", slot, sess.IssueNumber, cpErr)
-				} else if cp != "" {
-					sess.CheckpointFile = cp
-					generated[slot] = cp
-				}
-			} else {
-				log.Printf("[daemon] restart-checkpoint: %s (issue #%d) — shutdown budget spent, stamping resumable marker without CHECKPOINT.md context", slot, sess.IssueNumber)
-			}
 			stamp := now
 			sess.RestartCheckpointAt = &stamp
-			changed = true
+			marked = append(marked, slot)
 			log.Printf("[daemon] restart-checkpoint: %s (issue #%d) marked resumable across restart — worktree preserved for exactly-once in-place resume", slot, sess.IssueNumber)
 		}
-		if !changed {
-			return
+		if len(marked) == 0 {
+			return nil, nil
 		}
 		err = state.Save(dir, s)
 		if err == nil {
-			return
+			return s, marked
 		}
 		if errors.Is(err, state.ErrStateConflict) && attempt < restartCheckpointRetries-1 {
 			log.Printf("[daemon] restart-checkpoint: save %s lost a merge to a concurrent flow save; reloading and retrying (attempt %d/%d)", dir, attempt+1, restartCheckpointRetries)
 			continue
 		}
 		log.Printf("[daemon] restart-checkpoint: save state %s failed: %v", dir, err)
+		return nil, nil
+	}
+	return nil, nil
+}
+
+// saveRestartCheckpointContext adds the optional CHECKPOINT.md paths after all
+// resumable markers for this state dir are durable. Timeout or save conflict is
+// harmless: the replacement daemon only needs RestartCheckpointAt for correct,
+// exactly-once reconciliation; the context file is diagnostic assistance.
+func (d *Daemon) saveRestartCheckpointContext(dir string, s *state.State, marked []string, deadline time.Time) {
+	changed := false
+	for _, slot := range marked {
+		sess := s.Sessions[slot]
+		if sess == nil || sess.CheckpointFile != "" {
+			continue
+		}
+		cp, cpErr, timedOut := saveCheckpointWithin(sess, time.Until(deadline))
+		if timedOut {
+			log.Printf("[daemon] restart-checkpoint: %s (issue #%d) — shutdown budget spent or checkpoint git wedged; resumable marker is already durable without CHECKPOINT.md context", slot, sess.IssueNumber)
+			continue
+		}
+		if cpErr != nil {
+			log.Printf("[daemon] restart-checkpoint: save checkpoint for %s (issue #%d) failed: %v", slot, sess.IssueNumber, cpErr)
+			continue
+		}
+		if cp != "" {
+			sess.CheckpointFile = cp
+			changed = true
+		}
+	}
+	if !changed {
 		return
+	}
+	if err := state.Save(dir, s); err != nil {
+		log.Printf("[daemon] restart-checkpoint: save best-effort CHECKPOINT.md paths for %s failed: %v", dir, err)
 	}
 }

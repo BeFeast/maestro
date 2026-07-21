@@ -150,6 +150,7 @@ func TestTriggerCommand(t *testing.T) {
 		"--units maestro.service",
 		"--result-file " + ResultPath(cfg.StateDir),
 		"--timeout-seconds 1800",
+		"--restart-timeout-seconds 270",
 		"--pr 698",
 		"--scope user",
 		"--health-url http://127.0.0.1:8788/api/v1/state",
