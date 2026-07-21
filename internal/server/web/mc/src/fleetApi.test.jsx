@@ -120,6 +120,21 @@ describe("Fleet workers ordering contract", () => {
     });
   });
 
+  test("ordinary done session keeps a historical token-budget failure visible", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "done",
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "token budget exceeded",
+      tone: "stuck",
+      section: "stuck",
+    });
+  });
+
   test("issue-guard retry hold is visible recent work, not a stuck worker", () => {
     const taxonomy = workerStatusTaxonomy({
       status: "dead",

@@ -244,7 +244,8 @@ type Session struct {
 	FinishedAt       *time.Time    `json:"finished_at,omitempty"`
 	Status           SessionStatus `json:"status"`
 	PRNumber         int           `json:"pr_number,omitempty"`
-	Backend          string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	PRMerged         bool          `json:"pr_merged,omitempty"` // authoritative merge evidence retained after a closed issue transitions from code_landed/pr_open to done
+	Backend          string        `json:"backend,omitempty"`   // "claude", "codex", etc.
 	// #730: model + self-reported cost captured from the backend's own
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
@@ -905,14 +906,15 @@ type SupervisorIssueTarget struct {
 
 // SupervisorProjectState captures the read-only state snapshot behind a decision.
 type SupervisorProjectState struct {
-	Sessions       int `json:"sessions"`
-	Running        int `json:"running"`
-	PROpen         int `json:"pr_open"`
-	Queued         int `json:"queued"`
-	RetryExhausted int `json:"retry_exhausted"`
-	OpenIssues     int `json:"open_issues"`
-	OpenPRs        int `json:"open_prs"`
-	AvailableSlots int `json:"available_slots"`
+	Sessions       int   `json:"sessions"`
+	Running        int   `json:"running"`
+	PROpen         int   `json:"pr_open"`
+	Queued         int   `json:"queued"`
+	RetryExhausted int   `json:"retry_exhausted"`
+	OpenIssues     int   `json:"open_issues"`
+	OpenPRs        int   `json:"open_prs"`
+	OpenPRNumbers  []int `json:"open_pr_numbers"` // exact identities make later closed-issue filtering safe; nil denotes a legacy aggregate-only snapshot
+	AvailableSlots int   `json:"available_slots"`
 }
 
 const (
@@ -3653,18 +3655,70 @@ func (s *State) StaleIssueApprovalsForClosedIssue(issueNumber int, now time.Time
 		reason = fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", issueNumber)
 	}
 	var staled []Approval
-	for i := range s.Approvals {
+	var reissues []SupervisorDecision
+	initialApprovals := len(s.Approvals)
+	for i := 0; i < initialApprovals; i++ {
 		approval := &s.Approvals[i]
 		if approval.Action == ApprovalActionDeployProject || !s.approvalTargetsIssue(approval, issueNumber) {
 			continue
 		}
 		switch approval.Status {
 		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			// A batch approval can authorize other still-open issues. Retire the
+			// old immutable payload, then reissue only the remaining targets as a
+			// fresh pending approval. Narrowing through a new gate keeps the closed
+			// issue moot without discarding unrelated operator-approved work.
+			if approval.Action == approvalActionCloseIssueBatch && approval.Target != nil {
+				remaining := make([]SupervisorIssueTarget, 0, len(approval.Target.Issues))
+				for _, target := range approval.Target.Issues {
+					if target.Issue != issueNumber {
+						remaining = append(remaining, target)
+					}
+				}
+				if len(remaining) > 0 {
+					target := cloneSupervisorTarget(approval.Target)
+					target.Issues = remaining
+					reissues = append(reissues, SupervisorDecision{
+						ID:                approval.DecisionID,
+						CreatedAt:         now,
+						Project:           approval.Project,
+						Repo:              approval.Repo,
+						Summary:           fmt.Sprintf("Close %d remaining verified merged issue(s); issue #%d was already closed externally.", len(remaining), issueNumber),
+						RecommendedAction: approval.Action,
+						Target:            target,
+						Risk:              approval.Risk,
+						Reasons:           append(append([]string(nil), approval.Evidence...), reason),
+						RequiresApproval:  true,
+					})
+				}
+			}
 			s.markApprovalStale(approval, now, reason)
 			staled = append(staled, *approval)
 		}
 	}
+	for _, decision := range reissues {
+		s.RecordPendingApprovalForDecision(decision, now)
+	}
 	return staled
+}
+
+// MootIssueApprovalMirrorCandidates returns every JSON-stale issue-scoped
+// approval for a closed issue. Unlike StaleIssueApprovalsForClosedIssue, this
+// includes approvals transitioned on an earlier cycle so a transient SQLite
+// mirror failure is retried until both stores converge.
+func (s *State) MootIssueApprovalMirrorCandidates(issueNumber int) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	var out []Approval
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action == ApprovalActionDeployProject || approval.Status != ApprovalStatusStale || !s.approvalTargetsIssue(approval, issueNumber) {
+			continue
+		}
+		out = append(out, *approval)
+	}
+	return out
 }
 
 func (s *State) approvalTargetsIssue(approval *Approval, issueNumber int) bool {

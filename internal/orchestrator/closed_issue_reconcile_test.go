@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/outcome"
@@ -111,6 +112,43 @@ func TestCheckSessionsClosedIssueWaitsForProcessLeaseTeardown(t *testing.T) {
 	}
 }
 
+func TestCheckSessionsClosedIssueWaitsForLegacyTeardownError(t *testing.T) {
+	st := state.NewState()
+	st.Sessions["slot-running"] = &state.Session{
+		IssueNumber: 906,
+		Status:      state.StatusRunning,
+		PID:         4242,
+		TmuxSession: "maestro-slot-running",
+	}
+	stopCalls := 0
+	o := &Orchestrator{
+		cfg:             &config.Config{Repo: "owner/repo"},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(int) (bool, error) { return true, nil },
+		workerStopFn: func(_ *config.Config, _ string, sess *state.Session) error {
+			stopCalls++
+			if stopCalls == 1 {
+				// Reproduce a legacy/controller stop that clears receipts before
+				// returning an ambiguous teardown failure.
+				sess.PID = 0
+				sess.TmuxSession = ""
+				return errors.New("legacy process teardown uncertain")
+			}
+			return nil
+		},
+	}
+
+	o.checkSessions(st)
+	if sess := st.Sessions["slot-running"]; sess.Status != state.StatusRunning || sess.IssueClosedAt != nil || sess.ReleasedForRedispatch {
+		t.Fatalf("failed legacy teardown session = %+v, want nonterminal ownership retained", sess)
+	}
+
+	o.checkSessions(st)
+	if sess := st.Sessions["slot-running"]; sess.Status != state.StatusDone || sess.IssueClosedAt == nil || !sess.ReleasedForRedispatch {
+		t.Fatalf("successful retry session = %+v, want terminal closed state", sess)
+	}
+}
+
 func TestCheckSessionsClosedIssuePreservesDeliveryOutcomeAndProjectApproval(t *testing.T) {
 	deployedAt := time.Date(2026, 7, 14, 12, 0, 0, 0, time.UTC)
 	checkedAt := deployedAt.Add(time.Hour)
@@ -158,6 +196,12 @@ func TestCheckSessionsClosedIssuePreservesDeliveryOutcomeAndProjectApproval(t *t
 			Status: state.ApprovalStatusApproved,
 			Target: &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
 		},
+		{
+			ID:     "close-batch",
+			Action: config.SupervisorActionCloseIssueBatch,
+			Status: state.ApprovalStatusApproved,
+			Target: &state.SupervisorTarget{Issues: []state.SupervisorIssueTarget{{Issue: 5, PR: 33}, {Issue: 6, PR: 34}}},
+		},
 	}
 	o := &Orchestrator{
 		cfg:             &config.Config{Repo: "owner/repo", Outcome: outcome.Brief{RequiresDeploy: true}},
@@ -168,7 +212,7 @@ func TestCheckSessionsClosedIssuePreservesDeliveryOutcomeAndProjectApproval(t *t
 	o.checkSessions(st)
 
 	sess := st.Sessions["txc-17"]
-	if sess.Status != state.StatusDone || sess.PRNumber != 33 || sess.DeploymentFinishedAt == nil || !sess.DeploymentFinishedAt.Equal(deployedAt) {
+	if sess.Status != state.StatusDone || sess.PRNumber != 33 || !sess.PRMerged || sess.DeploymentFinishedAt == nil || !sess.DeploymentFinishedAt.Equal(deployedAt) {
 		t.Fatalf("closed delivery session lost audit history: %+v", sess)
 	}
 	if st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthFailing || st.OutcomeHealth.Summary != "runtime still failing" {
@@ -180,10 +224,46 @@ func TestCheckSessionsClosedIssuePreservesDeliveryOutcomeAndProjectApproval(t *t
 	if got := approvalStatus(t, st, "deploy-failed-33"); got != state.ApprovalStatusExecutionFailed {
 		t.Fatalf("failed project delivery approval = %q, want execution_failed", got)
 	}
-	for _, id := range []string{"merge-33", "restart-txc-17"} {
+	for _, id := range []string{"merge-33", "restart-txc-17", "close-batch"} {
 		if got := approvalStatus(t, st, id); got != state.ApprovalStatusStale {
 			t.Fatalf("issue-scoped approval %s = %q, want stale", id, got)
 		}
+	}
+	remainingBatch := 0
+	for i := range st.Approvals {
+		approval := &st.Approvals[i]
+		if approval.ID == "close-batch" || approval.Action != config.SupervisorActionCloseIssueBatch || approval.Status != state.ApprovalStatusPending || approval.Target == nil {
+			continue
+		}
+		remainingBatch++
+		if len(approval.Target.Issues) != 1 || approval.Target.Issues[0].Issue != 6 || approval.Target.Issues[0].PR != 34 {
+			t.Fatalf("reissued close batch = %+v, want only issue #6 / PR #34", approval)
+		}
+	}
+	if remainingBatch != 1 {
+		t.Fatalf("reissued close batches = %d, want 1", remainingBatch)
+	}
+}
+
+func TestClosedIssueReconciliationRetainsStillOpenPRTruth(t *testing.T) {
+	st := state.NewState()
+	st.Sessions["slot-pr"] = &state.Session{
+		IssueNumber: 907,
+		Status:      state.StatusPROpen,
+		PRNumber:    44,
+	}
+	o := &Orchestrator{
+		cfg:             &config.Config{Repo: "owner/repo"},
+		listOpenPRsFn:   func() ([]github.PR, error) { return []github.PR{{Number: 44}}, nil },
+		isIssueClosedFn: func(int) (bool, error) { return true, nil },
+		isPRMergedFn:    func(int) (bool, error) { return false, nil },
+		workerStopFn:    func(*config.Config, string, *state.Session) error { return nil },
+	}
+
+	o.checkSessions(st)
+	sess := st.Sessions["slot-pr"]
+	if sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.PRMerged {
+		t.Fatalf("closed issue/open PR session = %+v, want done issue lifecycle with PR still open", sess)
 	}
 }
 
@@ -242,6 +322,64 @@ func TestClosedIssueReconciliationMirrorsJSONAndSQLiteTogether(t *testing.T) {
 		if sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.PRNumber != 33 || sess.DeploymentFinishedAt == nil || !sess.DeploymentFinishedAt.Equal(deployedAt) {
 			t.Fatalf("%s session did not converge with audit history: %+v", source, sess)
 		}
+	}
+}
+
+func TestClosedIssueApprovalMirrorRetriesAfterJSONAlreadyStale(t *testing.T) {
+	now := time.Date(2026, 7, 15, 14, 28, 15, 0, time.UTC)
+	stateDir := t.TempDir()
+	store, err := approvalstore.Open(filepath.Join(t.TempDir(), "maestro.db"))
+	if err != nil {
+		t.Fatalf("open approval store: %v", err)
+	}
+	t.Cleanup(func() { store.Close() })
+
+	approval := state.Approval{
+		ID:        "merge-33",
+		CreatedAt: now.Add(-time.Hour),
+		UpdatedAt: now.Add(-time.Hour),
+		Action:    config.SupervisorActionMergePR,
+		Target:    &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		Summary:   "Merge PR #33",
+		Risk:      "approval_gated",
+		Status:    state.ApprovalStatusPending,
+		Repo:      "owner/repo",
+		Project:   "owner/repo",
+	}
+	approval.PayloadHash = approval.ComputePayloadHash()
+	if _, err := store.Put(context.Background(), &approval, approvalstore.RowBinding{Project: "owner/repo", Repo: "owner/repo", StateDir: stateDir}); err != nil {
+		t.Fatalf("seed approval store: %v", err)
+	}
+
+	st := state.NewState()
+	st.Sessions["txc-17"] = &state.Session{IssueNumber: 5, Status: state.StatusCodeLanded, PRNumber: 33}
+	st.Approvals = []state.Approval{approval}
+	o := &Orchestrator{
+		cfg:              &config.Config{Repo: "owner/repo", StateDir: stateDir},
+		repo:             "owner/repo",
+		approvalsBinding: approvalstore.Binding{Mode: approvalstore.ModeSQLite, DBPath: t.TempDir()},
+	}
+
+	if !o.reconcileClosedIssueSession(st, "txc-17", st.Sessions["txc-17"], now) {
+		t.Fatal("first closed-issue reconciliation did not transition JSON state")
+	}
+	if got := approvalStatus(t, st, "merge-33"); got != state.ApprovalStatusStale {
+		t.Fatalf("JSON approval status = %q, want stale", got)
+	}
+	if row, err := store.Get(context.Background(), stateDir, "merge-33"); err != nil || row.Status != state.ApprovalStatusPending {
+		t.Fatalf("SQLite row after forced mirror failure = row %+v err %v, want pending", row, err)
+	}
+
+	o.approvalsBinding = approvalstore.Binding{Mode: approvalstore.ModeSQLite, Handle: store}
+	if !o.reconcileClosedIssueSession(st, "txc-17", st.Sessions["txc-17"], now.Add(time.Minute)) {
+		t.Fatal("second closed-issue reconciliation did not complete")
+	}
+	row, err := store.Get(context.Background(), stateDir, "merge-33")
+	if err != nil {
+		t.Fatalf("load retried SQLite row: %v", err)
+	}
+	if row.Status != state.ApprovalStatusStale {
+		t.Fatalf("SQLite approval status after retry = %q, want stale", row.Status)
 	}
 }
 

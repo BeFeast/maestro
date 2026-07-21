@@ -1872,6 +1872,7 @@ type fleetWorkerState struct {
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
 	BackendSelection   *state.BackendSelection `json:"backend_selection,omitempty"`
 	PRNumber           int                     `json:"pr_number,omitempty"`
+	PRMerged           bool                    `json:"pr_merged,omitempty"`
 	PRURL              string                  `json:"pr_url,omitempty"`
 	TokensUsedAttempt  int                     `json:"tokens_used_attempt"`
 	TokensUsedTotal    int                     `json:"tokens_used_total"`
@@ -5620,6 +5621,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		AdvisorReviews:            append([]state.AdvisorReview(nil), worker.AdvisorReviews...),
 		BackendSelection:          worker.BackendSelection,
 		PRNumber:                  worker.PRNumber,
+		PRMerged:                  worker.PRMerged,
 		PRURL:                     worker.PRURL,
 		TokensUsedAttempt:         worker.TokensUsedAttempt,
 		TokensUsedTotal:           worker.TokensUsedTotal,
@@ -5678,7 +5680,7 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 	issue, pr, session, sessionStatus := fleetApprovalTarget(st, approval.Target)
 	closedIssue := 0
 	if approval.Action == state.ApprovalActionDeployProject {
-		closedIssue = fleetClosedIssueForApproval(st, issue, pr, session)
+		closedIssue = fleetClosedIssueForApproval(st, approval, issue, pr, session)
 		if closedIssue > 0 {
 			// Keep the durable approval payload untouched, but project it as
 			// project/deployment work rather than an action on a closed issue.
@@ -5739,23 +5741,44 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 	return item
 }
 
-func fleetClosedIssueForApproval(st *state.State, issue, pr int, session string) int {
+func fleetClosedIssueForApproval(st *state.State, approval state.Approval, issue, pr int, session string) int {
 	if st == nil {
 		return 0
 	}
 	if session = strings.TrimSpace(session); session != "" {
-		if sess := st.Sessions[session]; sess != nil && sess.Status == state.StatusDone && sess.IssueClosedAt != nil {
-			return sess.IssueNumber
+		if sess := st.Sessions[session]; sess != nil {
+			if sess.Status == state.StatusDone && sess.IssueClosedAt != nil &&
+				(issue <= 0 || issue == sess.IssueNumber) && (pr <= 0 || pr == sess.PRNumber) {
+				return sess.IssueNumber
+			}
+			// An exact live/fresh session is authoritative. Do not fall back to
+			// an older closed session for the same issue after a reopen.
+			return 0
 		}
 	}
+	if pr > 0 {
+		for _, sess := range st.Sessions {
+			if sess == nil || sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.PRNumber != pr {
+				continue
+			}
+			if issue > 0 && sess.IssueNumber != issue {
+				continue
+			}
+			return sess.IssueNumber
+		}
+		// A PR identity is stronger than an issue-only historical marker. If
+		// this PR does not match the closed session, it belongs to later work.
+		return 0
+	}
+	createdAt := approval.CreatedAt.UTC()
 	for _, sess := range st.Sessions {
 		if sess == nil || sess.Status != state.StatusDone || sess.IssueClosedAt == nil {
 			continue
 		}
 		if issue > 0 && sess.IssueNumber == issue {
-			return sess.IssueNumber
-		}
-		if issue <= 0 && pr > 0 && sess.PRNumber == pr {
+			if !createdAt.IsZero() && sess.IssueClosedAt.Before(createdAt) {
+				continue
+			}
 			return sess.IssueNumber
 		}
 	}
@@ -6235,8 +6258,10 @@ func failedCount(summary map[string]int) int {
 // case (#564) and must contribute to the count. When the latest supervisor
 // decision reports ProjectState.OpenPRs (the GitHub truth, populated from
 // ListOpenPRs), the larger of the two values wins so a transient session
-// drift never under-counts the dashboard while a stale supervisor decision
-// cannot over-count it.
+// drift never under-counts the dashboard. New decisions also persist exact PR
+// numbers, allowing a later closed-issue reconciliation to remove only a PR
+// proven merged without subtracting unrelated or still-open work from an
+// aggregate.
 func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
 	count := len(projectState.PROpen)
 	if st != nil {
@@ -6264,23 +6289,33 @@ func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
 	}
 	if latest := projectState.SupervisorLatest; latest != nil {
 		reported := latest.ProjectState.OpenPRs
-		// A supervisor snapshot can predate the standing closed-issue
-		// reconciliation. Remove each reconciled merged PR from that stale
-		// aggregate so Fleet never keeps calling it open until the next
-		// supervisor write; unrelated open PRs remain represented.
-		seenClosedPRs := make(map[int]struct{})
-		if st != nil {
-			for _, sess := range st.Sessions {
-				if sess == nil || sess.PRNumber <= 0 || sess.IssueClosedAt == nil || sess.IssueClosedAt.Before(latest.CreatedAt) {
+		if latest.ProjectState.OpenPRNumbers != nil {
+			// Exact identities are required before filtering. A legacy aggregate
+			// alone cannot prove whether the closed session's PR was counted, and
+			// issue closure does not itself prove that the PR merged.
+			closedMergedPRs := make(map[int]struct{})
+			if st != nil {
+				for _, sess := range st.Sessions {
+					if sess == nil || sess.PRNumber <= 0 || !sess.PRMerged || sess.IssueClosedAt == nil || sess.IssueClosedAt.Before(latest.CreatedAt) {
+						continue
+					}
+					closedMergedPRs[sess.PRNumber] = struct{}{}
+				}
+			}
+			reported = 0
+			seen := make(map[int]struct{}, len(latest.ProjectState.OpenPRNumbers))
+			for _, pr := range latest.ProjectState.OpenPRNumbers {
+				if pr <= 0 {
 					continue
 				}
-				if _, seen := seenClosedPRs[sess.PRNumber]; seen {
+				if _, duplicate := seen[pr]; duplicate {
 					continue
 				}
-				seenClosedPRs[sess.PRNumber] = struct{}{}
-				if reported > 0 {
-					reported--
+				seen[pr] = struct{}{}
+				if _, closedAndMerged := closedMergedPRs[pr]; closedAndMerged {
+					continue
 				}
+				reported++
 			}
 		}
 		if reported > count {

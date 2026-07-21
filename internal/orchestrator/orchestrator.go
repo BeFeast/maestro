@@ -4089,16 +4089,35 @@ func (o *Orchestrator) reconcileClosedIssueSession(s *state.State, slotName stri
 			sess.PRNumber = prNumber
 		}
 	}
+	if sess.PRNumber > 0 && !sess.PRMerged {
+		switch previous {
+		case state.StatusCodeLanded:
+			// code_landed is reached only from authoritative merge evidence.
+			// Preserve that fact before replacing the lifecycle status with done.
+			sess.PRMerged = true
+		default:
+			// A manually closed issue may still have an open PR. Query the exact
+			// PR when the read path is available and retain the result so Fleet can
+			// distinguish a merged historical PR from an orphaned open PR.
+			if o.isPRMergedFn != nil || o.readSource != nil || o.gh != nil {
+				if merged, err := o.isPRMerged(sess.PRNumber); err != nil {
+					log.Printf("[orch] issue #%d is closed; PR #%d merge state could not be refreshed: %v", sess.IssueNumber, sess.PRNumber, err)
+				} else {
+					sess.PRMerged = merged
+				}
+			}
+		}
+	}
 	if sess.Status == state.StatusRunning || sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued || sess.PID > 0 || strings.TrimSpace(sess.TmuxSession) != "" || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		if err := o.stopWorker(slotName, sess); err != nil {
 			log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
-			// A surviving process-lease receipt proves teardown is not complete.
-			// Preserve the nonterminal session and retry next cycle rather than
-			// reporting done while its isolated process may still be running.
-			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
-				return false
-			}
+			// Any teardown error is ambiguous. Legacy PID/tmux workers have no
+			// process-lease receipt to prove survival, and an injected/controller
+			// stop can mutate receipts before returning an error. Preserve the
+			// nonterminal lifecycle and retry instead of releasing a possibly-live
+			// worker merely because its receipt fields are now empty.
+			return false
 		}
 	}
 	sess.Status = state.StatusDone
@@ -4121,11 +4140,13 @@ func (o *Orchestrator) reconcileClosedIssueSession(s *state.State, slotName stri
 	reason := fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", sess.IssueNumber)
 	for _, approval := range s.StaleIssueApprovalsForClosedIssue(sess.IssueNumber, now, reason) {
 		log.Printf("[orch] reconciled moot approval %s after issue #%d closed", approval.ID, sess.IssueNumber)
-		if o.cfg != nil && o.approvalsBinding.UseSQLite() {
-			binding := o.approvalsBinding
-			binding.StateDir = o.cfg.StateDir
-			binding.Repo = o.repo
-			binding.Project = o.repo
+	}
+	if o.cfg != nil && o.approvalsBinding.UseSQLite() {
+		binding := o.approvalsBinding
+		binding.StateDir = o.cfg.StateDir
+		binding.Repo = o.repo
+		binding.Project = o.repo
+		for _, approval := range s.MootIssueApprovalMirrorCandidates(sess.IssueNumber) {
 			if err := approvalstore.ReconcileMoot(binding, approval.ID, now, reason); err != nil {
 				log.Printf("[orch] approval %s closed-issue mirror to SQLite failed (JSON will retry on later reconciliation): %v", approval.ID, err)
 			}
@@ -6044,6 +6065,7 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	// #1013: a code_landed transition is terminal reconciliation — the PR
 	// merged, so any scheduled retry (including one deliberately held behind a
 	// current issue-guard label) is settled and must not survive. Clear it at
@@ -6077,6 +6099,7 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	// #443: issue-specific completion gates. Healthz alone is not enough to
 	// close UI/design work that requires live visual or deployment-status
 	// verification. When the configured gates match this issue (by label
@@ -6140,6 +6163,7 @@ func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	if sess.Status != state.StatusCodeLanded {
 		sess.Status = state.StatusCodeLanded
 	}

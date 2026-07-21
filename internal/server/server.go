@@ -360,6 +360,7 @@ type sessionInfo struct {
 	// Empty for backends that do not self-report a model.
 	Model                     string                `json:"model,omitempty"`
 	PRNumber                  int                   `json:"pr_number,omitempty"`
+	PRMerged                  bool                  `json:"pr_merged,omitempty"`
 	PRURL                     string                `json:"pr_url,omitempty"`
 	Phase                     string                `json:"phase,omitempty"`
 	PlanVersion               int                   `json:"plan_version,omitempty"`
@@ -503,6 +504,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		CredentialAggregateReason: sess.CredentialAggregateReason,
 		Model:                     currentSessionModel(sess),
 		PRNumber:                  sess.PRNumber,
+		PRMerged:                  sess.PRMerged,
 		PRURL:                     githubPRURL(repo, sess.PRNumber),
 		Phase:                     string(sess.Phase),
 		PlanVersion:               sess.PlanVersion,

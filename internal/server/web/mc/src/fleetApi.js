@@ -1141,7 +1141,7 @@ export function workerStatusTaxonomy(worker) {
   // GitHub issue closure reconciles the session to terminal done. Historical
   // worker outcomes/display tokens remain available for audit, but they must
   // not pull the closed issue back into the SPA's stuck/actionable section.
-  if (status === "done") {
+  if (status === "done" && String(worker.issue_closed_at || "") !== "") {
     return { label: "done", tone: "ok", section: "done" };
   }
 

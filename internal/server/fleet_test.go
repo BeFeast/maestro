@@ -5195,6 +5195,7 @@ func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *tes
 		IssueTitle:            "Closed delivery",
 		Status:                state.StatusDone,
 		PRNumber:              33,
+		PRMerged:              true,
 		StartedAt:             now.Add(-4 * time.Hour),
 		FinishedAt:            &finishedAt,
 		IssueClosedAt:         &closedAt,
@@ -5222,7 +5223,7 @@ func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *tes
 		Summary:           "Review PR #33 before issue #5 can be closed.",
 		RecommendedAction: config.SupervisorActionMergePR,
 		Target:            &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
-		ProjectState:      state.SupervisorProjectState{OpenPRs: 1, OpenIssues: 1},
+		ProjectState:      state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}, OpenIssues: 1},
 		StuckStates: []state.SupervisorStuckState{{
 			Code:              "failing_checks",
 			Severity:          "blocked",
@@ -5251,7 +5252,7 @@ func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *tes
 	project := findFleetProject(t, resp.Projects, "Project")
 	worker := findFleetWorker(t, resp.Workers, "txc-17")
 
-	if worker.Status != string(state.StatusDone) || worker.NeedsAttention || worker.IssueClosedAt == "" || len(worker.Actions) != 0 {
+	if worker.Status != string(state.StatusDone) || worker.NeedsAttention || worker.IssueClosedAt == "" || !worker.PRMerged || len(worker.Actions) != 0 {
 		t.Fatalf("closed worker projection = %+v, want terminal historical row without actions", worker)
 	}
 	if contains(worker.StatusReason, "before the issue can be closed") || contains(worker.StatusReason, "PR #33 is open") || contains(worker.NextAction, "close the issue") {
@@ -5284,6 +5285,102 @@ func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *tes
 	}
 	if contains(resp.OperatorBrief.Sentence, "on issue #5") {
 		t.Fatalf("global brief still targets the closed issue: %q", resp.OperatorBrief.Sentence)
+	}
+}
+
+func TestFleetTruthfulOpenPRCountFiltersOnlyExactMergedClosedPR(t *testing.T) {
+	now := time.Now().UTC()
+	closedAt := now
+	st := state.NewState()
+	st.Sessions["closed"] = &state.Session{
+		IssueNumber:   5,
+		Status:        state.StatusDone,
+		PRNumber:      33,
+		PRMerged:      true,
+		IssueClosedAt: &closedAt,
+	}
+
+	tests := []struct {
+		name      string
+		project   state.SupervisorProjectState
+		prMerged  bool
+		wantCount int
+	}{
+		{
+			name:      "exact merged PR removed",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}},
+			prMerged:  true,
+			wantCount: 0,
+		},
+		{
+			name:      "unrelated open PR preserved",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{34}},
+			prMerged:  true,
+			wantCount: 1,
+		},
+		{
+			name:      "closed issue still-open PR preserved",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}},
+			prMerged:  false,
+			wantCount: 1,
+		},
+		{
+			name:      "legacy aggregate is not guessed at",
+			project:   state.SupervisorProjectState{OpenPRs: 1},
+			prMerged:  true,
+			wantCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st.Sessions["closed"].PRMerged = tt.prMerged
+			projectState := stateResponse{SupervisorLatest: &state.SupervisorDecision{
+				CreatedAt:    now.Add(-time.Minute),
+				ProjectState: tt.project,
+			}}
+			if got := fleetTruthfulOpenPRCount(projectState, st); got != tt.wantCount {
+				t.Fatalf("fleetTruthfulOpenPRCount = %d, want %d", got, tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestFleetDeliveryApprovalForReopenedIssueKeepsFreshTarget(t *testing.T) {
+	now := time.Now().UTC()
+	closedAt := now.Add(-2 * time.Hour)
+	st := state.NewState()
+	st.Sessions["old"] = &state.Session{
+		IssueNumber:   5,
+		Status:        state.StatusDone,
+		PRNumber:      33,
+		PRMerged:      true,
+		IssueClosedAt: &closedAt,
+	}
+	st.Sessions["fresh"] = &state.Session{
+		IssueNumber: 5,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    34,
+		PRMerged:    true,
+		StartedAt:   now.Add(-time.Hour),
+	}
+	approval := state.Approval{
+		ID:        "deploy-34",
+		CreatedAt: now.Add(-30 * time.Minute),
+		UpdatedAt: now.Add(-30 * time.Minute),
+		Action:    state.ApprovalActionDeployProject,
+		Status:    state.ApprovalStatusPending,
+		Target:    &state.SupervisorTarget{Issue: 5, PR: 34, Session: "fresh"},
+		Summary:   "Deploy PR #34 for reopened issue #5",
+		Delivery:  &state.DeliveryPayload{Project: "owner/repo", Repo: "owner/repo", Issue: 5, PR: 34},
+	}
+
+	item := makeFleetApprovalState(fleetProjectState{Name: "Project", Repo: "owner/repo"}, st, approval, now)
+	if item.IssueNumber != 5 || item.PRNumber != 34 {
+		t.Fatalf("fresh approval target = issue #%d PR #%d session %q, want reopened issue/PR target retained", item.IssueNumber, item.PRNumber, item.Session)
+	}
+	if contains(item.Summary, "Issue #5 is closed") || item.Delivery == nil || item.Delivery.Issue != 5 {
+		t.Fatalf("fresh approval was projected as historical closure: %+v", item)
 	}
 }
 

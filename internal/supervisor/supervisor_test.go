@@ -517,6 +517,9 @@ func TestDecide_RunningWorkerWaits(t *testing.T) {
 	if decision.Target == nil || decision.Target.Session != "slot-1" || decision.Target.Issue != 42 {
 		t.Fatalf("target = %#v, want slot-1 issue 42", decision.Target)
 	}
+	if len(decision.ProjectState.OpenPRNumbers) != 1 || decision.ProjectState.OpenPRNumbers[0] != 55 {
+		t.Fatalf("open PR identities = %v, want [55]", decision.ProjectState.OpenPRNumbers)
+	}
 	if reader.issueCalls != 0 {
 		t.Fatalf("ListOpenIssues called %d time(s), want 0 for running-worker decision", reader.issueCalls)
 	}
