@@ -363,6 +363,70 @@ model:
 
 When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
 
+#### Claude harness through CLIProxyAPI: non-Anthropic telemetry smoke (2026-07-21)
+
+Claude Code 2.1.216 was exercised in the same structured worker shape used by
+Maestro, with the proxy URL/credential inherited from the environment (values
+were neither printed nor captured):
+
+```sh
+printf 'Reply with exactly the word PONG.\n' |
+  claude --model <model> --effort low -p \
+    --output-format stream-json --verbose \
+    --dangerously-skip-permissions
+```
+
+All three translated upstreams completed successfully and emitted plausible,
+non-zero usage on the terminal `result` frame:
+
+| Requested/init model | Assistant model | Input | Output | Cache read | Total | `total_cost_usd` | Frame note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `kimi-k3` | `kimi-k3` | 17,535 | 20 | 6,144 | 23,699 | 0.091247 | assistant output was `0`; live cap under-counts output |
+| `grok-4.5` | `grok-4.5-build` | 24,762 | 22 | 1,280 | 26,064 | 0.125000 | assistant usage was all zero; live cap is terminal-only |
+| `gpt-5.6-sol` | `gpt-5.6-sol` | 21,581 | 6 | 0 | 21,587 | 0.111585 | assistant usage was all zero; live cap is terminal-only |
+
+This confirms that the terminal result is authoritative for history/cost
+accounting, but it also finds a live-enforcement degradation: none of the three
+routes supplied fully plausible input/output usage on assistant frames. Kimi
+under-counted generated output until the result; Grok and Sol supplied no live
+count at all. A sanitized Grok capture (identifiers/timing removed; frame shapes
+and usage retained) lives at
+`internal/worker/testdata/claude_proxy_grok_4_5_stream.jsonl` and is round-tripped
+through `stream-split` in the Go test suite.
+
+`--effort low` was harmless for every route: the deployed proxy accepted all
+three calls, and current CLIProxyAPI model metadata declares a `low` reasoning
+level for Kimi K3, Grok 4.5, and GPT-5.6 Sol. CLIProxyAPI's thinking translation
+maps supported levels to the upstream request and strips the setting for a route
+that declares no thinking support; Maestro therefore keeps emitting the normal
+Claude `--effort` flag rather than special-casing model names.
+
+Maestro now logs and persists both degradation scopes on the active backend
+attribution:
+
+- `usage_unreliable_scope: live_budget` when assistant usage has a zero
+  input/output field. A later complete result still makes history/cost exact,
+  but `worker_max_tokens` was not enforceable response-by-response for that
+  segment.
+- `usage_unreliable_scope: accounting` when a successful terminal result omits
+  `usage` or reports zero input/output. Token totals are then a lower bound, and
+  the cost-observability API includes the session in
+  `usage_unreliable_sessions` instead of dropping it as no activity.
+
+In either scope, `0` tokens means unavailable — never progress. The live token
+monitor does not synthesize a budget hit or kill from missing usage; the
+stalled-progress watchdog remains driven by terminal/checkpoint, worktree/Git,
+process/tmux, and PR-review signals rather than token counters. Operators using
+a positive hard cap should therefore treat these three proxy routes as
+degraded until CLIProxyAPI supplies non-zero assistant-frame input and output.
+
+**External dashboard comparison remains operator verification.** The worker
+environment has proxy request credentials but no access to the external usage
+sink/dashboard, and current CLIProxyAPI usage-queue reads are destructive. The
+numbers above are the captured translated stream values, not an independently
+claimed dashboard match; keep issue #946 open until an operator compares these
+three request rows in the deployed dashboard.
+
 When `worker_max_tokens` is positive, structured usage is no longer optional:
 Maestro fails the worker start closed if the selected backend/output mode cannot
 enforce a live ceiling. Claude, Pi, and OpenCode stop from their usage event

@@ -14,14 +14,25 @@ import (
 // total across attempts — monotonic as the log grows, which is what the
 // orchestrator's respawn-safe token watermark expects.
 type ClaudeUsage struct {
-	Model       string  // session model (system/init), falling back to the assistant message model
-	Input       int     // sum of input_tokens across result frames
-	Output      int     // sum of output_tokens across result frames
-	CacheRead   int     // sum of cache_read_input_tokens across result frames
-	CacheWrite  int     // sum of cache_creation_input_tokens across result frames
-	TotalTokens int     // Input + Output + CacheRead + CacheWrite
-	CostUSD     float64 // sum of total_cost_usd across result frames
+	Model                 string  // session model (system/init), falling back to the assistant message model
+	Input                 int     // sum of input_tokens across result frames
+	Output                int     // sum of output_tokens across result frames
+	CacheRead             int     // sum of cache_read_input_tokens across result frames
+	CacheWrite            int     // sum of cache_creation_input_tokens across result frames
+	TotalTokens           int     // Input + Output + CacheRead + CacheWrite
+	CostUSD               float64 // sum of total_cost_usd across result frames
+	UsageUnreliable       bool    // live assistant or successful terminal usage omitted plausible input/output
+	UsageUnreliableReason string  // stable secret-free degradation reason
+	UsageUnreliableScope  string  // live_budget or accounting
 }
+
+const (
+	claudeUsageMissingResult     = "terminal_result_missing_usage"
+	claudeUsageZeroResult        = "terminal_result_zero_input_or_output"
+	claudeUsageZeroLiveAssistant = "live_assistant_zero_input_or_output"
+	claudeUsageScopeLiveBudget   = "live_budget"
+	claudeUsageScopeAccounting   = "accounting"
+)
 
 // claudeStreamFrame is the subset of a claude stream-json line this package
 // decodes. `model` is present on the system/init frame; `message` on
@@ -29,6 +40,7 @@ type ClaudeUsage struct {
 type claudeStreamFrame struct {
 	Type         string               `json:"type"`
 	Subtype      string               `json:"subtype"`
+	IsError      bool                 `json:"is_error"`
 	Model        string               `json:"model"`
 	Message      *claudeStreamMessage `json:"message"`
 	Usage        *claudeUsageBlock    `json:"usage"`
@@ -57,8 +69,10 @@ type claudeUsageBlock struct {
 // ParseClaudeUsage scans a claude stream-json NDJSON stream (the appended
 // slot.jsonl) and aggregates usage across every terminal `result` frame.
 // It returns ok=false when no usage-bearing result frame is found, so callers
-// can leave tokens/cost at 0 (the documented degradation when the
-// stream-splitter was unavailable or no frame has landed yet).
+// do not treat zero as token progress. A successful terminal frame with a
+// missing usage object or zero input/output marks accounting unreliable. A
+// zero input/output field on an assistant frame marks live-budget telemetry
+// unreliable even when the later terminal result makes accounting exact.
 func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	var out ClaudeUsage
 	seen := false
@@ -70,17 +84,31 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 		if usage == nil || claudeUsageTotal(&live) > claudeUsageTotal(usage) {
 			usage = &live
 		}
-		if claudeUsageTotal(usage) == 0 {
-			live = claudeUsageBlock{}
-			return
+		selected := claudeUsageBlock{}
+		if usage != nil {
+			selected = *usage
 		}
-		out.Input += usage.InputTokens
-		out.Output += usage.OutputTokens
-		out.CacheRead += usage.CacheReadInputTokens
-		out.CacheWrite += usage.CacheCreationInputTokens
-		seen = true
 		live = claudeUsageBlock{}
 		clear(liveMessages)
+		if claudeUsageTotal(&selected) == 0 {
+			return
+		}
+		out.Input += selected.InputTokens
+		out.Output += selected.OutputTokens
+		out.CacheRead += selected.CacheReadInputTokens
+		out.CacheWrite += selected.CacheCreationInputTokens
+		seen = true
+	}
+	markUnreliable := func(reason, scope string) {
+		out.UsageUnreliable = true
+		upgrade := out.UsageUnreliableScope == "" ||
+			(out.UsageUnreliableScope == claudeUsageScopeLiveBudget && scope == claudeUsageScopeAccounting)
+		if upgrade {
+			out.UsageUnreliableScope = scope
+		}
+		if out.UsageUnreliableReason == "" || upgrade {
+			out.UsageUnreliableReason = reason
+		}
 	}
 
 	for _, raw := range strings.Split(text, "\n") {
@@ -104,6 +132,9 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 					assistantModel = fr.Message.Model
 				}
 				if fr.Message.Usage != nil {
+					if fr.Message.Usage.InputTokens <= 0 || fr.Message.Usage.OutputTokens <= 0 {
+						markUnreliable(claudeUsageZeroLiveAssistant, claudeUsageScopeLiveBudget)
+					}
 					messageID := strings.TrimSpace(fr.Message.ID)
 					if messageID == "" {
 						live.InputTokens += fr.Message.Usage.InputTokens
@@ -121,8 +152,16 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 				}
 			}
 		case "result":
-			if fr.Usage == nil {
-				continue
+			// Explicit provider errors may legitimately omit usage. Successful
+			// completions may not: without plausible input/output counts the
+			// stream cannot safely drive budgets or cost attribution.
+			if !fr.IsError {
+				switch {
+				case fr.Usage == nil:
+					markUnreliable(claudeUsageMissingResult, claudeUsageScopeAccounting)
+				case fr.Usage.InputTokens <= 0 || fr.Usage.OutputTokens <= 0:
+					markUnreliable(claudeUsageZeroResult, claudeUsageScopeAccounting)
+				}
 			}
 			flushLive(fr.Usage)
 			out.CostUSD += fr.TotalCostUSD
