@@ -46,3 +46,28 @@ func TestCICheckRollupFingerprintIgnoresSupersededAttemptHistory(t *testing.T) {
 		t.Fatalf("superseded attempt changed fingerprint: got=%q want=%q", got, want)
 	}
 }
+
+func TestCICheckRollupSignals_CarriesNonSecretCheckIdentity(t *testing.T) {
+	checks := []greptileCheckRun{{ID: 10, Name: "Android SDK license acceptance gate", Status: "completed", Conclusion: "failure"}}
+	combined := combinedStatusResponse{State: "failure"}
+	combined.Statuses = append(combined.Statuses, struct {
+		Context     string `json:"context"`
+		State       string `json:"state"`
+		Description string `json:"description"`
+		TargetURL   string `json:"target_url"`
+	}{Context: "legacy/legal-gate", State: "pending", Description: "private detail", TargetURL: "https://private.invalid"})
+
+	signals := ciCheckRollupSignals(checks, combined)
+	if len(signals) != 2 {
+		t.Fatalf("signals = %#v, want two", signals)
+	}
+	for _, signal := range signals {
+		if signal.Name == "Android SDK license acceptance gate" && signal.Source == "check_run" && signal.Conclusion == "failure" {
+			continue
+		}
+		if signal.Name == "legacy/legal-gate" && signal.Source == "commit_status" && signal.Status == "pending" {
+			continue
+		}
+		t.Fatalf("unexpected signal: %#v", signal)
+	}
+}

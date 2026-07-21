@@ -1769,6 +1769,14 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		}
 		seenPRs[pr.Number] = struct{}{}
 
+		if attention, ok := state.OperatorGateAttention(sess); ok {
+			findings = append(findings, stuckState("operator_gate", SeverityInfo,
+				attention.Reason,
+				attention.NextAction, false, target,
+				fmt.Sprintf("Session %s status=%s pr=%d operator_gate=%s", slot, sess.Status, pr.Number, sess.OperatorGateName)))
+			continue
+		}
+
 		if pr.IsDraft {
 			findings = append(findings, stuckState("draft_pr", SeverityInfo,
 				fmt.Sprintf("PR #%d is still a draft.", pr.Number),
@@ -2562,6 +2570,9 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
 	}
+	if label, ok := firstMatchingIssueLabel(issue, e.operatorGateLabels()); ok {
+		return fmt.Sprintf("held by operator gate label %q", label), nil
+	}
 	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
 		return "excluded by supervisor policy label", nil
 	}
@@ -2606,6 +2617,9 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 	}
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && !strings.EqualFold(blockedLabel, ignoredBlockedLabel) && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
+	}
+	if label, ok := firstMatchingIssueLabel(issue, excludeLabelsExcept(e.operatorGateLabels(), ignoredBlockedLabel)); ok {
+		return fmt.Sprintf("held by operator gate label %q", label), nil
 	}
 	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
 		return "excluded by supervisor policy label", nil
@@ -2798,6 +2812,9 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") {
 			return true
 		}
+	}
+	if _, ok := state.OperatorGateAttention(sess); ok {
+		return false
 	}
 	// A draft/WIP marker means the PR still needs lifecycle work, but it does
 	// not make that work actionable while the exact current head is already
@@ -2997,6 +3014,9 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 // honest text instead of a single "monitor" word.
 func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr github.PR) []string {
 	var reasons []string
+	if sess != nil && strings.TrimSpace(sess.OperatorGateName) != "" {
+		reasons = append(reasons, fmt.Sprintf("Operator gate %q is waiting for a human decision", sess.OperatorGateName))
+	}
 	if pr.IsDraft {
 		reasons = append(reasons, "PR is still a draft")
 	}
@@ -3422,8 +3442,20 @@ func (e *Engine) dynamicWaveExcludedLabels() []string {
 	labels := []string{"blocked", "wontfix", "question", "duplicate", "invalid"}
 	labels = append(labels, e.cfg.ExcludeLabels...)
 	labels = append(labels, e.policyExcludedLabels()...)
+	labels = append(labels, e.operatorGateLabels()...)
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
 		labels = append(labels, blockedLabel)
+	}
+	return uniqueLabelNames(labels)
+}
+
+func (e *Engine) operatorGateLabels() []string {
+	labels := []string{"operator-decision", "blocked"}
+	if e != nil && e.cfg != nil {
+		if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
+			labels = append(labels, blockedLabel)
+		}
+		labels = append(labels, e.cfg.Supervisor.OperatorGate.Labels...)
 	}
 	return uniqueLabelNames(labels)
 }

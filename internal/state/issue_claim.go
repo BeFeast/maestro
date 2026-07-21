@@ -26,6 +26,7 @@ const (
 	IssueClaimScheduledRetry       = "scheduled_retry"
 	IssueClaimRetainedWorktree     = "retained_worktree"
 	IssueClaimTerminalReconcile    = "terminal_reconciliation"
+	IssueClaimOperatorGate         = "operator_gate"
 	IssueClaimRepairDispatch       = "repair_dispatch"
 	IssueClaimReviewRepairDispatch = "review_repair_dispatch"
 )
@@ -109,7 +110,7 @@ func issueClaimPriority(claim IssueClaim) int {
 	switch claim.Kind {
 	case IssueClaimRepairDispatch, IssueClaimReviewRepairDispatch:
 		return 0
-	case IssueClaimImplementation, IssueClaimScheduledRetry:
+	case IssueClaimImplementation, IssueClaimScheduledRetry, IssueClaimOperatorGate:
 		return 1
 	case IssueClaimOpenPRMaintenance:
 		return 2
@@ -272,6 +273,11 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		Session:     slot,
 		PRNumber:    sess.PRNumber,
 		Status:      string(sess.Status),
+	}
+	if strings.TrimSpace(sess.OperatorGateName) != "" {
+		claim.Kind = IssueClaimOperatorGate
+		claim.Reason = fmt.Sprintf("issue #%d is held by operator gate %q on session %s", sess.IssueNumber, sess.OperatorGateName, slot)
+		return claim, true
 	}
 	switch sess.Status {
 	case StatusRunning, StatusQueued, StatusCodeLanded:

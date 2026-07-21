@@ -4869,9 +4869,9 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 
 func TestStartNewWorkers_RepairSpawnCannotBypassExcludedLabel(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
-	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.ExcludeLabels = []string{"needs-maintenance-triage"}
 	cfg.Supervisor.ReviewRepair.MaxRetries = 1
-	issues := []github.Issue{makeIssue(669, "repair open PR", "blocked")}
+	issues := []github.Issue{makeIssue(669, "repair open PR", "needs-maintenance-triage")}
 
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
 	s := state.NewState()
