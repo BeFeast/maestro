@@ -30,8 +30,8 @@ const (
 	searchGuardrailWrapperMode = 0o755
 )
 
-// workerCredentialEnvKeys are the provider credential env vars the worker
-// harness needs to reach CLIProxyAPI / upstream APIs. The daemon inherits them
+// workerCredentialEnvKeys are the provider and GitHub credential env vars the
+// worker harness needs to reach CLIProxyAPI / upstream APIs and open PRs. The daemon inherits them
 // from its own private credential boundary (an operator-managed systemd
 // EnvironmentFile / MAESTRO_WORKER_CREDENTIALS_FILE), but `tmux new-session`
 // does not propagate them into a fresh worker session by default (#822). They
@@ -45,6 +45,8 @@ var workerCredentialEnvKeys = []string{
 	"ANTHROPIC_AUTH_TOKEN",
 	"CLIPROXY_API_KEY",
 	"GEMINI_API_KEY",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
 	"OPENAI_BASE_URL",
 	"OPENAI_API_KEY",
 }
@@ -57,6 +59,8 @@ var workerCredentialSecretKeys = []string{
 	"ANTHROPIC_AUTH_TOKEN",
 	"CLIPROXY_API_KEY",
 	"GEMINI_API_KEY",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
 	"OPENAI_API_KEY",
 }
 
@@ -599,7 +603,7 @@ func resolveWorkerCommandPath(args []string) ([]string, error) {
 //     symlinked, or foreign-owned) target is a hard error so a spawn fails
 //     closed rather than reading an insecure secret file.
 //   - Otherwise no raw credential may be ambient. CLI-native auth can proceed
-//     with an empty reference; any known provider value without the explicit
+//     with an empty reference; any known worker credential value without the explicit
 //     service-file boundary fails the spawn closed. Maestro never manufactures
 //     a project-local or per-worker secret copy.
 func resolveWorkerCredentialsFile(stateDir string) (string, error) {
@@ -615,7 +619,7 @@ func resolveWorkerCredentialsFile(stateDir string) (string, error) {
 	}
 	for _, key := range workerCredentialEnvKeys {
 		if os.Getenv(key) != "" {
-			return "", fmt.Errorf("%s must name the authoritative private service credential file when provider environment variables are set", workerCredentialsFileEnvVar)
+			return "", fmt.Errorf("%s must name the authoritative private service credential file when worker credential environment variables are set", workerCredentialsFileEnvVar)
 		}
 	}
 	return "", nil
@@ -1201,7 +1205,7 @@ func ScrubLegacyRunArtifacts(stateDir string) {
 		log.Printf("[worker] scrub credential artifacts: %v", err)
 	}
 	if redacted > 0 {
-		log.Printf("[worker] redacted provider credential values from %d historical text artifact(s) (#888)", redacted)
+		log.Printf("[worker] redacted worker credential values from %d historical text artifact(s) (#888)", redacted)
 	}
 }
 
