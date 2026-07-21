@@ -960,7 +960,7 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			if !stuckTargetsSession(stuck, infos[i]) {
 				continue
 			}
-			if staleReviewFeedbackResolved(stuck, infos[i]) {
+			if staleSupervisorFindingResolved(stuck, infos[i]) {
 				continue
 			}
 			attention := supervisorStuckNeedsAttention(stuck)
@@ -979,6 +979,23 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			break
 		}
 	}
+}
+
+func staleSupervisorFindingResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	if staleReviewFeedbackResolved(stuck, info) {
+		return true
+	}
+	if stuck.Code != "dead_running_pid" {
+		return false
+	}
+	// Fleet derives PID and liveness from the current session projection. A
+	// supervisor decision recorded before an in-place respawn can still carry
+	// the dead predecessor's PID; never overwrite a coherent live tuple with
+	// that stale explanation.
+	if state.SessionStatus(info.Status) != state.StatusRunning {
+		return true
+	}
+	return info.Alive != nil && *info.Alive
 }
 
 func staleReviewFeedbackResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
