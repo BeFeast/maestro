@@ -14,6 +14,9 @@ import (
 // Unlike Start, this does NOT create a new worktree or branch — it reuses the session's
 // existing workspace. The session is updated in place with a new PID and status.
 func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase transitions")
+	}
 	if sess.Worktree == "" {
 		return fmt.Errorf("session %s has no worktree", slotName)
 	}
@@ -50,6 +53,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	if effort := pipeline.EffortForPhase(cfg, sess.Phase); effort != "" {
 		backendCfg.TierEffort = effort
 	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -71,7 +75,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	logFile := fmt.Sprintf("%s/%s-%s.log", logDir, slotName, sess.Phase)
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -79,7 +83,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 

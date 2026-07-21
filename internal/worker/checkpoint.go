@@ -332,6 +332,9 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
 func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
+	}
 	// #959: assert the rendered issue matches the session's canonical
 	// issue_number before killing the current worker, so a slot-suffix-derived
 	// number can never respawn a mis-scoped worker in the preserved worktree.
@@ -384,6 +387,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
 		return err
 	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -393,7 +397,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Assemble prompt with checkpoint. The checkpoint is historical context and
 	// never a terminal instruction; the fresh continuation payload is placed after
 	// it behind an explicit precedence marker (#973).
-	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext, sess.CheckpointFile)
+	prompt := assemblePromptWithCheckpointSource(promptBase, issue, executionWorktree, sess.Worktree, sess.Branch, cfg, checkpointContext, sess.CheckpointFile)
 	if checkpointContext != "" {
 		log.Printf("[worker] in-place continuation %s: checkpoint source=%s continuation_rev=%s (checkpoint is historical context; fresh continuation requirements are authoritative)",
 			slotName, sess.CheckpointFile, continuationRevision(promptBase))
@@ -422,7 +426,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	}
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -430,7 +434,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 
@@ -562,7 +566,11 @@ func continuationRevision(base string) string {
 // genuine token-budget recovery — the checkpoint still lets a worker skip
 // already-completed work — while guaranteeing fresh instructions win.
 func assemblePromptWithCheckpoint(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config, checkpoint, checkpointSource string) string {
-	fresh := assemblePrompt(base, issue, worktreePath, branchName, cfg)
+	return assemblePromptWithCheckpointSource(base, issue, worktreePath, worktreePath, branchName, cfg, checkpoint, checkpointSource)
+}
+
+func assemblePromptWithCheckpointSource(base string, issue github.Issue, executionWorktree, sourceWorktree, branchName string, cfg *config.Config, checkpoint, checkpointSource string) string {
+	fresh := assemblePromptWithSource(base, issue, executionWorktree, sourceWorktree, branchName, cfg)
 	if checkpoint == "" {
 		return fresh
 	}

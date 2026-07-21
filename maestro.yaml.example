@@ -15,6 +15,16 @@ stalled_progress_watchdog:         # explicit opt-in; evaluates independently of
   eval_interval_seconds: 60
 worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
+# One-shot SSH runner spike. Default off; see docs/remote-runner-spike.md.
+# The v1 path requires auto_rebase: false and keeps SQLite/control-plane state local.
+# remote_runner:
+#   enabled: true
+#   target: runner@runner.example.internal
+#   repo_path: /srv/maestro/repos/PROJECT
+#   worktree_base: /srv/maestro/worktrees/PROJECT
+#   ssh_args: [-o, ConnectTimeout=15]
+#   maestro_command: /usr/local/bin/maestro
+#   credentials_file: /run/user/UID/maestro-runner/worker.env
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between sequential merges (default: 30)
 review_gate: greptile              # "greptile" (default) or "none"

@@ -2031,6 +2031,164 @@ func windowsDriveAbsPath(p string) bool {
 	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
 }
 
+// RemoteRunnerConfig is the deliberately small, project-scoped SSH adapter
+// used by the remote-worker spike (#1058). The control plane still owns issue
+// selection, durable state, the local tmux/process lease, and a lightweight
+// shadow worktree. Only the agent CLI and its canonical working tree move to
+// the configured host.
+//
+// Enabled is an explicit opt-in and defaults false. CredentialsFile names a
+// private file that exists on the runner; Maestro never reads it on the
+// control-plane host or copies credential values over SSH.
+type RemoteRunnerConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	Target          string   `yaml:"target"`           // ssh target, e.g. runner@example.internal
+	RepoPath        string   `yaml:"repo_path"`        // existing clone on the runner
+	WorktreeBase    string   `yaml:"worktree_base"`    // runner-side parent for per-slot worktrees
+	BaseBranch      string   `yaml:"base_branch"`      // default: main
+	SSHCommand      string   `yaml:"ssh_command"`      // default: ssh
+	SSHArgs         []string `yaml:"ssh_args"`         // argv entries before target; no shell parsing
+	MaestroCommand  string   `yaml:"maestro_command"`  // runner-side binary; default: maestro
+	CredentialsFile string   `yaml:"credentials_file"` // optional runner-side private credential file
+}
+
+func validateRemoteRunner(cfg *Config) error {
+	if cfg == nil || !cfg.RemoteRunner.Enabled {
+		return nil
+	}
+	r := &cfg.RemoteRunner
+	if strings.TrimSpace(r.SSHCommand) == "" {
+		r.SSHCommand = "ssh"
+	}
+	r.SSHCommand = strings.TrimSpace(r.SSHCommand)
+	if strings.TrimSpace(r.MaestroCommand) == "" {
+		r.MaestroCommand = "maestro"
+	}
+	r.MaestroCommand = strings.TrimSpace(r.MaestroCommand)
+	if strings.TrimSpace(r.BaseBranch) == "" {
+		r.BaseBranch = "main"
+	}
+	r.BaseBranch = strings.TrimSpace(r.BaseBranch)
+	if err := validateRemoteCommandToken("ssh_command", r.SSHCommand); err != nil {
+		return err
+	}
+	if err := validateRemoteCommandToken("maestro_command", r.MaestroCommand); err != nil {
+		return err
+	}
+	target := strings.TrimSpace(r.Target)
+	if target == "" || strings.HasPrefix(target, "-") || containsControlOrSpace(target) {
+		return fmt.Errorf("config: remote_runner.target must be a non-empty ssh target without whitespace or a leading '-'")
+	}
+	r.Target = target
+	r.RepoPath = strings.TrimSpace(r.RepoPath)
+	r.WorktreeBase = strings.TrimSpace(r.WorktreeBase)
+	r.CredentialsFile = strings.TrimSpace(r.CredentialsFile)
+	if err := validateRemoteAbsolutePath("repo_path", r.RepoPath, false); err != nil {
+		return err
+	}
+	if err := validateRemoteAbsolutePath("worktree_base", r.WorktreeBase, false); err != nil {
+		return err
+	}
+	if r.CredentialsFile != "" {
+		if err := validateRemoteAbsolutePath("credentials_file", r.CredentialsFile, true); err != nil {
+			return err
+		}
+	}
+	if err := validateRemoteGitRef("base_branch", r.BaseBranch); err != nil {
+		return err
+	}
+	if err := validateRemoteSSHArgs(r.SSHArgs); err != nil {
+		return err
+	}
+	if cfg.AutoRebase {
+		return fmt.Errorf("config: remote_runner requires auto_rebase: false in the v1 spike; rebase automation still operates on the control-plane shadow worktree")
+	}
+	if cfg.ValidationContract {
+		return fmt.Errorf("config: remote_runner does not support validation_contract in the v1 spike")
+	}
+	if cfg.Pipeline.Enabled {
+		return fmt.Errorf("config: remote_runner does not support pipeline.enabled in the v1 spike")
+	}
+	if cfg.Hooks.AfterCreate != "" || cfg.Hooks.BeforeRun != "" || cfg.Hooks.AfterRun != "" || cfg.Hooks.BeforeRemove != "" ||
+		cfg.Hooks.PreTool.Command != "" || cfg.Hooks.PostEdit.Command != "" {
+		return fmt.Errorf("config: remote_runner does not support lifecycle or tool hooks in the v1 spike")
+	}
+	return nil
+}
+
+func validateRemoteCommandToken(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "-") || containsControlOrSpace(value) {
+		return fmt.Errorf("config: remote_runner.%s must be one executable path or name without whitespace", name)
+	}
+	return nil
+}
+
+func validateRemoteSSHArgs(args []string) error {
+	needsValue := map[string]bool{
+		"-B": true, "-b": true, "-c": true, "-E": true, "-e": true,
+		"-F": true, "-I": true, "-i": true, "-J": true, "-L": true,
+		"-l": true, "-m": true, "-O": true, "-o": true, "-p": true,
+		"-Q": true, "-R": true, "-S": true, "-W": true, "-w": true,
+	}
+	expectValue := false
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\x00\r\n") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must not contain NUL or newlines", i)
+		}
+		if expectValue {
+			if arg == "" {
+				return fmt.Errorf("config: remote_runner.ssh_args[%d] must not be empty", i)
+			}
+			expectValue = false
+			continue
+		}
+		if arg == "" || arg == "--" || !strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must be an ssh option, not a target or remote command", i)
+		}
+		expectValue = needsValue[arg]
+	}
+	if expectValue {
+		return fmt.Errorf("config: remote_runner.ssh_args ends with an option that requires a value")
+	}
+	return nil
+}
+
+func validateRemoteAbsolutePath(name, value string, allowFile bool) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") || !pathpkg.IsAbs(value) {
+		return fmt.Errorf("config: remote_runner.%s must be an absolute runner-side POSIX path", name)
+	}
+	clean := pathpkg.Clean(value)
+	if clean != value || clean == "/" {
+		return fmt.Errorf("config: remote_runner.%s must be normalized and must not be '/'", name)
+	}
+	if !allowFile && strings.HasSuffix(value, "/") {
+		return fmt.Errorf("config: remote_runner.%s must not have a trailing slash", name)
+	}
+	return nil
+}
+
+func validateRemoteGitRef(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "@" || strings.ContainsAny(value, "\x00\r\n ~^:?*[\\") || strings.HasPrefix(value, "-") ||
+		strings.HasPrefix(value, ".") || strings.Contains(value, "/.") || strings.HasSuffix(value, ".lock") ||
+		strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") ||
+		strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.Contains(value, "//") {
+		return fmt.Errorf("config: remote_runner.%s is not a safe git branch name", name)
+	}
+	return nil
+}
+
+func containsControlOrSpace(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
 type Config struct {
 	Server     ServerConfig     `yaml:"server"`
 	Supervisor SupervisorConfig `yaml:"supervisor"`
@@ -2046,6 +2204,7 @@ type Config struct {
 	Outcome                         outcome.Brief                 `yaml:"outcome"`
 	LocalPath                       string                        `yaml:"local_path"`
 	WorktreeBase                    string                        `yaml:"worktree_base"`
+	RemoteRunner                    RemoteRunnerConfig            `yaml:"remote_runner"`
 	MaxParallel                     int                           `yaml:"max_parallel"`
 	MaxLiveWorkers                  int                           `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
 	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
@@ -2305,6 +2464,9 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateManagementHome(cfg.ManagementHome); err != nil {
+		return nil, err
+	}
+	if err := validateRemoteRunner(cfg); err != nil {
 		return nil, err
 	}
 	if !cfg.Delivery.ValidMode() {
