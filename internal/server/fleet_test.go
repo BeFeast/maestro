@@ -4151,6 +4151,132 @@ func TestFleetSupersedingIssueSessionSuppressesHistoricalSharedPRAttention(t *te
 	}
 }
 
+// TestFleetSupersedingIssueSessionSuppressesOlderFailedPredecessorsBehindLaterDone
+// pins acceptance #976.1: an issue accumulated two older failed implementation
+// attempts (A, B), then a later canonical session (C) merged its PR and reached
+// done while the issue stayed open/blocked for runtime QA. Neither predecessor
+// may become operator_state — the later authoritative session supersedes both,
+// without any duplicate_dispatch_reconciled marker or a started-after-completion
+// dispatch (both predecessors ran and failed *before* C completed).
+func TestFleetSupersedingIssueSessionSuppressesOlderFailedPredecessorsBehindLaterDone(t *testing.T) {
+	failedA := sessionInfo{
+		Slot: "ok-player-210", IssueNumber: 512, Status: string(state.StatusFailed),
+		NeedsAttention: true, StartedAt: "2026-07-19T08:00:00Z",
+	}
+	failedB := sessionInfo{
+		Slot: "ok-player-221", IssueNumber: 512, Status: string(state.StatusDead),
+		NeedsAttention: true, StartedAt: "2026-07-19T09:00:00Z",
+	}
+	doneC := sessionInfo{
+		Slot: "ok-player-244", IssueNumber: 512, Status: string(state.StatusDone),
+		PRNumber: 640, StartedAt: "2026-07-19T10:00:00Z", FinishedAt: "2026-07-19T11:30:00Z",
+	}
+	all := []sessionInfo{failedA, failedB, doneC}
+
+	for _, predecessor := range []sessionInfo{failedA, failedB} {
+		got, ok := fleetSupersedingIssueSession(predecessor, all)
+		if !ok || got.Slot != doneC.Slot {
+			t.Fatalf("predecessor %s superseding session = %+v, %v; want %s", predecessor.Slot, got, ok, doneC.Slot)
+		}
+	}
+
+	// A released (issue-reopened) canonical completion must not hide the
+	// predecessors: once released it is no longer the authoritative owner.
+	releasedC := doneC
+	releasedC.ReleasedForRedispatch = true
+	if got, ok := fleetSupersedingIssueSession(failedA, []sessionInfo{failedA, releasedC}); ok {
+		t.Fatalf("released canonical completion incorrectly superseded predecessor: %+v", got)
+	}
+}
+
+// TestFleetSupersedingIssueSessionSurfacesLaterGenuineRegression pins acceptance
+// #976.3: when the later authoritative session itself regresses genuinely, the
+// current (newest) session must surface, not an older predecessor. An older
+// failed attempt A is superseded by the delivered done C, but a genuine failed
+// follow-up D that started *before* C completed (a live regression racing the
+// canonical merge, not a post-completion duplicate) is not hidden behind C.
+func TestFleetSupersedingIssueSessionSurfacesLaterGenuineRegression(t *testing.T) {
+	failedA := sessionInfo{
+		Slot: "ok-player-260", IssueNumber: 733, Status: string(state.StatusFailed),
+		NeedsAttention: true, StartedAt: "2026-07-20T08:00:00Z",
+	}
+	doneC := sessionInfo{
+		Slot: "ok-player-271", IssueNumber: 733, Status: string(state.StatusDone),
+		PRNumber: 780, StartedAt: "2026-07-20T09:00:00Z", FinishedAt: "2026-07-20T12:00:00Z",
+	}
+	// Regression D is the newest session and started after C but before C
+	// finished: it is neither a predecessor of C nor a post-completion
+	// duplicate, so it must remain actionable.
+	regressionD := sessionInfo{
+		Slot: "ok-player-289", IssueNumber: 733, Status: string(state.StatusFailed),
+		NeedsAttention: true, StartedAt: "2026-07-20T10:00:00Z",
+	}
+	all := []sessionInfo{failedA, doneC, regressionD}
+
+	if got, ok := fleetSupersedingIssueSession(failedA, all); !ok || got.Slot != doneC.Slot {
+		t.Fatalf("older predecessor A superseding = %+v, %v; want %s", got, ok, doneC.Slot)
+	}
+	if got, ok := fleetSupersedingIssueSession(regressionD, all); ok {
+		t.Fatalf("later genuine regression incorrectly superseded by predecessor completion: %+v", got)
+	}
+}
+
+// TestFleetSupersedingIssueSessionIsIdempotentAcrossReordering pins acceptance
+// #976.4: selection is deterministic regardless of session ordering, so
+// reconciliation cycles/restarts that iterate sessions in a different order
+// converge on the same superseding owner.
+func TestFleetSupersedingIssueSessionIsIdempotentAcrossReordering(t *testing.T) {
+	failedA := sessionInfo{
+		Slot: "ok-player-300", IssueNumber: 815, Status: string(state.StatusFailed),
+		NeedsAttention: true, StartedAt: "2026-07-21T08:00:00Z",
+	}
+	doneC := sessionInfo{
+		Slot: "ok-player-311", IssueNumber: 815, Status: string(state.StatusDone),
+		PRNumber: 900, StartedAt: "2026-07-21T10:00:00Z", FinishedAt: "2026-07-21T11:00:00Z",
+	}
+	orderings := [][]sessionInfo{
+		{failedA, doneC},
+		{doneC, failedA},
+	}
+	for _, all := range orderings {
+		got, ok := fleetSupersedingIssueSession(failedA, all)
+		if !ok || got.Slot != doneC.Slot {
+			t.Fatalf("ordering %v: superseding session = %+v, %v; want %s", all, got, ok, doneC.Slot)
+		}
+	}
+}
+
+// TestFleetSupersedingIssueSessionSuppressesDeadSourceBehindActiveContinuation
+// pins acceptance #976.2: a dead source session that was explicitly superseded
+// by a unique continuation issue (a different issue number that took over the
+// same PR lifecycle artifact) must become non-actionable behind the active
+// continuation — without deleting the source's audit/usage history. The
+// continuation is a distinct issue, so the linkage is the shared delivered PR.
+func TestFleetSupersedingIssueSessionSuppressesDeadSourceBehindActiveContinuation(t *testing.T) {
+	deadSource := sessionInfo{
+		Slot: "ok-player-330", IssueNumber: 611, Status: string(state.StatusDead),
+		PRNumber: 705, NeedsAttention: true, StartedAt: "2026-07-20T08:00:00Z",
+	}
+	continuation := sessionInfo{
+		Slot: "ok-player-341", IssueNumber: 640, Status: string(state.StatusPROpen),
+		PRNumber: 705, StartedAt: "2026-07-20T12:00:00Z",
+	}
+	all := []sessionInfo{deadSource, continuation}
+
+	got, ok := fleetSupersedingIssueSession(deadSource, all)
+	if !ok || got.Slot != continuation.Slot {
+		t.Fatalf("dead source superseding session = %+v, %v; want %s", got, ok, continuation.Slot)
+	}
+
+	// A continuation on a genuinely different PR does not link to this source,
+	// so the source stays actionable rather than being silently hidden.
+	unrelated := continuation
+	unrelated.PRNumber = 706
+	if got, ok := fleetSupersedingIssueSession(deadSource, []sessionInfo{deadSource, unrelated}); ok {
+		t.Fatalf("unrelated continuation PR incorrectly superseded dead source: %+v", got)
+	}
+}
+
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
 // whose last notification is NOT a CI failure is convergence-bound: the
