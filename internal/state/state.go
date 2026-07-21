@@ -264,6 +264,8 @@ type Session struct {
 	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
 	RestartCheckpointAt         *time.Time        `json:"restart_checkpoint_at,omitempty"`          // #877: set when the daemon deliberately checkpoints this still-running worker on shutdown (self-deploy/restart), because KillMode reaps the worker's cgroup once the daemon exits. A non-nil value tells the next daemon's reconcile to resume the SAME logical session in place exactly once — preserving the dirty worktree — instead of a false running->dead transition. Cleared as soon as the resume is attempted so it can never loop.
 	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
+	CodeLandedVerifyDeadline    *time.Time        `json:"code_landed_verify_deadline,omitempty"`    // #1020: when a code_landed session was first observed failing its blocking outcome check; past this the fix is judged ineffective if the SAME fingerprint persists
+	OutcomeFailureFingerprint   string            `json:"outcome_failure_fingerprint,omitempty"`    // #1020: stable identity of the blocking outcome failure captured when the deadline was armed; a changed fingerprint re-arms rather than convicting
 
 	// #705: opt-in verify.visual outcome for this session's PR. Set once by
 	// the orchestrator's merge flow: "not_required" (no UI paths touched),
