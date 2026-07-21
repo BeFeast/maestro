@@ -100,6 +100,40 @@ func TestMaestroServiceKillOwnershipExplicit(t *testing.T) {
 	}
 }
 
+// #920 coordinates with #877's restart topology: the daemon remains one system
+// service, while each worker is launched into a sibling system-manager scope.
+// A user-manager scope cannot migrate a production system-service child, and a
+// shared slice/tmux cgroup must never become the teardown target.
+func TestWorkerLeaseUsesProductionSystemManagerTopology(t *testing.T) {
+	unit := repoFile(t, "maestro.service")
+	for _, want := range []string{"#877/#920", "maestro-workers.slice", "per-worker scopes", "persisted scope identity"} {
+		if !strings.Contains(unit, want) {
+			t.Errorf("maestro.service must document durable worker ownership — missing %q", want)
+		}
+	}
+
+	source := repoFile(t, "internal", "tmuxsession", "tmuxsession.go")
+	systemCase := strings.Index(source, "case ProcessLeaseManagerSystem:")
+	userCase := strings.Index(source, "case ProcessLeaseManagerUser:")
+	if systemCase < 0 || userCase < 0 || systemCase >= userCase {
+		t.Fatal("worker scope launcher must have explicit system and user manager branches")
+	}
+	production := source[systemCase:userCase]
+	for _, want := range []string{"resolvedPath(sudoName)", "resolvedPath(systemdRunName)", `"--uid="`} {
+		if !strings.Contains(production, want) {
+			t.Errorf("production worker scope launcher missing %q", want)
+		}
+	}
+	if strings.Contains(production, `"--user"`) {
+		t.Error("production worker scope launcher must not rely on systemd-run --user from maestro.service")
+	}
+	for _, want := range []string{`"--scope"`, `"--slice=" + workerSlice`, `"--kill-whom=all"`} {
+		if !strings.Contains(source, want) {
+			t.Errorf("worker lease implementation missing %q", want)
+		}
+	}
+}
+
 // #953: maestro.service is a system-scoped unit. Without an explicit User and
 // home/store path, systemd expands %h for root and self-deploy boots an empty
 // fleet from /root/.maestro instead of the operator's live config store.

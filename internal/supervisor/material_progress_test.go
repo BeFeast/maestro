@@ -104,18 +104,28 @@ func TestMaterialProgressWatchdog_UsageUnreliableDoesNotKillHealthyWorker(t *tes
 func TestCollectMaterialProgressObservations_WorkerReplacementHasNewLease(t *testing.T) {
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
-	sess := &state.Session{IssueNumber: 9, Status: state.StatusRunning, PID: 100, StartedAt: t0}
+	sess := &state.Session{
+		IssueNumber:      9,
+		Status:           state.StatusRunning,
+		PID:              100,
+		StartedAt:        t0,
+		ProcessLeaseUnit: "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+	}
 	st.Sessions["slot-9"] = sess
 	first := collectMaterialProgressObservations(st, t0)
 
 	sess.PID = 200
 	sess.StartedAt = t0.Add(10 * time.Minute)
+	sess.ProcessLeaseUnit = "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope"
 	second := collectMaterialProgressObservations(st, t0.Add(10*time.Minute))
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("observations first=%d second=%d, want one each", len(first), len(second))
 	}
 	if first[0].Target.Key() == second[0].Target.Key() || first[0].Target.LeaseID == second[0].Target.LeaseID {
 		t.Fatalf("respawn reused old exact lease: before=%+v after=%+v", first[0].Target, second[0].Target)
+	}
+	if first[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope" || second[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope" {
+		t.Fatalf("material progress lost OS process lease identity: before=%+v after=%+v", first[0].Target, second[0].Target)
 	}
 }
 
