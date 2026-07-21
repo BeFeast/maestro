@@ -324,6 +324,33 @@ func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
 	}
 }
 
+func TestReconcile_RestartCheckpoint_ConsumesMarkerWhenRuntimeSurvived(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	const pid = 7788
+	const tmuxName = "maestro-sup-313"
+	o.pidAliveFn = func(got int) bool { return got == pid }
+	o.tmuxSessionExistsFn = func(name string) bool { return name == tmuxName }
+
+	stamp := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["sup-313"] = &state.Session{
+		IssueNumber: 313, Status: state.StatusRunning, PID: pid, TmuxSession: tmuxName,
+		Worktree: t.TempDir(), Branch: "feat/sup-313", Backend: "claude",
+		RestartCheckpointAt: &stamp,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("surviving runtime should consume its restart marker")
+	}
+	if s.Sessions["sup-313"].RestartCheckpointAt != nil {
+		t.Fatal("surviving runtime retained a marker that would replay after natural exit")
+	}
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0", resumeCount)
+	}
+}
+
 // If a replacement's tmux is alive but its live pane pid can't be read, the
 // marker must be PRESERVED (not consumed) so the next cycle retries the
 // non-destructive adoption — the session must never be respawned over or falsely

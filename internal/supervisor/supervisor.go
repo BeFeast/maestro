@@ -4453,7 +4453,7 @@ func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
 			alreadyStopped := sess == nil || sess.PID <= 0 || !worker.IsAlive(sess.PID)
-			if err := worker.StopProcess(slot, sess); err != nil {
+			if err := worker.StopProcess(cfg, slot, sess); err != nil {
 				return err
 			}
 			now := time.Now().UTC()

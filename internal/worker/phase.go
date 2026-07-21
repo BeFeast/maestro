@@ -21,9 +21,12 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("session %s has no worktree", slotName)
 	}
 
-	// Kill any leftover tmux session from the previous phase
+	// End the previous attempt through its exact lease before starting the next
+	// phase. Legacy sessions retain the tmux/process-tree fallback.
 	tmuxName := TmuxSessionName(slotName)
-	tmuxsession.KillSession(tmuxName)
+	if err := StopProcess(cfg, slotName, sess); err != nil {
+		return fmt.Errorf("stop previous phase: %w", err)
+	}
 
 	// Determine backend
 	if backendName == "" {
@@ -78,7 +81,8 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
+	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split, "phase_transition")
+	if err != nil {
 		return err
 	}
 
@@ -89,21 +93,25 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		WorkspacePath: sess.Worktree,
 	}
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
 	// Start tmux session
 	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
 	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("parse pane pid: %w", err)
 	}
 
@@ -114,6 +122,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
 	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
+	assignWorkerLease(sess, attemptLease)
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.LastNotifiedStatus = ""

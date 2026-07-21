@@ -170,28 +170,33 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split, "initial_spawn")
+	if err != nil {
 		return "", err
 	}
 
 	// Run before_run hook (fatal on failure)
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return "", fmt.Errorf("before_run hook: %w", err)
 	}
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
 	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID of the shell running inside the tmux pane
 	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return "", fmt.Errorf("tmux list-panes: %w", err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return "", fmt.Errorf("parse pane pid: %w", err)
 	}
 
@@ -211,6 +216,7 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		Status:      state.StatusRunning,
 		Backend:     backendName,
 	}
+	assignWorkerLease(s.Sessions[slotName], attemptLease)
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
@@ -247,7 +253,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Clean up old worker (tmux session, process, worktree)
-	Stop(cfg, slotName, sess)
+	if err := Stop(cfg, slotName, sess); err != nil {
+		return fmt.Errorf("stop previous worker attempt: %w", err)
+	}
 
 	// Delete old local branch (ignore errors — branch may not exist locally)
 	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
@@ -332,28 +340,33 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split, "fallover")
+	if err != nil {
 		return err
 	}
 
 	// Run before_run hook (fatal on failure)
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
 	// Start tmux session
 	tmuxName := TmuxSessionName(slotName)
 	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
 	}
 
 	// Get PID
 	pidOut, err := tmuxsession.PanePID(tmuxName)
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("tmux list-panes: %w", err)
 	}
 	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("parse pane pid: %w", err)
 	}
 
@@ -370,6 +383,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// #513/#931: stamp the fallover segment and clear the previous attempt's
 	// terminal/model projection without losing cumulative history.
 	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
+	assignWorkerLease(sess, attemptLease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
@@ -391,7 +405,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 // StopProcess terminates only the worker runtime for a slot. It deliberately
 // preserves the worktree, branch, and PR so a safety stop cannot destroy the
 // worker's durable output; cleanup remains a separate, explicit operation.
-func StopProcess(slotName string, sess *state.Session) error {
+func StopProcess(cfg *config.Config, slotName string, sess *state.Session) error {
+	ownedLease, err := stopOwnedWorkerLease(cfg, sess)
+	if err != nil {
+		return err
+	}
 	// Try to kill the tmux session first (covers tmux-spawned workers)
 	tmuxName := TmuxSessionName(slotName)
 	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
@@ -402,7 +420,7 @@ func StopProcess(slotName string, sess *state.Session) error {
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
 	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
-	if sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
+	if !ownedLease && sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
 		KillProcessTree(sess.PID)
 	}
 	return nil
@@ -410,7 +428,7 @@ func StopProcess(slotName string, sess *state.Session) error {
 
 // Stop kills a worker and removes its worktree.
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
-	if err := StopProcess(slotName, sess); err != nil {
+	if err := StopProcess(cfg, slotName, sess); err != nil {
 		return err
 	}
 	if sess == nil {

@@ -236,6 +236,60 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	}
 }
 
+func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *testing.T) {
+	stateDir := filepath.Join(t.TempDir(), "state")
+	st := state.NewState()
+	st.WorkerLeaseAttention = []state.WorkerLeaseAttention{{
+		Identity:   "ambiguous-a1b2c3d4e5f6",
+		Slot:       "slot-a",
+		Reason:     "invalid ownership manifest",
+		NextAction: "Inspect the exact persisted lease and ownership manifest; do not delete by age, path prefix, or executable name.",
+		DetectedAt: time.Now().UTC().Add(-time.Minute),
+	}}
+	st.WorkerLeaseReconciledAt = time.Now().UTC()
+	if err := state.Save(stateDir, st); err != nil {
+		t.Fatal(err)
+	}
+	project := NewFleetProject("One", "", "", &config.Config{Repo: "owner/one", StateDir: stateDir, MaxParallel: 1})
+	srv := NewFleet([]FleetProject{project}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleet(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d", w.Code)
+	}
+	var resp fleetResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.Summary.NeedsAttention != 1 || len(resp.Attention) != 1 {
+		t.Fatalf("attention projection = summary %+v inbox %d", resp.Summary, len(resp.Attention))
+	}
+	worker := resp.Attention[0]
+	if worker.Status != "worker_lease_attention" || !worker.NeedsAttention || !strings.Contains(worker.NextAction, "do not delete") {
+		t.Fatalf("worker lease attention = %+v", worker)
+	}
+	encoded := w.Body.String()
+	if strings.Contains(encoded, "/var/tmp/") || strings.Contains(encoded, "systemctl") {
+		t.Fatalf("worker lease attention leaked private runtime detail: %s", encoded)
+	}
+
+	detailReq := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot="+worker.Slot, nil)
+	detailW := httptest.NewRecorder()
+	srv.handleFleetWorker(detailW, detailReq)
+	if detailW.Code != http.StatusOK {
+		t.Fatalf("detail status = %d: %s", detailW.Code, detailW.Body.String())
+	}
+	var detail fleetWorkerDetailResponse
+	if err := json.Unmarshal(detailW.Body.Bytes(), &detail); err != nil {
+		t.Fatal(err)
+	}
+	if detail.Log.Available || !strings.Contains(detail.Log.Reason, "no process log") {
+		t.Fatalf("detail log = %+v", detail.Log)
+	}
+}
+
 func TestFleetWorkersOrderActuallyRunningFirst(t *testing.T) {
 	dir := t.TempDir()
 	now := time.Now().UTC()
@@ -418,6 +472,10 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 		ExcludeLabels:            []string{"hold"},
 		WorkerMaxTokens:          200000,
 		WorkerSoftTokenThreshold: &soft,
+		WorkerRuntime: config.WorkerRuntimeConfig{
+			Mode: config.WorkerRuntimeModeIsolated, Scope: config.WorkerRuntimeScopeSystem,
+			ScratchRoot: filepath.Join(dir, "scratch-"+secret), MemoryMaxMB: 4096,
+		},
 		Telegram: config.TelegramConfig{
 			BotToken:    secret,
 			OpenclawURL: "https://relay.example/" + secret,
@@ -490,6 +548,10 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	eff := resp.Projects[0].EffectiveConfig
 	if eff.MaxParallel != 4 || eff.ReviewGate != "none" || eff.ModelPolicy.Default != "codex" {
 		t.Fatalf("effective config basics = %+v", eff)
+	}
+	if eff.WorkerRuntime.Mode != config.WorkerRuntimeModeIsolated || eff.WorkerRuntime.Scope != config.WorkerRuntimeScopeSystem ||
+		eff.WorkerRuntime.MemoryMaxMB != 4096 || !eff.WorkerRuntime.ScratchConfigured {
+		t.Fatalf("worker runtime = %+v", eff.WorkerRuntime)
 	}
 	if eff.ApprovalAction != config.SupervisorActionChangeGlobalConfig {
 		t.Fatalf("approval action = %q", eff.ApprovalAction)

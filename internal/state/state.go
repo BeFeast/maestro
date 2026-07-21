@@ -190,18 +190,24 @@ const (
 )
 
 type Session struct {
-	IssueNumber int           `json:"issue_number"`
-	IssueTitle  string        `json:"issue_title"`
-	Worktree    string        `json:"worktree"`
-	Branch      string        `json:"branch"`
-	PID         int           `json:"pid"`
-	TmuxSession string        `json:"tmux_session,omitempty"`
-	LogFile     string        `json:"log_file"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Status      SessionStatus `json:"status"`
-	PRNumber    int           `json:"pr_number,omitempty"`
-	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	IssueNumber          int           `json:"issue_number"`
+	IssueTitle           string        `json:"issue_title"`
+	Worktree             string        `json:"worktree"`
+	Branch               string        `json:"branch"`
+	PID                  int           `json:"pid"`
+	TmuxSession          string        `json:"tmux_session,omitempty"`
+	WorkerLeaseID        string        `json:"worker_lease_id,omitempty"`
+	WorkerLeaseUnit      string        `json:"worker_lease_unit,omitempty"`
+	WorkerLeaseScope     string        `json:"worker_lease_scope,omitempty"`
+	WorkerScratchDir     string        `json:"worker_scratch_dir,omitempty"`
+	WorkerLeaseManifest  string        `json:"worker_lease_manifest,omitempty"`
+	WorkerLeaseAttention string        `json:"worker_lease_attention,omitempty"`
+	LogFile              string        `json:"log_file"`
+	StartedAt            time.Time     `json:"started_at"`
+	FinishedAt           *time.Time    `json:"finished_at,omitempty"`
+	Status               SessionStatus `json:"status"`
+	PRNumber             int           `json:"pr_number,omitempty"`
+	Backend              string        `json:"backend,omitempty"` // "claude", "codex", etc.
 	// #730: model + self-reported cost captured from the backend's own
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
@@ -353,6 +359,13 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAttention {
 	if sess == nil {
 		return SessionAttention{}
+	}
+	if reason := strings.TrimSpace(sess.WorkerLeaseAttention); reason != "" {
+		return SessionAttention{
+			Reason:         "Worker scratch ownership needs attention: " + reason + ".",
+			NextAction:     "Inspect the exact persisted worker lease and ownership manifest; do not delete by age, path prefix, or executable name.",
+			NeedsAttention: true,
+		}
 	}
 	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
 		return SessionAttention{
@@ -1286,6 +1299,18 @@ type ApprovalAudit struct {
 	TargetStateHash string    `json:"target_state_hash,omitempty"`
 }
 
+// WorkerLeaseAttention is a durable, path-free ownership warning produced by
+// the worker scratch reconciler. Identity is either a validated lease ID or an
+// opaque fingerprint for an ambiguous entry; raw host paths and command lines
+// are deliberately excluded from persisted/UI state.
+type WorkerLeaseAttention struct {
+	Identity   string    `json:"identity"`
+	Slot       string    `json:"slot,omitempty"`
+	Reason     string    `json:"reason"`
+	NextAction string    `json:"next_action"`
+	DetectedAt time.Time `json:"detected_at"`
+}
+
 type State struct {
 	Sessions            map[string]*Session        `json:"sessions"`
 	Missions            map[int]*Mission           `json:"missions,omitempty"` // parent issue number → mission
@@ -1306,6 +1331,12 @@ type State struct {
 	ProjectStatusSync          map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
 	NextSlot                   int                                 `json:"next_slot"`
 	LastMergeAt                time.Time                           `json:"last_merge_at,omitempty"`
+
+	// WorkerLeaseAttention is the current startup/periodic reconciliation
+	// result for scratch ownership that cannot be changed automatically. The
+	// watermark makes concurrent state saves choose the newest complete pass.
+	WorkerLeaseAttention    []WorkerLeaseAttention `json:"worker_lease_attention,omitempty"`
+	WorkerLeaseReconciledAt time.Time              `json:"worker_lease_reconciled_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1872,6 +1903,8 @@ func (s *State) copyFrom(src *State) {
 	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
+	s.WorkerLeaseAttention = src.WorkerLeaseAttention
+	s.WorkerLeaseReconciledAt = src.WorkerLeaseReconciledAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
 	s.Paused = src.Paused
@@ -1936,11 +1969,26 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
+	mergeWorkerLeaseAttention(merged, current, ours)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
 	mergeSupervisorHeartbeat(merged, current, ours)
 	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
+}
+
+func mergeWorkerLeaseAttention(merged, current, ours *State) {
+	winner := current
+	if winner == nil || (ours != nil && ours.WorkerLeaseReconciledAt.After(winner.WorkerLeaseReconciledAt)) {
+		winner = ours
+	}
+	if winner == nil {
+		merged.WorkerLeaseAttention = nil
+		merged.WorkerLeaseReconciledAt = time.Time{}
+		return
+	}
+	merged.WorkerLeaseAttention = append([]WorkerLeaseAttention(nil), winner.WorkerLeaseAttention...)
+	merged.WorkerLeaseReconciledAt = winner.WorkerLeaseReconciledAt
 }
 
 // mergeSupervisorHeartbeat preserves the newest completed supervisor pulse
@@ -4158,6 +4206,9 @@ func SessionAttentionActionableAt(sess *Session, now time.Time) bool {
 func sessionAttentionActionableAt(sess *Session, now time.Time, ttl time.Duration) bool {
 	if sess == nil {
 		return false
+	}
+	if strings.TrimSpace(sess.WorkerLeaseAttention) != "" {
+		return true
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()

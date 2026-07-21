@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -1466,6 +1467,7 @@ type fleetEffectiveConfig struct {
 	ManagementHome *fleetManagementHome   `json:"management_home,omitempty"`
 	ModelPolicy    fleetModelPolicy       `json:"model_policy"`
 	Pipeline       fleetEffectivePipeline `json:"pipeline"`
+	WorkerRuntime  fleetWorkerRuntime     `json:"worker_runtime"`
 	MaxParallel    int                    `json:"max_parallel"`
 	ReviewGate     string                 `json:"review_gate"`
 	Labels         fleetConfigLabels      `json:"labels"`
@@ -1478,6 +1480,13 @@ type fleetEffectiveConfig struct {
 	// (builtin/fleet/project). Mission Control uses Source to highlight
 	// non-default overrides. Source is builtin for file-loaded configs.
 	Settings []fleetSettingSource `json:"settings"`
+}
+
+type fleetWorkerRuntime struct {
+	Mode              string `json:"mode"`
+	Scope             string `json:"scope"`
+	MemoryMaxMB       int    `json:"memory_max_mb,omitempty"`
+	ScratchConfigured bool   `json:"scratch_configured"`
 }
 
 // fleetSettingSource is one cost/LLM knob's effective value and provenance.
@@ -1882,6 +1891,21 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	}
 	sess, ok := st.Sessions[slot]
 	if !ok {
+		if attention, found := workerLeaseAttentionForSlot(st.WorkerLeaseAttention, slot); found {
+			projectState := fleetProjectState{
+				Name: project.Name, Repo: project.cfg.Repo, DashboardURL: project.DashboardURL,
+				ReadOnly: project.cfg.Server.ReadOnly || s.readOnly,
+			}
+			writeJSON(w, http.StatusOK, fleetWorkerDetailResponse{
+				Worker: makeFleetWorkerState(projectState, workerLeaseAttentionSessionInfo(attention)),
+				Log: fleetLogTail{
+					Available: false,
+					Reason:    "Worker lease attention contains no process log or command line by design.",
+					UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+				},
+			})
+			return
+		}
 		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", slot))
 		return
 	}
@@ -4054,6 +4078,12 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			Implementer: fleetEffectivePipelineRoleFrom(cfg.Pipeline.Implementer),
 			Validator:   fleetEffectivePipelineRoleFrom(cfg.Pipeline.Validator),
 		},
+		WorkerRuntime: fleetWorkerRuntime{
+			Mode:              cfg.WorkerRuntime.EffectiveMode(),
+			Scope:             cfg.WorkerRuntime.EffectiveScope(),
+			MemoryMaxMB:       cfg.WorkerRuntime.MemoryMaxMB,
+			ScratchConfigured: strings.TrimSpace(cfg.WorkerRuntime.ScratchRoot) != "",
+		},
 		MaxParallel: cfg.MaxParallel,
 		ReviewGate:  strings.TrimSpace(cfg.ReviewGate),
 		Labels: fleetConfigLabels{
@@ -4312,6 +4342,12 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.Active = append(item.Active, worker)
 		}
 	}
+	for _, runtimeAttention := range st.WorkerLeaseAttention {
+		info := workerLeaseAttentionSessionInfo(runtimeAttention)
+		item.NeedsAttention++
+		item.Attention = append(item.Attention, info)
+		workers = append(workers, makeFleetWorkerState(item, info))
+	}
 	if len(backendRestartTargets) > 0 || len(backendRestartSkipped) > 0 {
 		item.Actions = append(item.Actions, backendDriftRestartControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, backendRestartTargets, backendRestartSkipped))
 	}
@@ -4339,6 +4375,39 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.ActivityReason = activityReason
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+func workerLeaseAttentionSlot(attention state.WorkerLeaseAttention) string {
+	identity := strings.TrimSpace(attention.Identity)
+	if identity == "" {
+		identity = "unknown"
+	}
+	fingerprint := sha256.Sum256([]byte(identity + "\x00" + attention.Slot + "\x00" + attention.Reason))
+	return "worker-lease-attention-" + identity + "-" + hex.EncodeToString(fingerprint[:6])
+}
+
+func workerLeaseAttentionForSlot(attention []state.WorkerLeaseAttention, slot string) (state.WorkerLeaseAttention, bool) {
+	for _, item := range attention {
+		if workerLeaseAttentionSlot(item) == slot {
+			return item, true
+		}
+	}
+	return state.WorkerLeaseAttention{}, false
+}
+
+func workerLeaseAttentionSessionInfo(attention state.WorkerLeaseAttention) sessionInfo {
+	startedAt := attention.DetectedAt.UTC().Format(time.RFC3339)
+	return sessionInfo{
+		Slot:           workerLeaseAttentionSlot(attention),
+		IssueTitle:     "Worker scratch ownership",
+		Status:         "worker_lease_attention",
+		DisplayStatus:  "needs_attention",
+		StatusReason:   attention.Reason,
+		NextAction:     attention.NextAction,
+		NeedsAttention: true,
+		Live:           true,
+		StartedAt:      startedAt,
+	}
 }
 
 // fleetSupersedingIssueSession identifies terminal duplicate attempts that

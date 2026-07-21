@@ -1972,6 +1972,7 @@ type Config struct {
 	Outcome                         outcome.Brief                 `yaml:"outcome"`
 	LocalPath                       string                        `yaml:"local_path"`
 	WorktreeBase                    string                        `yaml:"worktree_base"`
+	WorkerRuntime                   WorkerRuntimeConfig           `yaml:"worker_runtime,omitempty"`
 	MaxParallel                     int                           `yaml:"max_parallel"`
 	MaxLiveWorkers                  int                           `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
 	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
@@ -2230,6 +2231,9 @@ func parse(data []byte) (*Config, error) {
 	if err := validateManagementHome(cfg.ManagementHome); err != nil {
 		return nil, err
 	}
+	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {
+		return nil, err
+	}
 	if !cfg.Delivery.ValidMode() {
 		return nil, fmt.Errorf("config: delivery.mode %q is invalid (want disabled, approval_required, or automatic)", cfg.Delivery.Mode)
 	}
@@ -2306,6 +2310,7 @@ func parse(data []byte) (*Config, error) {
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
+	cfg.WorkerRuntime.ScratchRoot = expandHome(cfg.WorkerRuntime.ScratchRoot)
 	cfg.Outcome = cfg.Outcome.Normalized()
 	if cfg.Outcome.Configured() {
 		cfg.Outcome.SourceRepoPath = expandHome(cfg.Outcome.SourceRepoPath)

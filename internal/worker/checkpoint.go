@@ -291,16 +291,11 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return err
 	}
 
-	// Kill tmux session + process subtree (but do NOT remove worktree). Reaping
-	// the whole descendant tree — not just the recorded pane PID — ensures
-	// worker grandchildren that reparented away (e.g. headless Chrome) do not
-	// leak across a respawn.
+	// End the previous attempt through its exact lease (or the legacy
+	// tmux/process-tree fallback) without removing the retained worktree.
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
-		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
-	}
-	if sess.PID > 0 && IsAlive(sess.PID) {
-		KillProcessTree(sess.PID)
+	if err := StopProcess(cfg, slotName, sess); err != nil {
+		return fmt.Errorf("stop previous in-place attempt: %w", err)
 	}
 
 	// Run after_run hook (non-fatal)
@@ -386,7 +381,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
+	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split, "in_place_respawn")
+	if err != nil {
 		return err
 	}
 
@@ -397,6 +393,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		WorkspacePath: sess.Worktree,
 	}
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
+		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
@@ -406,6 +403,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// replaying the runner command and creating two live workers.
 	pid, err := startOrReconcileTmuxSession(tmuxName, sess.Worktree, runnerPath, sess.PID)
 	if err != nil {
+		rollbackPreparedLease(attemptLease)
 		return err
 	}
 
@@ -418,6 +416,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// #513/#931: start a new attempt projection while preserving the same
 	// worktree/session identity and cumulative attribution history.
 	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
+	assignWorkerLease(sess, attemptLease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

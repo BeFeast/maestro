@@ -2590,19 +2590,31 @@ func (o *Orchestrator) RunOnce() error {
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
 
+	// Storage/process ownership is reconciled before any session-status or
+	// scheduling decision. An orphaned exact lease is stopped and cleaned here;
+	// ambiguity is persisted as attention and never converted into a broad
+	// process/path sweep.
+	leaseReconcile := worker.ReconcileWorkerLeases(o.cfg, s, time.Now().UTC())
+	if len(leaseReconcile.Cleaned) > 0 {
+		log.Printf("[orch] worker lease reconcile cleaned %d exact lease(s)", len(leaseReconcile.Cleaned))
+	}
+	if leaseReconcile.Attention > 0 {
+		log.Printf("[orch] worker lease reconcile surfaced %d ownership attention item(s)", leaseReconcile.Attention)
+	}
+
 	// Step 0: Surface a finished self-deploy (#698) as a supervisor finding.
 	// Persist immediately: the result file is already consumed, so the
 	// finding must not depend on the rest of the cycle succeeding.
 	// The stale-trigger watchdog (#807) runs in the same step, right after — it
 	// makes the OPPOSITE outcome loud: a trigger that produced no result because
 	// the detached deploy unit died silently. Both persist together.
-	changed := o.consumeSelfDeployResult(s)
+	changed := leaseReconcile.Changed || o.consumeSelfDeployResult(s)
 	if o.maybeSurfaceStaleSelfDeploy(s) {
 		changed = true
 	}
 	if changed {
 		if err := state.Save(o.cfg.StateDir, s); err != nil {
-			return fmt.Errorf("save state after self-deploy result: %w", err)
+			return fmt.Errorf("save state after pre-cycle reconciliation: %w", err)
 		}
 	}
 
@@ -2858,6 +2870,11 @@ func (o *Orchestrator) runStartupTasks(once bool) {
 		return
 	}
 
+	// Reconcile isolated scratch before startup jitter delays the first normal
+	// cycle. This is best-effort and idempotent; RunOnce repeats the same exact
+	// pass periodically.
+	o.reconcileWorkerLeasesOnStartup()
+
 	// The long-running daemon just (re)started — that is the "restart" the
 	// restart-required banner asks for. Reconcile any stale restart_required flag
 	// persisted by a previous process into this process's reality (the in-memory
@@ -2883,6 +2900,26 @@ func (o *Orchestrator) runStartupTasks(once bool) {
 	// a no-op when nothing is past the floors. Failures are logged inside the
 	// helper.
 	o.compactTerminalSessionsOnStartup()
+}
+
+func (o *Orchestrator) reconcileWorkerLeasesOnStartup() {
+	if o == nil || o.cfg == nil {
+		return
+	}
+	s, err := state.Load(o.cfg.StateDir)
+	if err != nil {
+		log.Printf("[orch] worker lease startup reconcile: load state: %v", err)
+		return
+	}
+	result := worker.ReconcileWorkerLeases(o.cfg, s, time.Now().UTC())
+	if !result.Changed {
+		return
+	}
+	if err := state.Save(o.cfg.StateDir, s); err != nil {
+		log.Printf("[orch] worker lease startup reconcile: save state: %v", err)
+		return
+	}
+	log.Printf("[orch] worker lease startup reconcile complete (cleaned=%d attention=%d)", len(result.Cleaned), result.Attention)
 }
 
 // scrubLegacyCredentialArtifactsOnStartup neutralizes provider-credential
@@ -3017,6 +3054,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	if newCfg.WorkerMaxTokens != old.WorkerMaxTokens {
 		changed = append(changed, fmt.Sprintf("worker_max_tokens: %d→%d", old.WorkerMaxTokens, newCfg.WorkerMaxTokens))
 		o.cfg.WorkerMaxTokens = newCfg.WorkerMaxTokens
+	}
+	if newCfg.WorkerRuntime != old.WorkerRuntime {
+		changed = append(changed, fmt.Sprintf("worker_runtime.mode: %s→%s", old.WorkerRuntime.EffectiveMode(), newCfg.WorkerRuntime.EffectiveMode()))
+		o.cfg.WorkerRuntime = newCfg.WorkerRuntime
 	}
 	if !strSliceEqual(newCfg.IssueLabels, old.IssueLabels) {
 		changed = append(changed, fmt.Sprintf("issue_labels: %v→%v", old.IssueLabels, newCfg.IssueLabels))
@@ -3255,19 +3296,48 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 
 		var reasons []string
+		tmuxAlive := o.tmuxSessionExists(tmuxName)
 		if sess.PID <= 0 {
 			reasons = append(reasons, "pid missing")
 		} else if !o.pidAlive(sess.PID) {
 			reasons = append(reasons, fmt.Sprintf("pid %d dead", sess.PID))
 		}
-
-		tmuxAlive := o.tmuxSessionExists(tmuxName)
 		if !tmuxAlive {
 			reasons = append(reasons, fmt.Sprintf("tmux session %q missing", tmuxName))
 		}
 
 		if len(reasons) == 0 {
+			if sess.RestartCheckpointAt != nil {
+				// The durable runtime survived the daemon restart. Consume the
+				// one-shot resume marker now; leaving it set would replay the
+				// already-running attempt after its later natural exit.
+				sess.RestartCheckpointAt = nil
+				reconciled = true
+				log.Printf("[orch] reconcile: %s worker runtime survived restart; consumed resume marker without respawn", slotName)
+			}
 			continue
+		}
+		leaseActive, leaseOwned, leaseErr := worker.WorkerLeaseActive(o.cfg, sess)
+		if leaseErr != nil {
+			sess.WorkerLeaseAttention = "worker lease liveness could not be inspected"
+			log.Printf("[orch] reconcile: %s exact worker lease is unreadable; refusing unsafe terminal transition: %v", slotName, leaseErr)
+			reconciled = true
+			continue
+		}
+		if leaseOwned && !leaseActive {
+			reasons = append(reasons, "worker lease inactive")
+		}
+		if leaseOwned && leaseActive {
+			// The lease is authoritative for descendants, while tmux remains the
+			// output/control attachment. If that attachment disappeared while the
+			// lease is still live, stop the exact cgroup before any retry so a
+			// detached descendant cannot overlap its replacement.
+			if err := worker.StopProcess(o.cfg, slotName, sess); err != nil {
+				sess.WorkerLeaseAttention = "exact detached worker lease could not be stopped"
+				log.Printf("[orch] reconcile: %s detached lease stop failed; refusing replacement: %v", slotName, err)
+				reconciled = true
+				continue
+			}
 		}
 
 		// Worker process/session is gone. Before marking dead, check whether it
@@ -3769,6 +3839,12 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	current.UsageTokensWatermark = runtime.UsageTokensWatermark
 	current.TokensUsedAttempt = runtime.TokensUsedAttempt
 	current.WorkerOutcome = runtime.WorkerOutcome
+	current.WorkerLeaseID = runtime.WorkerLeaseID
+	current.WorkerLeaseUnit = runtime.WorkerLeaseUnit
+	current.WorkerLeaseScope = runtime.WorkerLeaseScope
+	current.WorkerScratchDir = runtime.WorkerScratchDir
+	current.WorkerLeaseManifest = runtime.WorkerLeaseManifest
+	current.WorkerLeaseAttention = runtime.WorkerLeaseAttention
 	current.Attribution = append([]state.BackendAttribution(nil), runtime.Attribution...)
 	current.NextRetryAt = runtime.NextRetryAt
 	current.RestartCheckpointAt = runtime.RestartCheckpointAt
@@ -4431,6 +4507,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
+				leaseActive, leaseOwned, leaseErr := worker.WorkerLeaseActive(o.cfg, sess)
+				if leaseErr != nil {
+					sess.WorkerLeaseAttention = "worker lease liveness could not be inspected"
+					log.Printf("[orch] worker %s pane died but exact lease is unreadable; refusing unsafe retry: %v", slotName, leaseErr)
+					continue
+				}
+				if leaseOwned && leaseActive {
+					if err := worker.StopProcess(o.cfg, slotName, sess); err != nil {
+						sess.WorkerLeaseAttention = "exact detached worker lease could not be stopped"
+						log.Printf("[orch] worker %s pane died but exact lease stop failed; refusing replacement: %v", slotName, err)
+						continue
+					}
+				}
 				// Pipeline phase transition: if this is a pipeline session,
 				// try to advance to the next phase before falling through
 				// to normal dead-worker handling.
