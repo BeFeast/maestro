@@ -24,8 +24,8 @@ const tmuxSpawnReconcileAttempts = 3
 
 var (
 	tmuxSessionExists = tmuxsession.HasSession
-	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
-		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath)
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
+		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath, lease)
 	}
 	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
 		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}").Output()
@@ -339,16 +339,12 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return err
 	}
 
-	// Kill tmux session + process subtree (but do NOT remove worktree). Reaping
-	// the whole descendant tree — not just the recorded pane PID — ensures
-	// worker grandchildren that reparented away (e.g. headless Chrome) do not
-	// leak across a respawn.
+	// Terminate the exact process lease (but do NOT remove the worktree). New
+	// workers use a dedicated cgroup that still owns descendants after they
+	// double-fork or reparent; legacy sessions fall back to the PPID sweep.
 	tmuxName := TmuxSessionName(slotName)
-	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
-		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
-	}
-	if sess.PID > 0 && IsAlive(sess.PID) {
-		KillProcessTree(sess.PID)
+	if err := StopProcess(slotName, sess); err != nil {
+		return fmt.Errorf("stop previous worker process lease: %w", err)
 	}
 
 	// Run after_run hook (non-fatal)
@@ -452,8 +448,12 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
-	pid, err := startOrReconcileTmuxSession(tmuxName, sess.Worktree, runnerPath, sess.PID)
+	nextGeneration := sess.WorkerGeneration + 1
+	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID)
 	if err != nil {
+		if lease.Unit != "" {
+			setSessionProcessLease(sess, lease)
+		}
 		return err
 	}
 
@@ -462,6 +462,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Update session — keep worktree and branch, reset runtime fields
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
+	setSessionProcessLease(sess, lease)
 	sess.LogFile = logFile
 	// #513/#931: start a new attempt projection while preserving the same
 	// worktree/session identity and cumulative attribution history.
@@ -478,8 +479,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	return nil
 }
 
-func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, previousPID int) (int, error) {
-	spawnOut, spawnErr := runTmuxNewSession(tmuxName, worktree, runnerPath)
+func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease, previousPID int) (int, error) {
+	spawnOut, spawnErr := runTmuxNewSession(tmuxName, worktree, runnerPath, lease)
 	wantWorktree := filepath.Clean(worktree)
 	var observeErr error
 	for i := 0; i < tmuxSpawnReconcileAttempts; i++ {

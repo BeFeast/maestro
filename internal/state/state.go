@@ -209,14 +209,23 @@ type AdvisorReview struct {
 }
 
 type Session struct {
-	IssueNumber int       `json:"issue_number"`
-	IssueTitle  string    `json:"issue_title"`
-	Worktree    string    `json:"worktree"`
-	Branch      string    `json:"branch"`
-	PID         int       `json:"pid"`
-	TmuxSession string    `json:"tmux_session,omitempty"`
-	LogFile     string    `json:"log_file"`
-	StartedAt   time.Time `json:"started_at"`
+	IssueNumber int    `json:"issue_number"`
+	IssueTitle  string `json:"issue_title"`
+	Worktree    string `json:"worktree"`
+	Branch      string `json:"branch"`
+	PID         int    `json:"pid"`
+	TmuxSession string `json:"tmux_session,omitempty"`
+	// ProcessLeaseUnit is the exact per-attempt systemd scope that owns the
+	// runner and every descendant it launches. Unlike PID/tmux ancestry, cgroup
+	// membership survives double-forking and reparenting. ProcessLeaseManager is
+	// "system" for the production system-service topology and "user" only for
+	// non-service development launches. Both remain set until teardown has
+	// confirmed the scope empty, so a replacement daemon can retry cleanup
+	// exactly once without guessing from a stale pane PID.
+	ProcessLeaseUnit    string    `json:"process_lease_unit,omitempty"`
+	ProcessLeaseManager string    `json:"process_lease_manager,omitempty"`
+	LogFile             string    `json:"log_file"`
+	StartedAt           time.Time `json:"started_at"`
 	// WorkerGeneration is the durable lease generation for the process that
 	// owns this canonical session. Every successful spawn, respawn, phase
 	// transition, or live-runtime adoption advances it. Destructive cleanup
@@ -4915,7 +4924,7 @@ func (s *State) IsMissionChild(issueNum int) bool {
 func (s *State) PruneOldSessions(maxAge time.Duration) int {
 	pruned := 0
 	for name, sess := range s.Sessions {
-		if !IsTerminal(sess.Status) {
+		if !IsTerminal(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 			continue
 		}
 		finished := sess.FinishedAt
@@ -4996,7 +5005,7 @@ func (s *State) CompactSessions(policy SessionRetentionPolicy, now time.Time) (S
 	}
 	eligible := make([]candidate, 0, len(s.Sessions))
 	for slot, sess := range s.Sessions {
-		if sess == nil || !IsRetentionEligible(sess.Status) {
+		if sess == nil || !IsRetentionEligible(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 			continue
 		}
 		finished := sess.StartedAt

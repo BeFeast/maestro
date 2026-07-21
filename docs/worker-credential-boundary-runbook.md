@@ -92,6 +92,48 @@ Mission Control. A per-credential cooldown is not surfaced as a provider
 failure; the proxy keeps rotating until a compatible credential succeeds or it
 returns the aggregate `model_cooldown` result.
 
+## Per-worker process ownership (#920)
+
+Credential isolation and process ownership share the same runner boundary but
+solve different problems. Every new worker attempt now receives a unique,
+generation-specific transient systemd scope under `maestro-workers.slice`.
+The persisted session fields `process_lease_unit` and
+`process_lease_manager` are the cleanup receipt; PID and tmux identity remain
+observations only.
+
+- In the production topology, `maestro.service` is a system unit. Worker scopes
+  are therefore created through the system manager with non-interactive
+  `sudo systemd-run --scope --uid=<service-user>`. Production does not depend on
+  `systemd-run --user --scope`, which cannot migrate a child out of the system
+  service cgroup and was rejected during #877.
+- The runner, model CLI, direct tool subprocesses, double-forked children, and
+  processes reparented to PID 1 remain in the same cgroup. The shared tmux
+  server is not the kill boundary and is never targeted as a group.
+- Stop, timeout, respawn, phase transition, failed start, and restart cleanup
+  signal the exact worker scope with SIGTERM, wait two seconds, then SIGKILL
+  only survivors in that scope. The synchronous `systemd-run` pane then closes
+  naturally. If a same-name tmux session remains, Maestro retains the receipt
+  and fails closed instead of killing a pane whose cgroup ownership is unproven.
+- If the system manager is temporarily unavailable, Maestro retains the lease
+  fields and retries cleanup on the next reconciliation cycle. Worktree cleanup
+  and state compaction refuse to discard a session while that receipt remains.
+- Legacy sessions with no process lease retain the ancestry sweep for migration
+  compatibility only. All new launches fail closed if their scope cannot be
+  created.
+
+The service user needs narrowly-scoped non-interactive permission for the
+existing system-scope launch command and for `systemctl show/kill` of
+`maestro-worker-*.scope`. Apply that operator policy alongside the binary; do
+not grant a wildcard permission to stop `maestro.service`, the shared worker
+slice, or arbitrary units.
+
+The opt-in integration test
+`TestProcessLeaseIntegrationReparentedChildAndNeighborIsolation` launches two
+workers, reparents a `setsid` child, removes one tmux pane first, and proves
+exact-scope teardown removes that complete lease while the neighboring worker
+remains alive. Run it on the production-topology systemd host with
+`MAESTRO_SYSTEMD_INTEGRATION=1 go test ./internal/tmuxsession -run ProcessLeaseIntegration`.
+
 ## Rollback
 
 Keep a reference-only backup drop-in and the prior private credential generation

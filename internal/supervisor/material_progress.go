@@ -184,6 +184,10 @@ func workerProgressObservation(st *state.State, project, slot string, sess *stat
 		return progress.Observation{}, false
 	}
 	sessionID := materialProgressSessionID(slot, sess)
+	leaseID := strings.TrimSpace(sess.ProcessLeaseUnit)
+	if leaseID == "" {
+		leaseID = "spawn:" + sessionID
+	}
 	target := progress.Target{
 		Kind:        progress.TargetWorker,
 		IssueNumber: sess.IssueNumber,
@@ -191,7 +195,7 @@ func workerProgressObservation(st *state.State, project, slot string, sess *stat
 		SessionID:   sessionID,
 		TmuxSession: strings.TrimSpace(sess.TmuxSession),
 		ProcessID:   sess.PID,
-		LeaseID:     "spawn:" + sessionID,
+		LeaseID:     leaseID,
 	}
 	if err := target.Validate(); err != nil {
 		return progress.Observation{}, false

@@ -8,6 +8,7 @@ package orchestrator
 // worktree, and never dispatch a duplicate.
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -635,5 +636,81 @@ func TestReconcile_RestartCheckpoint_MissingWorktree_FallsThrough(t *testing.T) 
 	}
 	if sess.Status != state.StatusDead {
 		t.Fatalf("status = %q, want %q (fell through to terminal handling)", sess.Status, state.StatusDead)
+	}
+}
+
+func TestReconcile_PaneExitedTerminatesPersistedProcessLease(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	stopCalls := 0
+	o.workerStopProcessFn = func(_ string, sess *state.Session) error {
+		stopCalls++
+		sess.ProcessLeaseUnit = ""
+		sess.ProcessLeaseManager = ""
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-920"] = &state.Session{
+		IssueNumber:         920,
+		IssueTitle:          "durable process lease",
+		Status:              state.StatusRunning,
+		PID:                 4242,
+		TmuxSession:         "maestro-sup-920",
+		Branch:              "feat/sup-920",
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+		ProcessLeaseManager: "system",
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected dead pane reconciliation")
+	}
+	if stopCalls != 1 {
+		t.Fatalf("process lease teardown calls = %d, want 1", stopCalls)
+	}
+	if got := s.Sessions["sup-920"]; got.ProcessLeaseUnit != "" || got.Status != state.StatusDead {
+		t.Fatalf("reconciled session = %+v, want released lease and dead status", got)
+	}
+}
+
+func TestReconcile_ProcessLeaseCleanupRetriesExactlyUntilConfirmed(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	stopCalls := 0
+	o.workerStopProcessFn = func(_ string, sess *state.Session) error {
+		stopCalls++
+		if stopCalls == 1 {
+			return errors.New("system manager temporarily unavailable")
+		}
+		sess.ProcessLeaseUnit = ""
+		sess.ProcessLeaseManager = ""
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-920"] = &state.Session{
+		IssueNumber:         920,
+		Status:              state.StatusFailed,
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope",
+		ProcessLeaseManager: "system",
+	}
+
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("failed lease cleanup must not claim reconciliation completed")
+	}
+	if s.Sessions["sup-920"].ProcessLeaseUnit == "" {
+		t.Fatal("failed cleanup lost the durable retry receipt")
+	}
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("successful retry should report reconciliation")
+	}
+	if stopCalls != 2 || s.Sessions["sup-920"].ProcessLeaseUnit != "" {
+		t.Fatalf("cleanup calls=%d lease=%q, want two calls and released metadata", stopCalls, s.Sessions["sup-920"].ProcessLeaseUnit)
+	}
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("released lease must not be cleaned a third time")
+	}
+	if stopCalls != 2 {
+		t.Fatalf("cleanup replayed after confirmation: %d calls", stopCalls)
 	}
 }

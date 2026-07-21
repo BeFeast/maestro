@@ -100,6 +100,7 @@ type Orchestrator struct {
 	usageLimitFromLogFn       func(logFile string, extraPatterns []string) (bool, string)
 	beforeWorktreeCleanupFn   func(slotName string)
 	removeWorktreeFn          func(localPath, worktreePath string) error
+	workerStopProcessFn       func(slotName string, sess *state.Session) error
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -865,6 +866,13 @@ func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
 	return worker.Stop(o.cfg, slotName, sess)
+}
+
+func (o *Orchestrator) stopWorkerProcess(slotName string, sess *state.Session) error {
+	if o.workerStopProcessFn != nil {
+		return o.workerStopProcessFn(slotName, sess)
+	}
+	return worker.StopProcess(slotName, sess)
 }
 
 func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
@@ -3335,6 +3343,17 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 		isRestartCheckpointedDead := sess.Status == state.StatusDead && sess.RestartCheckpointAt != nil
 		if sess.Status != state.StatusRunning && !isRestartCheckpointedDead {
+			// A terminal/pr_open projection can outlive its tmux pane while a
+			// double-forked tool remains in the worker cgroup. Durable ownership
+			// metadata is the restart-safe cleanup receipt: retain it on failure and
+			// retry next cycle; clear it only after exact-scope teardown succeeds.
+			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+				if err := o.stopWorkerProcess(slotName, sess); err != nil {
+					log.Printf("[orch] reconcile: %s process lease cleanup deferred: %v", slotName, err)
+					continue
+				}
+				reconciled = true
+			}
 			continue
 		}
 		// #967: a worker may die after drain starts but before the daemon's
@@ -3346,6 +3365,12 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+				if err := o.stopWorkerProcess(slotName, sess); err != nil {
+					log.Printf("[orch] reconcile: %s token-budget process lease cleanup deferred: %v", slotName, err)
+					continue
+				}
+			}
 			o.runAfterRunHook(sess)
 			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
 			reconciled = true
@@ -3506,6 +3531,14 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					continue
 				}
 			}
+		}
+
+		if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+			if err := o.stopWorkerProcess(slotName, sess); err != nil {
+				log.Printf("[orch] reconcile: %s stale runtime process lease cleanup deferred: %v", slotName, err)
+				continue
+			}
+			reconciled = true
 		}
 
 		// Before marking the session dead, check whether the worker died because
@@ -3879,6 +3912,8 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	}
 	current.PID = runtime.PID
 	current.TmuxSession = runtime.TmuxSession
+	current.ProcessLeaseUnit = runtime.ProcessLeaseUnit
+	current.ProcessLeaseManager = runtime.ProcessLeaseManager
 	current.WorkerGeneration = runtime.WorkerGeneration
 	current.LogFile = runtime.LogFile
 	current.StartedAt = runtime.StartedAt
@@ -4222,7 +4257,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				}
 				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
 				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				o.stopWorker(slotName, sess)
+				if err := o.stopWorker(slotName, sess); err != nil {
+					log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
+					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+						continue
+					}
+				}
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
@@ -4234,6 +4274,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 		// Check if issue is now closed (only for running sessions)
 		if sess.Status == state.StatusRunning {
 			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+					if err := o.stopWorkerProcess(slotName, sess); err != nil {
+						log.Printf("[orch] token-budget process lease cleanup deferred for %s: %v", slotName, err)
+						continue
+					}
+				}
 				o.runAfterRunHook(sess)
 				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
 				if sess.Phase == state.PhaseAdvisor {
@@ -4250,7 +4296,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				}
 				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
 				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				o.stopWorker(slotName, sess)
+				if err := o.stopWorker(slotName, sess); err != nil {
+					log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
+					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+						continue
+					}
+				}
 				sess.Status = state.StatusDone
 				now := time.Now().UTC()
 				sess.FinishedAt = &now
@@ -4260,6 +4311,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
+				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+					if err := o.stopWorkerProcess(slotName, sess); err != nil {
+						log.Printf("[orch] dead worker process lease cleanup deferred for %s: %v", slotName, err)
+						continue
+					}
+				}
 				if sess.Phase == state.PhaseAdvisor {
 					if pr, found := branchToPR[sess.Branch]; found {
 						o.runAfterRunHook(sess)
@@ -4500,6 +4557,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							o.runAfterRunHook(sess)
 							if err := o.stopWorker(slotName, sess); err != nil {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
+								if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+									continue
+								}
 							}
 							now := time.Now().UTC()
 							resetAt := &resetTime
@@ -4606,6 +4666,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
+							if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+								continue
+							}
 						}
 						now := time.Now().UTC()
 						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
@@ -4636,6 +4699,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								o.runAfterRunHook(sess)
 								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
+									if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+										continue
+									}
 								}
 
 								// Count previous silent-timeout kills before updating this session,
@@ -4684,6 +4750,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				o.runAfterRunHook(sess)
 				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
+					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+						continue
+					}
 				}
 				if sess.Phase == state.PhaseAdvisor {
 					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "timeout", sess.AdvisorUnresolvedFindings)
@@ -6925,8 +6994,11 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 
 	if o.cfg.ShouldCleanupWorktrees() {
 		log.Printf("[orch] cleaning up worktree for %s after merge", slotName)
-		o.stopWorker(slotName, sess)
-		sess.Worktree = "" // Mark as cleaned
+		if err := o.stopWorker(slotName, sess); err != nil {
+			log.Printf("[orch] post-merge worker teardown deferred for %s: %v", slotName, err)
+		} else {
+			sess.Worktree = "" // Mark as cleaned
+		}
 	} else {
 		log.Printf("[orch] skipping worktree cleanup for %s (cleanup_worktrees_on_merge=false)", slotName)
 	}

@@ -12,7 +12,13 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
+
+var checkpointTestLease = tmuxsession.ProcessLease{
+	Unit:    "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+	Manager: tmuxsession.ProcessLeaseManagerUser,
+}
 
 func TestStartOrReconcileTmuxSession_UncertainSpawnAdoptsExactSessionWithoutReplay(t *testing.T) {
 	originalSpawn := runTmuxNewSession
@@ -22,7 +28,7 @@ func TestStartOrReconcileTmuxSession_UncertainSpawnAdoptsExactSessionWithoutRepl
 		readTmuxPaneIdentity = originalRead
 	})
 	spawnCalls := 0
-	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
 		spawnCalls++
 		return nil, errors.New("command result uncertain")
 	}
@@ -30,7 +36,7 @@ func TestStartOrReconcileTmuxSession_UncertainSpawnAdoptsExactSessionWithoutRepl
 		return 202, "/worktrees/slot-1", nil
 	}
 
-	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101)
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", checkpointTestLease, 101)
 	if err != nil || pid != 202 {
 		t.Fatalf("reconciled spawn: pid=%d err=%v", pid, err)
 	}
@@ -47,7 +53,7 @@ func TestStartOrReconcileTmuxSession_RejectsDifferentSessionIdentity(t *testing.
 		readTmuxPaneIdentity = originalRead
 	})
 	spawnCalls := 0
-	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
 		spawnCalls++
 		return nil, errors.New("command result uncertain")
 	}
@@ -55,7 +61,7 @@ func TestStartOrReconcileTmuxSession_RejectsDifferentSessionIdentity(t *testing.
 		return 303, "/worktrees/different-slot", nil
 	}
 
-	if _, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 101); err == nil {
+	if _, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", checkpointTestLease, 101); err == nil {
 		t.Fatal("different tmux/worktree identity was adopted")
 	}
 	if spawnCalls != 1 {
@@ -72,7 +78,7 @@ func TestStartOrReconcileTmuxSession_ObservesAfterConfirmedSpawnWithoutReplay(t 
 	})
 	spawnCalls := 0
 	readCalls := 0
-	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
 		spawnCalls++
 		return nil, nil
 	}
@@ -84,7 +90,7 @@ func TestStartOrReconcileTmuxSession_ObservesAfterConfirmedSpawnWithoutReplay(t 
 		return 404, "/worktrees/slot-1", nil
 	}
 
-	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", 0)
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", checkpointTestLease, 0)
 	if err != nil || pid != 404 {
 		t.Fatalf("observed spawn: pid=%d err=%v", pid, err)
 	}

@@ -38,6 +38,25 @@ func TestValidateCleanupLease_AllowsUnchangedTerminalSession(t *testing.T) {
 	}
 }
 
+func TestValidateCleanupLease_RejectsUnreleasedProcessLease(t *testing.T) {
+	sess := &state.Session{
+		IssueNumber:         920,
+		PID:                 111,
+		Worktree:            "/wt/sup-920",
+		Branch:              "feat/sup-920",
+		StartedAt:           time.Now().Add(-2 * time.Hour),
+		WorkerGeneration:    2,
+		Status:              state.StatusFailed,
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope",
+		ProcessLeaseManager: "system",
+	}
+	lease := CaptureCleanupLease("sup-920", sess)
+	err := ValidateCleanupLease(lease, sess, CleanupProbes{PIDAlive: neverAlive, TmuxAlive: neverTmux}, CleanupPolicy{RequireTerminal: true})
+	if !errors.Is(err, ErrCleanupLeaseChanged) {
+		t.Fatalf("unreleased process lease should block worktree cleanup, got %v", err)
+	}
+}
+
 func TestValidateCleanupLease_AbortsOnEachReleaseSignal(t *testing.T) {
 	started := time.Now().Add(-2 * time.Hour)
 	base := func() *state.Session {

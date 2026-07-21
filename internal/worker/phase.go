@@ -3,14 +3,11 @@ package worker
 import (
 	"fmt"
 	"log"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
-	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // StartPhase launches a new worker session for a pipeline phase in an existing worktree.
@@ -21,9 +18,13 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("session %s has no worktree", slotName)
 	}
 
-	// Kill any leftover tmux session from the previous phase
+	// Finish the previous phase's exact process lease before starting another
+	// generation in the same slot. This remains correct after the pane exits
+	// while a reparented tool subprocess is still alive.
 	tmuxName := TmuxSessionName(slotName)
-	tmuxsession.KillSession(tmuxName)
+	if err := StopProcess(slotName, sess); err != nil {
+		return fmt.Errorf("stop previous phase process lease: %w", err)
+	}
 
 	// Determine backend
 	if backendName == "" {
@@ -92,19 +93,13 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
-	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
-		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID
-	pidOut, err := tmuxsession.PanePID(tmuxName)
+	nextGeneration := sess.WorkerGeneration + 1
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID)
 	if err != nil {
-		return fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return fmt.Errorf("parse pane pid: %w", err)
+		if processLease.Unit != "" {
+			setSessionProcessLease(sess, processLease)
+		}
+		return err
 	}
 
 	log.Printf("[worker] started phase %s for %s in tmux %s (pane_pid=%d)", sess.Phase, slotName, tmuxName, pid)
@@ -112,6 +107,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	// Update session in place
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
+	setSessionProcessLease(sess, processLease)
 	sess.LogFile = logFile
 	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
 	sess.LastOutputHash = ""

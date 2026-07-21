@@ -128,9 +128,27 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		if err := validateExactWorktreeIdentity(cfg.LocalPath, worktreePath, branchName); err != nil {
 			return "", fmt.Errorf("validate reserved live worker identity: %w", err)
 		}
+		processLease, err := workerProcessLease(cfg, slotName, 1)
+		if err != nil {
+			return "", err
+		}
+		active, err := workerProcessLeaseActive(processLease)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved worker process lease: %w", err)
+		}
+		if !active {
+			return "", fmt.Errorf("reserved tmux session %s has no active durable process lease %s", tmuxName, processLease.Unit)
+		}
+		owned, err := workerProcessLeaseAnchored(processLease, pid)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved worker pane ownership: %w", err)
+		}
+		if !owned {
+			return "", fmt.Errorf("reserved tmux session %s pane pid %d is not owned by durable process lease %s", tmuxName, pid, processLease.Unit)
+		}
 		startedAt := time.Now().UTC()
 		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
-		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, startedAt)
+		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
 		recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn_adopted", "", startedAt)
 		log.Printf("[worker] adopted reserved worker %s in tmux session %s (pane_pid=%d)", slotName, tmuxName, pid)
 		return slotName, nil
@@ -236,9 +254,31 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		return "", fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
-	pid, err := startOrReconcileTmuxSession(tmuxName, worktreePath, runnerPath, 0)
+	// Start tmux session inside its unique OS process lease.
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0)
 	if err != nil {
+		if processLease.Unit != "" {
+			startedAt := time.Now().UTC()
+			retryAt := startedAt
+			s.Sessions[slotName] = &state.Session{
+				IssueNumber:         issue.Number,
+				IssueTitle:          issue.Title,
+				Worktree:            worktreePath,
+				Branch:              branchName,
+				ProcessLeaseUnit:    processLease.Unit,
+				ProcessLeaseManager: processLease.Manager,
+				LogFile:             logFile,
+				StartedAt:           startedAt,
+				WorkerGeneration:    1,
+				Status:              state.StatusDead,
+				Backend:             backendName,
+				RetryReason:         state.RetryReasonStalledProgress,
+				NextRetryAt:         &retryAt,
+			}
+			if saveErr := state.Save(cfg.StateDir, s); saveErr != nil {
+				return "", fmt.Errorf("%w (persist failed-start process lease: %v)", err, saveErr)
+			}
+		}
 		return "", err
 	}
 
@@ -246,10 +286,21 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 
 	// Save session to state
 	startedAt := time.Now().UTC()
-	s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, startedAt)
+	s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
+	// Close the launch/state gap before returning to either the daemon cycle or
+	// the one-shot CLI. A replacement daemon must always have the exact scope
+	// receipt needed to adopt or clean this worker; caller-specific metadata
+	// (such as backend-selection audit detail) can be saved immediately after.
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		stopErr := StopProcess(slotName, s.Sessions[slotName])
+		if stopErr != nil {
+			return "", fmt.Errorf("persist worker process lease: %w (rollback teardown: %v)", err, stopErr)
+		}
+		return "", fmt.Errorf("persist worker process lease: %w", err)
+	}
 
 	return slotName, nil
 }
@@ -275,19 +326,21 @@ func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
 	return nil
 }
 
-func freshRunningSession(issue github.Issue, worktree, branch string, pid int, tmuxName, logFile, backend string, startedAt time.Time) *state.Session {
+func freshRunningSession(issue github.Issue, worktree, branch string, pid int, tmuxName, logFile, backend string, processLease tmuxsession.ProcessLease, startedAt time.Time) *state.Session {
 	return &state.Session{
-		IssueNumber:      issue.Number,
-		IssueTitle:       issue.Title,
-		Worktree:         worktree,
-		Branch:           branch,
-		PID:              pid,
-		TmuxSession:      tmuxName,
-		LogFile:          logFile,
-		StartedAt:        startedAt.UTC(),
-		WorkerGeneration: 1,
-		Status:           state.StatusRunning,
-		Backend:          backend,
+		IssueNumber:         issue.Number,
+		IssueTitle:          issue.Title,
+		Worktree:            worktree,
+		Branch:              branch,
+		PID:                 pid,
+		TmuxSession:         tmuxName,
+		ProcessLeaseUnit:    processLease.Unit,
+		ProcessLeaseManager: processLease.Manager,
+		LogFile:             logFile,
+		StartedAt:           startedAt.UTC(),
+		WorkerGeneration:    1,
+		Status:              state.StatusRunning,
+		Backend:             backend,
 	}
 }
 
@@ -320,7 +373,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Clean up old worker (tmux session, process, worktree)
-	Stop(cfg, slotName, sess)
+	if err := Stop(cfg, slotName, sess); err != nil {
+		return fmt.Errorf("stop previous worker process lease: %w", err)
+	}
 
 	// Delete old local branch (ignore errors — branch may not exist locally)
 	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
@@ -414,20 +469,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
+	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
-	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, worktreePath, runnerPath); err != nil {
-		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID
-	pidOut, err := tmuxsession.PanePID(tmuxName)
+	nextGeneration := sess.WorkerGeneration + 1
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID)
 	if err != nil {
-		return fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return fmt.Errorf("parse pane pid: %w", err)
+		if processLease.Unit != "" {
+			setSessionProcessLease(sess, processLease)
+		}
+		return err
 	}
 
 	log.Printf("[worker] respawned %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
@@ -437,6 +487,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.Branch = branchName
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
+	setSessionProcessLease(sess, processLease)
 	sess.LogFile = logFile
 	now := time.Now()
 	sess.PRNumber = 0
@@ -465,12 +516,51 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 // preserves the worktree, branch, and PR so a safety stop cannot destroy the
 // worker's durable output; cleanup remains a separate, explicit operation.
 func StopProcess(slotName string, sess *state.Session) error {
-	// Try to kill the tmux session first (covers tmux-spawned workers)
-	tmuxName := TmuxSessionName(slotName)
-	if out, err := tmuxsession.KillSession(tmuxName); err != nil {
-		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
+	lease, hasLease, leaseErr := sessionProcessLease(sess)
+	if leaseErr != nil {
+		return leaseErr
+	}
+	if hasLease {
+		// The cgroup is the ownership boundary. Signal it directly so
+		// double-forked/reparented descendants receive the graceful window and
+		// stubborn survivors are force-killed without touching a neighbor.
+		if err := terminateWorkerProcessLease(lease); err != nil {
+			return err
+		}
+		tmuxName := ""
+		if sess != nil {
+			tmuxName = strings.TrimSpace(sess.TmuxSession)
+		}
+		// systemd-run --scope is synchronous, so the owned tmux pane exits when
+		// the scope empties. Wait briefly for that natural close instead of ever
+		// killing a same-name pane whose lease ownership is not proven.
+		if !waitWorkerTmuxSessionGone(tmuxName, processLeaseTmuxExitWait) {
+			return fmt.Errorf("worker process lease %s is empty but tmux session %q still exists; refusing unowned tmux kill", lease.Unit, tmuxName)
+		}
+		clearSessionProcessLease(sess)
+		if sess != nil {
+			sess.TmuxSession = ""
+		}
+		return nil
 	}
 
+	// Remove only this exact tmux session after the lease is empty. The pane may
+	// already be gone; that is expected and does not weaken cgroup teardown.
+	tmuxName := ""
+	if sess != nil && strings.TrimSpace(sess.TmuxSession) != "" {
+		tmuxName = strings.TrimSpace(sess.TmuxSession)
+	}
+	if tmuxName != "" {
+		if out, err := killWorkerTmuxSession(tmuxName); err != nil {
+			log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if sess != nil {
+		sess.TmuxSession = ""
+	}
+
+	// Legacy sessions predate durable process leases. Retain the ancestry sweep
+	// only for their read/cleanup compatibility; every new launch uses a cgroup.
 	// Reap the worker's whole process subtree. tmux kill-session only reaps
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
