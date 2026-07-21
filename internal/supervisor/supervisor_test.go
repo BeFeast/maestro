@@ -1840,7 +1840,10 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 		RuntimeTarget:  "https://app.example.com",
 		HealthcheckURL: "https://app.example.com/healthz",
 	}
-	reader := &fakeReader{prs: []github.PR{{Number: 55, HeadRefName: "untracked-open-pr", State: "OPEN"}}}
+	reader := &fakeReader{
+		prs:    []github.PR{{Number: 55, HeadRefName: "untracked-open-pr", State: "OPEN"}},
+		issues: []github.Issue{testIssue(1023, "ready while outcome is red", "maestro-ready")},
+	}
 	now := time.Date(2026, 4, 29, 12, 0, 0, 0, time.UTC)
 	st := state.NewState()
 	st.OutcomeHealth = &outcome.HealthCheckResult{
@@ -1865,8 +1868,11 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 	if !strings.Contains(stuck.Summary, "failing") {
 		t.Fatalf("stuck summary = %q, want failing outcome", stuck.Summary)
 	}
-	if reader.issueCalls != 0 {
-		t.Fatalf("ListOpenIssues called %d time(s), want failing outcome gate before issue throughput", reader.issueCalls)
+	if reader.issueCalls != 1 {
+		t.Fatalf("ListOpenIssues called %d time(s), want one blocker-panel snapshot read", reader.issueCalls)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.EligibleCandidates != 1 || len(decision.QueueAnalysis.EligibleRanked) != 1 || decision.QueueAnalysis.EligibleRanked[0].Number != 1023 {
+		t.Fatalf("queue analysis = %#v, want ready issue #1023 preserved behind the outcome hold", decision.QueueAnalysis)
 	}
 	reasons := strings.Join(decision.Reasons, "\n")
 	if !strings.Contains(reasons, "Open PRs observed: 1") {
@@ -3164,6 +3170,26 @@ func TestDynamicWaveDoneStateDoesNotSkipWhenOutcomeNotVerified(t *testing.T) {
 	}
 	if reason != "" {
 		t.Fatalf("reason = %q, want no done-state skip until outcome passes", reason)
+	}
+}
+
+func TestDynamicWaveCodeLandedGuardNamesAwaitingVerification(t *testing.T) {
+	cfg := testConfig(t)
+	enableDynamicWave(cfg)
+	st := state.NewState()
+	st.Sessions["slot-42"] = &state.Session{
+		IssueNumber: 42,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    420,
+	}
+	issue := testIssue(42, "verify merged outcome", "maestro-ready")
+
+	reason, _, err := testEngine(cfg, &fakeReader{}).dynamicWaveSkipReason(st, issue, []github.Issue{issue})
+	if err != nil {
+		t.Fatalf("dynamicWaveSkipReason: %v", err)
+	}
+	if want := "already in progress (code_landed, awaiting verification)"; reason != want {
+		t.Fatalf("reason = %q, want %q", reason, want)
 	}
 }
 

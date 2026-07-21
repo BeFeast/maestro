@@ -1305,6 +1305,12 @@ type State struct {
 	ProjectStatusSync          map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
 	NextSlot                   int                                 `json:"next_slot"`
 	LastMergeAt                time.Time                           `json:"last_merge_at,omitempty"`
+	// DispatchHold is the latest machine-readable reason fresh issue dispatch
+	// is suspended. IdleStall tracks consecutive no-worker cycles against the
+	// same hold so the orchestrator can emit one durable idle_stall alert after
+	// two observations instead of spamming every poll (#1023).
+	DispatchHold DispatchHold   `json:"dispatch_hold"`
+	IdleStall    IdleStallState `json:"idle_stall,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
@@ -1862,6 +1868,8 @@ func (s *State) copyFrom(src *State) {
 	s.OutcomeHealth = src.OutcomeHealth
 	s.OutcomeGateStreaks = src.OutcomeGateStreaks
 	s.OutcomeGateStreakCheckedAt = src.OutcomeGateStreakCheckedAt
+	s.DispatchHold = src.DispatchHold
+	s.IdleStall = src.IdleStall
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
 	s.ProviderModelHealth = src.ProviderModelHealth
@@ -1927,6 +1935,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
 	merged.OutcomeRecovery = mergeOutcomeRecovery(base.OutcomeRecovery, current.OutcomeRecovery, ours.OutcomeRecovery)
 	merged.OutcomeGateStreaks, merged.OutcomeGateStreakCheckedAt = mergeOutcomeGateStreaks(current, ours)
+	merged.DispatchHold, merged.IdleStall = mergeDispatchVisibility(current, ours)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
