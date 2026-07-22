@@ -70,3 +70,40 @@ func TestDecide_TokenBudgetDoesNotStarveSpareSlotBacklog(t *testing.T) {
 		t.Fatalf("target = %#v, want issue #30", decision.Target)
 	}
 }
+
+func TestDecide_BlockedOpenPRDoesNotStarveSpareSlotBacklog(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 6
+	cfg.MaxLiveWorkers = 6
+	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.IssueLabels = []string{"ok-player-ready"}
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(345, "blocked flatpak", "blocked"),
+			testIssue(546, "next backlog", "ok-player-ready"),
+		},
+		prs: []github.PR{{
+			Number: 388, HeadRefName: "feat/flatpak", State: "OPEN",
+			Mergeable: "MERGEABLE", IsDraft: true,
+		}},
+		openPRIssues: map[int]bool{345: true},
+		ciStatuses:   map[int]string{388: "pending"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, IssueTitle: "blocked flatpak", Status: state.StatusPROpen,
+		PRNumber: 388, Branch: "feat/flatpak",
+		StartedAt: time.Date(2026, 7, 22, 12, 0, 0, 0, time.UTC),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want spawn_worker (blocked open PR must not freeze spare slots)", decision.RecommendedAction)
+	}
+	if decision.Target == nil || decision.Target.Issue != 546 {
+		t.Fatalf("target = %#v, want issue #546", decision.Target)
+	}
+}

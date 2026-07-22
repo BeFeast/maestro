@@ -705,31 +705,34 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 					"Repair dispatch is fail-closed against the issue's current forge state",
 					guardReason,
 				)
-				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
-				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-					fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
-					RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+				// Hands-off: a guarded/blocked open PR must not freeze spare
+				// slots — defer the monitor decision and try backlog fill.
+				if projectState.AvailableSlots > 0 {
+					deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr, guardReason: guardReason}
+					baseReasons = appendReasons(reasons,
+						"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
+					)
+				} else {
+					target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+					decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+						fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
+						RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+					decision.StuckStates = stuckStates
+					return decision, nil
+				}
+			} else {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
+					"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
+				)
+				decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
+					fmt.Sprintf("Start a repair worker for issue #%d; PR #%d is not enough to prove the live outcome.", sess.IssueNumber, pr.Number),
+					RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
 				decision.StuckStates = stuckStates
 				return decision, nil
 			}
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
-				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
-				"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
-			)
-			decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
-				fmt.Sprintf("Start a repair worker for issue #%d; PR #%d is not enough to prove the live outcome.", sess.IssueNumber, pr.Number),
-				RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
-			return decision, nil
-		}
-		// #512 (Phase 1.6): if the PR is actually ready to merge — not draft,
-		// mergeable, CI green, Greptile approved (when configured) — recommend
-		// merge_pr (risk=mutating, cautious-gate gates approval). Without this
-		// rule, every CLEAN/SUCCESS PR sat in pr_open forever while supervisor
-		// emitted monitor_open_pr loops; the reasoning even claimed "Maestro will
-		// merge when the merge gate allows it" — aspirational, never implemented.
-		if mergeReady {
+		} else if mergeReady {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
 			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, HeadSHA: mergeHeadSHA, Session: slot}
@@ -743,32 +746,35 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		// Hands-off fill (2026-07-22): a non-urgent open PR must NOT starve
 		// spare capacity when backlog exists. Defer monitor_open_pr until we
 		// know whether eligible backlog remains; if none, resume monitoring.
-		if projectState.AvailableSlots <= 0 {
-			monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
-			summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
-				"No GitHub mutation is needed for supervisor mode",
-			)
-			reasons = appendReasons(reasons, monitorReasons...)
-			if sess.Status == state.StatusRetryExhausted {
-				reasons = appendReasons(reasons,
-					fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
-					"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+		// (Guarded/blocked repair may already have deferred above.)
+		if deferredOpenPR == nil {
+			if projectState.AvailableSlots <= 0 {
+				monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
+				summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
+					"No GitHub mutation is needed for supervisor mode",
 				)
+				reasons = appendReasons(reasons, monitorReasons...)
+				if sess.Status == state.StatusRetryExhausted {
+					reasons = appendReasons(reasons,
+						fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
+						"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+					)
+				}
+				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+					summary,
+					RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+				decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
+				return decision, nil
 			}
-			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
-			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-				summary,
-				RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
-			return decision, nil
+			deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr}
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Open PR #%d for issue #%d is monitored passively while spare capacity remains", pr.Number, sess.IssueNumber),
+				"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
+			)
 		}
-		deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr}
-		baseReasons = appendReasons(baseReasons,
-			fmt.Sprintf("Open PR #%d for issue #%d is monitored passively while spare capacity remains", pr.Number, sess.IssueNumber),
-			"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
-		)
 	}
 
 	if slot, sess, ok := runningSession(st); ok && e.shouldWaitForRunningWorker(st) {
@@ -1141,9 +1147,10 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 // deferredOpenPRMonitor holds a non-urgent open-PR monitor decision that is
 // postponed while spare capacity is used to fill backlog (hands-off band).
 type deferredOpenPRMonitor struct {
-	slot string
-	sess *state.Session
-	pr   github.PR
+	slot        string
+	sess        *state.Session
+	pr          github.PR
+	guardReason string // non-empty when repair was blocked by a current-issue guard
 }
 
 func (e *Engine) decisionMonitorOpenPR(
@@ -1154,6 +1161,19 @@ func (e *Engine) decisionMonitorOpenPR(
 	stuckStates []state.SupervisorStuckState,
 	def deferredOpenPRMonitor,
 ) state.SupervisorDecision {
+	target := &state.SupervisorTarget{Issue: def.sess.IssueNumber, PR: def.pr.Number, Session: def.slot}
+	if def.guardReason != "" {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", def.slot, def.pr.Number),
+			"Repair dispatch is fail-closed against the issue's current forge state",
+			def.guardReason,
+		)
+		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+			fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", def.sess.IssueNumber, def.guardReason),
+			RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+		decision.StuckStates = stuckStates
+		return decision
+	}
 	monitorReasons := e.monitorOpenPRReasons(def.slot, def.sess, def.pr)
 	summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", def.pr.Number, def.sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
 	reasons := appendReasons(baseReasons,
@@ -1167,7 +1187,6 @@ func (e *Engine) decisionMonitorOpenPR(
 			"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
 		)
 	}
-	target := &state.SupervisorTarget{Issue: def.sess.IssueNumber, PR: def.pr.Number, Session: def.slot}
 	decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
 		summary,
 		RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
