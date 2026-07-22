@@ -168,6 +168,9 @@ func TestStatusForIgnoresHealthCheckBeforeLastMerge(t *testing.T) {
 
 func TestCheckerHealthcheckURL(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if got := r.Header.Get(HealthProbeHeader); got != HealthProbeHeaderValue {
+			t.Errorf("%s = %q, want %q", HealthProbeHeader, got, HealthProbeHeaderValue)
+		}
 		w.WriteHeader(http.StatusNoContent)
 	}))
 	defer server.Close()
