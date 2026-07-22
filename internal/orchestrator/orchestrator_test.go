@@ -9080,6 +9080,7 @@ func TestDeferProjectBoardSweepDelaysOnlyBroadSweep(t *testing.T) {
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()
+	closed := time.Now().UTC().Add(-time.Minute)
 
 	tests := []struct {
 		name           string
@@ -9096,6 +9097,8 @@ func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 		{name: "code_landed -> deploying when deploy required", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, requiresDeploy: true, want: github.ProjectStatusDeploying, wantOK: true},
 		{name: "code_landed -> live_verification after deploy succeeds", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10, DeploymentFinishedAt: &deployed}, requiresDeploy: true, want: github.ProjectStatusLiveVerify, wantOK: true},
 		{name: "done -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone}, want: github.ProjectStatusDone, wantOK: true},
+		{name: "done+released open -> todo", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone, ReleasedForRedispatch: true}, want: github.ProjectStatusTodo, wantOK: true},
+		{name: "done+released closed -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone, ReleasedForRedispatch: true, IssueClosedAt: &closed}, want: github.ProjectStatusDone, wantOK: true},
 		{name: "retry_exhausted -> blocked", sess: &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "conflict_failed -> blocked", sess: &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "failed -> blocked", sess: &state.Session{IssueNumber: 8, Status: state.StatusFailed}, want: github.ProjectStatusBlocked, wantOK: true},

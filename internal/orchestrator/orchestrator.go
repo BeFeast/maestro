@@ -47,6 +47,9 @@ const (
 	// observes the authoritative terminal state within the 10-minute SLA even
 	// when the prior check landed immediately after a cycle boundary.
 	terminalReconcileInterval = 9 * time.Minute
+	// Give the normal merge-to-close flow a short window to settle before a
+	// merged session whose issue is still open releases its terminal claim.
+	terminalReconcileGrace = 15 * time.Minute
 	// A fresh dispatch lease spans the slow pre-worker setup window. If its
 	// owner dies, the next cycle renews the same exact slot/worktree/branch;
 	// it never allocates a duplicate identity merely to retry startup.
@@ -2082,6 +2085,15 @@ func projectStatusForSession(sess *state.Session, requiresDeploy bool) (github.P
 		}
 		return codeLandedProjectStatusForSession(sess, requiresDeploy), true
 	case state.StatusDone:
+		// #1103: a merged session released because its issue stayed open did
+		// not settle the issue. Keep a standing Todo mapping so a transient
+		// failure in the edge-triggered release sync cannot strand dynamic wave
+		// behind an Awaiting Close / Done board status. Forge-closed sessions
+		// retain Done even though closed-issue reconciliation releases their
+		// state claim for audit/reopen semantics.
+		if sess.ReleasedForRedispatch && sess.IssueClosedAt == nil {
+			return github.ProjectStatusTodo, true
+		}
 		return github.ProjectStatusDone, true
 	case state.StatusRetryExhausted, state.StatusConflictFailed:
 		return github.ProjectStatusBlocked, true
@@ -4680,7 +4692,6 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						// "in progress" with zero live workers and starves the
 						// ready queue. After a short grace for close-issue to land,
 						// release so hands-off fill can redispatch or move on.
-						const terminalReconcileGrace = 15 * time.Minute
 						if now.Sub(sess.FinishedAt.UTC()) >= terminalReconcileGrace {
 							merged, mErr := o.isPRMerged(sess.PRNumber)
 							if mErr != nil {
@@ -7298,10 +7309,10 @@ func (o *Orchestrator) releaseDoneMergedOpenIssueForRedispatch(s *state.State, s
 	}
 	sess.ReleasedForRedispatch = true
 	if strings.TrimSpace(sess.WorkerOutcome) == "" {
-		sess.WorkerOutcome = "merged_pr_issue_still_open"
+		sess.WorkerOutcome = state.WorkerOutcomeMergedPRIssueStillOpen
 	}
 	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
-	log.Printf("[orch] merged_pr_issue_still_open: %s", reason)
+	log.Printf("[orch] %s: %s", state.WorkerOutcomeMergedPRIssueStillOpen, reason)
 	if o.notifier != nil {
 		o.notifier.Sendf("♻️ maestro: PR #%d merged but issue #%d is still open — released terminal claim for redispatch", sess.PRNumber, sess.IssueNumber)
 	}

@@ -20,6 +20,9 @@ const (
 	// but the blocking outcome check the issue targeted stayed failing with the
 	// same fingerprint past the post-merge verification deadline.
 	WorkerOutcomeCodeLandedIneffective = "code_landed_ineffective"
+	// WorkerOutcomeMergedPRIssueStillOpen: the PR merged successfully, but the
+	// linked issue remained open past terminal reconciliation's close grace.
+	WorkerOutcomeMergedPRIssueStillOpen = "merged_pr_issue_still_open"
 )
 
 // OutcomeFailureFingerprint returns a stable identity for a FAILING outcome
