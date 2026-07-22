@@ -104,6 +104,19 @@ func TestWorkerProcessLeaseIsUniquePerSlotAndGeneration(t *testing.T) {
 	}
 }
 
+func TestWorkerProcessServiceLeaseUsesSameGenerationIdentity(t *testing.T) {
+	lease, err := WorkerProcessServiceLease("BeFeast/maestro", "sup-927", 3, ProcessLeaseManagerSystem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(lease.Unit, "-g3.service") || lease.Manager != ProcessLeaseManagerSystem || lease.Runtime != nil {
+		t.Fatalf("service lease = %+v", lease)
+	}
+	if _, err := processLeaseLaunchCommand(lease, "/state/run.sh", 1000, "/usr/bin"); err == nil || !strings.Contains(err.Error(), "complete isolated runtime") {
+		t.Fatalf("service without scratch receipt error = %v", err)
+	}
+}
+
 func TestProcessLeaseUnitInCgroupRequiresExactPathComponent(t *testing.T) {
 	unit := "maestro-worker-0123456789abcdef0123456789abcdef-g7.scope"
 	for _, tc := range []struct {
@@ -173,6 +186,82 @@ func TestProcessLeaseLaunchCommandUsesExactSystemScope(t *testing.T) {
 	}
 	if containsArg(got, "--user") {
 		t.Fatalf("production system scope must not use --user: %v", got)
+	}
+}
+
+func TestProcessLeaseLaunchCommandBindsScratchOnTheSameService(t *testing.T) {
+	lease := ProcessLease{
+		Unit:    "maestro-worker-0123456789abcdef0123456789abcdef-g7.service",
+		Manager: ProcessLeaseManagerSystem,
+		Runtime: &ProcessLeaseRuntime{
+			ScratchID:    "mw-test",
+			ScratchDir:   "/var/tmp/maestro-workers/mw-test",
+			TempDir:      "/var/tmp/maestro-workers/mw-test/tmp",
+			GoTempDir:    "/var/tmp/maestro-workers/mw-test/tmp/go",
+			CargoTarget:  "/var/tmp/maestro-workers/mw-test/tmp/cargo-target",
+			ManifestPath: "/var/tmp/maestro-workers/mw-test/lease.json",
+			CleanupExec:  `"/usr/bin/maestro" "_worker-lease-cleanup" "--manifest" "/var/tmp/maestro-workers/mw-test/lease.json" "--lease" "mw-test"`,
+			Home:         "/home/worker",
+			User:         "worker",
+			MemoryMaxMB:  4096,
+		},
+	}
+	got, err := processLeaseLaunchCommand(lease, "/state/sup-927-run.sh", 1000, "/usr/local/bin:/usr/bin:/bin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantPrefix := []string{resolvedPath(sudoName), "-n", resolvedPath(systemdRunName), "--uid=1000", "--quiet", "--wait", "--pipe", "--collect", "--service-type=exec"}
+	if len(got) < len(wantPrefix) || !reflect.DeepEqual(got[:len(wantPrefix)], wantPrefix) {
+		t.Fatalf("isolated service argv prefix = %#v, want %#v", got, wantPrefix)
+	}
+	for _, want := range []string{
+		"--unit=" + lease.Unit,
+		"--property=Slice=" + isolatedWorkerSlice,
+		"--property=BindPaths=" + lease.Runtime.TempDir + ":/tmp",
+		"--property=ExecStopPost=" + lease.Runtime.CleanupExec,
+		"--setenv=TMPDIR=/tmp",
+		"--setenv=TMP=/tmp",
+		"--setenv=TEMP=/tmp",
+		"--setenv=GOTMPDIR=/tmp/go",
+		"--setenv=CARGO_TARGET_DIR=/tmp/cargo-target",
+		"--property=MemoryMax=4096M",
+		bashPath,
+		"/state/sup-927-run.sh",
+	} {
+		if !containsArg(got, want) {
+			t.Errorf("isolated service argv missing %q: %v", want, got)
+		}
+	}
+	if containsArg(got, "--scope") {
+		t.Fatalf("isolated scratch created a nested scope instead of one service lease: %v", got)
+	}
+}
+
+func TestProcessLeaseServiceAnchorsExactTmuxLauncher(t *testing.T) {
+	lease := ProcessLease{Unit: "maestro-worker-0123456789abcdef0123456789abcdef-g9.service", Manager: ProcessLeaseManagerSystem}
+	commands := map[int][]string{
+		10: {"/usr/bin/sudo", "-n", "/usr/bin/systemd-run"},
+		20: {"/usr/bin/systemd-run", "--unit=" + lease.Unit, "--wait"},
+	}
+	children := map[int][]int{10: {20}}
+	anchored, err := processLeaseServiceAnchoredAtPID(
+		lease,
+		10,
+		func(pid int) ([]string, error) { return commands[pid], nil },
+		func(pid int) ([]int, error) { return children[pid], nil },
+	)
+	if err != nil || !anchored {
+		t.Fatalf("anchored=%v err=%v, want exact service launcher descendant", anchored, err)
+	}
+	commands[20] = []string{"/usr/bin/systemd-run", "--unit=maestro-worker-fedcba9876543210fedcba9876543210-g9.service"}
+	anchored, err = processLeaseServiceAnchoredAtPID(
+		lease,
+		10,
+		func(pid int) ([]string, error) { return commands[pid], nil },
+		func(pid int) ([]int, error) { return children[pid], nil },
+	)
+	if err != nil || anchored {
+		t.Fatalf("neighbor launcher anchored=%v err=%v, want false", anchored, err)
 	}
 }
 

@@ -225,12 +225,12 @@ type Session struct {
 	Branch      string `json:"branch"`
 	PID         int    `json:"pid"`
 	TmuxSession string `json:"tmux_session,omitempty"`
-	// ProcessLeaseUnit is the exact per-attempt systemd scope that owns the
+	// ProcessLeaseUnit is the exact per-attempt systemd unit that owns the
 	// runner and every descendant it launches. Unlike PID/tmux ancestry, cgroup
 	// membership survives double-forking and reparenting. ProcessLeaseManager is
 	// "system" for the production system-service topology and "user" only for
 	// non-service development launches. Both remain set until teardown has
-	// confirmed the scope empty, so a replacement daemon can retry cleanup
+	// confirmed the unit empty, so a replacement daemon can retry cleanup
 	// exactly once without guessing from a stale pane PID.
 	ProcessLeaseUnit    string    `json:"process_lease_unit,omitempty"`
 	ProcessLeaseManager string    `json:"process_lease_manager,omitempty"`
@@ -240,12 +240,21 @@ type Session struct {
 	// owns this canonical session. Every successful spawn, respawn, phase
 	// transition, or live-runtime adoption advances it. Destructive cleanup
 	// captures and revalidates this exact value before touching the worktree.
-	WorkerGeneration uint64        `json:"worker_generation,omitempty"`
-	FinishedAt       *time.Time    `json:"finished_at,omitempty"`
-	Status           SessionStatus `json:"status"`
-	PRNumber         int           `json:"pr_number,omitempty"`
-	PRMerged         bool          `json:"pr_merged,omitempty"` // authoritative merge evidence retained after a closed issue transitions from code_landed/pr_open to done
-	Backend          string        `json:"backend,omitempty"`   // "claude", "codex", etc.
+	WorkerGeneration uint64 `json:"worker_generation,omitempty"`
+	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
+	// Unit/scope intentionally duplicate the process receipt so reconciliation
+	// can reject corrupted cross-ownership without inventing another owner.
+	WorkerLeaseID        string        `json:"worker_lease_id,omitempty"`
+	WorkerLeaseUnit      string        `json:"worker_lease_unit,omitempty"`
+	WorkerLeaseScope     string        `json:"worker_lease_scope,omitempty"`
+	WorkerScratchDir     string        `json:"worker_scratch_dir,omitempty"`
+	WorkerLeaseManifest  string        `json:"worker_lease_manifest,omitempty"`
+	WorkerLeaseAttention string        `json:"worker_lease_attention,omitempty"`
+	FinishedAt           *time.Time    `json:"finished_at,omitempty"`
+	Status               SessionStatus `json:"status"`
+	PRNumber             int           `json:"pr_number,omitempty"`
+	PRMerged             bool          `json:"pr_merged,omitempty"` // authoritative merge evidence retained after a closed issue transitions from code_landed/pr_open to done
+	Backend              string        `json:"backend,omitempty"`   // "claude", "codex", etc.
 	// #730: model + self-reported cost captured from the backend's own
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
@@ -423,6 +432,13 @@ func SessionAttentionFor(sess *Session, alive *bool) SessionAttention {
 func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAttention {
 	if sess == nil {
 		return SessionAttention{}
+	}
+	if reason := strings.TrimSpace(sess.WorkerLeaseAttention); reason != "" {
+		return SessionAttention{
+			Reason:         "Worker scratch ownership needs attention: " + reason + ".",
+			NextAction:     "Inspect the exact persisted worker lease and ownership manifest; do not delete by age, path prefix, or executable name.",
+			NeedsAttention: true,
+		}
 	}
 	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
 		return SessionAttention{Reason: "Issue is closed on GitHub; the session is terminal and retained only for audit."}
@@ -1439,6 +1455,18 @@ type ApprovalAudit struct {
 	TargetStateHash string    `json:"target_state_hash,omitempty"`
 }
 
+// WorkerLeaseAttention is a durable, path-free ownership warning produced by
+// the worker scratch reconciler. Identity is either a validated lease ID or an
+// opaque fingerprint for an ambiguous entry; raw host paths and command lines
+// are deliberately excluded from persisted/UI state.
+type WorkerLeaseAttention struct {
+	Identity   string    `json:"identity"`
+	Slot       string    `json:"slot,omitempty"`
+	Reason     string    `json:"reason"`
+	NextAction string    `json:"next_action"`
+	DetectedAt time.Time `json:"detected_at"`
+}
+
 type State struct {
 	Sessions            map[string]*Session         `json:"sessions"`
 	FreshDispatchClaims map[int]*FreshDispatchClaim `json:"fresh_dispatch_claims,omitempty"`
@@ -1466,6 +1494,12 @@ type State struct {
 	// two observations instead of spamming every poll (#1023).
 	DispatchHold DispatchHold   `json:"dispatch_hold"`
 	IdleStall    IdleStallState `json:"idle_stall,omitempty"`
+
+	// WorkerLeaseAttention is the current startup/periodic reconciliation
+	// result for scratch ownership that cannot be changed automatically. The
+	// watermark makes concurrent state saves choose the newest complete pass.
+	WorkerLeaseAttention    []WorkerLeaseAttention `json:"worker_lease_attention,omitempty"`
+	WorkerLeaseReconciledAt time.Time              `json:"worker_lease_reconciled_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
 	// cannot be hot-applied (currently routing.*) changes during a reload. It is
@@ -2042,6 +2076,8 @@ func (s *State) copyFrom(src *State) {
 	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
+	s.WorkerLeaseAttention = src.WorkerLeaseAttention
+	s.WorkerLeaseReconciledAt = src.WorkerLeaseReconciledAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
 	s.ShutdownDrain = src.ShutdownDrain
@@ -2109,11 +2145,26 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
+	mergeWorkerLeaseAttention(merged, current, ours)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
 	mergeSupervisorHeartbeat(merged, current, ours)
 	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
+}
+
+func mergeWorkerLeaseAttention(merged, current, ours *State) {
+	winner := current
+	if winner == nil || (ours != nil && ours.WorkerLeaseReconciledAt.After(winner.WorkerLeaseReconciledAt)) {
+		winner = ours
+	}
+	if winner == nil {
+		merged.WorkerLeaseAttention = nil
+		merged.WorkerLeaseReconciledAt = time.Time{}
+		return
+	}
+	merged.WorkerLeaseAttention = append([]WorkerLeaseAttention(nil), winner.WorkerLeaseAttention...)
+	merged.WorkerLeaseReconciledAt = winner.WorkerLeaseReconciledAt
 }
 
 // mergeSupervisorHeartbeat preserves the newest completed supervisor pulse
@@ -4688,6 +4739,9 @@ func sessionAttentionActionableAt(sess *Session, now time.Time, ttl time.Duratio
 	if sess == nil {
 		return false
 	}
+	if strings.TrimSpace(sess.WorkerLeaseAttention) != "" {
+		return true
+	}
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -5068,7 +5122,7 @@ func (s *State) IsMissionChild(issueNum int) bool {
 func (s *State) PruneOldSessions(maxAge time.Duration) int {
 	pruned := 0
 	for name, sess := range s.Sessions {
-		if !IsTerminal(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+		if !IsTerminal(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" || strings.TrimSpace(sess.WorkerLeaseID) != "" {
 			continue
 		}
 		finished := sess.FinishedAt
@@ -5149,7 +5203,7 @@ func (s *State) CompactSessions(policy SessionRetentionPolicy, now time.Time) (S
 	}
 	eligible := make([]candidate, 0, len(s.Sessions))
 	for slot, sess := range s.Sessions {
-		if sess == nil || !IsRetentionEligible(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+		if sess == nil || !IsRetentionEligible(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" || strings.TrimSpace(sess.WorkerLeaseID) != "" {
 			continue
 		}
 		finished := sess.StartedAt

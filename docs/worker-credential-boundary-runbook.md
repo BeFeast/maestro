@@ -102,7 +102,8 @@ CLIProxyAPI.
 
 Credential isolation and process ownership share the same runner boundary but
 solve different problems. Every new worker attempt now receives a unique,
-generation-specific transient systemd scope under `maestro-workers.slice`.
+generation-specific transient systemd unit under `maestro-workers.slice` (a
+scope normally, or the same lease in service form when isolated scratch is enabled).
 The persisted session fields `process_lease_unit` and
 `process_lease_manager` are the cleanup receipt; PID and tmux identity remain
 observations only.

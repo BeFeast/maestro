@@ -150,6 +150,11 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		if !owned {
 			return "", fmt.Errorf("reserved tmux session %s pane pid %d is not owned by durable process lease %s", tmuxName, pid, processLease.Unit)
 		}
+		scratchLease, err := recoverWorkerScratchLease(cfg, slotName, processLease)
+		if err != nil {
+			return "", err
+		}
+		attachWorkerScratchReceipt(&processLease, scratchLease)
 		startedAt := time.Now().UTC()
 		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
 		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
@@ -263,26 +268,26 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	// Start tmux session inside its unique OS process lease.
-	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0)
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0, "initial_spawn")
 	if err != nil {
 		if processLease.Unit != "" {
 			startedAt := time.Now().UTC()
 			retryAt := startedAt
-			s.Sessions[slotName] = &state.Session{
-				IssueNumber:         issue.Number,
-				IssueTitle:          issue.Title,
-				Worktree:            worktreePath,
-				Branch:              branchName,
-				ProcessLeaseUnit:    processLease.Unit,
-				ProcessLeaseManager: processLease.Manager,
-				LogFile:             logFile,
-				StartedAt:           startedAt,
-				WorkerGeneration:    1,
-				Status:              state.StatusDead,
-				Backend:             backendName,
-				RetryReason:         state.RetryReasonStalledProgress,
-				NextRetryAt:         &retryAt,
+			failedSession := &state.Session{
+				IssueNumber:      issue.Number,
+				IssueTitle:       issue.Title,
+				Worktree:         worktreePath,
+				Branch:           branchName,
+				LogFile:          logFile,
+				StartedAt:        startedAt,
+				WorkerGeneration: 1,
+				Status:           state.StatusDead,
+				Backend:          backendName,
+				RetryReason:      state.RetryReasonStalledProgress,
+				NextRetryAt:      &retryAt,
 			}
+			setSessionProcessLease(failedSession, processLease)
+			s.Sessions[slotName] = failedSession
 			if saveErr := state.Save(cfg.StateDir, s); saveErr != nil {
 				return "", fmt.Errorf("%w (persist failed-start process lease: %v)", err, saveErr)
 			}
@@ -335,21 +340,21 @@ func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
 }
 
 func freshRunningSession(issue github.Issue, worktree, branch string, pid int, tmuxName, logFile, backend string, processLease tmuxsession.ProcessLease, startedAt time.Time) *state.Session {
-	return &state.Session{
-		IssueNumber:         issue.Number,
-		IssueTitle:          issue.Title,
-		Worktree:            worktree,
-		Branch:              branch,
-		PID:                 pid,
-		TmuxSession:         tmuxName,
-		ProcessLeaseUnit:    processLease.Unit,
-		ProcessLeaseManager: processLease.Manager,
-		LogFile:             logFile,
-		StartedAt:           startedAt.UTC(),
-		WorkerGeneration:    1,
-		Status:              state.StatusRunning,
-		Backend:             backend,
+	sess := &state.Session{
+		IssueNumber:      issue.Number,
+		IssueTitle:       issue.Title,
+		Worktree:         worktree,
+		Branch:           branch,
+		PID:              pid,
+		TmuxSession:      tmuxName,
+		LogFile:          logFile,
+		StartedAt:        startedAt.UTC(),
+		WorkerGeneration: 1,
+		Status:           state.StatusRunning,
+		Backend:          backend,
 	}
+	setSessionProcessLease(sess, processLease)
+	return sess
 }
 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
@@ -487,9 +492,10 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
 	nextGeneration := sess.WorkerGeneration + 1
-	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID)
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID, "fallover")
 	if err != nil {
 		if processLease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
 			setSessionProcessLease(sess, processLease)
 		}
 		return err
@@ -502,13 +508,13 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.Branch = branchName
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
-	setSessionProcessLease(sess, processLease)
 	sess.LogFile = logFile
 	now := time.Now()
 	sess.PRNumber = 0
 	// #513/#931: stamp the fallover segment and clear the previous attempt's
 	// terminal/model projection without losing cumulative history.
 	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
+	setSessionProcessLease(sess, processLease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
@@ -542,6 +548,9 @@ func StopProcess(slotName string, sess *state.Session) error {
 		if err := terminateWorkerProcessLease(lease); err != nil {
 			return err
 		}
+		if _, err := cleanupOwnedWorkerScratch(nil, sess); err != nil {
+			return err
+		}
 		tmuxName := ""
 		if sess != nil {
 			tmuxName = strings.TrimSpace(sess.TmuxSession)
@@ -557,6 +566,10 @@ func StopProcess(slotName string, sess *state.Session) error {
 			sess.TmuxSession = ""
 		}
 		return nil
+	}
+	if sess != nil && strings.TrimSpace(sess.WorkerLeaseID) != "" {
+		sess.WorkerLeaseAttention = "worker scratch has no matching process lease"
+		return fmt.Errorf("worker scratch receipt exists without a durable process lease")
 	}
 
 	// Remove only this exact tmux session after the lease is empty. The pane may

@@ -29,6 +29,12 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.UsageTokensWatermark = 0
 	sess.TokensUsedAttempt = 0
 	sess.WorkerOutcome = ""
+	sess.WorkerLeaseID = ""
+	sess.WorkerLeaseUnit = ""
+	sess.WorkerLeaseScope = ""
+	sess.WorkerScratchDir = ""
+	sess.WorkerLeaseManifest = ""
+	sess.WorkerLeaseAttention = ""
 	// A scheduled retry owns NextRetryAt only until a replacement process has
 	// actually started. Keeping the elapsed timestamp on a Running attempt makes
 	// Fleet report contradictory queued/running state and lets a later terminal
@@ -51,7 +57,16 @@ func AdoptLiveRuntime(cfg *config.Config, sess *state.Session, pid int, tmuxName
 	if sess == nil || pid <= 0 || tmuxName == "" {
 		return
 	}
+	leaseID, leaseUnit, leaseScope := sess.WorkerLeaseID, sess.WorkerLeaseUnit, sess.WorkerLeaseScope
+	scratchDir, manifest := sess.WorkerScratchDir, sess.WorkerLeaseManifest
+	leaseAttention := sess.WorkerLeaseAttention
 	beginSessionAttempt(cfg, sess, sess.Backend, "runtime_adoption", "runtime_state_lost", observedAt)
+	sess.WorkerLeaseID = leaseID
+	sess.WorkerLeaseUnit = leaseUnit
+	sess.WorkerLeaseScope = leaseScope
+	sess.WorkerScratchDir = scratchDir
+	sess.WorkerLeaseManifest = manifest
+	sess.WorkerLeaseAttention = leaseAttention
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.NextRetryAt = nil

@@ -400,6 +400,8 @@ func main() {
 		streamSplitCmd(args)
 	case "_worker-exec":
 		workerExecCmd(args)
+	case "_worker-lease-cleanup":
+		workerLeaseCleanupCmd(args)
 	case "_watch-updater":
 		watchUpdaterCmd(args)
 	case "_watch-tail":

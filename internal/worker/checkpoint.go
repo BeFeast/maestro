@@ -453,9 +453,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
 	nextGeneration := sess.WorkerGeneration + 1
-	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID)
+	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
 	if err != nil {
 		if lease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
 			setSessionProcessLease(sess, lease)
 		}
 		return err
@@ -466,11 +467,11 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Update session — keep worktree and branch, reset runtime fields
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
-	setSessionProcessLease(sess, lease)
 	sess.LogFile = logFile
 	// #513/#931: start a new attempt projection while preserving the same
 	// worktree/session identity and cumulative attribution history.
 	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
+	setSessionProcessLease(sess, lease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

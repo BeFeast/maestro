@@ -39,7 +39,9 @@ ExecStart=/usr/local/bin/maestro daemon \
 TimeoutStopSec=6min
 # Kill ownership is explicit (#877/#920). The private worker tmux server runs in
 # a sibling transient scope (#891), and every runner it launches is moved again
-# into its own generation-specific scope below maestro-workers.slice. A worker's
+# into its own generation-specific unit below maestro-workers.slice. Legacy temp
+# behavior uses a scope; config-gated isolated scratch uses the service form of
+# that same lease so BindPaths and ExecStopPost share its lifecycle. A worker's
 # model CLI, tools, and reparented descendants therefore survive daemon restart
 # but remain exactly attributable and independently terminable. KillMode=mixed
 # also protects any legacy worker still inside this unit's cgroup: the systemd
@@ -56,7 +58,7 @@ TimeoutStopSec=6min
 #
 # The daemon is the belt to this suspenders: any worker still in-flight near the
 # deadline is checkpointed to a resumable marker before flow joins. The next
-# daemon adopts the same surviving isolated PID/worktree, or resumes a legacy
+# daemon adopts the same surviving leased PID/worktree, or resumes a pre-#920
 # worker in place if it did exit — same logical session, exactly once
 # (internal/worker/checkpoint.go, orchestrator reconcile).
 KillMode=mixed

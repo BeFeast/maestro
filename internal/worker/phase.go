@@ -98,9 +98,10 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	}
 
 	nextGeneration := sess.WorkerGeneration + 1
-	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID)
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "phase_transition")
 	if err != nil {
 		if processLease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
 			setSessionProcessLease(sess, processLease)
 		}
 		return err
@@ -111,9 +112,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	// Update session in place
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
-	setSessionProcessLease(sess, processLease)
 	sess.LogFile = logFile
 	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
+	setSessionProcessLease(sess, processLease)
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.LastNotifiedStatus = ""
