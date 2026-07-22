@@ -277,6 +277,32 @@ func (s *State) CompleteFreshDispatch(issueNumber int, leaseID string, sess *Ses
 	return nil
 }
 
+// SupersedeFreshDispatch marks a pre-spawn lease terminal without a Session.
+// Call this when worker start fails after ClaimFreshDispatch so the issue does
+// not stay status=claimed for the full lease window and block re-dispatch
+// (zombie leases → "already in progress" with zero live workers).
+func (s *State) SupersedeFreshDispatch(issueNumber int, leaseID, reason string, now time.Time) error {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	claim, ok := s.FreshDispatchClaimFor(issueNumber)
+	if !ok {
+		return nil
+	}
+	if strings.TrimSpace(leaseID) != "" && claim.LeaseID != leaseID {
+		return fmt.Errorf("fresh dispatch lease changed")
+	}
+	now = now.UTC()
+	claim.Status = FreshDispatchClaimStatusSuperseded
+	claim.UpdatedAt = now
+	claim.LeaseExpiresAt = time.Time{}
+	if strings.TrimSpace(reason) == "" {
+		reason = "start_failed"
+	}
+	claim.TerminalReason = reason
+	return nil
+}
+
 // ReconcileFreshDispatchClaims makes a pre-spawn lease terminal when its exact
 // Session was persisted by a later compatible save. This is the
 // crash-after-launch repair: it preserves the worker identity already present

@@ -258,3 +258,37 @@ func TestFreshDispatchClaim_ReconcilesCrashAfterSessionSave(t *testing.T) {
 		t.Fatalf("reconciled claim = %+v", claim)
 	}
 }
+
+func TestFreshDispatchClaim_SupersedeReleasesIssueForRedispatch(t *testing.T) {
+	s := NewState()
+	now := time.Date(2026, 7, 22, 20, 0, 0, 0, time.UTC)
+	claim, acquired, err := s.ClaimFreshDispatch(505, "ok-player", "lease-a", 10*time.Minute, now)
+	if err != nil || !acquired {
+		t.Fatalf("claim: acquired=%t err=%v", acquired, err)
+	}
+	claim.Branch = "feat/ok-player-1-505"
+	claim.Worktree = filepath.Join("/worktrees", claim.Slot)
+
+	if err := s.SupersedeFreshDispatch(505, "lease-a", "start_failed", now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, active := s.FreshDispatchClaimFor(505); active {
+		t.Fatal("superseded claim remained active")
+	}
+	evidence := s.FreshDispatchClaims[505]
+	if evidence == nil || evidence.Status != FreshDispatchClaimStatusSuperseded || evidence.TerminalReason != "start_failed" {
+		t.Fatalf("superseded evidence = %+v", evidence)
+	}
+	if _, ok := s.IssueClaimFor(505); ok {
+		t.Fatal("superseded lease still appears in ActiveIssueClaims")
+	}
+
+	// A new owner can claim a fresh identity after supersede (not renew-in-place).
+	next, acquired, err := s.ClaimFreshDispatch(505, "ok-player", "lease-b", 10*time.Minute, now.Add(2*time.Minute))
+	if err != nil || !acquired {
+		t.Fatalf("reclaim after supersede: acquired=%t err=%v", acquired, err)
+	}
+	if next.Slot == claim.Slot || next.LeaseGeneration != 1 {
+		t.Fatalf("expected new identity after supersede, got %+v (prior slot %s)", next, claim.Slot)
+	}
+}
