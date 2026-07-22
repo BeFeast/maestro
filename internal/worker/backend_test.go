@@ -49,6 +49,73 @@ func TestBuildWorkerCmd_Claude(t *testing.T) {
 	}
 }
 
+func TestBuildWorkerCmd_Kimi(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("implement the issue"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	worktree := "/tmp/kimi-worktree"
+
+	cfg := BackendConfig{Cmd: "kimi", Provider: "moonshot"}
+	cmd, stdinFile, err := BuildWorkerCmd("moonshot-primary", cfg, promptFile, worktree)
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if stdinFile != promptFile {
+		t.Fatalf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	wantArgs := []string{"kimi", "--print", "--output-format=stream-json"}
+	if !reflect.DeepEqual(cmd.Args, wantArgs) {
+		t.Fatalf("args = %v, want %v", cmd.Args, wantArgs)
+	}
+	if strings.Contains(strings.Join(cmd.Args, " "), "implement the issue") {
+		t.Fatalf("prompt content leaked into argv: %v", cmd.Args)
+	}
+	if cmd.Dir != worktree {
+		t.Fatalf("Dir = %q, want %q", cmd.Dir, worktree)
+	}
+}
+
+func TestBuildWorkerCmd_KimiCmdBasenameAndPinnedOutput(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("do the thing"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{
+		Cmd:       "/opt/kimi/bin/kimi --thinking",
+		ExtraArgs: []string{"--output-format", "text"},
+	}
+	cmd, stdinFile, err := BuildWorkerCmd("custom", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdinFile != promptFile {
+		t.Fatalf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	joined := strings.Join(cmd.Args, " ")
+	if !strings.Contains(joined, "--print") || !strings.Contains(joined, "--thinking") {
+		t.Fatalf("Kimi flags missing from %v", cmd.Args)
+	}
+	if strings.Contains(joined, "stream-json") {
+		t.Fatalf("operator-pinned output format must win: %v", cmd.Args)
+	}
+	if split := streamSplitForBackend("custom", cfg, "/tmp/slot.log"); split != nil {
+		t.Fatalf("text-mode Kimi must not install stream-split: %+v", split)
+	}
+}
+
+func TestStreamSplitForBackend_KimiDefaultsStructured(t *testing.T) {
+	split := streamSplitForBackend("kimi", BackendConfig{Cmd: "kimi"}, "/tmp/slot.log")
+	if split == nil {
+		t.Fatal("first-class Kimi backend should install stream-split by default")
+	}
+	if split.Backend != "kimi" || split.JSONLPath != "/tmp/slot.jsonl" {
+		t.Fatalf("split = %+v, want kimi /tmp/slot.jsonl", split)
+	}
+}
+
 // TestBuildWorkerCmd_ClaudeUsageStream verifies the #737 opt-in: when
 // UsageStream is set the claude worker runs in stream-json mode, and an
 // operator-pinned --output-format in extra_args overrides it (no duplicate).
@@ -996,9 +1063,34 @@ func TestBuildSupervisorCmd_CustomNameProviderAnthropic(t *testing.T) {
 	}
 }
 
+func TestBuildSupervisorCmd_KimiIsReadOnlyAndUsesStdin(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("make a decision"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{Cmd: "kimi", Provider: "moonshot", Model: "kimi-for-coding"}
+	cmd, stdinFile, err := BuildSupervisorCmd("moonshot-primary", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdinFile != promptFile {
+		t.Fatalf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	joined := strings.Join(cmd.Args, " ")
+	for _, want := range []string{"--print", "--plan", "--final-message-only", "--model kimi-for-coding"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("args missing %q: %v", want, cmd.Args)
+		}
+	}
+	if strings.Contains(joined, "make a decision") {
+		t.Fatalf("prompt content leaked into argv: %v", cmd.Args)
+	}
+}
+
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
-	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false, "pi": false}
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false, "kimi": false, "pi": false}
 	for _, name := range backends {
 		if _, ok := expected[name]; ok {
 			expected[name] = true

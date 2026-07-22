@@ -62,7 +62,7 @@ func TestBackendFromLabels_EmptyModelValue(t *testing.T) {
 }
 
 func TestBackendFromLabels_AllKnownBackends(t *testing.T) {
-	backends := []string{"claude", "codex", "gemini", "cline"}
+	backends := []string{"claude", "codex", "gemini", "kimi", "cline"}
 	for _, b := range backends {
 		issue := makeIssue(10, "Test", "model:"+b)
 		got := BackendFromLabels(issue)
