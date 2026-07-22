@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -49,6 +50,11 @@ type fakeGH struct {
 	merged                    bool
 	mergedErr                 error
 	mergedAfterConcurrentCall bool
+	issue                     github.Issue
+	prLabels                  []string
+	reviewHead                string
+	reviewThreads             []github.ReviewThread
+	reviewThreadsErr          error
 }
 
 const testMergeHeadSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -122,6 +128,28 @@ func (f *fakeGH) IssueBody(issue int) (string, error) {
 	}
 	return f.issueBody, nil
 }
+func (f *fakeGH) GetIssue(number int) (github.Issue, error) {
+	if f.issue.Number == 0 {
+		return github.Issue{Number: number}, nil
+	}
+	return f.issue, nil
+}
+func (f *fakeGH) PRLabels(int) ([]string, error) {
+	return append([]string(nil), f.prLabels...), nil
+}
+func (f *fakeGH) PRUnresolvedReviewThreadsOnHead(int) (string, []github.ReviewThread, error) {
+	if f.reviewThreadsErr != nil {
+		return "", nil, f.reviewThreadsErr
+	}
+	head := f.reviewHead
+	if head == "" {
+		head = f.headSHA
+	}
+	if head == "" {
+		head = testMergeHeadSHA
+	}
+	return head, append([]github.ReviewThread(nil), f.reviewThreads...), nil
+}
 
 type fakeWT struct {
 	calls []wtCall
@@ -145,6 +173,11 @@ func newCfg() *config.Config {
 }
 
 func mkApproval(action string, target *state.SupervisorTarget, summary, approveReason string) *state.Approval {
+	if action == config.SupervisorActionMergePR && target != nil && target.PR > 0 && target.Issue <= 0 {
+		copyTarget := *target
+		copyTarget.Issue = 42
+		target = &copyTarget
+	}
 	now := time.Now().UTC()
 	a := &state.Approval{
 		ID:        "approval-test",
@@ -326,6 +359,40 @@ func TestExecute_MergePR_ChangedHeadSkipsWithoutMerge(t *testing.T) {
 	}
 }
 
+func TestExecute_MergePR_RefusesLateIssueHoldAtFinalBoundary(t *testing.T) {
+	issue := github.Issue{Number: 42}
+	issue.Labels = append(issue.Labels, struct {
+		Name string `json:"name"`
+	}{Name: "blocked"})
+	gh := &fakeGH{issue: issue}
+	cfg := newCfg()
+	cfg.ExcludeLabels = []string{"blocked"}
+	ex := &Executor{GH: gh, Cfg: cfg}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{Issue: 42, PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped || !strings.Contains(res.Summary, "blocked") {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("merge calls = %v, want none", gh.mergeCalls)
+	}
+}
+
+func TestExecute_MergePR_RefusesCurrentHeadUnresolvedThreadAtFinalBoundary(t *testing.T) {
+	gh := &fakeGH{reviewThreads: []github.ReviewThread{{ID: "codex-p1", Path: "merge.go", Line: 42, Author: "codex"}}}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{Issue: 42, PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped || !strings.Contains(res.Summary, "unresolved") {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("merge calls = %v, want none", gh.mergeCalls)
+	}
+}
+
 // --- #547: BEHIND-but-mergeable PR -> update-branch, do not fail --------------
 
 // TestExecute_MergePR_Behind_UpdatesBranchAndSkips verifies the core #547
@@ -439,9 +506,8 @@ func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
 }
 
 // TestExecute_MergePR_StatusFetchError_StillMerges verifies that a failure
-// to fetch the merge status does NOT block the merge — we fall through to
-// the original MergePR path (gh pr merge does its own gating). This keeps
-// the change additive and avoids a status-endpoint flake stalling merges.
+// to fetch the merge status does NOT block the final head-bound merge. This
+// avoids a status-endpoint flake stalling an otherwise valid merge.
 func TestExecute_MergePR_StatusFetchError_StillMerges(t *testing.T) {
 	gh := &fakeGH{mergeStatusErr: errors.New("rate limited")}
 	ex := &Executor{GH: gh, Cfg: newCfg()}

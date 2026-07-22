@@ -168,6 +168,147 @@ func TestAutoMergePRs_HoldLabelPreventsGreenPRMerge(t *testing.T) {
 	}
 }
 
+func TestAutoMergePRs_LateBlockedLabelAfterGreenGateWinsAtFinalBoundary(t *testing.T) {
+	pr := github.PR{Number: 7, HeadRefName: "feat/late-hold"}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: t.TempDir(), ExcludeLabels: []string{"blocked"}}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	issueReads := 0
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		issueReads++
+		if issueReads == 1 {
+			return makeIssue(number, "late hold"), nil
+		}
+		return makeIssue(number, "late hold", "blocked"), nil
+	}
+	merged := 0
+	o.ghMergePRFn = func(int) error {
+		merged++
+		return nil
+	}
+
+	st := makeTestState([]github.PR{pr})
+	o.autoMergePRs(st)
+
+	if merged != 0 {
+		t.Fatalf("merged = %d, want 0 after late blocked label", merged)
+	}
+	sess := st.Sessions["slot-0"]
+	if sess.OperatorGateName != "label:blocked" {
+		t.Fatalf("operator gate = %q, want label:blocked", sess.OperatorGateName)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	control, ok := loaded.MergeControlForPR(pr.Number)
+	if !ok || !strings.Contains(control.LastRefusalReason, "blocked") {
+		t.Fatalf("merge refusal evidence = %+v", control)
+	}
+}
+
+func TestAutoMergePRs_LateUnresolvedThreadAfterGreenGateWinsAtFinalBoundary(t *testing.T) {
+	pr := github.PR{Number: 7, HeadRefName: "feat/late-thread"}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: t.TempDir()}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	threadReads := 0
+	o.ghPRUnresolvedThreadsFn = func(int) (string, []github.ReviewThread, error) {
+		threadReads++
+		if threadReads == 1 {
+			return strings.Repeat("a", 40), nil, nil
+		}
+		return strings.Repeat("a", 40), []github.ReviewThread{{ID: "codex-p1", Path: "merge.go", Line: 42, Author: "codex"}}, nil
+	}
+	merged := 0
+	o.ghMergePRFn = func(int) error {
+		merged++
+		return nil
+	}
+
+	st := makeTestState([]github.PR{pr})
+	o.autoMergePRs(st)
+
+	if merged != 0 {
+		t.Fatalf("merged = %d, want 0 with late unresolved thread", merged)
+	}
+	if got := st.Sessions["slot-0"].OperatorGateName; got != "review-thread:codex-p1" {
+		t.Fatalf("operator gate = %q", got)
+	}
+}
+
+func TestAutoMergePRs_LateHeadChangeInvalidatesPreviouslyGreenGate(t *testing.T) {
+	pr := github.PR{Number: 7, HeadRefName: "feat/late-head"}
+	oldHead := strings.Repeat("a", 40)
+	newHead := strings.Repeat("b", 40)
+	cfg := &config.Config{Repo: "owner/repo", StateDir: t.TempDir()}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	o.ghPRCIStatusFn = nil
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: oldHead, Verdict: "success", Complete: true}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return oldHead, nil }
+	o.ghPRUnresolvedThreadsFn = func(int) (string, []github.ReviewThread, error) {
+		return newHead, nil, nil
+	}
+	merged := 0
+	o.ghMergePRFn = func(int) error {
+		merged++
+		return nil
+	}
+
+	st := makeTestState([]github.PR{pr})
+	o.autoMergePRs(st)
+
+	if merged != 0 {
+		t.Fatalf("merged = %d, want 0 after head changed beyond green gate", merged)
+	}
+	if got := st.Sessions["slot-0"].OperatorGateName; got != "merge-check:head-changed" {
+		t.Fatalf("operator gate = %q", got)
+	}
+}
+
+func TestAutoMergePRs_ExplicitReleaseRestoresEligibilityOnlyAfterHoldClears(t *testing.T) {
+	pr := github.PR{Number: 7, HeadRefName: "feat/held-canary"}
+	cfg := &config.Config{Repo: "owner/repo", StateDir: t.TempDir(), Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"}}
+	o, _ := newMergeTestOrchestrator(cfg, []github.PR{pr})
+	held := true
+	o.getIssueFn = func(number int) (github.Issue, error) {
+		if held {
+			return makeIssue(number, "canary", "blocked"), nil
+		}
+		return makeIssue(number, "canary"), nil
+	}
+	merged := 0
+	o.ghMergePRFn = func(int) error {
+		merged++
+		return nil
+	}
+	if err := state.Update(cfg.StateDir, func(st *state.State) error {
+		st.HoldMerge(100, pr.Number, "operator", "canary hold", time.Now().UTC())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	st := makeTestState([]github.PR{pr})
+	o.autoMergePRs(st)
+	if merged != 0 {
+		t.Fatalf("held canary merged = %d", merged)
+	}
+
+	held = false
+	if err := state.Update(cfg.StateDir, func(st *state.State) error {
+		st.ReleaseMergeHold(100, pr.Number, "operator", "explicit release", time.Now().UTC())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	clearOperatorGateHold(st.Sessions["slot-0"])
+	o.autoMergePRs(st)
+	if merged != 1 {
+		t.Fatalf("merged after explicit release = %d, want 1", merged)
+	}
+}
+
 func TestAutoMergePRs_AmbiguousFailureRetriesAfterGateOpens(t *testing.T) {
 	pr := github.PR{Number: 7, HeadRefName: "feat/android"}
 	cfg := &config.Config{

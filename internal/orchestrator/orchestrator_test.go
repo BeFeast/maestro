@@ -1419,6 +1419,10 @@ func newMergeTestOrchestrator(cfg *config.Config, prs []github.PR) (*Orchestrato
 		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
 			return true, false, nil // approved, not pending
 		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "merge candidate"), nil
+		},
+		ghPRLabelsFn: func(int) ([]string, error) { return nil, nil },
 		ghMergePRFn: func(prNumber int) error {
 			merged = append(merged, prNumber)
 			return nil

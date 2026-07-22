@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -65,6 +66,13 @@ func (b *blockingGH) EditIssueBody(issue int, body string) error {
 }
 func (b *blockingGH) IssueBody(issue int) (string, error) {
 	return "", nil
+}
+func (b *blockingGH) GetIssue(number int) (github.Issue, error) {
+	return github.Issue{Number: number}, nil
+}
+func (b *blockingGH) PRLabels(int) ([]string, error) { return nil, nil }
+func (b *blockingGH) PRUnresolvedReviewThreadsOnHead(int) (string, []github.ReviewThread, error) {
+	return testMergeHeadSHA, nil, nil
 }
 
 // --- #488: per-approval-ID lock (concurrent Execute) -----------------------
