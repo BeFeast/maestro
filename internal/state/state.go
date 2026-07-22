@@ -5023,10 +5023,23 @@ func (s *State) IssueInProgress(issueNum int) bool {
 	return ok
 }
 
-// IssueDone returns true if the given issue already has a completed session.
+// IssueDone returns true only when forge reconciliation has closed the issue
+// on a completed session. Historical StatusDone rows (duplicate_dispatch,
+// abandoned attempts, docs-only merges that left the GitHub issue open) must
+// NOT permanently starve dynamic-wave eligibility — that was the live path to
+// eligible=0 / live=0 while *-ready backlog still existed (#1103).
+//
+// The merge→close race is owned by sessionIssueClaim's terminal_reconcile
+// lease (done+PR, not yet ReleasedForRedispatch), not by this helper.
 func (s *State) IssueDone(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusDone {
+		if sess == nil || sess.IssueNumber != issueNum || sess.Status != StatusDone {
+			continue
+		}
+		if sess.ReleasedForRedispatch {
+			continue
+		}
+		if sess.IssueClosedAt != nil {
 			return true
 		}
 	}

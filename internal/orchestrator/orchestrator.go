@@ -4674,6 +4674,24 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						if !o.reconcileClosedIssueSession(s, slotName, sess, now) {
 							remoteReconcileFailed = true
 						}
+					} else if !sess.ReleasedForRedispatch {
+						// #1103: PR finished but the GitHub issue is still open.
+						// Holding terminal_reconcile forever makes the issue look
+						// "in progress" with zero live workers and starves the
+						// ready queue. After a short grace for close-issue to land,
+						// release so hands-off fill can redispatch or move on.
+						const terminalReconcileGrace = 15 * time.Minute
+						if now.Sub(sess.FinishedAt.UTC()) >= terminalReconcileGrace {
+							merged, mErr := o.isPRMerged(sess.PRNumber)
+							if mErr != nil {
+								remoteReconcileFailed = true
+								log.Printf("[orch] terminal claim merge check for PR #%d: %v", sess.PRNumber, mErr)
+							} else if merged {
+								o.releaseDoneMergedOpenIssueForRedispatch(s, sess,
+									fmt.Sprintf("issue #%d still open after merged PR #%d past %s grace — released for redispatch",
+										sess.IssueNumber, sess.PRNumber, terminalReconcileGrace))
+							}
+						}
 					}
 				}
 			}
@@ -7267,6 +7285,29 @@ func (o *Orchestrator) releaseCodeLandedForRedispatch(s *state.State, sess *stat
 	if strings.TrimSpace(o.cfg.StateDir) != "" {
 		if err := state.Save(o.cfg.StateDir, s); err != nil {
 			log.Printf("[orch] release for redispatch: state save failed for issue #%d: %v", sess.IssueNumber, err)
+		}
+	}
+}
+
+// releaseDoneMergedOpenIssueForRedispatch drops the terminal_reconcile claim on
+// a StatusDone session whose PR merged but whose GitHub issue stayed open.
+// Keeps history; marks ReleasedForRedispatch so dynamic wave can fill again (#1103).
+func (o *Orchestrator) releaseDoneMergedOpenIssueForRedispatch(s *state.State, sess *state.Session, reason string) {
+	if sess == nil || sess.ReleasedForRedispatch {
+		return
+	}
+	sess.ReleasedForRedispatch = true
+	if strings.TrimSpace(sess.WorkerOutcome) == "" {
+		sess.WorkerOutcome = "merged_pr_issue_still_open"
+	}
+	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+	log.Printf("[orch] merged_pr_issue_still_open: %s", reason)
+	if o.notifier != nil {
+		o.notifier.Sendf("♻️ maestro: PR #%d merged but issue #%d is still open — released terminal claim for redispatch", sess.PRNumber, sess.IssueNumber)
+	}
+	if strings.TrimSpace(o.cfg.StateDir) != "" {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			log.Printf("[orch] release done+merged open issue: state save failed for issue #%d: %v", sess.IssueNumber, err)
 		}
 	}
 }
