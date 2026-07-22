@@ -67,6 +67,16 @@ func TestTierArgv_GeminiModelEffort(t *testing.T) {
 	}
 }
 
+func TestTierArgv_KimiModelDropsEffort(t *testing.T) {
+	args := buildArgs(t, "kimi", BackendConfig{Cmd: "kimi", TierModel: "kimi-k2", TierEffort: "medium"})
+	if !strings.Contains(args, "--model kimi-k2") {
+		t.Errorf("Kimi args missing tier model: %s", args)
+	}
+	if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
+		t.Errorf("Kimi must not emit an unsupported effort flag: %s", args)
+	}
+}
+
 func TestTierArgv_NoOverrideWhenEmpty(t *testing.T) {
 	// Without a tier override the argv is unchanged — no spurious --model/--effort.
 	args := buildArgs(t, "claude", BackendConfig{Cmd: "claude"})

@@ -1347,6 +1347,11 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	if kind == config.BackendKindCodex && o.sessionUsageStream(sess) {
 		return o.updateCodexUsageFromJSONL(slotName, sess)
 	}
+	// Kimi's first-class print mode always emits stream-json, so usage capture
+	// is not gated by the legacy usage_stream opt-in.
+	if kind == config.BackendKindKimi {
+		return o.updateKimiUsageFromJSONL(slotName, sess)
+	}
 	if kind == config.BackendKindOpencode && o.sessionUsageStream(sess) {
 		return o.updateOpenCodeUsageFromJSONL(slotName, sess)
 	}
@@ -1553,6 +1558,47 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
 		slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
 	return true
+}
+
+// updateKimiUsageFromJSONL parses Kimi Code CLI's stream-json side channel and
+// stamps cache-aware split tokens onto the session. Kimi reports no USD cost,
+// so CostUSDBackend remains zero and the configured pricing block supplies a
+// virtual estimate to history and Fleet cost observability. The full JSONL is
+// cumulative across attempts; UsageTokensWatermark makes retries delta-only.
+func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Session) bool {
+	jsonlPath := o.workerJSONLFile(slotName, sess)
+	if jsonlPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		return false
+	}
+	usage, ok := worker.ParseKimiUsage(string(data))
+	if !ok {
+		return false
+	}
+	changed := false
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
+		sess.TokensUsedTotal += delta
+		sess.TokensInput = usage.Input
+		sess.TokensOutput = usage.Output
+		sess.TokensCacheRead = usage.CacheRead
+		sess.TokensCacheWrite = usage.CacheWrite
+		changed = true
+	}
+	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
+		sess.Model = usage.Model
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s kimi usage: input=%d output=%d cache_read=%d cache_write=%d tokens=%d (total=%d)",
+			slotName, usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite, usage.TotalTokens, sess.TokensUsedTotal)
+	}
+	return changed
 }
 
 // updateOpenCodeUsageFromJSONL parses the opencode --format json side-channel

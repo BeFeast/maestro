@@ -101,7 +101,8 @@ type BackendDef struct {
 	// keeping slot.log human-readable. Off by default: plain `claude -p` text
 	// mode prints no parseable token total, so usage/cost stay 0 (the #737
 	// symptom) until an operator opts in. Overridable via extra_args (a
-	// trailing --output-format wins). Only the claude kind consumes this today.
+	// trailing --output-format wins). Claude, Codex, and OpenCode consume this
+	// opt-in; Kimi's first-class print path always emits structured output.
 	UsageStream bool `yaml:"usage_stream,omitempty"`
 
 	// #507: NonAgentic marks a backend that is a TEXT-COMPLETION helper,

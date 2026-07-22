@@ -19,11 +19,14 @@ func TestResolveBackendKind(t *testing.T) {
 		{"codex", "", "", BackendKindCodex},
 		{"gemini", "", "gemini-cli", BackendKindGemini},
 		{"cline", "", "", BackendKindCline},
+		{"kimi", "", "", BackendKindKimi},
 		// 2. Provider field resolves custom names (sup-175 `fable:` shape).
 		{"fable", "anthropic", "claude --model claude-fable-5 --effort xhigh", BackendKindClaude},
 		{"fast", "openai", "codex --profile fast", BackendKindCodex},
 		{"flash", "google", "gemini", BackendKindGemini},
 		{"wrapped", "cline", "cline", BackendKindCline},
+		{"k2", "moonshot", "kimi", BackendKindKimi},
+		{"k3", "kimi", "my-kimi-wrapper", BackendKindKimi},
 		// #730: provider pi / ollama resolves to the first-class pi backend.
 		{"pi-ollama", "ollama", "pi", BackendKindPi},
 		{"picustom", "pi", "my-pi-shim", BackendKindPi},
@@ -35,6 +38,7 @@ func TestResolveBackendKind(t *testing.T) {
 		{"mymodel", "", "/usr/local/bin/claude --model opus", BackendKindClaude},
 		{"mymodel", "", "codex --flag", BackendKindCodex},
 		{"mymodel", "groq", "gemini", BackendKindGemini},
+		{"moonshot-model", "", "/usr/local/bin/kimi --verbose", BackendKindKimi},
 		{"picli", "", "/usr/local/bin/pi", BackendKindPi},
 		// 4. Everything else is generic.
 		{"helper", "groq", "groq-cli", BackendKindGeneric},
@@ -107,6 +111,22 @@ func TestConfig_Warnings_PiBackendNoGenericWarning(t *testing.T) {
 	for _, msg := range cfg.Warnings() {
 		if strings.Contains(msg, "generic exec path") {
 			t.Fatalf("Warnings() = %v, pi backend should not trigger the generic path warning", cfg.Warnings())
+		}
+	}
+}
+
+func TestConfig_Warnings_KimiBackendNoGenericWarning(t *testing.T) {
+	cfg := &Config{
+		Model: ModelConfig{
+			Default: "kimi-k2",
+			Backends: map[string]BackendDef{
+				"kimi-k2": {Provider: "moonshot", Cmd: "kimi"},
+			},
+		},
+	}
+	for _, msg := range cfg.Warnings() {
+		if strings.Contains(msg, "generic exec path") {
+			t.Fatalf("Warnings() = %v, Kimi backend should not trigger the generic path warning", cfg.Warnings())
 		}
 	}
 }

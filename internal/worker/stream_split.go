@@ -112,6 +112,8 @@ func renderStreamLine(backend, line string) string {
 		return renderClaudeStreamLine(line)
 	case "codex":
 		return renderCodexStreamLine(line)
+	case "kimi":
+		return renderKimiStreamLine(line)
 	case "opencode":
 		return renderOpenCodeStreamLine(line)
 	default:
@@ -131,6 +133,12 @@ func RenderClaudeStreamLine(line string) string {
 // rate-limit / auth-failure text intact).
 func RenderCodexStreamLine(line string) string {
 	return renderCodexStreamLine(line)
+}
+
+// RenderKimiStreamLine is the exported entry point for rendering one Kimi
+// Code CLI stream-json line.
+func RenderKimiStreamLine(line string) string {
+	return renderKimiStreamLine(line)
 }
 
 type claudeRenderFrame struct {
@@ -244,6 +252,63 @@ func renderClaudeContent(raw json.RawMessage) string {
 		}
 	}
 	return strings.Join(parts, "\n")
+}
+
+type kimiRenderFrame struct {
+	Role       string               `json:"role"`
+	Type       string               `json:"type"`
+	Content    json.RawMessage      `json:"content"`
+	ToolCallID string               `json:"tool_call_id"`
+	ToolCalls  []kimiRenderToolCall `json:"tool_calls"`
+	Payload    *kimiPayload         `json:"payload"`
+}
+
+type kimiRenderToolCall struct {
+	Function struct {
+		Name string `json:"name"`
+	} `json:"function"`
+}
+
+func renderKimiStreamLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return line
+	}
+	var frame kimiRenderFrame
+	if json.Unmarshal([]byte(trimmed), &frame) != nil {
+		return line
+	}
+	switch strings.ToLower(strings.TrimSpace(frame.Role)) {
+	case "assistant":
+		parts := make([]string, 0, 1+len(frame.ToolCalls))
+		if content := renderClaudeContent(frame.Content); strings.TrimSpace(content) != "" {
+			parts = append(parts, content)
+		}
+		for _, call := range frame.ToolCalls {
+			parts = append(parts, "[tool_use: "+strings.TrimSpace(call.Function.Name)+"]")
+		}
+		return strings.Join(parts, "\n")
+	case "tool":
+		content := renderClaudeContent(frame.Content)
+		if strings.TrimSpace(content) == "" {
+			return "[tool_result]"
+		}
+		return "[tool_result] " + content
+	case "meta":
+		if content := renderClaudeContent(frame.Content); strings.TrimSpace(content) != "" {
+			return "[kimi] " + content
+		}
+		return ""
+	}
+	if strings.EqualFold(strings.TrimSpace(frame.Type), "StatusUpdate") && frame.Payload != nil && frame.Payload.TokenUsage != nil {
+		usage := frame.Payload.TokenUsage.counts()
+		if usage.total() > 0 {
+			return fmt.Sprintf("[kimi] usage: input=%d output=%d cache_read=%d cache_write=%d total=%d",
+				usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite, usage.total())
+		}
+		return ""
+	}
+	return line
 }
 
 // codexRenderFrame is the subset of a codex `exec --json` line the renderer

@@ -1,0 +1,5 @@
+{"role":"assistant","content":"Inspecting the repository.","tool_calls":[{"type":"function","id":"tool-1","function":{"name":"Shell","arguments":"{\"command\":\"git status --short\"}"}}]}
+{"role":"tool","tool_call_id":"tool-1","content":""}
+{"type":"StatusUpdate","payload":{"token_usage":{"input_other":1200,"output":80,"input_cache_read":400,"input_cache_creation":100},"message_id":"message-1"}}
+{"role":"assistant","content":"Implementation complete."}
+{"type":"StatusUpdate","payload":{"token_usage":{"input_other":600,"output":20,"input_cache_read":200,"input_cache_creation":0},"message_id":"message-2"}}

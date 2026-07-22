@@ -155,6 +155,84 @@ func TestBuildWorkerCmd_CodexUsageStream(t *testing.T) {
 	})
 }
 
+func TestBuildWorkerCmd_Kimi(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("implement the issue"), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name        string
+		backendName string
+		cfg         BackendConfig
+	}{
+		{
+			name:        "provider resolves custom backend",
+			backendName: "kimi-k2",
+			cfg:         BackendConfig{Cmd: "kimi", Provider: "moonshot"},
+		},
+		{
+			name:        "command basename resolves custom backend",
+			backendName: "fast",
+			cfg:         BackendConfig{Cmd: "/usr/local/bin/kimi --verbose"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cmd, stdinFile, err := BuildWorkerCmd(tt.backendName, tt.cfg, promptFile, "/tmp/kimi-worktree")
+			if err != nil {
+				t.Fatalf("BuildWorkerCmd: %v", err)
+			}
+			if stdinFile != promptFile {
+				t.Fatalf("stdinFile = %q, want %q", stdinFile, promptFile)
+			}
+			if cmd.Dir != "/tmp/kimi-worktree" {
+				t.Fatalf("Dir = %q, want /tmp/kimi-worktree", cmd.Dir)
+			}
+			args := cmd.Args[1:]
+			if !containsArg(args, "--print") {
+				t.Errorf("args = %v, want --print", args)
+			}
+			if !containsArg(args, "--output-format=stream-json") {
+				t.Errorf("args = %v, want --output-format=stream-json", args)
+			}
+			if strings.Contains(strings.Join(args, " "), "implement the issue") {
+				t.Errorf("prompt content must not appear in argv: %v", args)
+			}
+		})
+	}
+
+	t.Run("operator output format is not duplicated", func(t *testing.T) {
+		cfg := BackendConfig{
+			Cmd:       "kimi --print",
+			Provider:  "moonshot",
+			ExtraArgs: []string{"--output-format", "stream-json"},
+		}
+		cmd, _, err := BuildWorkerCmd("kimi-k2", cfg, promptFile, "/tmp/kimi-worktree")
+		if err != nil {
+			t.Fatal(err)
+		}
+		if countFlag(cmd.Args, "--print") != 1 {
+			t.Fatalf("--print duplicated in args: %v", cmd.Args)
+		}
+		if countFlag(cmd.Args, "--output-format") != 1 {
+			t.Fatalf("--output-format duplicated in args: %v", cmd.Args)
+		}
+	})
+}
+
+func TestStreamSplitForBackend_KimiAlwaysEnabled(t *testing.T) {
+	split := streamSplitForBackend("kimi-k2", BackendConfig{Cmd: "kimi", Provider: "moonshot"}, "/tmp/kimi.log")
+	if split == nil {
+		t.Fatal("Kimi must use stream-split without a usage_stream opt-in")
+	}
+	if split.Backend != config.BackendKindKimi || split.JSONLPath != "/tmp/kimi.jsonl" {
+		t.Fatalf("split = %+v, want kimi backend and sibling JSONL path", split)
+	}
+}
+
 func TestBuildWorkerCmd_ClaudeLargePromptViaStdin(t *testing.T) {
 	dir := t.TempDir()
 	promptFile := filepath.Join(dir, "prompt.md")
@@ -537,6 +615,31 @@ func TestBuildSupervisorCmd_CodexReadOnly(t *testing.T) {
 	}
 	if strings.Contains(args, "dangerously") || strings.Contains(args, "bypass") {
 		t.Errorf("supervisor command should not include worker permission bypass flags: %s", args)
+	}
+}
+
+func TestBuildSupervisorCmd_Kimi(t *testing.T) {
+	dir := t.TempDir()
+	promptFile := filepath.Join(dir, "prompt.md")
+	if err := os.WriteFile(promptFile, []byte("decide safely"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := BackendConfig{Cmd: "kimi", Provider: "moonshot", Model: "kimi-k2"}
+	cmd, stdinFile, err := BuildSupervisorCmd("kimi", cfg, promptFile, "/tmp/wt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if stdinFile != promptFile {
+		t.Fatalf("stdinFile = %q, want %q", stdinFile, promptFile)
+	}
+	args := strings.Join(cmd.Args, " ")
+	for _, want := range []string{"--print", "--final-message-only", "--model kimi-k2"} {
+		if !strings.Contains(args, want) {
+			t.Errorf("Kimi supervisor args missing %q: %s", want, args)
+		}
+	}
+	if strings.Contains(args, "decide safely") {
+		t.Errorf("supervisor prompt leaked into argv: %s", args)
 	}
 }
 
@@ -998,7 +1101,7 @@ func TestBuildSupervisorCmd_CustomNameProviderAnthropic(t *testing.T) {
 
 func TestKnownBackends(t *testing.T) {
 	backends := KnownBackends()
-	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false, "pi": false}
+	expected := map[string]bool{"claude": false, "codex": false, "gemini": false, "cline": false, "kimi": false, "pi": false}
 	for _, name := range backends {
 		if _, ok := expected[name]; ok {
 			expected[name] = true
@@ -1009,6 +1112,25 @@ func TestKnownBackends(t *testing.T) {
 			t.Errorf("expected %q in KnownBackends(), got: %v", name, backends)
 		}
 	}
+}
+
+func containsArg(args []string, want string) bool {
+	for _, arg := range args {
+		if arg == want {
+			return true
+		}
+	}
+	return false
+}
+
+func countFlag(args []string, flag string) int {
+	count := 0
+	for _, arg := range args {
+		if arg == flag || strings.HasPrefix(arg, flag+"=") {
+			count++
+		}
+	}
+	return count
 }
 
 // #730: the Pi backend runs headless in JSON event-stream mode with the

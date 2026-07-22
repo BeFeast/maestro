@@ -59,8 +59,8 @@ type BackendConfig struct {
 	TierEffort    string
 	// UsageStream opts a structured-stream worker into emitting NDJSON usage
 	// frames on a side-channel slot.jsonl: claude `--output-format stream-json
-	// --verbose` (#737) and codex `exec --json` (#738). Off by default;
-	// ignored by backends without a structured-stream mode.
+	// --verbose` (#737), codex `exec --json` (#738), and OpenCode JSON output.
+	// Off by default; Kimi always uses its structured print path independently.
 	UsageStream bool
 	// TokenBudget is the active per-attempt hard ceiling. A positive value
 	// requires an enforceable live-usage mode; BuildWorkerCmd fails closed for
@@ -83,6 +83,7 @@ var knownBackends = map[string]Backend{
 	"cline":    clineBackend{},
 	"codex":    codexBackend{},
 	"gemini":   geminiBackend{},
+	"kimi":     kimiBackend{},
 	"opencode": opencodeBackend{},
 	"pi":       piBackend{},
 }
@@ -184,6 +185,35 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	// Stdin redirection is handled by the runner script — no file opened here
+	return cmd, promptFile, nil
+}
+
+// --- Kimi Backend ---
+
+// kimiBackend runs Kimi Code CLI in non-interactive print mode. Print mode
+// auto-approves tool calls and reads a text prompt from stdin when no -p value
+// is supplied, so large Maestro prompts never enter argv. Kimi's stream-json
+// output is always enabled for workers: the runner splits its JSONL into the
+// raw usage side channel and a human-readable worker log.
+type kimiBackend struct{}
+
+func (kimiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	kimiCmd := cfg.Cmd
+	if kimiCmd == "" {
+		kimiCmd = "kimi"
+	}
+	binary, cmdArgs := splitCmd(kimiCmd)
+	args := append([]string(nil), cmdArgs...)
+	if !argsHaveFlag(cmdArgs, "--print") && !argsHaveFlag(cfg.ExtraArgs, "--print") {
+		args = append(args, "--print")
+	}
+	if !argsHaveOutputFormat(cmdArgs) && !argsHaveOutputFormat(cfg.ExtraArgs) {
+		args = append(args, "--output-format=stream-json")
+	}
+	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindKimi, cfg)
+	args = append(args, cfg.ExtraArgs...)
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
 	return cmd, promptFile, nil
 }
 
@@ -686,16 +716,18 @@ func maestroExecutablePath() (string, bool) {
 
 // streamSplitForBackend returns the worker runner's stream-split configuration,
 // or nil when the plain `tee` pipeline should be used. Only a structured-stream
-// backend (claude #737, codex #738) with usage_stream opted in streams NDJSON;
-// when the maestro binary cannot be resolved it degrades to nil (plain tee).
-// The resolved backend kind is passed to the splitter so it renders the right
+// backend with structured output streams NDJSON when enabled. Kimi always uses
+// stream-json in its first-class print mode; claude/codex/opencode retain their
+// usage_stream opt-in, while Pi enables splitting when a live budget needs it.
+// When the maestro binary cannot be resolved this degrades to nil (plain tee).
+// The resolved kind is passed to the splitter so it renders the right
 // human-readable form into slot.log.
 func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
 	kind := resolveBackendKind(backendName, cfg)
-	if !cfg.UsageStream && !(cfg.TokenBudget > 0 && kind == config.BackendKindPi) {
+	if kind != config.BackendKindKimi && !cfg.UsageStream && !(cfg.TokenBudget > 0 && kind == config.BackendKindPi) {
 		return nil
 	}
-	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindOpencode && kind != config.BackendKindPi {
+	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindKimi && kind != config.BackendKindOpencode && kind != config.BackendKindPi {
 		return nil
 	}
 	bin, ok := maestroExecutablePath()
@@ -713,7 +745,7 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 
 // BuildWorkerCmd creates the right exec.Cmd for a backend. The backend name,
 // provider field, and cmd binary resolve to a CLI-specific builder (claude,
-// codex, gemini, cline — see resolveBackendKind); anything else uses the
+// codex, gemini, cline, kimi — see resolveBackendKind); anything else uses the
 // generic builder with prompt_mode from config.
 // Returns the command, an optional stdinFile path (for backends that read
 // the prompt via stdin, e.g. claude/codex), and any error.
@@ -755,6 +787,8 @@ func validateLiveTokenBudget(backendName string, cfg BackendConfig) error {
 		if !cfg.UsageStream || argsHaveFlag(cfg.ExtraArgs, "--format") {
 			return fmt.Errorf("worker_max_tokens=%d requires OpenCode usage_stream with Maestro-managed JSON output", cfg.TokenBudget)
 		}
+	case config.BackendKindKimi:
+		return fmt.Errorf("worker_max_tokens=%d cannot be enforced live for Kimi; its print-mode stream is supported for accounting but not as a reliable live ceiling", cfg.TokenBudget)
 	default:
 		return fmt.Errorf("worker_max_tokens=%d cannot be enforced live for backend %q; disable the budget or use claude, codex, pi, or opencode structured usage", cfg.TokenBudget, backendName)
 	}
@@ -835,6 +869,26 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = worktree
 		return cmd, "", nil
+	case "kimi":
+		kimiCmd := cfg.Cmd
+		if kimiCmd == "" {
+			kimiCmd = "kimi"
+		}
+		binary, cmdArgs := splitCmd(kimiCmd)
+		args := append([]string(nil), cmdArgs...)
+		if !argsHaveFlag(cmdArgs, "--print") && !argsHaveFlag(cfg.ExtraArgs, "--print") {
+			args = append(args, "--print")
+		}
+		if !argsHaveFlag(cmdArgs, "--final-message-only") && !argsHaveFlag(cfg.ExtraArgs, "--final-message-only") {
+			args = append(args, "--final-message-only")
+		}
+		args = append(args, cfg.ExtraArgs...)
+		if model := strings.TrimSpace(cfg.Model); model != "" && !argsHaveFlag(pinnedArgs(cmdArgs, cfg), "--model") {
+			args = append(args, "--model", model)
+		}
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, promptFile, nil
 	case "pi":
 		piCmd := cfg.Cmd
 		if piCmd == "" {

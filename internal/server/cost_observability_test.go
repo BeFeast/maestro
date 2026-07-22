@@ -405,6 +405,22 @@ func TestSessionCostEstimate_CodexVirtual(t *testing.T) {
 	}
 }
 
+func TestSessionCostEstimate_KimiVirtualSplit(t *testing.T) {
+	pricing := map[string]config.BackendPricing{
+		"kimi-k2": {
+			InputUSDPerMtok:      2,
+			OutputUSDPerMtok:     8,
+			CacheReadUSDPerMtok:  0.2,
+			CacheWriteUSDPerMtok: 2.5,
+		},
+	}
+	got := sessionCostEstimate("kimi-k2", 2600, 1800, 100, 600, 100, pricing, 0)
+	want := (1800*2.0 + 100*8.0 + 600*0.2 + 100*2.5) / 1_000_000
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("Kimi virtual split cost = %f, want %f", got, want)
+	}
+}
+
 // TestBuildFleetCostObservability_SplitCosting proves the rollup prices a
 // session carrying cache-aware split tokens (#739) with EstimateCostSplit —
 // the cache-read discount makes the panel's USD a small fraction of the naive

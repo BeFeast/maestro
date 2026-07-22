@@ -17,6 +17,7 @@ const (
 	BackendKindCodex    = "codex"
 	BackendKindGemini   = "gemini"
 	BackendKindCline    = "cline"
+	BackendKindKimi     = "kimi"
 	BackendKindPi       = "pi"
 	BackendKindOpencode = "opencode"
 	BackendKindGeneric  = "generic"
@@ -34,6 +35,8 @@ var providerBackendKinds = map[string]string{
 	"google":    BackendKindGemini,
 	"gemini":    BackendKindGemini,
 	"cline":     BackendKindCline,
+	"kimi":      BackendKindKimi,
+	"moonshot":  BackendKindKimi,
 	"pi":        BackendKindPi,
 	"ollama":    BackendKindPi,
 	"opencode":  BackendKindOpencode,
@@ -41,10 +44,10 @@ var providerBackendKinds = map[string]string{
 
 // ResolveBackendKind decides which CLI-specific exec path a backend uses.
 // Resolution order (#684):
-//  1. the backend name itself — claude/codex/gemini/cline keys keep their
+//  1. the backend name itself — claude/codex/gemini/cline/kimi keys keep their
 //     existing behaviour,
 //  2. the per-backend provider field (anthropic → claude, openai → codex, …),
-//  3. the binary basename of cmd's first token (claude/codex/gemini/cline),
+//  3. the binary basename of cmd's first token (claude/codex/gemini/cline/kimi),
 //  4. the generic fallback (prompt_mode applies, no permission-bypass flag).
 //
 // Before #684, dispatch was keyed on the name alone: the Anthropic CLI
@@ -53,7 +56,7 @@ var providerBackendKinds = map[string]string{
 // mutating tool call was denied by the CLI's permission layer (sup-175).
 func ResolveBackendKind(name, provider, cmd string) string {
 	switch name {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi, BackendKindOpencode:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindKimi, BackendKindPi, BackendKindOpencode:
 		return name
 	}
 	if kind, ok := providerBackendKinds[strings.ToLower(strings.TrimSpace(provider))]; ok {
@@ -73,7 +76,7 @@ func backendKindFromCmd(cmd string) string {
 		return ""
 	}
 	switch base := filepath.Base(fields[0]); base {
-	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindPi, BackendKindOpencode:
+	case BackendKindClaude, BackendKindCodex, BackendKindGemini, BackendKindCline, BackendKindKimi, BackendKindPi, BackendKindOpencode:
 		return base
 	}
 	return ""
@@ -105,7 +108,7 @@ func (c *Config) backendResolutionWarnings() []string {
 		kind := ResolveBackendKind(name, def.Provider, def.Cmd)
 		if kind == BackendKindGeneric {
 			warnings = append(warnings, fmt.Sprintf(
-				"config: backend %q resolves to the generic exec path (provider %q and cmd %q match no known CLI) — workers run without a permission-bypass flag (mutating tool calls may be denied) and the prompt is delivered per prompt_mode=%q (argv delivery risks E2BIG on large prompts). If this wraps a known CLI, set provider: anthropic|openai|google|cline|pi|ollama or use a claude/codex/gemini/cline/pi binary in cmd.",
+				"config: backend %q resolves to the generic exec path (provider %q and cmd %q match no known CLI) — workers run without a permission-bypass flag (mutating tool calls may be denied) and the prompt is delivered per prompt_mode=%q (argv delivery risks E2BIG on large prompts). If this wraps a known CLI, set provider: anthropic|openai|google|cline|moonshot|kimi|pi|ollama or use a claude/codex/gemini/cline/kimi/pi binary in cmd.",
 				name, def.Provider, def.Cmd, coalescePromptMode(def.PromptMode)))
 			continue
 		}

@@ -140,6 +140,13 @@ func TestBuildWorkerCmd_TokenBudgetFailClosedAndCodexProxy(t *testing.T) {
 		}
 	})
 
+	t.Run("kimi explicitly fails closed", func(t *testing.T) {
+		_, _, err := BuildWorkerCmd("kimi", BackendConfig{Cmd: "kimi", Provider: "moonshot", TokenBudget: 80_000}, "/tmp/prompt", "/tmp")
+		if err == nil || !strings.Contains(err.Error(), "cannot be enforced live for Kimi") {
+			t.Fatalf("error = %v, want explicit Kimi live-budget limitation", err)
+		}
+	})
+
 	t.Run("codex receives native rollout budget", func(t *testing.T) {
 		cmd, _, err := BuildWorkerCmd("codex", BackendConfig{Cmd: "codex", UsageStream: true, TokenBudget: 80_000}, "/tmp/prompt", "/tmp")
 		if err != nil {

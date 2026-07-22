@@ -11655,3 +11655,51 @@ func TestUpdateTokensUsedFromOutput_CodexBackendRetryNoDoubleCount(t *testing.T)
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
 	}
 }
+
+func TestUpdateTokensUsedFromOutput_KimiFixtureStampsWatermarkAndSplits(t *testing.T) {
+	dir := t.TempDir()
+	slot := "sup-kimi"
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default: "kimi-k2",
+				Backends: map[string]config.BackendDef{
+					"kimi-k2": {
+						Cmd:      "kimi",
+						Provider: "moonshot",
+						Pricing:  config.BackendPricing{InputUSDPerMtok: 1, OutputUSDPerMtok: 2},
+					},
+				},
+			},
+		},
+	}
+	logFile := filepath.Join(dir, slot+".log")
+	jsonlPath := filepath.Join(dir, slot+".jsonl")
+	sess := &state.Session{Backend: "kimi-k2", LogFile: logFile}
+	fixture, err := os.ReadFile(filepath.Join("..", "worker", "testdata", "kimi_stream_usage.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(jsonlPath, fixture, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !o.updateTokensUsedFromOutput(slot, sess, "human-readable Kimi output") {
+		t.Fatal("expected Kimi JSONL usage to update the session")
+	}
+	if sess.TokensUsedAttempt != 2600 || sess.TokensUsedTotal != 2600 || sess.UsageTokensWatermark != 2600 {
+		t.Fatalf("tokens attempt/total/watermark = %d/%d/%d, want 2600/2600/2600",
+			sess.TokensUsedAttempt, sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+	if sess.TokensInput != 1800 || sess.TokensOutput != 100 || sess.TokensCacheRead != 600 || sess.TokensCacheWrite != 100 {
+		t.Fatalf("split tokens = %d/%d/%d/%d, want 1800/100/600/100",
+			sess.TokensInput, sess.TokensOutput, sess.TokensCacheRead, sess.TokensCacheWrite)
+	}
+	if sess.CostUSDBackend != 0 {
+		t.Fatalf("CostUSDBackend = %v, want 0 (Kimi cost is virtual)", sess.CostUSDBackend)
+	}
+	if o.updateTokensUsedFromOutput(slot, sess, "same output") {
+		t.Fatal("unchanged Kimi JSONL must not double-count")
+	}
+}
