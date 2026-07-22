@@ -59,6 +59,16 @@ You only need one — whichever you have access to.
 ### Optional for Go repositories
 - **`gopls`** — enables symbol-aware pre-worker research context for Go modules (`go install golang.org/x/tools/gopls@latest`)
 
+### Entire checkpoints in the Maestro dogfood repo
+
+The public `BeFeast/maestro` repository may use Entire for optional local
+checkpoint history. Its committed `.entire/settings.json` keeps
+`strategy_options.push_sessions` set to `false` (and telemetry disabled)
+because session payloads can contain prompts, tool calls, and local paths;
+redaction is best-effort and does not make those payloads safe to publish. Do
+not push `entire/*` refs. This is a repo-local dogfood policy, not fleet-wide
+Maestro integration.
+
 ### Verify prerequisites
 ```bash
 git --version        # any recent version
