@@ -88,17 +88,22 @@ func TestLiveTokenMonitor_BackendEvents(t *testing.T) {
 		name    string
 		backend string
 		line    string
+		measure string
 	}{
-		{"claude assistant", "claude", claudeAssistantUsageFrame(100)},
-		{"pi turn", "pi", `{"type":"turn_end","message":{"role":"assistant","usage":{"input":60,"output":40}}}`},
-		{"opencode step", "opencode", `{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":60,"output":30,"reasoning":10}}}`},
-		{"codex native budget", "codex", `{"type":"turn.failed","error":{"message":"shared rollout token budget exhausted"}}`},
+		{"claude assistant", "claude", claudeAssistantUsageFrame(100), TokenBudgetMeasureUncached},
+		{"pi turn", "pi", `{"type":"turn_end","message":{"role":"assistant","usage":{"input":60,"output":40}}}`, TokenBudgetMeasureUncached},
+		{"opencode step", "opencode", `{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":60,"output":30,"reasoning":10}}}`, TokenBudgetMeasureInputOutputReasoning},
+		{"codex native budget", "codex", `{"type":"turn.failed","error":{"message":"shared rollout token budget exhausted"}}`, TokenBudgetMeasureCodexRollout},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			observed, exceeded := newLiveTokenMonitor(tt.backend, 100).observe(tt.line)
+			monitor := newLiveTokenMonitor(tt.backend, 100)
+			observed, exceeded := monitor.observe(tt.line)
 			if !exceeded || observed != 100 {
 				t.Fatalf("observe = %d,%t, want 100,true", observed, exceeded)
+			}
+			if monitor.measure != tt.measure {
+				t.Fatalf("measure = %q, want %q", monitor.measure, tt.measure)
 			}
 		})
 	}

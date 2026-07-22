@@ -335,8 +335,11 @@ configuration, and semantics.
 ## Worker Token Budgets
 
 For projects with `worker_max_tokens > 0`, the worker drawer's **Spend** section
-shows current-attempt usage beside the configured ceiling. A worker stopped by
-the live ceiling is displayed as `token budget exceeded`, with status `failed`
+shows the budget measure and current-attempt budget usage beside the configured
+ceiling. For Claude and Pi this row is labeled **uncached tokens** and counts
+input + output + cache writes while excluding cache reads; the session and issue
+spend rows remain inclusive cache-aware telemetry for cost reporting. A worker
+stopped by the live ceiling is displayed as `token budget exceeded`, with status `failed`
 and an operator-facing reason; it is never placed in the actually-running
 group, even during the interval before the orchestrator persists its next
 reconciliation cycle. The Fleet API derives that immediate view from the

@@ -20,6 +20,7 @@ type ClaudeUsage struct {
 	CacheRead             int     // sum of cache_read_input_tokens across result frames
 	CacheWrite            int     // sum of cache_creation_input_tokens across result frames
 	TotalTokens           int     // Input + Output + CacheRead + CacheWrite
+	BudgetTokens          int     // Input + Output + CacheWrite (cache reads excluded)
 	CostUSD               float64 // sum of total_cost_usd across result frames
 	UsageUnreliable       bool    // live assistant or successful terminal usage omitted plausible input/output
 	UsageUnreliableReason string  // stable secret-free degradation reason
@@ -174,6 +175,7 @@ func ParseClaudeUsage(text string) (ClaudeUsage, bool) {
 	// model when init was not captured (truncated stream).
 	out.Model = nonEmpty(assistantModel, systemModel)
 	out.TotalTokens = out.Input + out.Output + out.CacheRead + out.CacheWrite
+	out.BudgetTokens = out.Input + out.Output + out.CacheWrite
 	return out, seen
 }
 

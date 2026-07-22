@@ -13,7 +13,10 @@ import (
 
 const TokenBudgetExceededOutcome = "token_budget_exceeded"
 const TokenBudgetMeasureUncached = "uncached_tokens"
-const tokenBudgetMeasureLegacy = "provider_total_tokens_legacy"
+const TokenBudgetMeasureCodexRollout = "codex_rollout_tokens"
+const TokenBudgetMeasureInputOutputReasoning = "input_output_reasoning_tokens"
+const TokenBudgetMeasureProviderTotal = "provider_total_tokens"
+const TokenBudgetMeasureProviderTotalLegacy = "provider_total_tokens_legacy"
 
 var ErrTokenBudgetExceeded = errors.New(TokenBudgetExceededOutcome)
 
@@ -52,12 +55,12 @@ func ReadTokenBudgetMarker(logFile string) (TokenBudgetMarker, bool) {
 		return TokenBudgetMarker{}, false
 	}
 	if strings.TrimSpace(marker.Measure) == "" {
-		marker.Measure = tokenBudgetMeasureLegacy
+		marker.Measure = TokenBudgetMeasureProviderTotalLegacy
 	}
 	return marker, true
 }
 
-func writeTokenBudgetMarker(path, backend string, observed, maxTokens int) error {
+func writeTokenBudgetMarker(path, backend, measure string, observed, maxTokens int) error {
 	if path == "" {
 		return fmt.Errorf("empty token-budget marker path")
 	}
@@ -69,7 +72,7 @@ func writeTokenBudgetMarker(path, backend string, observed, maxTokens int) error
 		Backend:        backend,
 		TokensObserved: observed,
 		MaxTokens:      maxTokens,
-		Measure:        TokenBudgetMeasureUncached,
+		Measure:        measure,
 		MeasuredAt:     time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
@@ -96,6 +99,7 @@ func StopCurrentProcessGroup() {
 
 type liveTokenMonitor struct {
 	backend          string
+	measure          string
 	maxTokens        int
 	totalTokens      int
 	claudeAssistants int
@@ -106,8 +110,25 @@ type liveTokenMonitor struct {
 func newLiveTokenMonitor(backend string, maxTokens int) *liveTokenMonitor {
 	return &liveTokenMonitor{
 		backend:        strings.TrimSpace(backend),
+		measure:        TokenBudgetMeasureForBackend(backend),
 		maxTokens:      maxTokens,
 		claudeMessages: make(map[string]int),
+	}
+}
+
+// TokenBudgetMeasureForBackend names the exact measure enforced by the live
+// stream monitor. Claude and Pi exclude cache reads; the other structured
+// backends retain their native token definitions.
+func TokenBudgetMeasureForBackend(backend string) string {
+	switch strings.TrimSpace(backend) {
+	case "claude", "pi":
+		return TokenBudgetMeasureUncached
+	case "codex":
+		return TokenBudgetMeasureCodexRollout
+	case "opencode":
+		return TokenBudgetMeasureInputOutputReasoning
+	default:
+		return TokenBudgetMeasureProviderTotal
 	}
 }
 

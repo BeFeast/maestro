@@ -380,11 +380,12 @@ type sessionInfo struct {
 	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
 	// operator_state aligned with the current PR head/check rollup, but does not
 	// expose the internal snapshot on the session JSON shape.
-	prGateSnapshot     *state.PRGateSnapshot
-	TokensUsedAttempt  int    `json:"tokens_used_attempt"`
-	TokensUsedTotal    int    `json:"tokens_used_total"`
-	TokenBudgetMeasure string `json:"token_budget_measure,omitempty"`
-	WorkerOutcome      string `json:"worker_outcome,omitempty"`
+	prGateSnapshot           *state.PRGateSnapshot
+	TokensUsedAttempt        int    `json:"tokens_used_attempt"`
+	TokensUsedTotal          int    `json:"tokens_used_total"`
+	TokenBudgetTokensAttempt int    `json:"token_budget_tokens_attempt,omitempty"`
+	TokenBudgetMeasure       string `json:"token_budget_measure,omitempty"`
+	WorkerOutcome            string `json:"worker_outcome,omitempty"`
 	// ReleasedForRedispatch means a terminal session no longer owns the issue.
 	// Fleet duplicate projection must preserve this bit so an older completed
 	// PR cannot hide a genuine follow-up after the issue is reopened (#949).
@@ -466,14 +467,18 @@ type backendDriftInfo struct {
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
-	tokenBudgetMeasure := ""
+	tokenBudgetMeasure := sess.TokenBudgetMeasure
 	marker, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile)
 	if markerOK {
 		tokenBudgetMeasure = marker.Measure
 	}
 	if markerOK && sess.WorkerOutcome == "" {
 		view := *sess
-		if marker.TokensObserved > view.TokensUsedAttempt {
+		if marker.TokensObserved > view.TokenBudgetTokensAttempt {
+			view.TokenBudgetTokensAttempt = marker.TokensObserved
+		}
+		view.TokenBudgetMeasure = marker.Measure
+		if marker.Measure == worker.TokenBudgetMeasureProviderTotalLegacy && marker.TokensObserved > view.TokensUsedAttempt {
 			delta := marker.TokensObserved - view.TokensUsedAttempt
 			view.TokensUsedAttempt = marker.TokensObserved
 			view.TokensUsedTotal += delta
@@ -524,6 +529,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		AdvisorReviews:            append([]state.AdvisorReview(nil), sess.AdvisorReviews...),
 		TokensUsedAttempt:         sess.TokensUsedAttempt,
 		TokensUsedTotal:           sess.TokensUsedTotal,
+		TokenBudgetTokensAttempt:  sess.TokenBudgetTokensAttempt,
 		TokenBudgetMeasure:        tokenBudgetMeasure,
 		WorkerOutcome:             sess.WorkerOutcome,
 		ReleasedForRedispatch:     sess.ReleasedForRedispatch,

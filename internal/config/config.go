@@ -2214,7 +2214,7 @@ type Config struct {
 	MaxRuntimeMinutes               int                           `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes      int                           `yaml:"worker_silent_timeout_minutes"` // deprecated (#887): terminal-output-only kill; superseded by stalled_progress_watchdog. Kills a running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	StalledProgressWatchdog         StalledProgressWatchdogConfig `yaml:"stalled_progress_watchdog"`     // #887: explicit-opt-in durable multi-signal watchdog (20-minute max silence when enabled with no override)
-	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // per-attempt live token budget; Claude/Pi exclude cache reads (0 = unlimited)
 	WorkerSoftTokenThreshold        *float64                      `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue              int                           `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
 	AutoRebase                      bool                          `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)

@@ -1339,15 +1339,17 @@ func TestSessionIssueGuardRetryHoldIsVisibleButNotActionableFailure(t *testing.T
 
 func TestSessionTokenBudgetExceededAttentionAndDisplay(t *testing.T) {
 	sess := &Session{
-		Status:            StatusFailed,
-		WorkerOutcome:     string(DisplayTokenBudgetExceeded),
-		TokensUsedAttempt: 85_000,
+		Status:                   StatusFailed,
+		WorkerOutcome:            string(DisplayTokenBudgetExceeded),
+		TokensUsedAttempt:        200_506,
+		TokenBudgetTokensAttempt: 77_030,
+		TokenBudgetMeasure:       "uncached_tokens",
 	}
 	if got := SessionDisplayStatusFor(sess, nil); got != string(DisplayTokenBudgetExceeded) {
 		t.Fatalf("display = %q, want %q", got, DisplayTokenBudgetExceeded)
 	}
 	attention := SessionAttentionFor(sess, nil)
-	if !attention.NeedsAttention || !containsString(attention.Reason, "token budget") || !containsString(attention.NextAction, "worker_max_tokens") {
+	if !attention.NeedsAttention || !containsString(attention.Reason, "token budget") || !containsString(attention.Reason, "77030 uncached_tokens") || containsString(attention.Reason, "200506") || !containsString(attention.NextAction, "worker_max_tokens") {
 		t.Fatalf("attention = %+v, want deterministic budget guidance", attention)
 	}
 }

@@ -1494,8 +1494,11 @@ function WorkerSpendSection({ worker, fleet }) {
   if (!worker) return null;
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const budgetTokens = Number(
+    worker.token_budget_measure ? worker.token_budget_tokens_attempt || 0 : attemptTokens,
+  );
   const maxTokens = Number(worker.worker_max_tokens || 0);
-  const budgetMeasure = String(worker.token_budget_measure || "uncached_tokens");
+  const budgetMeasure = String(worker.token_budget_measure || "provider_total_tokens_legacy");
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -1525,10 +1528,10 @@ function WorkerSpendSection({ worker, fleet }) {
       {maxTokens > 0 && (
         <div className="kv">
           <span>
-            Configured cap ({budgetMeasure === "uncached_tokens" ? "uncached tokens" : budgetMeasure})
+            Budget use ({budgetMeasure === "uncached_tokens" ? "uncached tokens" : budgetMeasure.replaceAll("_", " ")})
           </span>
           <strong className="mono">
-            {formatTokens(maxTokens)} tok
+            {formatTokens(budgetTokens)} / {formatTokens(maxTokens)} tok
           </strong>
         </div>
       )}

@@ -28,6 +28,9 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.CostUSDBackend = 0
 	sess.UsageTokensWatermark = 0
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensWatermark = 0
+	sess.TokenBudgetTokensAttempt = 0
+	sess.TokenBudgetMeasure = ""
 	sess.WorkerOutcome = ""
 	sess.WorkerLeaseID = ""
 	sess.WorkerLeaseUnit = ""

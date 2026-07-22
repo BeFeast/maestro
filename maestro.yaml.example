@@ -18,7 +18,7 @@ stalled_progress_watchdog:         # explicit opt-in; evaluates independently of
   enabled: true
   max_silence_minutes: 20          # recommendation threshold; current v1 does not actuate recovery
   eval_interval_seconds: 60
-worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
+worker_max_tokens: 0               # per-attempt live budget; Claude/Pi exclude cache reads (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 # One-shot SSH runner spike. Default off; see docs/remote-runner-spike.md.
 # The v1 path requires auto_rebase: false and keeps SQLite/control-plane state local.

@@ -35,6 +35,7 @@ import (
 	"github.com/befeast/maestro/internal/statestore"
 	"github.com/befeast/maestro/internal/tmpfshygiene"
 	"github.com/befeast/maestro/internal/webhook"
+	"github.com/befeast/maestro/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -1919,17 +1920,18 @@ type fleetWorkerState struct {
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
-	BackendSelection   *state.BackendSelection `json:"backend_selection,omitempty"`
-	PRNumber           int                     `json:"pr_number,omitempty"`
-	PRMerged           bool                    `json:"pr_merged,omitempty"`
-	PRURL              string                  `json:"pr_url,omitempty"`
-	OperatorGateName   string                  `json:"operator_gate_name,omitempty"`
-	OperatorGateAction string                  `json:"operator_gate_required_action,omitempty"`
-	TokensUsedAttempt  int                     `json:"tokens_used_attempt"`
-	TokensUsedTotal    int                     `json:"tokens_used_total"`
-	WorkerMaxTokens    int                     `json:"worker_max_tokens,omitempty"`
-	TokenBudgetMeasure string                  `json:"token_budget_measure,omitempty"`
-	WorkerOutcome      string                  `json:"worker_outcome,omitempty"`
+	BackendSelection         *state.BackendSelection `json:"backend_selection,omitempty"`
+	PRNumber                 int                     `json:"pr_number,omitempty"`
+	PRMerged                 bool                    `json:"pr_merged,omitempty"`
+	PRURL                    string                  `json:"pr_url,omitempty"`
+	OperatorGateName         string                  `json:"operator_gate_name,omitempty"`
+	OperatorGateAction       string                  `json:"operator_gate_required_action,omitempty"`
+	TokensUsedAttempt        int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal          int                     `json:"tokens_used_total"`
+	TokenBudgetTokensAttempt int                     `json:"token_budget_tokens_attempt,omitempty"`
+	WorkerMaxTokens          int                     `json:"worker_max_tokens,omitempty"`
+	TokenBudgetMeasure       string                  `json:"token_budget_measure,omitempty"`
+	WorkerOutcome            string                  `json:"worker_outcome,omitempty"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
 	// project's configured per-backend pricing (#619), OR the backend's
 	// self-reported cost when present (#730, Pi --mode json cost.total). 0
@@ -6199,10 +6201,14 @@ func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
 	return worker.NeedsAttention || worker.Live
 }
 
+func fleetTokenBudgetMeasureForBackend(backend string) string {
+	return worker.TokenBudgetMeasureForBackend(backend)
+}
+
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
 	tokenBudgetMeasure := worker.TokenBudgetMeasure
 	if project.EffectiveConfig.CostCaps.WorkerMaxTokens > 0 && tokenBudgetMeasure == "" {
-		tokenBudgetMeasure = "uncached_tokens"
+		tokenBudgetMeasure = fleetTokenBudgetMeasureForBackend(worker.Backend)
 	}
 	return fleetWorkerState{
 		ProjectName:               project.Name,
@@ -6251,6 +6257,7 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		OperatorGateAction:        worker.OperatorGateAction,
 		TokensUsedAttempt:         worker.TokensUsedAttempt,
 		TokensUsedTotal:           worker.TokensUsedTotal,
+		TokenBudgetTokensAttempt:  worker.TokenBudgetTokensAttempt,
 		WorkerMaxTokens:           project.EffectiveConfig.CostCaps.WorkerMaxTokens,
 		TokenBudgetMeasure:        tokenBudgetMeasure,
 		WorkerOutcome:             worker.WorkerOutcome,

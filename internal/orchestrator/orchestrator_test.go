@@ -3270,6 +3270,95 @@ func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
 	}
 }
 
+func TestCheckSessions_CacheReadExcludedFromClaudeAndPiBudgets(t *testing.T) {
+	softThreshold := 0.8
+	tests := []struct {
+		name       string
+		backend    string
+		backendDef config.BackendDef
+		stream     string
+		writeJSONL bool
+	}{
+		{
+			name:       "claude",
+			backend:    "claude",
+			backendDef: config.BackendDef{Cmd: "claude", Provider: "anthropic", UsageStream: true},
+			// fin-26 shape: almost all observed provider tokens are cache
+			// replay on the second assistant turn. Inclusive telemetry is
+			// 200,506, while the uncached budget measure is only 77,030.
+			stream:     claudeResultFrame(10, 30, 76_990, 123_476, 0, "working"),
+			writeJSONL: true,
+		},
+		{
+			name:       "pi",
+			backend:    "pi",
+			backendDef: config.BackendDef{Cmd: "pi", Provider: "pi"},
+			stream:     `{"type":"turn_end","message":{"role":"assistant","provider":"anthropic","model":"claude-opus","usage":{"input":10,"output":30,"cacheRead":123476,"cacheWrite":76990,"totalTokens":200506,"cost":{"total":0}}}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := &config.Config{
+				Repo:                     "owner/repo",
+				StateDir:                 dir,
+				WorkerMaxTokens:          160_000,
+				WorkerSoftTokenThreshold: &softThreshold,
+				MaxRuntimeMinutes:        999,
+				Model: config.ModelConfig{
+					Default:  tt.backend,
+					Backends: map[string]config.BackendDef{tt.backend: tt.backendDef},
+				},
+			}
+			tmuxOutput := tt.stream
+			if tt.writeJSONL {
+				tmuxOutput = "working"
+			}
+			o, stopped := newCheckSessionsOrchestrator(cfg, tmuxOutput)
+			checkpointed := 0
+			o.saveCheckpointFn = func(*state.Session) (string, error) {
+				checkpointed++
+				return "/tmp/CHECKPOINT.md", nil
+			}
+
+			logFile := filepath.Join(dir, "slot.log")
+			if tt.writeJSONL {
+				if err := os.WriteFile(worker.JSONLPathForLog(logFile), []byte(tt.stream), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := state.NewState()
+			s.Sessions["slot"] = &state.Session{
+				IssueNumber: 64,
+				Status:      state.StatusRunning,
+				PID:         1234,
+				TmuxSession: "maestro-slot",
+				Branch:      "feat/slot-64-budget",
+				Backend:     tt.backend,
+				LogFile:     logFile,
+				StartedAt:   time.Now().Add(-time.Minute),
+			}
+
+			o.checkSessions(s)
+
+			sess := s.Sessions["slot"]
+			if sess.Status != state.StatusRunning {
+				t.Fatalf("status = %q, want running; inclusive cache telemetry must not kill the worker", sess.Status)
+			}
+			if sess.TokensUsedAttempt != 200_506 || sess.TokensUsedTotal != 200_506 {
+				t.Fatalf("inclusive telemetry = %d/%d, want 200506/200506", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+			}
+			if sess.TokenBudgetTokensAttempt != 77_030 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+				t.Fatalf("budget observation = %d %q, want 77030 %q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+			}
+			if checkpointed != 0 || len(*stopped) != 0 {
+				t.Fatalf("cache replay triggered checkpoint/stop: checkpointed=%d stopped=%v", checkpointed, *stopped)
+			}
+		})
+	}
+}
+
 func TestCheckSessions_RunningInPlaceRetryKeepsWorkerRunning(t *testing.T) {
 	cfg := &config.Config{
 		Repo:              "owner/repo",
@@ -3513,6 +3602,7 @@ func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) 
 		Backend:        "claude",
 		TokensObserved: 85_000,
 		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
 		MeasuredAt:     time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
@@ -3553,8 +3643,11 @@ func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) 
 	if sess.PRNumber != 0 || sess.NextRetryAt != nil || sess.PID != 0 {
 		t.Fatalf("budget stop was reclassified as PR/retry/running: %+v", sess)
 	}
-	if sess.TokensUsedAttempt != 85_000 || sess.TokensUsedTotal != 85_000 {
-		t.Fatalf("tokens = %d/%d, want 85000/85000", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+	if sess.TokenBudgetTokensAttempt != 85_000 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("budget observation = %d %q, want 85000 %q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
+	if sess.TokensUsedAttempt != 0 || sess.TokensUsedTotal != 0 {
+		t.Fatalf("uncached marker polluted inclusive telemetry: attempt=%d total=%d", sess.TokensUsedAttempt, sess.TokensUsedTotal)
 	}
 }
 
@@ -9472,6 +9565,7 @@ func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
 			respawnedInPlace = append(respawnedInPlace, slotName)
 			sess.Status = state.StatusRunning
 			sess.TokensUsedAttempt = 0
+			sess.TokenBudgetTokensAttempt = 0
 			return nil
 		},
 	}
@@ -9547,6 +9641,7 @@ func TestCheckSessions_SoftThreshold_CheckpointRespawnKeepsTierOverride(t *testi
 			respawned++
 			sess.Status = state.StatusRunning
 			sess.TokensUsedAttempt = 0
+			sess.TokenBudgetTokensAttempt = 0
 			return nil
 		},
 	}
@@ -11354,10 +11449,14 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 		t.Fatalf("attempt1: total=%d wm=%d attempt=%d, want 773/773/773",
 			sess.TokensUsedTotal, sess.UsageTokensWatermark, sess.TokensUsedAttempt)
 	}
+	if sess.TokenBudgetTokensAttempt != 773 || sess.TokenBudgetTokensWatermark != 773 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("attempt1 budget=%d watermark=%d measure=%q, want 773/773/%q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
 
 	// Simulate respawn: per-attempt counter resets to 0 (checkpoint/worker/phase
 	// reset it), but UsageTokensWatermark persists across respawns.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the SAME appended log (cumulative 773) before the new turn
 	// lands — must NOT re-add the prior attempt's tokens.
@@ -11380,6 +11479,9 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 	}
 	if sess.TokensUsedAttempt != 1000 {
 		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.TokenBudgetTokensAttempt != 1000 {
+		t.Errorf("TokenBudgetTokensAttempt = %d, want 1000", sess.TokenBudgetTokensAttempt)
 	}
 	if sess.UsageTokensWatermark != 1773 {
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
@@ -11441,6 +11543,9 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
 	}
 	if sess.UsageTokensWatermark != 20076 {
 		t.Errorf("UsageTokensWatermark = %d, want 20076", sess.UsageTokensWatermark)
+	}
+	if sess.TokenBudgetTokensAttempt != 4415 || sess.TokenBudgetTokensWatermark != 4415 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Errorf("budget usage=%d watermark=%d measure=%q, want 4415/4415/%q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
 	}
 	if !approxCostEq(sess.CostUSDBackend, 0.0401785) {
 		t.Errorf("CostUSDBackend = %v, want 0.0401785", sess.CostUSDBackend)
@@ -11511,6 +11616,7 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 
 	// Respawn: per-attempt counter resets, watermark persists.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
 	if o.updateTokensUsedFromOutput("sup-737", sess, "") {
@@ -11533,6 +11639,9 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 	}
 	if sess.TokensUsedAttempt != 1000 {
 		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.TokenBudgetTokensAttempt != 1000 {
+		t.Errorf("TokenBudgetTokensAttempt = %d, want 1000", sess.TokenBudgetTokensAttempt)
 	}
 	if sess.UsageTokensWatermark != 1773 {
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
@@ -11628,6 +11737,7 @@ func TestUpdateTokensUsedFromOutput_CodexBackendRetryNoDoubleCount(t *testing.T)
 
 	// Respawn: per-attempt counter resets, watermark persists.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
 	if o.updateTokensUsedFromOutput("sup-738", sess, "") {
