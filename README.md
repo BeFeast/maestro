@@ -6,11 +6,11 @@ Replaces the previous `ao` (agent-orchestrator npm package) + shell scripts setu
 
 ## What it does
 
-maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini, Cline), each working on a separate GitHub issue in its own git worktree. It:
+maestro orchestrates multiple parallel AI coding agents (Claude, Codex, Gemini, Cline, Kimi), each working on a separate GitHub issue in its own git worktree. It:
 
 - Picks open GitHub issues matching a label (e.g. `enhancement`)
 - Creates git worktrees for each agent
-- Spawns the configured backend CLI (e.g. `claude`, `codex`, `gemini`, or `cline`) in each worktree with a task prompt
+- Spawns the configured backend CLI (e.g. `claude`, `codex`, `gemini`, `cline`, or `kimi`) in each worktree with a task prompt
 - Monitors agent progress (process alive? PR created? CI green?)
 - Auto-merges PRs when CI passes
 - Rebases PRs that have merge conflicts
@@ -74,7 +74,7 @@ Maestro integration.
 git --version        # any recent version
 gh --version         # 2.x+
 tmux -V              # any recent version
-claude --version     # or: codex --version / gemini --version / cline --version
+claude --version     # or: codex --version / gemini --version / cline --version / kimi --version
 gopls version        # optional; used for Go symbol context when available
 ```
 
@@ -314,6 +314,9 @@ model:
       cmd: gemini        # Google Gemini CLI
     cline:
       cmd: cline         # Cline CLI (e.g. SAP AI Core / any OpenAI-compatible provider)
+    kimi:
+      cmd: kimi          # Kimi Code CLI (print mode, stream-json)
+      provider: moonshot
 ```
 
 ### Supported backends
@@ -339,13 +342,18 @@ model:
 > Headless mode: `cline -y "task"` — auto-approves all actions and exits when done.
 > SAP AI Core example: set provider to `sapaicore`, model to `anthropic--claude-4.5-opus`.
 
+> [!NOTE]
+> **Kimi Code** — Moonshot AI Kimi Code CLI
+> Install/configure with the upstream Kimi Code instructions, then verify `kimi --version`.
+> Maestro runs `kimi --print --output-format=stream-json` with the worker prompt on stdin; print mode auto-approves tool calls.
+
 ### Custom-named backends
 
 Backends do not have to be named after the CLI they run. A custom key (e.g. a model nickname) keeps full CLI-specific behaviour — permission-bypass flags and stdin prompt delivery — as long as Maestro can tell which CLI it wraps. Resolution order:
 
-1. the backend name itself (`claude`, `codex`, `gemini`, `cline`),
-2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `cline` → Cline),
-3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `cline`).
+1. the backend name itself (`claude`, `codex`, `gemini`, `cline`, `kimi`),
+2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `cline` → Cline, `moonshot`/`kimi` → Kimi),
+3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `cline`, `kimi`).
 
 ```yaml
 model:
@@ -357,11 +365,14 @@ model:
     fast:
       provider: openai       # → codex exec path (exec, bypass flag, prompt via stdin)
       cmd: codex --profile fast
+    kimi-k2:
+      provider: moonshot     # → kimi print path (stream-json, prompt via stdin)
+      cmd: kimi
 ```
 
 A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
 
-### Claude / Codex usage capture (tokens + cost)
+### Claude / Codex / Kimi usage capture (tokens + cost)
 
 Plain `claude -p` text mode prints no parseable token total, and `codex exec` text mode only prints a fuzzy single total — so a worker's `tokens_used_total` and USD cost are unreliable or `0`. Opt a `claude` or `codex` backend into structured usage capture with `usage_stream: true`:
 
@@ -380,7 +391,10 @@ model:
         output_usd_per_mtok: 10
 ```
 
-When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
+When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. Claude and Codex are off by default, and an operator-pinned `--output-format` or `--json` overrides their managed format. Kimi always uses the same splitter in `--print --output-format=stream-json` mode and needs no `usage_stream` opt-in. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Claude reports its own `total_cost_usd`; codex and Kimi do not, so their cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
+
+For Kimi native authentication versus CLIProxyAPI custom-provider routing, see
+the [project setup runbook](docs/project-setup-runbook.md#kimi-code-worker-authentication-and-proxy-routing).
 
 #### Claude harness through CLIProxyAPI: non-Anthropic telemetry smoke (2026-07-21)
 
@@ -451,8 +465,10 @@ Maestro fails the worker start closed if the selected backend/output mode cannot
 enforce a live ceiling. Claude, Pi, and OpenCode stop from their usage event
 stream; Codex combines cumulative rollout `token_count` telemetry with its
 native rollout budget inside the agent loop (`--ephemeral` is rejected).
-Enforcement lags by at most one provider response, not by the orchestration poll
-interval.
+Kimi's stream currently supports accounting but is not accepted as a reliable
+live ceiling, so a positive `worker_max_tokens` rejects Kimi at worker start.
+Enforcement for supported backends lags by at most one provider response, not by
+the orchestration poll interval.
 
 ### Optional worker MCP tools
 
@@ -823,8 +839,8 @@ maestro logs <slot>    # e.g. maestro logs pan-1
 ```
 
 Common causes:
-- AI CLI not authenticated/configured — run `claude auth` (or `codex auth` / `gemini auth`); for Cline, configure provider credentials in `~/.cline/data/globalState.json` + `secrets.json`
-- AI CLI not found in PATH — verify with `which claude` / `which codex` / `which gemini` / `which cline`, or use an absolute path in config: `cmd: /usr/local/bin/claude`
+- AI CLI not authenticated/configured — run `claude auth` (or `codex auth` / `gemini auth`); for Cline or Kimi, complete the CLI's provider setup in its user configuration
+- AI CLI not found in PATH — verify with `which claude` / `which codex` / `which gemini` / `which cline` / `which kimi`, or use an absolute path in config: `cmd: /usr/local/bin/claude`
 - Git worktree creation failed (ensure the local repo clone is clean)
 
 ### `maestro run` exits with "load config" error
@@ -907,7 +923,7 @@ maestro spawn --issue <number>   # retry the issue
 - `gopkg.in/yaml.v3` (config parsing)
 - `gh` CLI (GitHub operations)
 - `git` (worktree management)
-- `claude` / `codex` / `gemini` / `cline` CLI (agent invocation — at least one required)
+- `claude` / `codex` / `gemini` / `cline` / `kimi` CLI (agent invocation — at least one required)
 
 ## Acknowledgments
 

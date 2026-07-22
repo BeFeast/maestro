@@ -330,6 +330,40 @@ model:
 
 `model.backends.<name>.effort` is the backend's default reasoning-effort policy for newly started workers. For Claude-compatible workers Maestro emits `--effort <value>`; for Codex-compatible workers it emits `-c model_reasoning_effort=<value>`; backends without a supported effort flag receive no effort flag. A configured backend effort replaces stale effort pins in Claude/Codex `cmd` or `extra_args`; routing-tier or pipeline phase effort overrides are narrower per-dispatch overrides and are shown in backend-selection/effective-config surfaces so an operator can tell whether the backend default or the dispatch override applied.
 
+### Kimi Code worker authentication and proxy routing
+
+Register Kimi Code as a Moonshot backend so Maestro selects its first-class
+print-mode path:
+
+```yaml
+model:
+  default: kimi
+  backends:
+    kimi:
+      cmd: kimi
+      provider: moonshot
+```
+
+Authenticate in one of two operator-owned ways:
+
+- Native Moonshot: complete Kimi Code's normal login/setup flow as the service
+  user. The resulting Kimi user configuration stays outside the repository and
+  outside Maestro project YAML.
+- CLIProxyAPI: define an OpenAI-compatible custom provider and model alias in
+  Kimi Code's user configuration, point it at the proxy endpoint, and select
+  that alias as Kimi's default model (or pin it in Kimi CLI arguments). Keep the
+  proxy credential in the existing private worker-credential boundary; never
+  copy it into a repository, issue, worker prompt, or Maestro config row.
+
+The Maestro `provider: moonshot` value selects the Kimi command builder; Kimi's
+own provider/model configuration decides whether requests go directly to
+Moonshot or through CLIProxyAPI. Maestro runs workers as
+`kimi --print --output-format=stream-json` with the prompt on stdin and records
+split usage for history and cost observability. Kimi does not currently expose
+a stream Maestro accepts as a reliable live hard ceiling, so projects using
+this backend must leave `worker_max_tokens: 0`; a positive value fails worker
+startup closed.
+
 ### Provider-local defaults and fallbacks
 
 Use provider lanes when the project should exhaust models within one provider

@@ -108,6 +108,9 @@ The ceiling fails closed when Maestro cannot enforce it live:
   rollout telemetry file.
 - Pi must retain Maestro-managed JSON mode.
 - OpenCode requires `usage_stream: true` with Maestro-managed JSON output.
+- Kimi's print-mode stream is captured for token/cost accounting but is not
+  currently accepted as a reliable live ceiling, so Kimi is rejected while a
+  positive `worker_max_tokens` is active.
 - Gemini, Cline, generic CLIs, and operator-overridden non-structured output
   cannot start while a positive `worker_max_tokens` is active.
 
