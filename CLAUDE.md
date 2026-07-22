@@ -35,3 +35,14 @@ from the repo root) working in the maestro repository.
 - `gofmt` changed Go files.
 - `go test ./...`
 - `go build ./cmd/maestro/`
+
+## Entire Local History (Maestro dogfood only)
+
+Entire is optional and local-only for the public `BeFeast/maestro` dogfood
+repo. If `command -v entire` succeeds and `entire status` shows enabled, a
+worker may run the read-only `entire search` or `entire why` commands to recover
+prior intent.
+
+Do not run `entire login`, create an Entire mirror, push any `entire/*` branch,
+or set `strategy_options.push_sessions` to `true`. Entire rewind/resume is not
+Maestro recovery; use Maestro's `CHECKPOINT.md` and respawn flow instead.
