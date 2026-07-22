@@ -9785,29 +9785,26 @@ func (o *Orchestrator) completeFreshDispatch(s *state.State, claim *state.FreshD
 	return nil
 }
 
-func (o *Orchestrator) releaseFreshDispatch(s *state.State, claim *state.FreshDispatchClaim, reason string) {
-	if claim == nil || !o.durableFreshDispatchClaimsEnabled() {
-		return
+func (o *Orchestrator) supersedeFreshDispatch(s *state.State, claim *state.FreshDispatchClaim, terminalReason string, now time.Time) error {
+	if claim == nil {
+		return nil
 	}
-	now := time.Now().UTC()
+	var superseded state.FreshDispatchClaim
 	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
-		return latest.SupersedeFreshDispatch(claim.IssueNumber, claim.LeaseID, reason, now)
+		if err := latest.SupersedeFreshDispatch(claim.IssueNumber, claim.LeaseID, terminalReason, now); err != nil {
+			return err
+		}
+		superseded = *latest.FreshDispatchClaims[claim.IssueNumber]
+		return nil
 	}); err != nil {
-		log.Printf("[orch] release fresh dispatch for issue #%d: %v", claim.IssueNumber, err)
-		return
+		return err
 	}
 	if s.FreshDispatchClaims == nil {
-		return
+		s.FreshDispatchClaims = make(map[int]*state.FreshDispatchClaim)
 	}
-	copy := *claim
-	copy.Status = state.FreshDispatchClaimStatusSuperseded
-	copy.UpdatedAt = now
-	copy.LeaseExpiresAt = time.Time{}
-	if strings.TrimSpace(reason) == "" {
-		reason = "start_failed"
-	}
-	copy.TerminalReason = reason
+	copy := superseded
 	s.FreshDispatchClaims[claim.IssueNumber] = &copy
+	return nil
 }
 
 func (o *Orchestrator) reconcileFreshDispatchClaims(s *state.State, now time.Time) {
@@ -10207,14 +10204,17 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if err != nil {
 			permit.Release()
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
+			// #1100: release the pre-spawn lease immediately so a failed start
+			// cannot leave the issue claimed with no worker. The next dispatch
+			// reuses this exact reserved slot, branch, and worktree, preventing
+			// repeated setup failures from leaking a new worktree each cycle.
+			if freshClaim != nil {
+				if supersedeErr := o.supersedeFreshDispatch(s, freshClaim, "start_failed", time.Now().UTC()); supersedeErr != nil {
+					log.Printf("[orch] supersede failed fresh dispatch for issue #%d on %s: %v (lease remains authoritative)", issue.Number, freshClaim.Slot, supersedeErr)
+				}
+			}
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
 				issue.Number, issue.Title, err)
-			// #1100: release the pre-spawn lease immediately so a failed start
-			// (dirty base, worktree create, hooks, …) does not leave status=claimed
-			// for freshDispatchLeaseDuration and starve the issue as "in progress".
-			if freshClaim != nil {
-				o.releaseFreshDispatch(s, freshClaim, "start_failed")
-			}
 			// #874: a review-repair dispatch claimed a (pr,head) attempt via
 			// tryClaimReviewRepairSlot BEFORE this start; release it so a failed
 			// start does not burn a slot from the bounded repair budget and leave

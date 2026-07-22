@@ -76,8 +76,8 @@ func SyncBaseBranch(localPath, branch string) error {
 	if strings.TrimSpace(head) == branch {
 		// Base branch is checked out: refuse a dirty *tracked* tree, then
 		// fast-forward merge. Untracked agent harness dirs (.claude/.codex/…)
-		// must not block sync — merge --ff-only does not touch them, and
-		// workers commonly leave those dirs in the shared base checkout (#1100).
+		// normally do not affect an ff-only merge and commonly live in the shared
+		// base checkout, so they must not freeze fleet spawn (#1100).
 		if dirty, err := baseCheckoutBlockingDirt(localPath); err != nil {
 			return fmt.Errorf("sync base branch %q: %w", branch, err)
 		} else if dirty != "" {
