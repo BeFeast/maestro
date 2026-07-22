@@ -129,7 +129,14 @@ func (o *Orchestrator) dispatchHoldForCycle(s *state.State, capacity state.Capac
 			}
 		}
 	}
-	return state.DispatchHold{}
+	// Empty ready with 0 live workers is still an idle stall — not a healthy
+	// quiet fleet. Surface it so operators get notified instead of discovering
+	// 0 workers by hand (F8 companion, 2026-07-22).
+	return state.DispatchHold{
+		Active:      true,
+		ReasonClass: state.DispatchHoldQueueEmpty,
+		Detail:      "no live workers and no eligible ready issues to dispatch",
+	}
 }
 
 func blockingOutcomeDispatchHold(s *state.State) (state.DispatchHold, bool) {
