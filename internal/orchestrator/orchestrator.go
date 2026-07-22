@@ -4970,22 +4970,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if !found {
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
-					// A no-PR terminal sibling is not an issue-level blocker when
-					// another open PR already owns the issue. In particular, it must
-					// not apply the blocked label behind the canonical PR's back.
-					// Preserve the sibling for commit handoff and let the canonical
-					// PR maintenance path converge in place.
-					canonicalOpen := false
-					for _, openPR := range prs {
-						if github.PRReferencesIssue(openPR, sess.IssueNumber) {
-							canonicalOpen = true
-							break
-						}
-					}
-					if canonicalOpen {
-						log.Printf("[orch] no-PR retry_exhausted session %s for issue #%d is superseded by an open canonical PR — preserving sibling work without blocking the issue", slotName, sess.IssueNumber)
-						continue
-					}
 					// #577: worker exhausted retries without ever producing a PR
 					// (e.g. the issue was already implemented by a prior merge via
 					// `Refs #N`, so the worker found zero diff). Without action the
@@ -4995,7 +4979,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					// already closes it and auto-close is allowed) or label it
 					// blocked so the supervisor's dynamic-wave drops it and picks
 					// the next eligible candidate.
-					o.reconcileNoPRRetryExhausted(s, slotName, sess)
+					o.reconcileNoPRRetryExhausted(s, slotName, sess, prs)
 					continue
 				}
 				// #818: retry_exhausted session records a PR, but no open PR
@@ -5773,10 +5757,195 @@ func mergeFlowPRForSession(sess *state.Session, byBranch map[string]github.PR, b
 	return github.PR{}, false
 }
 
-// noPRReconciledStatus marks a retry_exhausted session whose worker never
-// produced a PR as having been reconciled by autoMergePRs. The marker keeps
-// the reconciliation idempotent so subsequent cycles do not re-label, re-close,
-// or re-notify, and so the "waiting for reconciliation" log stops firing.
+// prBelongsToIssue reports whether an already-fetched PR is part of the
+// issue's aggregate session state. The durable session identity is important:
+// worker PR bodies use non-closing references, and historical/manual PRs may
+// omit an issue reference entirely even though their owning session records the
+// exact issue, PR number, and branch.
+func prBelongsToIssue(s *state.State, issueNumber int, pr github.PR) bool {
+	if issueNumber <= 0 {
+		return false
+	}
+	if github.PRReferencesIssue(pr, issueNumber) {
+		return true
+	}
+	if s == nil {
+		return false
+	}
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber {
+			continue
+		}
+		if pr.Number > 0 && (sess.PRNumber == pr.Number || sess.LastClosedPRNumber == pr.Number) {
+			return true
+		}
+		if branch := strings.TrimSpace(sess.Branch); branch != "" && branch == pr.HeadRefName {
+			return true
+		}
+	}
+	return false
+}
+
+func openPRForIssueState(s *state.State, issueNumber int, prs []github.PR) (github.PR, bool) {
+	for _, pr := range prs {
+		if prBelongsToIssue(s, issueNumber, pr) {
+			return pr, true
+		}
+	}
+	return github.PR{}, false
+}
+
+// mergedPRForIssueState checks the issue's aggregate durable identity before a
+// no-PR retry_exhausted slot is allowed to block it. It recognizes a merged PR
+// owned by any sibling session even when the PR used only `Refs #N` (or no
+// textual reference), then falls back to the legacy closing-keyword lookup for
+// historical work without a retained session.
+func (o *Orchestrator) mergedPRForIssueState(s *state.State, issueNumber int) (int, bool, error) {
+	if issueNumber <= 0 {
+		return 0, false, nil
+	}
+
+	seen := make(map[int]struct{})
+	var firstErr error
+	checkPR := func(prNumber int) (int, bool) {
+		if prNumber <= 0 {
+			return 0, false
+		}
+		if _, ok := seen[prNumber]; ok {
+			return 0, false
+		}
+		seen[prNumber] = struct{}{}
+		merged, err := o.isPRMerged(prNumber)
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("check PR #%d: %w", prNumber, err)
+			}
+			return 0, false
+		}
+		if merged {
+			return prNumber, true
+		}
+		return 0, false
+	}
+
+	if s != nil {
+		for _, slotName := range sortedStateSessionNames(s) {
+			sess := s.Sessions[slotName]
+			if sess == nil || sess.IssueNumber != issueNumber {
+				continue
+			}
+			if prNumber, merged := checkPR(sess.PRNumber); merged {
+				return prNumber, true, nil
+			}
+			if prNumber, merged := checkPR(sess.LastClosedPRNumber); merged {
+				return prNumber, true, nil
+			}
+		}
+	}
+
+	// During a real cycle the shared closed-PR snapshot lets this path detect
+	// bare non-closing references without one subprocess per stale slot. Direct
+	// unit callers opt in by injecting listClosedPRsFn; otherwise preserve the
+	// legacy hasMergedPRForIssue test surface below.
+	if o.cycleActive || o.listClosedPRsFn != nil {
+		prs, err := o.listClosedPRsForCycle()
+		if err != nil {
+			if firstErr == nil {
+				firstErr = fmt.Errorf("list closed PRs: %w", err)
+			}
+		} else {
+			for _, pr := range prs {
+				if pr.MergedAt != "" && prBelongsToIssue(s, issueNumber, pr) {
+					return pr.Number, true, nil
+				}
+			}
+		}
+	}
+
+	merged, err := o.hasMergedPRForIssue(issueNumber)
+	if err != nil {
+		if firstErr != nil {
+			return 0, false, fmt.Errorf("aggregate merged-PR state unavailable (%v; legacy lookup: %w)", firstErr, err)
+		}
+		return 0, false, err
+	}
+	if merged {
+		prNumber := 0
+		if o.mergedPRForIssueFn != nil || o.gh != nil {
+			if resolved, resolveErr := o.mergedPRForIssue(issueNumber); resolveErr == nil {
+				prNumber = resolved
+			}
+		}
+		return prNumber, true, nil
+	}
+	if firstErr != nil {
+		return 0, false, firstErr
+	}
+	return 0, false, nil
+}
+
+// settleNoPRRetryExhaustedSiblings retires every stale no-PR terminal slot for
+// an issue after authoritative issue-level state proves that blocking is moot.
+// It intentionally does not sync the project board: a stale slot must never
+// overwrite the live/closed issue's aggregate status. skipSlot remains the
+// canonical code_landed owner when delivery approval is required.
+func settleNoPRRetryExhaustedSiblings(s *state.State, issueNumber int, skipSlot string, issueClosed bool, now time.Time) int {
+	if s == nil || issueNumber <= 0 {
+		return 0
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	settled := 0
+	for _, slotName := range sortedStateSessionNames(s) {
+		if slotName == skipSlot {
+			continue
+		}
+		sess := s.Sessions[slotName]
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusRetryExhausted || sess.PRNumber != 0 {
+			continue
+		}
+		sess.Status = state.StatusDone
+		sess.LastNotifiedStatus = noPRReconciledStatus
+		sess.NextRetryAt = nil
+		sess.RetryHoldReason = ""
+		sess.RestartCheckpointAt = nil
+		sess.ReleasedForRedispatch = true
+		if sess.FinishedAt == nil {
+			sess.FinishedAt = &now
+		}
+		state.MarkWorkerEnded(sess, now)
+		if issueClosed {
+			sess.IssueClosedAt = &now
+			sess.LastTerminalReconcileAt = &now
+		}
+		settled++
+	}
+	return settled
+}
+
+func markNoPRRetryExhaustedReconciled(s *state.State, issueNumber int) int {
+	if s == nil || issueNumber <= 0 {
+		return 0
+	}
+	marked := 0
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber || sess.Status != state.StatusRetryExhausted || sess.PRNumber != 0 {
+			continue
+		}
+		if sess.LastNotifiedStatus != noPRReconciledStatus {
+			sess.LastNotifiedStatus = noPRReconciledStatus
+			marked++
+		}
+	}
+	return marked
+}
+
+// noPRReconciledStatus marks no-PR retry_exhausted sessions for one issue after
+// their aggregate issue outcome has been reconciled by autoMergePRs. Marking
+// every stale sibling keeps later map iterations and subsequent cycles from
+// re-labelling, re-closing, re-syncing, or re-notifying per slot.
 const noPRReconciledStatus = "no_pr_reconciled"
 
 // closedPRCloseRetryStatus marks a merged-PR retry_exhausted session whose
@@ -5790,11 +5959,11 @@ const closedPRCloseRetryStatus = "closed_pr_close_retry"
 // retries without opening a PR (often because the issue was already
 // implemented by a prior merge via `Refs #N`), so the merge flow has nothing
 // to advance, the session is terminal, and at max_parallel=1 the dynamic-wave
-// queue halts. This helper runs once per session: it auto-closes the issue
-// when a merged PR already closes it (and close_issue is a configured safe
-// action), otherwise it adds the configured blocked label so the supervisor
-// drops the issue from the wave and selects the next eligible candidate.
-func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName string, sess *state.Session) {
+// queue halts. This helper first evaluates the current issue-level state. An
+// open sibling PR preserves the stale slots, while a closed issue or merged
+// sibling PR retires them. Only a genuinely stuck issue receives the configured
+// blocked label, once for the aggregate issue rather than once per slot.
+func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName string, sess *state.Session, openPRs []github.PR) {
 	if sess == nil || sess.IssueNumber <= 0 {
 		return
 	}
@@ -5804,11 +5973,27 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName stri
 		return
 	}
 
-	merged, err := o.hasMergedPRForIssue(sess.IssueNumber)
+	closed, err := o.isIssueClosed(sess.IssueNumber)
+	if err != nil {
+		log.Printf("[orch] no-PR retry_exhausted: could not check issue #%d state (slot %s): %v", sess.IssueNumber, slotName, err)
+		return
+	}
+	if closed {
+		settled := settleNoPRRetryExhaustedSiblings(s, sess.IssueNumber, "", true, time.Now().UTC())
+		log.Printf("[orch] no-PR retry_exhausted: issue #%d is already closed; reconciled %d stale no-PR slot(s) to done without applying blocked or syncing stale slot status", sess.IssueNumber, settled)
+		return
+	}
+
+	if openPR, ok := openPRForIssueState(s, sess.IssueNumber, openPRs); ok {
+		log.Printf("[orch] no-PR retry_exhausted: issue #%d has open PR #%d in aggregate session state; slot %s is superseded in flight, preserving it without applying blocked", sess.IssueNumber, openPR.Number, slotName)
+		return
+	}
+
+	mergedPR, merged, err := o.mergedPRForIssueState(s, sess.IssueNumber)
 	if err != nil {
 		// Don't mark reconciled on transient GitHub failure; try again next
 		// cycle. Log so operators can correlate with API errors.
-		log.Printf("[orch] no-PR retry_exhausted: could not check merged PR for issue #%d (slot %s): %v", sess.IssueNumber, slotName, err)
+		log.Printf("[orch] no-PR retry_exhausted: could not check aggregate merged PR state for issue #%d (slot %s): %v", sess.IssueNumber, slotName, err)
 		return
 	}
 
@@ -5817,12 +6002,20 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName stri
 		// approval_required mode it must enter the standing delivery gate before
 		// this retry-reconciliation path may close the issue or report Done.
 		if o.approvalRequiredDeliveryEnabled() {
-			prNumber, prErr := o.mergedPRForIssue(sess.IssueNumber)
+			prNumber := mergedPR
+			var prErr error
+			if prNumber <= 0 {
+				prNumber, prErr = o.mergedPRForIssue(sess.IssueNumber)
+			}
 			if prErr != nil || prNumber <= 0 {
 				log.Printf("[orch] no-PR retry_exhausted: merged work for issue #%d could not be pinned to a PR for delivery: %v — holding", sess.IssueNumber, prErr)
 				return
 			}
 			o.markCodeLanded(sess, prNumber)
+			settled := settleNoPRRetryExhaustedSiblings(s, sess.IssueNumber, slotName, false, time.Now().UTC())
+			if settled > 0 {
+				log.Printf("[orch] no-PR retry_exhausted: merged PR #%d owns issue #%d; reconciled %d stale sibling slot(s) to done while slot %s holds delivery", prNumber, sess.IssueNumber, settled, slotName)
+			}
 			if !o.reconcileCodeLandedDelivery(s, sess) {
 				log.Printf("[orch] no-PR retry_exhausted: issue #%d is held in code_landed for delivery approval", sess.IssueNumber)
 			}
@@ -5833,6 +6026,7 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName stri
 		// action without an approval gate; otherwise surface it as a
 		// close-candidate via notification.
 		comment := fmt.Sprintf("Maestro: closing this issue because worker session %s exhausted retries without producing a PR (the work appears to be implemented by an already-merged PR).", slotName)
+		issueNowClosed := false
 		if o.supervisorActionAllowed(config.SupervisorActionCloseIssue) && !o.supervisorActionRequiresApproval(config.SupervisorActionCloseIssue) {
 			if cerr := o.closeIssue(sess.IssueNumber, comment); cerr != nil {
 				log.Printf("[orch] no-PR retry_exhausted: auto-close failed for issue #%d (slot %s): %v", sess.IssueNumber, slotName, cerr)
@@ -5846,12 +6040,20 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName stri
 				o.notifier.Sendf("✅ maestro: closed issue #%d after retry_exhausted with no PR (already implemented by a merged PR)", sess.IssueNumber)
 			}
 			o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+			issueNowClosed = true
 		} else {
 			log.Printf("[orch] no-PR retry_exhausted: issue #%d (slot %s) has a merged PR — surfaced as operator close-candidate", sess.IssueNumber, slotName)
 			if o.notifier != nil {
 				o.notifier.Sendf("⚠️ maestro: issue #%d retry_exhausted with no PR; a merged PR already implements it — operator close-candidate", sess.IssueNumber)
 			}
 		}
+		settled := settleNoPRRetryExhaustedSiblings(s, sess.IssueNumber, "", issueNowClosed, time.Now().UTC())
+		if mergedPR > 0 {
+			log.Printf("[orch] no-PR retry_exhausted: merged PR #%d owns issue #%d; reconciled %d stale no-PR slot(s) to done without applying blocked", mergedPR, sess.IssueNumber, settled)
+		} else {
+			log.Printf("[orch] no-PR retry_exhausted: merged work owns issue #%d; reconciled %d stale no-PR slot(s) to done without applying blocked", sess.IssueNumber, settled)
+		}
+		return
 	} else {
 		// No merged PR detected — apply the configured blocked label so the
 		// supervisor's dynamic-wave skips this issue on the next cycle and
@@ -5874,10 +6076,10 @@ func (o *Orchestrator) reconcileNoPRRetryExhausted(s *state.State, slotName stri
 		o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
 	}
 
-	// Mark the session reconciled so future cycles short-circuit. The status
-	// stays retry_exhausted (terminal) but the marker prevents repeated
-	// labels, close attempts, or notifications.
-	sess.LastNotifiedStatus = noPRReconciledStatus
+	// A genuinely stuck issue keeps every historical retry_exhausted status,
+	// but the issue-level marker prevents sibling slots from repeating the same
+	// label, status sync, and notification later in this or a future cycle.
+	markNoPRRetryExhaustedReconciled(s, sess.IssueNumber)
 }
 
 // reconcileClosedPRRetryExhausted handles retry_exhausted sessions whose PR
