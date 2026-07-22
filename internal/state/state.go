@@ -4145,14 +4145,16 @@ func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
 			continue
 		}
 		snapshot.Sessions = append(snapshot.Sessions, approvalSessionSnapshot{
-			Slot:        name,
-			IssueNumber: sess.IssueNumber,
-			Status:      sess.Status,
-			Branch:      sess.Branch,
-			PRNumber:    sess.PRNumber,
-			FinishedAt:  sess.FinishedAt,
-			RetryCount:  sess.RetryCount,
-			NextRetryAt: sess.NextRetryAt,
+			Slot:             name,
+			IssueNumber:      sess.IssueNumber,
+			Status:           sess.Status,
+			Branch:           sess.Branch,
+			PRNumber:         sess.PRNumber,
+			StartedAt:        sess.StartedAt,
+			WorkerGeneration: sess.WorkerGeneration,
+			FinishedAt:       sess.FinishedAt,
+			RetryCount:       sess.RetryCount,
+			NextRetryAt:      sess.NextRetryAt,
 		})
 	}
 	return stableHash(snapshot)
@@ -4223,9 +4225,15 @@ type approvalSessionSnapshot struct {
 	Status      SessionStatus `json:"status"`
 	Branch      string        `json:"branch,omitempty"`
 	PRNumber    int           `json:"pr_number,omitempty"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	RetryCount  int           `json:"retry_count,omitempty"`
-	NextRetryAt *time.Time    `json:"next_retry_at,omitempty"`
+	// StartedAt and WorkerGeneration identify the exact worker attempt. An
+	// in-place respawn can return every other projected field to its prior value
+	// while replacing the process an earlier worker-control approval addressed
+	// (#964). StartedAt also fences legacy sessions whose generation is zero.
+	StartedAt        time.Time  `json:"started_at"`
+	WorkerGeneration uint64     `json:"worker_generation,omitempty"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	RetryCount       int        `json:"retry_count,omitempty"`
+	NextRetryAt      *time.Time `json:"next_retry_at,omitempty"`
 }
 
 func approvalID(decision SupervisorDecision, createdAt time.Time) string {
