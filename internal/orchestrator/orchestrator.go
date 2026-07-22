@@ -9436,7 +9436,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			if !repairSpawn {
 				continue
 			}
-		} else if freshDispatchPending && s.IssueHasNonFreshClaim(issue.Number) {
+		} else if freshDispatchPending && s.IssueHasNonFreshClaim(issue.Number) && !repairSpawn {
+			// A selected repair must reach dispatchSpawnRepairWorker so its
+			// exact-session revalidation can see the earlier fresh claim and
+			// terminalize the competing repair authority. Skipping here would
+			// leave both claims active, while revoking the startup lease would
+			// reopen the duplicate-worker race.
 			log.Printf("[orch] refusing fresh dispatch renewal for issue #%d: a canonical session/PR claim appeared", issue.Number)
 			continue
 		}
