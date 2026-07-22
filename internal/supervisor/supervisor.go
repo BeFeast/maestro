@@ -669,6 +669,9 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	projectState.OpenPRNumbers = supervisorOpenPRNumbers(prs)
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
+	var deferredOpenPR *deferredOpenPRMonitor
+	var deferredBudgetSlot string
+	var deferredBudgetSess *state.Session
 
 	if slot, sess, pr, mergeReady, mergeHeadSHA, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		// #565: auto review-repair respawn. When a green+mergeable PR is
@@ -737,28 +740,35 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			return decision, nil
 		}
 
-		// PR exists but is not yet merge-ready. Stay on monitor_open_pr but
-		// surface the actual blocker (CI pending, review missing, draft, etc.)
-		// in the summary instead of claiming auto-merge will happen.
-		monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
-		summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
-			"No GitHub mutation is needed for supervisor mode",
-		)
-		reasons = appendReasons(reasons, monitorReasons...)
-		if sess.Status == state.StatusRetryExhausted {
-			reasons = appendReasons(reasons,
-				fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
-				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+		// Hands-off fill (2026-07-22): a non-urgent open PR must NOT starve
+		// spare capacity when backlog exists. Defer monitor_open_pr until we
+		// know whether eligible backlog remains; if none, resume monitoring.
+		if projectState.AvailableSlots <= 0 {
+			monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
+			summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
+				"No GitHub mutation is needed for supervisor mode",
 			)
+			reasons = appendReasons(reasons, monitorReasons...)
+			if sess.Status == state.StatusRetryExhausted {
+				reasons = appendReasons(reasons,
+					fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
+					"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+				)
+			}
+			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+				summary,
+				RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
+			return decision, nil
 		}
-		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
-		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-			summary,
-			RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
-		return decision, nil
+		deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr}
+		baseReasons = appendReasons(baseReasons,
+			fmt.Sprintf("Open PR #%d for issue #%d is monitored passively while spare capacity remains", pr.Number, sess.IssueNumber),
+			"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
+		)
 	}
 
 	if slot, sess, ok := runningSession(st); ok && e.shouldWaitForRunningWorker(st) {
@@ -774,28 +784,44 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 
 	if slot, sess, ok := tokenBudgetExceededSession(st); ok {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Session %s for issue #%d stopped deterministically at worker_max_tokens", slot, sess.IssueNumber),
-			"Restarting or re-planning automatically would spend more tokens without an operator budget decision",
+		// Hands-off fill (2026-07-22): a historical token-budget stop on one
+		// issue must not freeze the whole project. Only halt immediately when
+		// there is no spare capacity; otherwise continue and only surface the
+		// budget stop if no other backlog remains.
+		if projectState.AvailableSlots <= 0 {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Session %s for issue #%d stopped deterministically at worker_max_tokens", slot, sess.IssueNumber),
+				"Restarting or re-planning automatically would spend more tokens without an operator budget decision",
+			)
+			decision := e.decision(st, now, projectState, ActionNone,
+				fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", sess.IssueNumber),
+				RiskSafe, 0.99, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			return decision, nil
+		}
+		deferredBudgetSlot, deferredBudgetSess = slot, sess
+		baseReasons = appendReasons(baseReasons,
+			fmt.Sprintf("Session %s for issue #%d previously hit worker_max_tokens", slot, sess.IssueNumber),
+			"Spare capacity remains — continue backlog fill instead of freezing the project on a budget stop",
 		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", sess.IssueNumber),
-			RiskSafe, 0.99, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		return decision, nil
 	}
 
 	if !e.cfg.Supervisor.OrderedQueueActive() && !e.cfg.Supervisor.DynamicWave.Active() {
-		if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
-				"Retry-exhausted work requires a human decision before more automation",
-			)
-			decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
-				fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
-				RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
-			return decision, nil
+		// When an open PR is already deferred for spare-slot fill, do not let
+		// retry_exhausted monopolize the cycle — resume deferred monitor if
+		// backlog probe finds nothing (pending CI must stay monitor_open_pr).
+		if deferredOpenPR == nil {
+			if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
+					"Retry-exhausted work requires a human decision before more automation",
+				)
+				decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
+					fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
+					RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
 		}
 	}
 
@@ -828,6 +854,9 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			hasActionable = len(eligibleProbe) > 0
 		}
 		if !hasActionable {
+			if deferredOpenPR != nil {
+				return e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR), nil
+			}
 			reasons := appendReasons(baseReasons,
 				stuck.Summary,
 				fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
@@ -870,7 +899,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, err
 	}
 	if policyResult.dynamicWave {
-		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult, cache)
+		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult, cache, deferredOpenPR, deferredBudgetSlot, deferredBudgetSess)
 	}
 	candidates := policyResult.candidates
 	policySkipped := policyResult.skipped
@@ -1053,6 +1082,16 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	for _, reason := range firstN(skipped, 3) {
 		reasons = append(reasons, reason)
 	}
+	if deferredOpenPR != nil {
+		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)), nil
+	}
+	if deferredBudgetSess != nil {
+		decision := e.decision(st, now, projectState, ActionNone,
+			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
+			RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, reasons)
+		decision.StuckStates = stuckStates
+		return withAnalysis(decision), nil
+	}
 	decision := e.decision(st, now, projectState, ActionNone,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
@@ -1099,7 +1138,44 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 	return bestSlot, best, best != nil
 }
 
-func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache) (state.SupervisorDecision, error) {
+// deferredOpenPRMonitor holds a non-urgent open-PR monitor decision that is
+// postponed while spare capacity is used to fill backlog (hands-off band).
+type deferredOpenPRMonitor struct {
+	slot string
+	sess *state.Session
+	pr   github.PR
+}
+
+func (e *Engine) decisionMonitorOpenPR(
+	st *state.State,
+	now time.Time,
+	projectState state.SupervisorProjectState,
+	baseReasons []string,
+	stuckStates []state.SupervisorStuckState,
+	def deferredOpenPRMonitor,
+) state.SupervisorDecision {
+	monitorReasons := e.monitorOpenPRReasons(def.slot, def.sess, def.pr)
+	summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", def.pr.Number, def.sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
+	reasons := appendReasons(baseReasons,
+		fmt.Sprintf("Session %s is associated with open PR #%d", def.slot, def.pr.Number),
+		"No GitHub mutation is needed for supervisor mode",
+	)
+	reasons = appendReasons(reasons, monitorReasons...)
+	if def.sess.Status == state.StatusRetryExhausted {
+		reasons = appendReasons(reasons,
+			fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", def.slot, def.pr.Number),
+			"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+		)
+	}
+	target := &state.SupervisorTarget{Issue: def.sess.IssueNumber, PR: def.pr.Number, Session: def.slot}
+	decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+		summary,
+		RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+	decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, def.pr, monitorReasons))
+	return decision
+}
+
+func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache, deferredOpenPR *deferredOpenPRMonitor, deferredBudgetSlot string, deferredBudgetSess *state.Session) (state.SupervisorDecision, error) {
 	candidates := result.candidates
 	analysis := result.analysis
 	outcomeStatus := e.outcomeStatus(st)
@@ -1202,6 +1278,14 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 
 		decision := e.decision(st, now, projectState, ActionNone,
 			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
+		if deferredOpenPR != nil {
+			decision = e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)
+		} else if deferredBudgetSess != nil {
+			decision = e.decision(st, now, projectState, ActionNone,
+				fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
+				RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+		}
 		return withAnalysis(decision), nil
 	}
 

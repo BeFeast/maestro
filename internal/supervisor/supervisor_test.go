@@ -1834,9 +1834,9 @@ func TestDecide_PRExistsForSessionMonitorsPR(t *testing.T) {
 	if decision.Target == nil || decision.Target.PR != 12 || decision.Target.Session != "slot-1" {
 		t.Fatalf("target = %#v, want PR 12 for slot-1", decision.Target)
 	}
-	if reader.issueCalls != 0 {
-		t.Fatalf("ListOpenIssues called %d time(s), want 0 for PR-session decision", reader.issueCalls)
-	}
+	// Hands-off fill probes open issues when spare slots remain so a passive
+	// open PR cannot starve backlog; with an empty queue the decision stays
+	// monitor_open_pr (issueCalls may be >0).
 }
 
 func TestDecide_EligibleIssueRecommendsSpawn(t *testing.T) {
