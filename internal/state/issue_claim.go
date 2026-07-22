@@ -277,10 +277,16 @@ func (s *State) CompleteFreshDispatch(issueNumber int, leaseID string, sess *Ses
 }
 
 // ReconcileFreshDispatchClaims makes a pre-spawn lease terminal when its exact
-// Session was persisted by a later compatible save, or when a different
-// canonical session/PR claim appeared. This is the crash-after-launch repair:
-// it preserves the worker identity already present and prevents an old startup
-// lease from blocking the issue forever.
+// Session was persisted by a later compatible save. This is the
+// crash-after-launch repair: it preserves the worker identity already present
+// and prevents an old startup lease from blocking the issue forever.
+//
+// A different session or repair approval must not supersede an active startup
+// lease here. The fresh claim was committed atomically before worker setup; a
+// later claim can race in while setup is still outside state.json. Revoking the
+// lease would let repair dispatch start a second worker before the first one
+// registers. Keep both claims visible so the dispatcher can refuse/reconcile
+// the later authority without deleting either worktree.
 func (s *State) ReconcileFreshDispatchClaims(now time.Time) int {
 	if s == nil || len(s.FreshDispatchClaims) == 0 {
 		return 0
@@ -300,15 +306,6 @@ func (s *State) ReconcileFreshDispatchClaims(now time.Time) int {
 			claim.SessionStartedAt = sess.StartedAt.UTC()
 			claim.LeaseExpiresAt = time.Time{}
 			claim.TerminalReason = "session_persisted"
-			changed++
-			continue
-		}
-		if s.IssueHasNonFreshClaim(issue) {
-			claim.Status = FreshDispatchClaimStatusSuperseded
-			claim.CompletedAt = now
-			claim.UpdatedAt = now
-			claim.LeaseExpiresAt = time.Time{}
-			claim.TerminalReason = "canonical_claim_appeared"
 			changed++
 		}
 	}
