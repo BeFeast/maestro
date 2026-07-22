@@ -256,9 +256,8 @@ func TestFleetMergedTruthOutranksPendingApprovalAndStaleReview(t *testing.T) {
 			t.Fatalf("terminal worker retained stale review copy %q: %+v", forbidden, worker)
 		}
 	}
-	merge := findControlAction(t, worker.Actions, "approve_merge")
-	if !merge.Disabled || !strings.Contains(strings.ToLower(merge.DisabledReason), "already merged") {
-		t.Fatalf("merged PR retained enabled merge CTA: %+v", merge)
+	if len(worker.Actions) != 0 {
+		t.Fatalf("merged PR retained terminal worker controls: %+v", worker.Actions)
 	}
 	project := findFleetProject(t, resp.Projects, "pcp")
 	if project.OperatorState.Kind != "code_landed" || !strings.Contains(project.OperatorState.Summary, "Greptile 4/5 · passed · PR merged") {
