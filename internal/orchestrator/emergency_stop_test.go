@@ -33,6 +33,31 @@ func TestStartNewWorkers_EmergencyStopBlocksNewSpawns(t *testing.T) {
 	}
 }
 
+// TestStartNewWorkers_FleetSpawnCeilingBlocksNewSpawns pins the cross-flow
+// live-worker ceiling: when fleet.max_live_workers is saturated, no new
+// workers spawn even with ready issues and free project slots.
+func TestStartNewWorkers_FleetSpawnCeilingBlocksNewSpawns(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	issues := []github.Issue{makeIssue(1025, "ready issue")}
+
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	listed := false
+	o.listOpenIssuesFn = func(labelFilter []string) ([]github.Issue, error) {
+		listed = true
+		return issues, nil
+	}
+	o.SetFleetSpawnCeiling(func() bool { return true })
+
+	o.startNewWorkers(state.NewState(), 5)
+
+	if len(*started) != 0 {
+		t.Fatalf("started %d workers under fleet ceiling, want 0", len(*started))
+	}
+	if listed {
+		t.Fatal("startNewWorkers listed issues under fleet ceiling; the gate must return before any GitHub call")
+	}
+}
+
 // TestStartNewWorkers_EmergencyResumeRestoresSpawns confirms that clearing the
 // halt (what `maestro emergency resume` does) restores spawning on the next
 // cycle — no restart, no extra state surgery.

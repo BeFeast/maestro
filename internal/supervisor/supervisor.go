@@ -805,6 +805,50 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 	projectState.OpenIssues = len(issues)
 
+	// F8 / sustained hands-off (2026-07-22): a red/unknown outcome must NOT
+	// permanently idle the project when backlog exists. The old early-return
+	// ActionCheckOutcomeHealth path stopped add_ready_label / spawn while
+	// ActiveSessions()==0, so after workers finished the ready queue drained
+	// and the fleet sat at 0 until a human kicked it. Prefer promoting or
+	// dispatching eligible backlog; only recommend outcome verification when
+	// there is truly nothing actionable left.
+	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
+		policyProbe, probeErr := e.policyCandidateIssues(st, issues)
+		if probeErr != nil {
+			return state.SupervisorDecision{}, probeErr
+		}
+		hasActionable := false
+		if policyProbe.dynamicWave {
+			hasActionable = len(policyProbe.candidates) > 0
+		} else {
+			eligibleProbe, _, eligErr := e.eligibleIssues(st, policyProbe.candidates, true)
+			if eligErr != nil {
+				return state.SupervisorDecision{}, eligErr
+			}
+			hasActionable = len(eligibleProbe) > 0
+		}
+		if !hasActionable {
+			reasons := appendReasons(baseReasons,
+				stuck.Summary,
+				fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
+				"No actionable backlog remains; recommend outcome verification before inventing new throughput",
+				"Supervisor remains read-only for deploy/runtime; it does not run deploy commands",
+			)
+			decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
+				"Verify outcome health before starting more issue work.",
+				RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			if st.OutcomeHealth != nil && st.OutcomeHealth.State == outcome.HealthFailing {
+				decision.QueueAnalysis = e.dispatchBlockerQueueAnalysis(st)
+			}
+			return decision, nil
+		}
+		baseReasons = appendReasons(baseReasons,
+			stuck.Summary,
+			"Outcome is unhealthy, but actionable backlog remains — prefer label/spawn over idling on check_outcome_health",
+		)
+	}
+
 	if slot, sess, issue, ok, err := e.retryExhaustedRepairCandidate(st, issues, cache); err != nil {
 		return state.SupervisorDecision{}, err
 	} else if ok {
