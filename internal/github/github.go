@@ -2393,10 +2393,40 @@ func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus
 //   - comment found but not approving → approved=false, pending=false
 //   - no greptile signal at all → pending=true
 func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, err error) {
+	verdict, err := c.prGreptileReviewStreamVerdict(prNumber)
+	if err != nil {
+		return false, false, err
+	}
+	return verdict.Passed, verdict.Pending, nil
+}
+
+const (
+	reviewVerdictPending        = "pending"
+	reviewVerdictPassed         = "passed"
+	reviewVerdictOKToMerge      = "ok_to_merge"
+	reviewVerdictRepairRequired = "repair_required"
+)
+
+type greptileReviewSignal struct {
+	Passed   bool
+	Pending  bool
+	Observed bool
+	Score    int
+	ScoreMax int
+	Verdict  string
+}
+
+var (
+	greptileConfidenceScorePattern = regexp.MustCompile(`(?i)\bconfidence(\s+score)?\s*[:=-]?\s*([0-9]+)\s*/\s*([0-9]+)\b`)
+	greptilePositiveMergePattern   = regexp.MustCompile(`(?i)\b(ok|okay|safe)\s+to\s+merge\b`)
+	greptileNegativeMergePattern   = regexp.MustCompile(`(?i)\b(no|not|never|isn't|isnt|wasn't|wasnt|can't|cant|cannot|don't|dont|doesn't|doesnt)\s+([[:alnum:]'-]+\s+){0,4}(ok|okay|safe)\s+to\s+merge\b|\bunsafe\s+to\s+merge\b`)
+)
+
+func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
 	// --- 1. Get head SHA of the PR ---
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
-		return false, false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+		return ReviewStreamVerdict{}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
 
 	// --- 2. Get check runs for the head SHA ---
@@ -2407,16 +2437,15 @@ func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, 
 	}
 
 	{
-		found, approved, pending := greptileCheckDecision(checkRuns)
+		found, signal := greptileCheckReviewSignal(checkRuns)
 		if found {
-			if pending {
-				return false, true, nil
+			verdict := reviewStreamVerdictFromGreptileSignal(signal)
+			if !verdict.Passed && !verdict.Pending {
+				if _, findings, hasFindings, findingsErr := c.PRHighSeverityReviewOnHead(prNumber); findingsErr == nil && hasFindings {
+					verdict.Findings = findings
+				}
 			}
-			if !approved {
-				return false, false, nil
-			}
-
-			return true, false, nil
+			return verdict, nil
 		}
 		// No greptile check run found → fall through to comment fallback
 	}
@@ -2425,19 +2454,28 @@ commentFallback:
 	// --- 3. Fallback: check PR comments (legacy Greptile comment-mode) ---
 	commentsOut, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
-		return false, false, fmt.Errorf("list issue comments for PR %d: %w", prNumber, err)
+		return ReviewStreamVerdict{}, fmt.Errorf("list issue comments for PR %d: %w", prNumber, err)
 	}
 
 	comments, err := parseIssueComments(commentsOut)
 	if err != nil {
-		return false, false, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
+		return ReviewStreamVerdict{}, fmt.Errorf("parse pr %d comments: %w", prNumber, err)
 	}
 
-	foundGreptile, approved := greptileCommentDecision(comments)
+	foundGreptile, signal, comment := greptileCommentReviewSignal(comments)
 	if !foundGreptile {
-		return false, true, nil
+		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending}, nil
 	}
-	return approved, false, nil
+	verdict := reviewStreamVerdictFromGreptileSignal(signal)
+	if !verdict.Passed && !verdict.Pending && isActionableReviewSummary(comment.Body) {
+		verdict.Findings = append(verdict.Findings, ReviewComment{Body: comment.Body, User: comment.User.Login})
+	}
+	if !verdict.Passed && !verdict.Pending {
+		if _, findings, hasFindings, findingsErr := c.PRHighSeverityReviewOnHead(prNumber); findingsErr == nil && hasFindings {
+			verdict.Findings = append(verdict.Findings, findings...)
+		}
+	}
+	return verdict, nil
 }
 
 // greptileCommentDecision is the legacy comment-mode fallback. Only comments
@@ -2446,43 +2484,126 @@ commentFallback:
 // into a false rejection. GitHub returns issue comments oldest-first, so the
 // latest bot verdict wins.
 func greptileCommentDecision(comments []issueComment) (found bool, approved bool) {
+	found, signal, _ := greptileCommentReviewSignal(comments)
+	return found, signal.Passed
+}
+
+func greptileCommentReviewSignal(comments []issueComment) (found bool, signal greptileReviewSignal, comment issueComment) {
 	for i := len(comments) - 1; i >= 0; i-- {
-		comment := comments[i]
+		comment = comments[i]
 		if !isGreptileLogin(comment.User.Login) {
 			continue
 		}
-		bodyLower := strings.ToLower(comment.Body)
-		if strings.Contains(bodyLower, "not safe to merge") || strings.Contains(bodyLower, "unsafe to merge") {
-			return true, false
-		}
-		if strings.Contains(bodyLower, "safe to merge") {
-			return true, true
-		}
-		if strings.Contains(bodyLower, "confidence score:") && (strings.Contains(bodyLower, "5/5") || strings.Contains(bodyLower, "4/5")) {
-			return true, true
-		}
-		// A Greptile-authored comment without an approving phrase is still an
-		// authoritative non-pass in legacy comment mode.
-		return true, false
+		return true, greptileSignalFromText(comment.Body), comment
 	}
-	return false, false
+	return false, greptileReviewSignal{}, issueComment{}
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {
+	found, signal := greptileCheckReviewSignal(checkRuns)
+	return found, signal.Passed, signal.Pending
+}
+
+func greptileCheckReviewSignal(checkRuns []greptileCheckRun) (found bool, signal greptileReviewSignal) {
 	for _, cr := range checkRuns {
 		if !strings.Contains(strings.ToLower(cr.Name), "greptile") {
 			continue
 		}
-		found = true
-		if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
-			return true, true, false
-		}
 		if cr.Status == "in_progress" || cr.Status == "queued" || cr.Status == "waiting" || cr.Conclusion == "" {
-			return true, false, true
+			return true, greptileReviewSignal{Pending: true, Verdict: reviewVerdictPending}
 		}
-		return true, false, false
+		text := strings.Join([]string{cr.Output.Title, cr.Output.Summary, cr.Output.Text}, "\n")
+		signal = greptileSignalFromText(text)
+		if signal.Observed {
+			return true, signal
+		}
+		if cr.Conclusion == "success" || cr.Conclusion == "neutral" {
+			return true, greptileReviewSignal{Passed: true, Verdict: reviewVerdictPassed}
+		}
+		return true, greptileReviewSignal{Verdict: reviewVerdictRepairRequired}
 	}
-	return false, false, false
+	return false, greptileReviewSignal{}
+}
+
+func greptileSignalFromText(text string) greptileReviewSignal {
+	normalized := normalizedReviewText(text)
+	signal := greptileReviewSignal{}
+	for _, match := range greptileConfidenceScorePattern.FindAllStringSubmatch(normalized, -1) {
+		if len(match) != 4 {
+			continue
+		}
+		score, scoreErr := strconv.Atoi(match[2])
+		maxScore, maxErr := strconv.Atoi(match[3])
+		if scoreErr != nil || maxErr != nil || maxScore != 5 || score < 0 || score > maxScore {
+			continue
+		}
+		signal.Score = score
+		signal.ScoreMax = maxScore
+		signal.Observed = true
+	}
+
+	negativeRanges := greptileNegativeMergePattern.FindAllStringIndex(normalized, -1)
+	explicitObserved := false
+	explicitPassed := false
+	lastExplicitStart := -1
+	for _, negativeRange := range negativeRanges {
+		if len(negativeRange) == 2 && negativeRange[0] > lastExplicitStart {
+			explicitObserved = true
+			explicitPassed = false
+			lastExplicitStart = negativeRange[0]
+		}
+	}
+	for _, positiveRange := range greptilePositiveMergePattern.FindAllStringIndex(normalized, -1) {
+		if !rangeContainedByAny(positiveRange, negativeRanges) && positiveRange[0] > lastExplicitStart {
+			explicitObserved = true
+			explicitPassed = true
+			lastExplicitStart = positiveRange[0]
+		}
+	}
+	repairRequired := strings.Contains(normalized, "repair required") || strings.Contains(normalized, "changes requested")
+	if explicitObserved || repairRequired {
+		signal.Observed = true
+	}
+	switch {
+	case explicitObserved && explicitPassed:
+		signal.Passed = true
+		signal.Verdict = reviewVerdictOKToMerge
+	case explicitObserved || repairRequired:
+		signal.Verdict = reviewVerdictRepairRequired
+	case signal.ScoreMax > 0:
+		signal.Passed = signal.Score >= 4
+		if signal.Passed {
+			signal.Verdict = reviewVerdictPassed
+		} else {
+			signal.Verdict = reviewVerdictRepairRequired
+		}
+	default:
+		signal.Verdict = reviewVerdictRepairRequired
+	}
+	return signal
+}
+
+func rangeContainedByAny(candidate []int, containers [][]int) bool {
+	if len(candidate) != 2 {
+		return false
+	}
+	for _, container := range containers {
+		if len(container) == 2 && candidate[0] >= container[0] && candidate[1] <= container[1] {
+			return true
+		}
+	}
+	return false
+}
+
+func reviewStreamVerdictFromGreptileSignal(signal greptileReviewSignal) ReviewStreamVerdict {
+	return ReviewStreamVerdict{
+		Name:     "greptile",
+		Passed:   signal.Passed,
+		Pending:  signal.Pending,
+		Score:    signal.Score,
+		ScoreMax: signal.ScoreMax,
+		Verdict:  signal.Verdict,
+	}
 }
 
 func isGreptileLogin(login string) bool {
@@ -3496,6 +3617,9 @@ type ReviewStreamVerdict struct {
 	Name     string          `json:"name"`
 	Passed   bool            `json:"passed"`
 	Pending  bool            `json:"pending"`
+	Score    int             `json:"score,omitempty"`
+	ScoreMax int             `json:"score_max,omitempty"`
+	Verdict  string          `json:"verdict,omitempty"`
 	Findings []ReviewComment `json:"findings,omitempty"`
 }
 
@@ -3526,7 +3650,11 @@ func (v ReviewGateVerdict) Summary() string {
 		case !stream.Passed:
 			status = "findings"
 		}
-		parts = append(parts, fmt.Sprintf("%s=%s", stream.Name, status))
+		if stream.ScoreMax > 0 {
+			parts = append(parts, fmt.Sprintf("%s=%d/%d %s", stream.Name, stream.Score, stream.ScoreMax, status))
+		} else {
+			parts = append(parts, fmt.Sprintf("%s=%s", stream.Name, status))
+		}
 	}
 	return strings.Join(parts, ", ")
 }
@@ -3637,17 +3765,7 @@ type reviewStreamSpec struct {
 }
 
 func (c *Client) greptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
-	approved, pending, err := c.PRGreptileApproved(prNumber)
-	if err != nil {
-		return ReviewStreamVerdict{}, err
-	}
-	sv := ReviewStreamVerdict{Name: "greptile", Passed: approved, Pending: pending}
-	if !approved && !pending {
-		if _, findings, hasFindings, err := c.PRHighSeverityReviewOnHead(prNumber); err == nil && hasFindings {
-			sv.Findings = findings
-		}
-	}
-	return sv, nil
+	return c.prGreptileReviewStreamVerdict(prNumber)
 }
 
 func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (ReviewStreamVerdict, error) {

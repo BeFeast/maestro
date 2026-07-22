@@ -374,6 +374,7 @@ type sessionInfo struct {
 	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
 	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
 	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
+	PRGate                    *fleetPRGateState     `json:"pr_gate,omitempty"`
 	// prGateSnapshot is the latest durable, reconciled gate observation for
 	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
 	// operator_state aligned with the current PR head/check rollup, but does not
@@ -1153,6 +1154,24 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			merge.DisabledReason = "No PR is associated with this worker; approve merge becomes available once a PR is open."
 		}
+	} else if gate := worker.PRGate; gate != nil {
+		switch {
+		case gate.Merged:
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("PR #%d is already merged; merge and review-repair controls are terminally unavailable.", worker.PRNumber)
+		case gate.MergeAction != nil && fleetMergeActionSuppressesDuplicate(gate.MergeAction.Status):
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("Merge already requested under approval %s (%s).", gate.MergeAction.ApprovalID, gate.MergeAction.Status)
+		case state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure || state.PRGateCIVerdict(gate.CI) == state.PRGateCIPending:
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("PR #%d cannot be merged while CI is %s.", worker.PRNumber, gate.CI)
+		case state.PRGateReviewDecision(gate.Review) == state.PRGateReviewBlocked:
+			merge.Disabled = true
+			merge.DisabledReason = firstNonEmpty(gate.ReviewSummary, "The review gate requires repair before merge.")
+		case state.PRGateReviewDecision(gate.Review) == state.PRGateReviewPending:
+			merge.Disabled = true
+			merge.DisabledReason = firstNonEmpty(gate.ReviewSummary, "The review gate is still pending.")
+		}
 	}
 	restart := newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	var repair *controlAction
@@ -1199,6 +1218,19 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		actions = append(actions, *repair)
 	}
 	return actions
+}
+
+func fleetMergeActionSuppressesDuplicate(status string) bool {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending,
+		state.ApprovalStatusApproved,
+		state.ApprovalStatusAwaitingDispatch,
+		state.ApprovalStatusExecuting,
+		state.ApprovalStatusExecuted:
+		return true
+	default:
+		return false
+	}
 }
 
 // newSafeControlAction returns a button for a safe verb (label/comment).

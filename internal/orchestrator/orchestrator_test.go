@@ -2158,6 +2158,56 @@ func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T)
 	}
 }
 
+func TestAutoMergePRs_GreptileThreeOfFiveEntersBoundedRepairWithFindings(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "greptile",
+		ReviewGateStreams:       []string{"greptile"},
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	head := strings.Repeat("a", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Fingerprint: strings.Repeat("1", 16), Complete: true}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{
+			Passed: false,
+			Streams: []github.ReviewStreamVerdict{{
+				Name: "greptile", Score: 3, ScoreMax: 5, Verdict: "repair_required",
+				Findings: []github.ReviewComment{{Path: "internal/foo.go", Line: 42, Body: "P1: nil pointer panic", User: "greptile-apps[bot]"}},
+			}},
+		}, nil
+	}
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic", nil
+	}
+	st := makeTestState(prs)
+	st.Sessions["slot-0"].Worktree = "/tmp/maestro-slot-0"
+
+	o.autoMergePRs(st)
+
+	if len(*merged) != 0 {
+		t.Fatalf("Greptile 3/5 must not merge: %v", *merged)
+	}
+	sess := st.Sessions["slot-0"]
+	if sess.Status != state.StatusDead || sess.MaintenanceRetryCount != 1 || sess.NextRetryAt == nil {
+		t.Fatalf("bounded review repair not scheduled: status=%q maintenance=%d next=%v", sess.Status, sess.MaintenanceRetryCount, sess.NextRetryAt)
+	}
+	if !strings.Contains(sess.PreviousAttemptFeedback, "internal/foo.go:42") {
+		t.Fatalf("repair context lost concrete finding: %q", sess.PreviousAttemptFeedback)
+	}
+	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, 10)
+	if snapshot.ReviewDecision != state.PRGateReviewBlocked || len(snapshot.ReviewStreams) != 1 || snapshot.ReviewStreams[0].Score != 3 {
+		t.Fatalf("Greptile 3/5 fact not persisted with blocked gate: %+v", snapshot)
+	}
+}
+
 func TestAutoMergePRs_SequentialRespectsInterval(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
