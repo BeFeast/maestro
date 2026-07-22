@@ -23,8 +23,9 @@ import (
 const tmuxSpawnReconcileAttempts = 3
 
 var (
-	runTmuxNewSession = func(tmuxName, worktree, runnerPath string) ([]byte, error) {
-		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath)
+	tmuxSessionExists = tmuxsession.HasSession
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
+		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath, lease)
 	}
 	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
 		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}").Output()
@@ -331,6 +332,9 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
 func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
+	}
 	// #959: assert the rendered issue matches the session's canonical
 	// issue_number before killing the current worker, so a slot-suffix-derived
 	// number can never respawn a mis-scoped worker in the preserved worktree.
@@ -338,11 +342,12 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return err
 	}
 
-	// End the previous attempt through its exact lease (or the legacy
-	// tmux/process-tree fallback) without removing the retained worktree.
+	// Terminate the exact process lease (but do NOT remove the worktree). New
+	// workers use a dedicated cgroup that still owns descendants after they
+	// double-fork or reparent; legacy sessions fall back to the PPID sweep.
 	tmuxName := TmuxSessionName(slotName)
-	if err := StopProcess(cfg, slotName, sess); err != nil {
-		return fmt.Errorf("stop previous in-place attempt: %w", err)
+	if err := StopProcess(slotName, sess); err != nil {
+		return fmt.Errorf("stop previous worker process lease: %w", err)
 	}
 
 	// Run after_run hook (non-fatal)
@@ -382,6 +387,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
 		return err
 	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -391,7 +397,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Assemble prompt with checkpoint. The checkpoint is historical context and
 	// never a terminal instruction; the fresh continuation payload is placed after
 	// it behind an explicit precedence marker (#973).
-	prompt := assemblePromptWithCheckpoint(promptBase, issue, sess.Worktree, sess.Branch, cfg, checkpointContext, sess.CheckpointFile)
+	prompt := assemblePromptWithCheckpointSource(promptBase, issue, executionWorktree, sess.Worktree, sess.Branch, cfg, checkpointContext, sess.CheckpointFile)
 	if checkpointContext != "" {
 		log.Printf("[worker] in-place continuation %s: checkpoint source=%s continuation_rev=%s (checkpoint is historical context; fresh continuation requirements are authoritative)",
 			slotName, sess.CheckpointFile, continuationRevision(promptBase))
@@ -420,7 +426,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	}
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -428,8 +434,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split, "in_place_respawn")
-	if err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 
@@ -440,7 +445,6 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		WorkspacePath: sess.Worktree,
 	}
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
-		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
@@ -448,9 +452,13 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
-	pid, err := startOrReconcileTmuxSession(tmuxName, sess.Worktree, runnerPath, sess.PID)
+	nextGeneration := sess.WorkerGeneration + 1
+	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
 	if err != nil {
-		rollbackPreparedLease(attemptLease)
+		if lease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
+			setSessionProcessLease(sess, lease)
+		}
 		return err
 	}
 
@@ -463,7 +471,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// #513/#931: start a new attempt projection while preserving the same
 	// worktree/session identity and cumulative attribution history.
 	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
-	assignWorkerLease(sess, attemptLease)
+	setSessionProcessLease(sess, lease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
@@ -476,8 +484,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	return nil
 }
 
-func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, previousPID int) (int, error) {
-	spawnOut, spawnErr := runTmuxNewSession(tmuxName, worktree, runnerPath)
+func startOrReconcileTmuxSession(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease, previousPID int) (int, error) {
+	spawnOut, spawnErr := runTmuxNewSession(tmuxName, worktree, runnerPath, lease)
 	wantWorktree := filepath.Clean(worktree)
 	var observeErr error
 	for i := 0; i < tmuxSpawnReconcileAttempts; i++ {
@@ -559,7 +567,11 @@ func continuationRevision(base string) string {
 // genuine token-budget recovery — the checkpoint still lets a worker skip
 // already-completed work — while guaranteeing fresh instructions win.
 func assemblePromptWithCheckpoint(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config, checkpoint, checkpointSource string) string {
-	fresh := assemblePrompt(base, issue, worktreePath, branchName, cfg)
+	return assemblePromptWithCheckpointSource(base, issue, worktreePath, worktreePath, branchName, cfg, checkpoint, checkpointSource)
+}
+
+func assemblePromptWithCheckpointSource(base string, issue github.Issue, executionWorktree, sourceWorktree, branchName string, cfg *config.Config, checkpoint, checkpointSource string) string {
+	fresh := assemblePromptWithSource(base, issue, executionWorktree, sourceWorktree, branchName, cfg)
 	if checkpoint == "" {
 		return fresh
 	}

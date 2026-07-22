@@ -2,17 +2,22 @@ package worker
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"os/user"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/workerlease"
 )
+
+var runtimeLeaseGeneration atomic.Uint64
 
 type fakeWorkerLeaseOps struct {
 	active      map[string]bool
@@ -78,10 +83,13 @@ func isolatedRuntimeConfig(t *testing.T, projectID string) *config.Config {
 
 func prepareRuntimeLease(t *testing.T, cfg *config.Config, slot string) workerlease.Lease {
 	t.Helper()
+	generation := runtimeLeaseGeneration.Add(1)
 	lease, err := workerlease.Prepare(workerlease.Spec{
 		Root: workerLeaseProjectRoot(cfg), ProjectKey: workerLeaseProjectKey(cfg), Repo: cfg.Repo,
-		Slot: slot, Attempt: "test", Scope: cfg.WorkerRuntime.EffectiveScope(),
-		Now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
+		Slot: slot, Attempt: "test",
+		Unit:  fmt.Sprintf("maestro-worker-0123456789abcdef0123456789abcdef-g%d.service", generation),
+		Scope: cfg.WorkerRuntime.EffectiveScope(),
+		Now:   time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -90,7 +98,10 @@ func prepareRuntimeLease(t *testing.T, cfg *config.Config, slot string) workerle
 }
 
 func sessionForRuntimeLease(lease workerlease.Lease, status state.SessionStatus) *state.Session {
-	sess := &state.Session{Status: status, PID: 1234, StartedAt: lease.CreatedAt}
+	sess := &state.Session{
+		Status: status, PID: 1234, StartedAt: lease.CreatedAt,
+		ProcessLeaseUnit: lease.Unit, ProcessLeaseManager: lease.Scope,
+	}
 	assignWorkerLease(sess, &lease)
 	return sess
 }
@@ -107,7 +118,37 @@ func TestWorkerLeaseProjectRootSeparatesProjectsSharingScratchBase(t *testing.T)
 	}
 }
 
-func TestPrepareAttemptRunnerCleansLeaseWhenCurrentUserLookupFails(t *testing.T) {
+func TestRecoverWorkerScratchLeaseRequiresOneManifestForTheExactProcessLease(t *testing.T) {
+	cfg := isolatedRuntimeConfig(t, "project-recover")
+	processLease, err := tmuxsession.WorkerProcessServiceLease(
+		processLeaseProjectIdentity(cfg), "slot-recover", 1, tmuxsession.ProcessLeaseManagerSystem,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := workerlease.Prepare(workerlease.Spec{
+		Root: workerLeaseProjectRoot(cfg), ProjectKey: workerLeaseProjectKey(cfg), Repo: cfg.Repo,
+		Slot: "slot-recover", Attempt: "test", Unit: processLease.Unit, Scope: processLease.Manager,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	recovered, err := recoverWorkerScratchLease(cfg, "slot-recover", processLease)
+	if err != nil || recovered == nil || recovered.ID != prepared.ID {
+		t.Fatalf("recovered=%+v err=%v, want exact prepared scratch", recovered, err)
+	}
+	if _, err := workerlease.Prepare(workerlease.Spec{
+		Root: workerLeaseProjectRoot(cfg), ProjectKey: workerLeaseProjectKey(cfg), Repo: cfg.Repo,
+		Slot: "slot-recover", Attempt: "duplicate", Unit: processLease.Unit, Scope: processLease.Manager,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := recoverWorkerScratchLease(cfg, "slot-recover", processLease); err == nil || !strings.Contains(err.Error(), "multiple manifests") {
+		t.Fatalf("duplicate process ownership error = %v", err)
+	}
+}
+
+func TestPrepareWorkerScratchDoesNotCreateLeaseWhenCurrentUserLookupFails(t *testing.T) {
 	cfg := isolatedRuntimeConfig(t, "project-a")
 	cfg.WorkerRuntime.Scope = config.WorkerRuntimeScopeUser
 
@@ -124,27 +165,23 @@ func TestPrepareAttemptRunnerCleansLeaseWhenCurrentUserLookupFails(t *testing.T)
 	}
 	t.Cleanup(func() { workerRuntimeCurrentUser = originalCurrentUser })
 
-	_, err := prepareAttemptRunner(
-		cfg,
-		"slot-user-failure",
-		filepath.Join(t.TempDir(), "runner.sh"),
-		[]string{"true"},
-		"",
-		filepath.Join(t.TempDir(), "worker.log"),
-		t.TempDir(),
-		nil,
-		"test",
+	processLease, leaseErr := tmuxsession.WorkerProcessServiceLease(
+		processLeaseProjectIdentity(cfg), "slot-user-failure", 1, tmuxsession.ProcessLeaseManagerUser,
 	)
+	if leaseErr != nil {
+		t.Fatal(leaseErr)
+	}
+	_, _, err := prepareWorkerScratchLease(cfg, "slot-user-failure", "test", processLease)
 	if err == nil || !strings.Contains(err.Error(), "resolve worker runtime user") {
 		t.Fatalf("error = %v, want current-user lookup failure", err)
 	}
 
-	entries, err := os.ReadDir(workerLeaseProjectRoot(cfg))
-	if err != nil {
-		t.Fatal(err)
+	entries, readErr := os.ReadDir(workerLeaseProjectRoot(cfg))
+	if readErr != nil && !os.IsNotExist(readErr) {
+		t.Fatal(readErr)
 	}
 	if len(entries) != 0 {
-		t.Fatalf("prepared worker lease survived failed user lookup: %v", entries)
+		t.Fatalf("worker scratch was created before failed user lookup: %v", entries)
 	}
 }
 
@@ -177,6 +214,37 @@ func TestReconcileWorkerLeasesCleansOwnedOrphanAndKeepsNeighbor(t *testing.T) {
 	}
 }
 
+func TestReconcileWorkerLeasesPreservesActiveFreshDispatchLaunchGap(t *testing.T) {
+	cfg := isolatedRuntimeConfig(t, "project-fresh")
+	processLease, err := workerProcessLease(cfg, "slot-fresh", 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease, err := workerlease.Prepare(workerlease.Spec{
+		Root: workerLeaseProjectRoot(cfg), ProjectKey: workerLeaseProjectKey(cfg), Repo: cfg.Repo,
+		Slot: "slot-fresh", Attempt: "initial_spawn", Unit: processLease.Unit, Scope: processLease.Manager,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := state.NewState()
+	st.FreshDispatchClaims[927] = &state.FreshDispatchClaim{
+		IssueNumber: 927, Slot: lease.Slot, Status: state.FreshDispatchClaimStatusClaimed,
+	}
+	ops := &fakeWorkerLeaseOps{
+		active: map[string]bool{lease.Unit: true}, cleanupReal: true,
+		activeErr: map[string]error{}, stopErr: map[string]error{}, cleanupErr: map[string]error{},
+	}
+
+	result := reconcileWorkerLeasesWithOps(cfg, st, time.Now().UTC(), ops)
+	if len(result.Cleaned) != 0 || result.Attention != 0 || len(ops.stopped) != 0 || len(ops.cleaned) != 0 {
+		t.Fatalf("recoverable launch gap was modified: result=%+v stopped=%v cleaned=%v", result, ops.stopped, ops.cleaned)
+	}
+	if _, err := os.Stat(lease.ManifestPath); err != nil {
+		t.Fatalf("recoverable launch-gap scratch was deleted: %v", err)
+	}
+}
+
 func TestReconcileWorkerLeasesCleansTerminalSessionExactly(t *testing.T) {
 	cfg := isolatedRuntimeConfig(t, "project-a")
 	lease := prepareRuntimeLease(t, cfg, "slot-done")
@@ -188,7 +256,7 @@ func TestReconcileWorkerLeasesCleansTerminalSessionExactly(t *testing.T) {
 	}
 
 	result := reconcileWorkerLeasesWithOps(cfg, st, time.Now().UTC(), ops)
-	if len(result.Cleaned) != 1 || st.Sessions[lease.Slot].WorkerLeaseID != "" {
+	if len(result.Cleaned) != 1 || st.Sessions[lease.Slot].WorkerLeaseID != "" || st.Sessions[lease.Slot].ProcessLeaseUnit != "" {
 		t.Fatalf("terminal cleanup did not converge: result=%+v session=%+v", result, st.Sessions[lease.Slot])
 	}
 	if _, err := os.Stat(lease.ScratchDir); !os.IsNotExist(err) {
@@ -209,7 +277,8 @@ func TestReconcileWorkerLeasesMarksInactiveRunningLeaseEnded(t *testing.T) {
 
 	result := reconcileWorkerLeasesWithOps(cfg, st, time.Now().UTC(), ops)
 	sess := st.Sessions[lease.Slot]
-	if len(result.Cleaned) != 1 || sess.PID != 0 || sess.TmuxSession != "" || sess.WorkerEndedAt == nil {
+	if len(result.Cleaned) != 1 || sess.PID != 0 || sess.TmuxSession != "" || sess.WorkerEndedAt == nil ||
+		sess.WorkerLeaseID != "" || sess.ProcessLeaseUnit != "" {
 		t.Fatalf("inactive lease did not converge to ended runtime: result=%+v session=%+v", result, sess)
 	}
 }
@@ -234,6 +303,34 @@ func TestReconcileWorkerLeasesLeavesAmbiguousSameSlotUntouched(t *testing.T) {
 	}
 	if _, err := os.Stat(extra.ManifestPath); err != nil {
 		t.Fatalf("ambiguous extra lease was deleted: %v", err)
+	}
+}
+
+func TestReconcileWorkerLeasesLeavesDuplicateProcessOwnershipUntouched(t *testing.T) {
+	cfg := isolatedRuntimeConfig(t, "project-a")
+	first := prepareRuntimeLease(t, cfg, "slot-a")
+	second, err := workerlease.Prepare(workerlease.Spec{
+		Root: workerLeaseProjectRoot(cfg), ProjectKey: workerLeaseProjectKey(cfg), Repo: cfg.Repo,
+		Slot: "slot-b", Attempt: "test", Unit: first.Unit, Scope: first.Scope,
+		Now: time.Date(2026, 7, 21, 12, 1, 0, 0, time.UTC),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	st := state.NewState()
+	ops := &fakeWorkerLeaseOps{
+		active: map[string]bool{first.Unit: true}, cleanupReal: true,
+		activeErr: map[string]error{}, stopErr: map[string]error{}, cleanupErr: map[string]error{},
+	}
+
+	result := reconcileWorkerLeasesWithOps(cfg, st, time.Now().UTC(), ops)
+	if result.Attention != 2 || len(result.Cleaned) != 0 || len(ops.stopped) != 0 || len(ops.cleaned) != 0 {
+		t.Fatalf("duplicate unit ownership was modified: result=%+v stopped=%v cleaned=%v", result, ops.stopped, ops.cleaned)
+	}
+	for _, manifest := range []string{first.ManifestPath, second.ManifestPath} {
+		if _, err := os.Stat(manifest); err != nil {
+			t.Fatalf("ambiguous manifest %s was deleted: %v", manifest, err)
+		}
 	}
 }
 

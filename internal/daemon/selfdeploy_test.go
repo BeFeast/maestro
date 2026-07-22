@@ -87,7 +87,7 @@ func TestRequestSelfDeployRestartsExactlyOneUnit(t *testing.T) {
 // verify hits one :port (the daemon serves no per-project HTTP server), and the
 // fleet snapshot carries the version field the script SHA-matches (#758/#698).
 func TestSelfDeployConfigRoutesHealthToFleetEndpoint(t *testing.T) {
-	d := New(fakeLoader{}, Options{Host: "127.0.0.1", Port: 8786})
+	d := New(fakeLoader{}, Options{Host: "127.0.0.1", Port: 8786, DrainTimeout: 7 * time.Minute})
 	// The fleet's single shared token env, as Run captures it from
 	// server.FleetAuthFromProjects. The probe hits /api/v1/fleet, so it must
 	// authenticate with THIS — not the triggering flow's own env (#758).
@@ -106,6 +106,9 @@ func TestSelfDeployConfigRoutesHealthToFleetEndpoint(t *testing.T) {
 	if got := dc.SelfDeploy.HealthTokenEnv; got != "FLEET_DASH_TOKEN" {
 		t.Fatalf("health token env = %q, want the FLEET shared token env, not the flow's", got)
 	}
+	if got := dc.SelfDeploy.EffectiveRestartTimeoutSeconds(); got != 7*60+30 {
+		t.Fatalf("restart timeout = %ds, want configured 7m drain + 30s grace", got)
+	}
 }
 
 // An explicit self_deploy.health_url is respected — the daemon does not clobber
@@ -113,11 +116,18 @@ func TestSelfDeployConfigRoutesHealthToFleetEndpoint(t *testing.T) {
 func TestSelfDeployConfigKeepsExplicitHealthURL(t *testing.T) {
 	d := New(fakeLoader{}, Options{Host: "127.0.0.1", Port: 8786})
 	dc := d.selfDeployConfig(&config.Config{
-		Repo:       "owner/alpha",
-		SelfDeploy: config.SelfDeployConfig{Enabled: true, HealthURL: "http://10.0.0.1:9000/custom"},
+		Repo: "owner/alpha",
+		SelfDeploy: config.SelfDeployConfig{
+			Enabled:               true,
+			HealthURL:             "http://10.0.0.1:9000/custom",
+			RestartTimeoutSeconds: 123,
+		},
 	})
 	if got := dc.SelfDeploy.HealthURL; got != "http://10.0.0.1:9000/custom" {
 		t.Fatalf("health URL = %q, want the explicit value preserved", got)
+	}
+	if got := dc.SelfDeploy.EffectiveRestartTimeoutSeconds(); got != 123 {
+		t.Fatalf("restart timeout = %d, want explicit value 123 preserved", got)
 	}
 }
 

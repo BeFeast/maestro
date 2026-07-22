@@ -83,13 +83,14 @@ func (o *Orchestrator) tierOverrideConfigForSession(sess *state.Session) *config
 // placeholders for the policy path).
 func (o *Orchestrator) policyBackendSelection(decision router.BackendDecision) *state.BackendSelection {
 	sel := &state.BackendSelection{
-		SelectedBackend: decision.Backend,
-		SelectionReason: decision.Reason,
-		TaskType:        decision.TaskType,
-		Tier:            decision.Tier,
-		Effort:          decision.Effort,
-		Model:           decision.Model,
-		ShadowTier:      decision.ShadowTier,
+		SelectedBackend:      decision.Backend,
+		SelectionReason:      decision.Reason,
+		RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+		TaskType:             decision.TaskType,
+		Tier:                 decision.Tier,
+		Effort:               decision.Effort,
+		Model:                decision.Model,
+		ShadowTier:           decision.ShadowTier,
 	}
 	if decision.Tier != "" {
 		sel.CandidateScores = o.policyCandidateScores(decision.Tier)
@@ -245,11 +246,11 @@ func (o *Orchestrator) escalateRetryBackend(s *state.State, sess *state.Session,
 	if !o.cfg.Routing.IsPolicyMode() || o.cfg.Routing.Policy == nil {
 		return router.BackendDecision{}, false
 	}
-	// Leave the planner/validator pipeline phases on their own per-role backend
-	// (pipeline.{planner,validator}.backend); policy escalation governs the
+	// Leave the planner/advisor/validator pipeline phases on their own per-role backend
+	// (pipeline.{planner,advisor,validator}.backend); policy escalation governs the
 	// normal single-phase / implement path only, so the two mechanisms stay
 	// orthogonal (RFC §1.4 / §2.6).
-	if sess.Phase == state.PhasePlan || sess.Phase == state.PhaseValidate {
+	if sess.Phase == state.PhasePlan || sess.Phase == state.PhaseAdvisor || sess.Phase == state.PhaseValidate {
 		return router.BackendDecision{}, false
 	}
 	steps := escalationSteps(o.cfg.Routing.Policy, sess)

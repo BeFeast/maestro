@@ -40,6 +40,14 @@ func EvaluateGateFailureStreaksOnce(cfg *config.Config, now time.Time) (bool, er
 	if !brief.GateFailStreakEnabled() {
 		return false, nil
 	}
+	// Automatic-recovery projects have a more specific bounded-futility
+	// controller: it owns retries until K unchanged failing verifications, then
+	// files the outcome-repair issue and emits futile_recovery. Running the
+	// generic gate-streak intake in parallel would file/notify before that fence
+	// expires and could create a second repair issue for the same red gate.
+	if brief.AutomaticRecoveryEnabled() {
+		return false, nil
+	}
 	if strings.TrimSpace(cfg.StateDir) == "" {
 		return false, fmt.Errorf("gate-fail-streak evaluator: empty state_dir")
 	}

@@ -15,10 +15,10 @@ const (
 	WorkerRuntimeScopeUser   = "user"
 )
 
-// WorkerRuntimeConfig controls the opt-in durable worker lease runtime.
-// Legacy mode preserves the existing shared-tmux launch path as the rollback
-// mechanism while isolated mode runs the worker payload in its own transient
-// systemd service and private disk-backed scratch tree.
+// WorkerRuntimeConfig controls the opt-in scratch layer on the durable process
+// lease. Legacy mode keeps #920's process scope with the existing host temp
+// behavior; isolated mode expresses that same generation lease as a service so
+// it can bind private disk-backed scratch and run exact post-stop cleanup.
 type WorkerRuntimeConfig struct {
 	Mode        string `yaml:"mode,omitempty"`
 	Scope       string `yaml:"scope,omitempty"`

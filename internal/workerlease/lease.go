@@ -1,7 +1,6 @@
-// Package workerlease owns the durable identity and private scratch tree for
-// an isolated worker attempt. The OS process boundary is a transient systemd
-// service; its ExecStopPost invokes the same exact-manifest cleanup used by
-// daemon reconciliation, so every termination path converges idempotently.
+// Package workerlease owns the durable private scratch receipt for an isolated
+// worker attempt. Its manifest is bound to the exact process lease created by
+// tmuxsession; scratch never introduces a second process ownership model.
 package workerlease
 
 import (
@@ -10,23 +9,22 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"golang.org/x/sys/unix"
 )
 
 const (
 	ManifestVersion = 1
 	ManifestName    = "lease.json"
-	WorkerSlice     = "maestro-workers.slice"
+	WorkerSlice     = "maestro-workers-isolated.slice"
 	// The shared worker slice keeps compiler/test pressure outside the
 	// orchestrator's cgroup and preserves deterministic host headroom. The
 	// isolated runtime config-gate is what opts workers into this slice; legacy
@@ -38,7 +36,6 @@ const (
 	ScopeUser   = "user"
 
 	workerLeaseInspectTimeout = 15 * time.Second
-	workerLeaseStopTimeout    = 5 * time.Minute
 )
 
 var leaseIDPattern = regexp.MustCompile(`^mw-[a-f0-9]{10}-[a-z0-9][a-z0-9-]{0,31}-[a-f0-9]{24}$`)
@@ -49,6 +46,7 @@ type Spec struct {
 	Repo       string
 	Slot       string
 	Attempt    string
+	Unit       string
 	Scope      string
 	Now        time.Time
 }
@@ -85,17 +83,6 @@ type Manifest struct {
 type Attention struct {
 	Entry  string
 	Reason string
-}
-
-type LaunchSpec struct {
-	Lease       Lease
-	UID         int
-	PATH        string
-	Home        string
-	User        string
-	PayloadPath string
-	MaestroBin  string
-	MemoryMaxMB int
 }
 
 // EnsureScratchBase creates the configured fleet/project scratch base without
@@ -144,6 +131,10 @@ func Prepare(spec Spec) (Lease, error) {
 	if scope != ScopeSystem && scope != ScopeUser {
 		return Lease{}, fmt.Errorf("worker lease: invalid scope %q", spec.Scope)
 	}
+	unit := strings.TrimSpace(spec.Unit)
+	if !ValidProcessLeaseUnit(unit) {
+		return Lease{}, fmt.Errorf("worker lease: invalid process lease unit %q", spec.Unit)
+	}
 	if err := ensureDiskBacked(root); err != nil {
 		return Lease{}, err
 	}
@@ -168,7 +159,7 @@ func Prepare(spec Spec) (Lease, error) {
 	dir := filepath.Join(root, id)
 	lease := Lease{
 		ID:           id,
-		Unit:         UnitName(id),
+		Unit:         unit,
 		Scope:        scope,
 		ScratchDir:   dir,
 		TempDir:      filepath.Join(dir, "tmp"),
@@ -207,12 +198,13 @@ func Prepare(spec Spec) (Lease, error) {
 	return lease, nil
 }
 
-func UnitName(leaseID string) string {
-	return "maestro-worker-" + strings.TrimSpace(leaseID) + ".service"
-}
-
 func ValidLeaseID(leaseID string) bool {
 	return leaseIDPattern.MatchString(strings.TrimSpace(leaseID))
+}
+
+func ValidProcessLeaseUnit(unit string) bool {
+	unit = strings.TrimSpace(unit)
+	return strings.HasSuffix(unit, ".service") && tmuxsession.ValidProcessLeaseUnit(unit)
 }
 
 func LeaseFromManifest(m Manifest, manifestPath string) Lease {
@@ -223,68 +215,6 @@ func LeaseFromManifest(m Manifest, manifestPath string) Lease {
 		CargoTarget: filepath.Join(dir, "tmp", "cargo-target"), ManifestPath: manifestPath,
 		ProjectKey: m.ProjectKey, Repo: m.Repo, Slot: m.Slot, Attempt: m.Attempt, CreatedAt: m.CreatedAt,
 	}
-}
-
-// BuildLaunchCommand constructs the systemd-run wrapper executed by the tmux
-// pane. --wait/--pipe preserve the existing live-output behavior while the
-// actual worker process tree belongs to its own service cgroup.
-func BuildLaunchCommand(spec LaunchSpec) (string, []string, error) {
-	lease := spec.Lease
-	if _, err := ValidateManifest(lease.ManifestPath, lease.ID); err != nil {
-		return "", nil, err
-	}
-	if strings.TrimSpace(spec.PayloadPath) == "" || strings.TrimSpace(spec.MaestroBin) == "" {
-		return "", nil, fmt.Errorf("worker lease: payload path and maestro binary are required")
-	}
-	if spec.MemoryMaxMB < 0 {
-		return "", nil, fmt.Errorf("worker lease: memory max must be >= 0")
-	}
-
-	args := []string{}
-	binary := "systemd-run"
-	if lease.Scope == ScopeSystem {
-		binary = "sudo"
-		args = append(args, "-n", "systemd-run", "--uid="+strconv.Itoa(spec.UID))
-	} else if lease.Scope == ScopeUser {
-		args = append(args, "--user")
-	} else {
-		return "", nil, fmt.Errorf("worker lease: invalid scope %q", lease.Scope)
-	}
-	cleanup := systemdExecCommand([]string{
-		spec.MaestroBin, "_worker-lease-cleanup", "--manifest", lease.ManifestPath, "--lease", lease.ID,
-	})
-	args = append(args,
-		"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
-		"--unit="+lease.Unit,
-		"--property=Slice="+WorkerSlice,
-		"--property=MemoryAccounting=yes",
-		"--property=KillMode=control-group",
-		"--property=TimeoutStopSec=30s",
-		"--property=OOMPolicy=stop",
-		"--property=BindPaths="+lease.TempDir+":/tmp",
-		"--property=ExecStopPost="+cleanup,
-		"--setenv=TMPDIR=/tmp",
-		"--setenv=TMP=/tmp",
-		"--setenv=TEMP=/tmp",
-		"--setenv=GOTMPDIR=/tmp/go",
-		"--setenv=CARGO_TARGET_DIR=/tmp/cargo-target",
-		"--setenv=MAESTRO_WORKER_LEASE_ID="+lease.ID,
-	)
-	if strings.TrimSpace(spec.PATH) != "" {
-		args = append(args, "--setenv=PATH="+spec.PATH)
-	}
-	if strings.TrimSpace(spec.Home) != "" {
-		args = append(args, "--setenv=HOME="+spec.Home)
-	}
-	if strings.TrimSpace(spec.User) != "" {
-		args = append(args, "--setenv=USER="+spec.User, "--setenv=LOGNAME="+spec.User)
-	}
-	args = append(args, "--setenv=SHELL=/usr/bin/bash")
-	if spec.MemoryMaxMB > 0 {
-		args = append(args, fmt.Sprintf("--property=MemoryMax=%dM", spec.MemoryMaxMB))
-	}
-	args = append(args, "/usr/bin/bash", spec.PayloadPath)
-	return binary, args, nil
 }
 
 // EnsureWorkerSlice applies the aggregate memory boundary used by every
@@ -312,52 +242,6 @@ func workerSliceControlCommand(scope string) (string, []string, error) {
 		"MemoryHigh="+WorkerSliceMemoryHigh,
 		"MemoryMax="+WorkerSliceMemoryMax,
 	)
-}
-
-func BuildLauncherScript(spec LaunchSpec) (string, error) {
-	binary, args, err := BuildLaunchCommand(spec)
-	if err != nil {
-		return "", err
-	}
-	return "#!/bin/bash\nexec " + shellJoin(append([]string{binary}, args...)) + "\n", nil
-}
-
-func Stop(scope, unit string) error {
-	binary, args, err := systemctlCommand(scope, "stop", unit)
-	if err != nil {
-		return err
-	}
-	out, err := runControlCommand(workerLeaseStopTimeout, binary, args...)
-	if err == nil {
-		return nil
-	}
-	text := strings.ToLower(strings.TrimSpace(string(out)))
-	if strings.Contains(text, "not loaded") || strings.Contains(text, "not found") || strings.Contains(text, "could not be found") {
-		return nil
-	}
-	return fmt.Errorf("stop worker lease %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
-}
-
-func Active(scope, unit string) (bool, error) {
-	binary, args, err := systemctlCommand(scope, "is-active", unit)
-	if err != nil {
-		return false, err
-	}
-	out, err := runControlCommand(workerLeaseInspectTimeout, binary, args...)
-	state := strings.ToLower(strings.TrimSpace(string(out)))
-	if err == nil {
-		return state == "active" || state == "reloading" || state == "activating" || state == "deactivating", nil
-	}
-	var exitErr *exec.ExitError
-	if errors.As(err, &exitErr) && (exitErr.ExitCode() == 3 || exitErr.ExitCode() == 4) {
-		switch state {
-		case "active", "reloading", "activating", "deactivating":
-			return true, nil
-		case "inactive", "failed", "unknown":
-			return false, nil
-		}
-	}
-	return false, fmt.Errorf("inspect worker lease %s: %w: %s", unit, err, strings.TrimSpace(string(out)))
 }
 
 func runControlCommand(timeout time.Duration, binary string, args ...string) ([]byte, error) {
@@ -449,7 +333,7 @@ func ValidateManifest(manifestPath, expectedLeaseID string) (Manifest, error) {
 	if err := json.Unmarshal(data, &m); err != nil {
 		return Manifest{}, fmt.Errorf("worker lease: parse manifest: %w", err)
 	}
-	if m.Version != ManifestVersion || m.LeaseID != id || m.Unit != UnitName(id) ||
+	if m.Version != ManifestVersion || m.LeaseID != id || !ValidProcessLeaseUnit(m.Unit) ||
 		(m.Scope != ScopeSystem && m.Scope != ScopeUser) || filepath.Clean(m.ScratchDir) != dir ||
 		strings.TrimSpace(m.ProjectKey) == "" || strings.TrimSpace(m.Slot) == "" {
 		return Manifest{}, fmt.Errorf("worker lease: manifest ownership is invalid or ambiguous")
@@ -658,12 +542,12 @@ func systemdExecCommand(args []string) string {
 	return strings.Join(quoted, " ")
 }
 
-func shellJoin(args []string) string {
-	parts := make([]string, len(args))
-	for i, arg := range args {
-		parts[i] = shellQuote(arg)
-	}
-	return strings.Join(parts, " ")
+// CleanupExec renders one exact ExecStopPost command. Percent and quoting
+// rules are systemd-specific, so callers should not treat this as shell text.
+func CleanupExec(maestroBin, manifestPath, leaseID string) string {
+	return systemdExecCommand([]string{
+		maestroBin, "_worker-lease-cleanup", "--manifest", manifestPath, "--lease", leaseID,
+	})
 }
 
 func shellQuote(value string) string {

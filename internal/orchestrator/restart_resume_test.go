@@ -8,6 +8,7 @@ package orchestrator
 // worktree, and never dispatch a duplicate.
 
 import (
+	"errors"
 	"fmt"
 	"path/filepath"
 	"testing"
@@ -464,30 +465,53 @@ func TestReconcile_RestartCheckpoint_AdoptsLiveReplacement(t *testing.T) {
 	}
 }
 
-func TestReconcile_RestartCheckpoint_ConsumesMarkerWhenRuntimeSurvived(t *testing.T) {
+// #966: workers launched in the isolated worker scope survive maestro.service
+// itself. The replacement daemon must consume the restart marker by adopting the
+// same PID/worktree, without respawning or starting a duplicate attempt.
+func TestReconcile_RestartCheckpoint_ConsumesMarkerForSameSurvivingWorker(t *testing.T) {
 	resumeCount := 0
 	o := restartResumeOrchestrator(t, &resumeCount)
-	const pid = 7788
-	const tmuxName = "maestro-sup-313"
-	o.pidAliveFn = func(got int) bool { return got == pid }
-	o.tmuxSessionExistsFn = func(name string) bool { return name == tmuxName }
 
-	stamp := time.Now().UTC().Add(-time.Minute)
+	const survivingPID = 7888
+	const slotTmux = "maestro-sup-313"
+	worktree := t.TempDir()
+	o.pidAliveFn = func(pid int) bool { return pid == survivingPID }
+	o.tmuxSessionExistsFn = func(name string) bool { return name == slotTmux }
+	o.tmuxPaneIdentityFn = func(session string) (int, string, error) {
+		return survivingPID, worktree, nil
+	}
+
+	stamp := time.Now().UTC()
 	s := state.NewState()
 	s.Sessions["sup-313"] = &state.Session{
-		IssueNumber: 313, Status: state.StatusRunning, PID: pid, TmuxSession: tmuxName,
-		Worktree: t.TempDir(), Branch: "feat/sup-313", Backend: "claude",
+		IssueNumber:         313,
+		IssueTitle:          "surviving worker",
+		Status:              state.StatusRunning,
+		PID:                 survivingPID,
+		TmuxSession:         slotTmux,
+		Worktree:            worktree,
 		RestartCheckpointAt: &stamp,
 	}
 
 	if !o.reconcileRunningSessions(s) {
-		t.Fatal("surviving runtime should consume its restart marker")
+		t.Fatal("expected surviving worker marker adoption to report a state change")
 	}
-	if s.Sessions["sup-313"].RestartCheckpointAt != nil {
-		t.Fatal("surviving runtime retained a marker that would replay after natural exit")
+	sess := s.Sessions["sup-313"]
+	if resumeCount != 0 {
+		t.Fatalf("respawnInPlace fired %d times, want 0 for the same surviving worker", resumeCount)
+	}
+	if sess.PID != survivingPID || sess.Worktree != worktree || sess.Status != state.StatusRunning {
+		t.Fatalf("surviving runtime changed: status=%q pid=%d worktree=%q", sess.Status, sess.PID, sess.Worktree)
+	}
+	if sess.RestartCheckpointAt != nil {
+		t.Fatal("restart marker was not consumed after exact surviving-worker adoption")
+	}
+
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("second reconcile changed an already-adopted live worker")
 	}
 	if resumeCount != 0 {
-		t.Fatalf("respawnInPlace fired %d times, want 0", resumeCount)
+		t.Fatalf("respawnInPlace fired %d times across two reconciles, want 0", resumeCount)
 	}
 }
 
@@ -612,5 +636,81 @@ func TestReconcile_RestartCheckpoint_MissingWorktree_FallsThrough(t *testing.T) 
 	}
 	if sess.Status != state.StatusDead {
 		t.Fatalf("status = %q, want %q (fell through to terminal handling)", sess.Status, state.StatusDead)
+	}
+}
+
+func TestReconcile_PaneExitedTerminatesPersistedProcessLease(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	stopCalls := 0
+	o.workerStopProcessFn = func(_ string, sess *state.Session) error {
+		stopCalls++
+		sess.ProcessLeaseUnit = ""
+		sess.ProcessLeaseManager = ""
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-920"] = &state.Session{
+		IssueNumber:         920,
+		IssueTitle:          "durable process lease",
+		Status:              state.StatusRunning,
+		PID:                 4242,
+		TmuxSession:         "maestro-sup-920",
+		Branch:              "feat/sup-920",
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+		ProcessLeaseManager: "system",
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected dead pane reconciliation")
+	}
+	if stopCalls != 1 {
+		t.Fatalf("process lease teardown calls = %d, want 1", stopCalls)
+	}
+	if got := s.Sessions["sup-920"]; got.ProcessLeaseUnit != "" || got.Status != state.StatusDead {
+		t.Fatalf("reconciled session = %+v, want released lease and dead status", got)
+	}
+}
+
+func TestReconcile_ProcessLeaseCleanupRetriesExactlyUntilConfirmed(t *testing.T) {
+	resumeCount := 0
+	o := restartResumeOrchestrator(t, &resumeCount)
+	stopCalls := 0
+	o.workerStopProcessFn = func(_ string, sess *state.Session) error {
+		stopCalls++
+		if stopCalls == 1 {
+			return errors.New("system manager temporarily unavailable")
+		}
+		sess.ProcessLeaseUnit = ""
+		sess.ProcessLeaseManager = ""
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["sup-920"] = &state.Session{
+		IssueNumber:         920,
+		Status:              state.StatusFailed,
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope",
+		ProcessLeaseManager: "system",
+	}
+
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("failed lease cleanup must not claim reconciliation completed")
+	}
+	if s.Sessions["sup-920"].ProcessLeaseUnit == "" {
+		t.Fatal("failed cleanup lost the durable retry receipt")
+	}
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("successful retry should report reconciliation")
+	}
+	if stopCalls != 2 || s.Sessions["sup-920"].ProcessLeaseUnit != "" {
+		t.Fatalf("cleanup calls=%d lease=%q, want two calls and released metadata", stopCalls, s.Sessions["sup-920"].ProcessLeaseUnit)
+	}
+	if o.reconcileRunningSessions(s) {
+		t.Fatal("released lease must not be cleaned a third time")
+	}
+	if stopCalls != 2 {
+		t.Fatalf("cleanup replayed after confirmation: %d calls", stopCalls)
 	}
 }

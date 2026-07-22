@@ -66,6 +66,7 @@ Commands:
   history       Show recently completed sessions
   digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
+  tmpfs-hygiene Protect-aware allowlisted /tmp tmpfs sweep (dry-run/apply JSONL)
   version-bump  Bump project version based on merged PR labels
   selfcheck     Run the bundled behavioral smoke gate (self-deploy pre-finalize check)
   version       Print version
@@ -171,6 +172,11 @@ Digest flags:
   sessions with open PRs, blocked issues whose blockers are resolved, PRs with
   stale unresolved review findings, promotable issues, and a per-project
   health line. See docs/digest-runbook.md for a systemd timer example.
+
+Tmpfs hygiene flags:
+  --dry-run             Inspect and report reclaimable entries without deleting
+  --apply               Apply the allowlisted sweep
+  --store string        Config store used to protect local/worktree paths
 
 Watch:
   maestro watch             Open tmux dashboard attached to live worker sessions
@@ -384,6 +390,8 @@ func main() {
 		digestCmd(args)
 	case "cleanup":
 		cleanupCmd(args)
+	case "tmpfs-hygiene":
+		tmpfsHygieneCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
 	case "selfcheck":

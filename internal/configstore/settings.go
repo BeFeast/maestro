@@ -139,7 +139,7 @@ func (s *Store) SetProjectSetting(ctx context.Context, project, key, value, acto
 	if err := yaml.Unmarshal(exported, &root); err != nil {
 		return err
 	}
-	old := scalarValueAtPath(&root, spec.YAMLPath)
+	old := settingValueAtPath(&root, spec.YAMLPath)
 	setNodeAtPath(&root, spec.YAMLPath, scalarNodeForKind(spec.Kind, norm))
 	edited, err := marshalNode(&root)
 	if err != nil {
@@ -175,7 +175,7 @@ func (s *Store) DeleteProjectSetting(ctx context.Context, project, key, actor st
 	if err := yaml.Unmarshal(exported, &root); err != nil {
 		return err
 	}
-	old := scalarValueAtPath(&root, spec.YAMLPath)
+	old := settingValueAtPath(&root, spec.YAMLPath)
 	if old == "" && nodeAtPath(&root, spec.YAMLPath) == nil {
 		return nil // nothing to clear
 	}
@@ -325,6 +325,14 @@ func applyFleetDefaults(projectYAML []byte, fleet map[string]string) ([]byte, ma
 // scalarNodeForKind builds a YAML scalar carrying the right tag for a fleet
 // value so config.Parse decodes it as the correct Go type (bool/int/string).
 func scalarNodeForKind(kind, value string) *yaml.Node {
+	if kind == config.SettingKindJSON {
+		var doc yaml.Node
+		if err := yaml.Unmarshal([]byte(value), &doc); err == nil {
+			if node := documentValue(&doc); node != nil {
+				return node
+			}
+		}
+	}
 	tag := "!!str"
 	switch kind {
 	case config.SettingKindBool:
@@ -333,6 +341,21 @@ func scalarNodeForKind(kind, value string) *yaml.Node {
 		tag = "!!int"
 	}
 	return &yaml.Node{Kind: yaml.ScalarNode, Tag: tag, Value: value}
+}
+
+func settingValueAtPath(root *yaml.Node, path []string) string {
+	n := nodeAtPath(root, path)
+	if n == nil {
+		return ""
+	}
+	if n.Kind == yaml.ScalarNode {
+		return strings.TrimSpace(n.Value)
+	}
+	out, err := yaml.Marshal(n)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(string(out))
 }
 
 // nodeAtPath walks the mapping value at path within root, returning the node or
@@ -469,7 +492,7 @@ func (s *Store) ExportFleetSettings(ctx context.Context) ([]byte, error) {
 // ill-typed keys are rejected so a hand-edited export cannot poison the layer.
 func importFleetSettingsTx(ctx context.Context, tx *sql.Tx, data []byte, actor string) error {
 	var doc struct {
-		FleetSettings map[string]string `yaml:"fleet_settings"`
+		FleetSettings map[string]any `yaml:"fleet_settings"`
 	}
 	if err := yaml.Unmarshal(data, &doc); err != nil {
 		return err
@@ -480,7 +503,18 @@ func importFleetSettingsTx(ctx context.Context, tx *sql.Tx, data []byte, actor s
 	}
 	sort.Strings(keys)
 	for _, key := range keys {
-		norm, err := config.NormalizeSettingValue(key, doc.FleetSettings[key])
+		raw := ""
+		switch value := doc.FleetSettings[key].(type) {
+		case string:
+			raw = value
+		default:
+			encoded, err := yaml.Marshal(value)
+			if err != nil {
+				return fmt.Errorf("%s: marshal %s: %w", FleetSettingsFileName, key, err)
+			}
+			raw = strings.TrimSpace(string(encoded))
+		}
+		norm, err := config.NormalizeSettingValue(key, raw)
 		if err != nil {
 			return fmt.Errorf("%s: %w", FleetSettingsFileName, err)
 		}

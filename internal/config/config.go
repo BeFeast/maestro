@@ -383,6 +383,11 @@ type ModelConfig struct {
 	Default          string                `yaml:"default"` // "claude", "codex", etc.
 	Backends         map[string]BackendDef `yaml:"backends"`
 	FallbackBackends []string              `yaml:"fallback_backends"` // ordered list of backends to try when rate-limited
+	// ProviderLanes declares provider-local defaults and fallback order. When
+	// fallback_backends is set, that legacy explicit backend chain remains the
+	// project override. Otherwise lanes compose in declaration order, with each
+	// provider's default followed by its local fallbacks before the next provider.
+	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -505,6 +510,11 @@ type SelfDeployConfig struct {
 	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
 	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
 	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+	// RestartTimeoutSeconds bounds only the blocking systemctl restart step. It is
+	// deliberately much smaller than TimeoutMinutes so Fleet unavailability is
+	// reported shortly after the daemon's bounded drain, not hidden under the
+	// overall build/deploy budget (#966).
+	RestartTimeoutSeconds int `yaml:"restart_timeout_seconds"`
 
 	// #722: minimum interval between self-deploy triggers. The deploy restarts
 	// the run-loop's own unit, so a burst of merges — or a run-loop restarted by
@@ -591,6 +601,19 @@ func (c SelfDeployConfig) EffectiveTimeoutMinutes() int {
 		return c.TimeoutMinutes
 	}
 	return 30
+}
+
+// DefaultSelfDeployRestartTimeoutSeconds covers the daemon's default four-minute
+// whole-shutdown deadline plus a fixed 30-second process-start grace. Keep this
+// separate from the 30-minute build/deploy timeout: a blocked restart means Fleet
+// is unavailable and must surface promptly (#966).
+const DefaultSelfDeployRestartTimeoutSeconds = 270
+
+func (c SelfDeployConfig) EffectiveRestartTimeoutSeconds() int {
+	if c.RestartTimeoutSeconds > 0 {
+		return c.RestartTimeoutSeconds
+	}
+	return DefaultSelfDeployRestartTimeoutSeconds
 }
 
 // EffectiveMinIntervalMinutes returns the debounce window between self-deploy
@@ -911,7 +934,35 @@ type SupervisorConfig struct {
 	// extends the set (for example a project-specific records/ or qa/ tree).
 	NonFunctionalPaths []string `yaml:"non_functional_paths" json:"non_functional_paths,omitempty"`
 
+	// Recommendation lifecycle policy. Zero selects the built-in defaults;
+	// negative values are rejected during normalization.
+	UnchangedDecisionWindowSeconds int `yaml:"unchanged_decision_window_seconds" json:"unchanged_decision_window_seconds,omitempty"`
+	RecommendationTTLSeconds       int `yaml:"recommendation_ttl_seconds" json:"recommendation_ttl_seconds,omitempty"`
+
 	excludedLabelsSet bool
+}
+
+const (
+	defaultUnchangedDecisionWindow = time.Hour
+	defaultRecommendationTTL       = 24 * time.Hour
+)
+
+// EffectiveUnchangedDecisionWindow returns the durable journal suppression
+// window for identical recommendations. Zero keeps the default at one hour.
+func (c SupervisorConfig) EffectiveUnchangedDecisionWindow() time.Duration {
+	if c.UnchangedDecisionWindowSeconds <= 0 {
+		return defaultUnchangedDecisionWindow
+	}
+	return time.Duration(c.UnchangedDecisionWindowSeconds) * time.Second
+}
+
+// EffectiveRecommendationTTL returns the maximum age of an unconsumed
+// recommendation before it is durably dropped with a disposition reason.
+func (c SupervisorConfig) EffectiveRecommendationTTL() time.Duration {
+	if c.RecommendationTTLSeconds <= 0 {
+		return defaultRecommendationTTL
+	}
+	return time.Duration(c.RecommendationTTLSeconds) * time.Second
 }
 
 // defaultNonFunctionalPaths mirrors pipeline.DefaultNonFunctionalPaths. It is
@@ -1455,7 +1506,7 @@ func (a ServerAuthConfig) ResolvedActorName() string {
 	return name
 }
 
-// RoleConfig defines settings for a single pipeline role (planner,
+// RoleConfig defines settings for a single pipeline role (planner, advisor,
 // implementer, validator).
 type RoleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
@@ -1472,13 +1523,24 @@ type RoleConfig struct {
 	Effort string `yaml:"effort"`
 }
 
-// PipelineConfig controls the planner → implementer → validator phase pipeline
-// and deterministic pre-worker context preparation phases.
+const (
+	DefaultAdvisorReviewRounds = 2
+	MaxAdvisorReviewRounds     = 5
+)
+
+// PipelineConfig controls the planner → optional advisor → implementer →
+// validator phase pipeline and deterministic pre-worker context preparation
+// phases.
 type PipelineConfig struct {
-	// Phase-based pipeline (planner → implementer → validator)
-	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline globally (default: false; issue label pipeline:full opts in per worker)
-	Planner   RoleConfig `yaml:"planner"`   // planner role settings
-	Validator RoleConfig `yaml:"validator"` // validator role settings
+	// Phase-based pipeline (planner → optional advisor → implementer → validator)
+	Enabled bool       `yaml:"enabled"` // enable the phase pipeline globally (default: false; issue labels can opt in per worker)
+	Planner RoleConfig `yaml:"planner"` // planner role settings
+	Advisor RoleConfig `yaml:"advisor"` // independent, review-only plan advisor (default: disabled)
+	// AdvisorReviewRounds bounds Advisor passes across planner revisions. Zero
+	// means the default of two; parse rejects values above the hard cap of five.
+	AdvisorReviewRounds int        `yaml:"advisor_review_rounds"`
+	AdvisorBestEffort   bool       `yaml:"advisor_best_effort"` // explicit auditable bypass instead of fail-closed (default: false)
+	Validator           RoleConfig `yaml:"validator"`           // validator role settings
 	// Implementer carries the implement phase's own backend/effort override (#841)
 	// so the token-heavy implement phase can run on a cheap backend + low effort
 	// while plan/validate keep the strong model. Empty backend falls back to
@@ -1491,6 +1553,20 @@ type PipelineConfig struct {
 	Research       bool  `yaml:"research"`        // scan repo context before worker starts (default: false)
 	PlanValidation *bool `yaml:"plan_validation"` // heuristic plan coverage check before coding starts (default: true)
 	TestMapping    *bool `yaml:"test_mapping"`    // map requirements to verify commands (default: true)
+}
+
+// EffectiveAdvisorReviewRounds returns the bounded number of Advisor passes.
+// Directly-constructed configs are clamped defensively even though Parse rejects
+// values above the hard cap.
+func (p PipelineConfig) EffectiveAdvisorReviewRounds() int {
+	rounds := p.AdvisorReviewRounds
+	if rounds <= 0 {
+		rounds = DefaultAdvisorReviewRounds
+	}
+	if rounds > MaxAdvisorReviewRounds {
+		return MaxAdvisorReviewRounds
+	}
+	return rounds
 }
 
 // PlanValidationEnabled returns whether plan validation is enabled (default: true).
@@ -1955,6 +2031,164 @@ func windowsDriveAbsPath(p string) bool {
 	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
 }
 
+// RemoteRunnerConfig is the deliberately small, project-scoped SSH adapter
+// used by the remote-worker spike (#1058). The control plane still owns issue
+// selection, durable state, the local tmux/process lease, and a lightweight
+// shadow worktree. Only the agent CLI and its canonical working tree move to
+// the configured host.
+//
+// Enabled is an explicit opt-in and defaults false. CredentialsFile names a
+// private file that exists on the runner; Maestro never reads it on the
+// control-plane host or copies credential values over SSH.
+type RemoteRunnerConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	Target          string   `yaml:"target"`           // ssh target, e.g. runner@example.internal
+	RepoPath        string   `yaml:"repo_path"`        // existing clone on the runner
+	WorktreeBase    string   `yaml:"worktree_base"`    // runner-side parent for per-slot worktrees
+	BaseBranch      string   `yaml:"base_branch"`      // default: main
+	SSHCommand      string   `yaml:"ssh_command"`      // default: ssh
+	SSHArgs         []string `yaml:"ssh_args"`         // argv entries before target; no shell parsing
+	MaestroCommand  string   `yaml:"maestro_command"`  // runner-side binary; default: maestro
+	CredentialsFile string   `yaml:"credentials_file"` // optional runner-side private credential file
+}
+
+func validateRemoteRunner(cfg *Config) error {
+	if cfg == nil || !cfg.RemoteRunner.Enabled {
+		return nil
+	}
+	r := &cfg.RemoteRunner
+	if strings.TrimSpace(r.SSHCommand) == "" {
+		r.SSHCommand = "ssh"
+	}
+	r.SSHCommand = strings.TrimSpace(r.SSHCommand)
+	if strings.TrimSpace(r.MaestroCommand) == "" {
+		r.MaestroCommand = "maestro"
+	}
+	r.MaestroCommand = strings.TrimSpace(r.MaestroCommand)
+	if strings.TrimSpace(r.BaseBranch) == "" {
+		r.BaseBranch = "main"
+	}
+	r.BaseBranch = strings.TrimSpace(r.BaseBranch)
+	if err := validateRemoteCommandToken("ssh_command", r.SSHCommand); err != nil {
+		return err
+	}
+	if err := validateRemoteCommandToken("maestro_command", r.MaestroCommand); err != nil {
+		return err
+	}
+	target := strings.TrimSpace(r.Target)
+	if target == "" || strings.HasPrefix(target, "-") || containsControlOrSpace(target) {
+		return fmt.Errorf("config: remote_runner.target must be a non-empty ssh target without whitespace or a leading '-'")
+	}
+	r.Target = target
+	r.RepoPath = strings.TrimSpace(r.RepoPath)
+	r.WorktreeBase = strings.TrimSpace(r.WorktreeBase)
+	r.CredentialsFile = strings.TrimSpace(r.CredentialsFile)
+	if err := validateRemoteAbsolutePath("repo_path", r.RepoPath, false); err != nil {
+		return err
+	}
+	if err := validateRemoteAbsolutePath("worktree_base", r.WorktreeBase, false); err != nil {
+		return err
+	}
+	if r.CredentialsFile != "" {
+		if err := validateRemoteAbsolutePath("credentials_file", r.CredentialsFile, true); err != nil {
+			return err
+		}
+	}
+	if err := validateRemoteGitRef("base_branch", r.BaseBranch); err != nil {
+		return err
+	}
+	if err := validateRemoteSSHArgs(r.SSHArgs); err != nil {
+		return err
+	}
+	if cfg.AutoRebase {
+		return fmt.Errorf("config: remote_runner requires auto_rebase: false in the v1 spike; rebase automation still operates on the control-plane shadow worktree")
+	}
+	if cfg.ValidationContract {
+		return fmt.Errorf("config: remote_runner does not support validation_contract in the v1 spike")
+	}
+	if cfg.Pipeline.Enabled {
+		return fmt.Errorf("config: remote_runner does not support pipeline.enabled in the v1 spike")
+	}
+	if cfg.Hooks.AfterCreate != "" || cfg.Hooks.BeforeRun != "" || cfg.Hooks.AfterRun != "" || cfg.Hooks.BeforeRemove != "" ||
+		cfg.Hooks.PreTool.Command != "" || cfg.Hooks.PostEdit.Command != "" {
+		return fmt.Errorf("config: remote_runner does not support lifecycle or tool hooks in the v1 spike")
+	}
+	return nil
+}
+
+func validateRemoteCommandToken(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "-") || containsControlOrSpace(value) {
+		return fmt.Errorf("config: remote_runner.%s must be one executable path or name without whitespace", name)
+	}
+	return nil
+}
+
+func validateRemoteSSHArgs(args []string) error {
+	needsValue := map[string]bool{
+		"-B": true, "-b": true, "-c": true, "-E": true, "-e": true,
+		"-F": true, "-I": true, "-i": true, "-J": true, "-L": true,
+		"-l": true, "-m": true, "-O": true, "-o": true, "-p": true,
+		"-Q": true, "-R": true, "-S": true, "-W": true, "-w": true,
+	}
+	expectValue := false
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\x00\r\n") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must not contain NUL or newlines", i)
+		}
+		if expectValue {
+			if arg == "" {
+				return fmt.Errorf("config: remote_runner.ssh_args[%d] must not be empty", i)
+			}
+			expectValue = false
+			continue
+		}
+		if arg == "" || arg == "--" || !strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must be an ssh option, not a target or remote command", i)
+		}
+		expectValue = needsValue[arg]
+	}
+	if expectValue {
+		return fmt.Errorf("config: remote_runner.ssh_args ends with an option that requires a value")
+	}
+	return nil
+}
+
+func validateRemoteAbsolutePath(name, value string, allowFile bool) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") || !pathpkg.IsAbs(value) {
+		return fmt.Errorf("config: remote_runner.%s must be an absolute runner-side POSIX path", name)
+	}
+	clean := pathpkg.Clean(value)
+	if clean != value || clean == "/" {
+		return fmt.Errorf("config: remote_runner.%s must be normalized and must not be '/'", name)
+	}
+	if !allowFile && strings.HasSuffix(value, "/") {
+		return fmt.Errorf("config: remote_runner.%s must not have a trailing slash", name)
+	}
+	return nil
+}
+
+func validateRemoteGitRef(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "@" || strings.ContainsAny(value, "\x00\r\n ~^:?*[\\") || strings.HasPrefix(value, "-") ||
+		strings.HasPrefix(value, ".") || strings.Contains(value, "/.") || strings.HasSuffix(value, ".lock") ||
+		strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") ||
+		strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.Contains(value, "//") {
+		return fmt.Errorf("config: remote_runner.%s is not a safe git branch name", name)
+	}
+	return nil
+}
+
+func containsControlOrSpace(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
 type Config struct {
 	Server     ServerConfig     `yaml:"server"`
 	Supervisor SupervisorConfig `yaml:"supervisor"`
@@ -1971,6 +2205,7 @@ type Config struct {
 	LocalPath                       string                        `yaml:"local_path"`
 	WorktreeBase                    string                        `yaml:"worktree_base"`
 	WorkerRuntime                   WorkerRuntimeConfig           `yaml:"worker_runtime,omitempty"`
+	RemoteRunner                    RemoteRunnerConfig            `yaml:"remote_runner"`
 	MaxParallel                     int                           `yaml:"max_parallel"`
 	MaxLiveWorkers                  int                           `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
 	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
@@ -2219,6 +2454,9 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
+	if cfg.Pipeline.AdvisorReviewRounds < 0 || cfg.Pipeline.AdvisorReviewRounds > MaxAdvisorReviewRounds {
+		return nil, fmt.Errorf("config: pipeline.advisor_review_rounds must be between 1 and %d when set (0 uses the default of %d)", MaxAdvisorReviewRounds, DefaultAdvisorReviewRounds)
+	}
 
 	// #869: optional project identity metadata. A present project_id must be a
 	// UUID; a present management_home must satisfy its field contract. Both are
@@ -2230,6 +2468,9 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {
+		return nil, err
+	}
+	if err := validateRemoteRunner(cfg); err != nil {
 		return nil, err
 	}
 	if !cfg.Delivery.ValidMode() {
@@ -2320,6 +2561,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
+	cfg.Pipeline.Advisor.Prompt = expandHome(cfg.Pipeline.Advisor.Prompt)
 	cfg.Pipeline.Implementer.Prompt = expandHome(cfg.Pipeline.Implementer.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
 	cfg.Supervisor.Prompt = expandHome(cfg.Supervisor.Prompt)
@@ -2366,7 +2608,11 @@ func parse(data []byte) (*Config, error) {
 
 	// Model backend defaults
 	if cfg.Model.Default == "" {
-		cfg.Model.Default = "claude"
+		if len(cfg.Model.FallbackBackends) == 0 && len(cfg.Model.ProviderLanes) > 0 && strings.TrimSpace(cfg.Model.ProviderLanes[0].Default) != "" {
+			cfg.Model.Default = strings.TrimSpace(cfg.Model.ProviderLanes[0].Default)
+		} else {
+			cfg.Model.Default = "claude"
+		}
 	}
 	if cfg.Model.Backends == nil {
 		cfg.Model.Backends = make(map[string]BackendDef)
@@ -2376,6 +2622,12 @@ func parse(data []byte) (*Config, error) {
 		if _, ok := cfg.Model.Backends["claude"]; !ok {
 			cfg.Model.Backends["claude"] = BackendDef{Cmd: cfg.ClaudeCmd}
 		}
+	}
+	// Provider lanes must reference explicit backend definitions. Validate before
+	// the legacy model.default compatibility block below can synthesize a backend
+	// for the effective default.
+	if err := validateProviderLanes(cfg); err != nil {
+		return nil, err
 	}
 
 	// Ensure the default backend is always present in the map
@@ -2401,7 +2653,6 @@ func parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
 		}
 	}
-
 	// #704: quota calibration sanity. Capacities must be non-negative and
 	// the dispatch threshold a fraction in (0, 1]; a percent-style value
 	// (e.g. 85) almost certainly means the operator meant 0.85, so fail
@@ -2778,6 +3029,12 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	if policy.DispatchSLASeconds < 0 {
 		return fmt.Errorf("supervisor.dispatch_sla_seconds must be >= 0")
 	}
+	if policy.UnchangedDecisionWindowSeconds < 0 {
+		return fmt.Errorf("supervisor.unchanged_decision_window_seconds must be >= 0")
+	}
+	if policy.RecommendationTTLSeconds < 0 {
+		return fmt.Errorf("supervisor.recommendation_ttl_seconds must be >= 0")
+	}
 	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
 	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)
 	policy.SafeActions = normalizeActionList(policy.SafeActions)
@@ -2967,11 +3224,12 @@ func (c *Config) manualRoutingLabelPinWarning() string {
 		return ""
 	}
 	if strings.TrimSpace(c.Pipeline.Planner.Backend) != "" ||
+		strings.TrimSpace(c.Pipeline.Advisor.Backend) != "" ||
 		strings.TrimSpace(c.Pipeline.Validator.Backend) != "" {
 		return ""
 	}
 	return fmt.Sprintf(
-		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
+		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,advisor,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
 		len(c.Model.Backends),
 		coalesceRoutingMode(c.Routing.Mode),
 	)

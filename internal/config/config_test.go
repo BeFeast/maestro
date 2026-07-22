@@ -1458,6 +1458,8 @@ supervisor:
   queue_comments: true
   one_at_a_time: true
   dispatch_sla_seconds: 90
+  unchanged_decision_window_seconds: 600
+  recommendation_ttl_seconds: 7200
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -1478,6 +1480,36 @@ supervisor:
 	if cfg.Supervisor.DispatchSLASeconds != 90 {
 		t.Errorf("Supervisor.DispatchSLASeconds = %d, want 90", cfg.Supervisor.DispatchSLASeconds)
 	}
+	if got := cfg.Supervisor.EffectiveUnchangedDecisionWindow(); got != 10*time.Minute {
+		t.Errorf("EffectiveUnchangedDecisionWindow = %s, want 10m", got)
+	}
+	if got := cfg.Supervisor.EffectiveRecommendationTTL(); got != 2*time.Hour {
+		t.Errorf("EffectiveRecommendationTTL = %s, want 2h", got)
+	}
+}
+
+func TestSupervisorRecommendationPolicyDefaults(t *testing.T) {
+	cfg := SupervisorConfig{}
+	if got := cfg.EffectiveUnchangedDecisionWindow(); got != time.Hour {
+		t.Fatalf("EffectiveUnchangedDecisionWindow = %s, want 1h", got)
+	}
+	if got := cfg.EffectiveRecommendationTTL(); got != 24*time.Hour {
+		t.Fatalf("EffectiveRecommendationTTL = %s, want 24h", got)
+	}
+
+	root := &Config{}
+	for key, want := range map[string]string{
+		"supervisor.unchanged_decision_window_seconds": "3600",
+		"supervisor.recommendation_ttl_seconds":        "86400",
+	} {
+		spec, ok := FleetSettingSpecByKey(key)
+		if !ok {
+			t.Fatalf("FleetSettingSpecByKey(%q) missing", key)
+		}
+		if got := spec.Value(root); got != want {
+			t.Fatalf("%s active default = %q, want %q", key, got, want)
+		}
+	}
 }
 
 func TestParse_SupervisorDispatchSLAMustBeNonNegative(t *testing.T) {
@@ -1492,6 +1524,21 @@ supervisor:
 	}
 	if !strings.Contains(err.Error(), "supervisor.dispatch_sla_seconds") {
 		t.Fatalf("error = %v, want supervisor.dispatch_sla_seconds", err)
+	}
+}
+
+func TestParse_SupervisorRecommendationPolicyMustBeNonNegative(t *testing.T) {
+	for _, field := range []string{"unchanged_decision_window_seconds", "recommendation_ttl_seconds"} {
+		t.Run(field, func(t *testing.T) {
+			yaml := "repo: owner/repo\nsupervisor:\n  " + field + ": -1\n"
+			_, err := parse([]byte(yaml))
+			if err == nil {
+				t.Fatal("parse succeeded, want invalid recommendation policy error")
+			}
+			if !strings.Contains(err.Error(), "supervisor."+field) {
+				t.Fatalf("error = %v, want supervisor.%s", err, field)
+			}
+		})
 	}
 }
 

@@ -9,9 +9,11 @@ import (
 func TestWorkerLeaseMetadataSurvivesSaveLoad(t *testing.T) {
 	dir := t.TempDir()
 	st := NewState()
+	unit := "maestro-worker-0123456789abcdef0123456789abcdef-g1.service"
 	st.Sessions["sup-1"] = &Session{
 		IssueNumber: 927, Status: StatusRunning, StartedAt: time.Now().UTC(),
-		WorkerLeaseID: "mw-lease", WorkerLeaseUnit: "maestro-worker-mw-lease.service",
+		ProcessLeaseUnit: unit, ProcessLeaseManager: "system",
+		WorkerLeaseID: "mw-lease", WorkerLeaseUnit: unit,
 		WorkerLeaseScope: "system", WorkerScratchDir: "/var/tmp/maestro-workers/lease",
 		WorkerLeaseManifest: "/var/tmp/maestro-workers/lease/lease.json",
 	}
@@ -23,8 +25,21 @@ func TestWorkerLeaseMetadataSurvivesSaveLoad(t *testing.T) {
 		t.Fatal(err)
 	}
 	sess := got.Sessions["sup-1"]
-	if sess.WorkerLeaseID != "mw-lease" || sess.WorkerLeaseScope != "system" || sess.WorkerLeaseManifest == "" {
+	if sess.WorkerLeaseID != "mw-lease" || sess.WorkerLeaseUnit != sess.ProcessLeaseUnit ||
+		sess.WorkerLeaseScope != sess.ProcessLeaseManager || sess.WorkerLeaseManifest == "" {
 		t.Fatalf("lease metadata lost: %+v", sess)
+	}
+}
+
+func TestUnreleasedWorkerScratchReceiptPreventsPruning(t *testing.T) {
+	st := NewState()
+	finished := time.Now().UTC().Add(-48 * time.Hour)
+	st.Sessions["sup-1"] = &Session{
+		IssueNumber: 927, Status: StatusDone, StartedAt: finished.Add(-time.Hour), FinishedAt: &finished,
+		WorkerLeaseID: "mw-retained",
+	}
+	if removed := st.PruneOldSessions(time.Hour); removed != 0 || st.Sessions["sup-1"] == nil {
+		t.Fatalf("unreleased scratch receipt was pruned: removed=%d sessions=%v", removed, st.Sessions)
 	}
 }
 

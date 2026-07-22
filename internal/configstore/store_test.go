@@ -227,8 +227,8 @@ model:
 	}
 }
 
-// #841: the per-phase backend + effort fields (pipeline.{planner,implementer,
-// validator}.{backend,effort}) live in the project document, so the store must
+// #841/#928: the per-phase backend + effort fields (pipeline.{planner,advisor,
+// implementer,validator}.{backend,effort}) live in the project document, so the store must
 // round-trip them through import → export → parse without a schema change, and a
 // row that omits them must load with empty defaults.
 func TestExportDirRoundTripsPerPhaseBackendEffort(t *testing.T) {
@@ -249,6 +249,13 @@ pipeline:
     enabled: true
     backend: fable
     effort: xhigh
+  advisor:
+    enabled: true
+    backend: codex
+    effort: high
+    max_runtime_minutes: 20
+  advisor_review_rounds: 4
+  advisor_best_effort: true
   implementer:
     backend: codex
     effort: low
@@ -291,6 +298,9 @@ pipeline:
 		t.Fatalf("planner/validator effort not preserved: planner=%q validator=%q",
 			roundTrip.Pipeline.Planner.Effort, roundTrip.Pipeline.Validator.Effort)
 	}
+	if !roundTrip.Pipeline.Advisor.Enabled || roundTrip.Pipeline.Advisor.Backend != "codex" || roundTrip.Pipeline.Advisor.Effort != "high" || roundTrip.Pipeline.Advisor.MaxRuntimeMinutes != 20 || roundTrip.Pipeline.AdvisorReviewRounds != 4 || !roundTrip.Pipeline.AdvisorBestEffort {
+		t.Fatalf("advisor config not preserved: %#v", roundTrip.Pipeline)
+	}
 }
 
 // A project row that predates #841 (no pipeline effort/implementer fields) must
@@ -328,6 +338,9 @@ pipeline:
 	if cfg.Pipeline.Planner.Effort != "" || cfg.Pipeline.Validator.Effort != "" {
 		t.Fatalf("absent effort should default empty: planner=%q validator=%q",
 			cfg.Pipeline.Planner.Effort, cfg.Pipeline.Validator.Effort)
+	}
+	if cfg.Pipeline.Advisor.Enabled || cfg.Pipeline.Advisor.Backend != "" || cfg.Pipeline.AdvisorReviewRounds != 0 || cfg.Pipeline.AdvisorBestEffort {
+		t.Fatalf("absent advisor should default disabled: %#v", cfg.Pipeline)
 	}
 }
 

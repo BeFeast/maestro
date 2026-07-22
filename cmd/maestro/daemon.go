@@ -31,6 +31,7 @@ func daemonCmd(args []string) {
 	storePath := fs.String("store", defaultConfigStorePath(), "Path to SQLite config store")
 	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
 	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
+	tmpfsHygieneInterval := fs.Duration("tmpfs-hygiene-interval", daemon.DefaultTmpfsHygieneInterval, "Protect-aware /tmp apply interval")
 	host := fs.String("host", "127.0.0.1", "Host/interface to bind the fleet web server")
 	port := fs.Int("port", 8786, "Port to bind the fleet web server")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
@@ -45,7 +46,7 @@ func daemonCmd(args []string) {
 	webhookPath := fs.String("webhook-path", webhook.DefaultPath, "HTTP path the webhook ingestion endpoint is served on (#824)")
 	webhookDB := fs.String("webhook-db", webhookstore.DefaultDBPath(), "Shared SQLite db path webhook deliveries land in (#824)")
 	emergencyDB := fs.String("emergency-db", emergencystore.DefaultDBPath(), "Shared SQLite db path the fleet-wide EMERGENCY STOP switch lives in (#840)")
-	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Max time the SIGTERM in-process drain waits for in-flight workers to finish (#761)")
+	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Whole SIGTERM drain + shutdown deadline; includes flow joins and restart checkpointing (#761, #966)")
 	fs.Parse(args)
 	if err := refuseUnmigratedCanonicalStore(*storePath); err != nil {
 		log.Fatalf("daemon: %v", err)
@@ -61,13 +62,14 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		Host:              *host,
-		Port:              *port,
-		RunInterval:       *runInterval,
-		SuperviseInterval: *superviseInterval,
-		PromptPath:        *promptPath,
-		Version:           resolveVersion(),
-		ReadOnly:          *readOnly,
+		Host:                 *host,
+		Port:                 *port,
+		RunInterval:          *runInterval,
+		SuperviseInterval:    *superviseInterval,
+		TmpfsHygieneInterval: *tmpfsHygieneInterval,
+		PromptPath:           *promptPath,
+		Version:              resolveVersion(),
+		ReadOnly:             *readOnly,
 		// Centralized self-deploy debounce marker (#758): one shared location next
 		// to the config store so every flow's RequestSelfDeploy debounces on the
 		// same marker, and it survives the daemon being restarted by its own
@@ -75,6 +77,7 @@ func daemonCmd(args []string) {
 		SelfDeployStateDir: filepath.Join(filepath.Dir(*storePath), "self-deploy"),
 		WatchStore:         *watchStore,
 		WatchStoreInterval: *watchStoreInterval,
+		DrainTimeout:       *drainTimeout,
 		ApprovalsStore:     *approvalsStore,
 		ApprovalsDBPath:    *approvalsDB,
 		StateStore:         *stateStore,
@@ -85,12 +88,33 @@ func daemonCmd(args []string) {
 		EmergencyDBPath:    *emergencyDB,
 	})
 
-	go handleDaemonSignals(ctx, cancel, d, *drainTimeout)
+	// runDone is closed when Run returns, so the signal handler's exact-deadline
+	// backstop can distinguish a clean shutdown from a wedged one (#966).
+	runDone := make(chan struct{})
+	go handleDaemonSignals(ctx, cancel, d, *drainTimeout, runDone)
 
 	log.Printf("starting maestro daemon — store=%s addr=%s:%d", *storePath, *host, *port)
-	if err := d.Run(ctx); err != nil {
+	err = d.Run(ctx)
+	close(runDone)
+	if err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
+}
+
+// shutdownHandoffGrace is reserved INSIDE the configured drain timeout for flow
+// cancellation, marker checkpointing, and HTTP/process handoff. The worker wait
+// gets the rest of the budget. Keeping this tail small leaves Fleet available
+// throughout the useful drain window while still guaranteeing the old process
+// exits by the advertised deadline (#966). A var so tests can shorten it.
+var shutdownHandoffGrace = 5 * time.Second
+
+// forceExit is the process-exit call the hard-shutdown backstop uses. A var so
+// tests can observe it firing without terminating the test binary.
+var forceExit = func(code int) { os.Exit(code) }
+
+type daemonShutdown interface {
+	SetShutdownDeadline(time.Time)
+	DrainUntil(context.Context, time.Time)
 }
 
 // handleDaemonSignals implements the two-phase shutdown the single-service
@@ -100,27 +124,107 @@ func daemonCmd(args []string) {
 // idle flows down. A SECOND signal aborts the drain wait and forces immediate
 // shutdown. It returns if the daemon stops on its own (ctx already done) before
 // any signal arrives.
-func handleDaemonSignals(ctx context.Context, cancel context.CancelFunc, d *daemon.Daemon, drainTimeout time.Duration) {
+//
+// The bounded drain deadline governs the ENTIRE shutdown, not just the wait for
+// in-flight workers (#966). A small handoff tail is reserved inside that budget;
+// if any non-context-aware operation still wedges, the exact-deadline backstop
+// force-exits once so systemd never needs an operator's second signal.
+func handleDaemonSignals(ctx context.Context, cancel context.CancelFunc, d *daemon.Daemon, drainTimeout time.Duration, runDone <-chan struct{}) {
 	sigCh := make(chan os.Signal, 2)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	defer signal.Stop(sigCh)
+	handleDaemonSignalStream(ctx, cancel, d, drainTimeout, runDone, sigCh)
+}
+
+// handleDaemonSignalStream is the testable signal-state machine. signals must
+// deliver the first shutdown signal and may deliver a second force signal.
+func handleDaemonSignalStream(ctx context.Context, cancel context.CancelFunc, d daemonShutdown, drainTimeout time.Duration, runDone <-chan struct{}, signals <-chan os.Signal) {
 	select {
 	case <-ctx.Done():
 		return
-	case <-sigCh:
+	case <-signals:
 	}
-	log.Printf("received signal — draining flows in-process (no new workers; up to %s); send the signal again to force shutdown", drainTimeout)
+	if drainTimeout <= 0 {
+		drainTimeout = daemon.DefaultDrainTimeout
+	}
+	// Anchor the whole-shutdown deadline at the moment the first signal lands so
+	// the drain, the flow teardown, and the checkpoint pass all share one budget.
+	shutdownDeadline := time.Now().Add(drainTimeout)
+	d.SetShutdownDeadline(shutdownDeadline)
+	handoffGrace := shutdownHandoffGraceFor(drainTimeout)
+	drainDeadline := shutdownDeadline.Add(-handoffGrace)
+	log.Printf("received signal — draining flows in-process (no new workers; up to %s total, reserving %s for bounded handoff); the daemon exits on its own by the deadline even if a flow stop wedges — send the signal again to force shutdown now", drainTimeout, handoffGrace)
+	// Start the hard backstop before any drain state I/O. Even a wedged state
+	// load/save cannot leave maestro.service deactivating past the deadline.
+	forceShutdown := make(chan struct{})
+	go awaitShutdownOrForceExit(shutdownDeadline, runDone, forceShutdown)
 	drainCtx, abortDrain := context.WithCancel(ctx)
 	defer abortDrain()
 	go func() {
 		select {
-		case <-sigCh:
+		case <-signals:
 			log.Printf("received second signal — aborting drain and shutting down now")
+			// Shorten both Run's teardown deadline and the independent process-exit
+			// backstop. Cancelling DrainUntil alone would still let checkpointing or
+			// a stuck flow join consume the original multi-minute budget.
+			d.SetShutdownDeadline(time.Now())
 			abortDrain()
+			cancel()
+			close(forceShutdown)
 		case <-drainCtx.Done():
 		}
 	}()
-	d.Drain(drainCtx, drainTimeout)
+	d.DrainUntil(drainCtx, drainDeadline)
 	cancel()
+}
+
+func shutdownHandoffGraceFor(timeout time.Duration) time.Duration {
+	grace := shutdownHandoffGrace
+	if grace <= 0 {
+		return 0
+	}
+	if timeout <= grace {
+		return timeout / 2
+	}
+	return grace
+}
+
+// awaitShutdownOrForceExit blocks until Run finishes its post-cancel teardown
+// (runDone closed) or the hard shutdown deadline elapses, whichever comes first.
+// On the deadline it force-exits: some non-context-aware shutdown work overran
+// its budget, so detaching it is the correct recovery. Surviving isolated workers
+// keep their worktrees and are reconciled by the new daemon while Fleet comes
+// back instead of hanging in deactivating (#877, #966).
+func awaitShutdownOrForceExit(hardDeadline time.Time, runDone, forceNow <-chan struct{}) {
+	remaining := time.Until(hardDeadline)
+	if remaining < 0 {
+		remaining = 0
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	select {
+	case <-runDone:
+		return
+	case <-forceNow:
+		// Resolve a simultaneous Run completion in favor of the clean return.
+		select {
+		case <-runDone:
+			return
+		default:
+		}
+		log.Printf("second shutdown signal received — force-exiting now so the restart handoff completes")
+		forceExit(0)
+	case <-timer.C:
+		// Resolve the timer/runDone race in favor of a clean return when Run closed
+		// concurrently with the deadline tick.
+		select {
+		case <-runDone:
+			return
+		default:
+		}
+		log.Printf("shutdown reached the configured drain deadline — force-exiting once so the restart handoff completes (#966)")
+		forceExit(0)
+	}
 }
 
 var legacyStoreWarningOnce sync.Once

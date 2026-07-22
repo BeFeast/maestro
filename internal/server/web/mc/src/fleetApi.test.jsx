@@ -5,6 +5,8 @@ import {
   formatBackendQuotaSentence,
   formatProviderModelHealthSentence,
   mapFleetResponse,
+  mapTmpfsHygiene,
+  supervisorDecisionsFromProject,
   workerSessionsFromFleet,
   workerNextAction,
   workerStatusTaxonomy,
@@ -102,6 +104,37 @@ describe("Fleet workers ordering contract", () => {
     });
   });
 
+  test("closed terminal session stays done despite historical failure tokens", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "done",
+      issue_closed_at: "2026-07-15T11:30:00Z",
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "done",
+      tone: "ok",
+      section: "done",
+    });
+  });
+
+  test("ordinary done session keeps a historical token-budget failure visible", () => {
+    const taxonomy = workerStatusTaxonomy({
+      status: "done",
+      display_status: "token_budget_exceeded",
+      worker_outcome: "token_budget_exceeded",
+      needs_attention: true,
+    });
+
+    expect(taxonomy).toEqual({
+      label: "token budget exceeded",
+      tone: "stuck",
+      section: "stuck",
+    });
+  });
+
   test("issue-guard retry hold is visible recent work, not a stuck worker", () => {
     const taxonomy = workerStatusTaxonomy({
       status: "dead",
@@ -125,6 +158,49 @@ describe("Fleet workers ordering contract", () => {
       text: "Maestro will resume the same canonical session.",
       buttons: [{ label: "Open issue →", href: "https://github.com/BeFeast/ok-player/issues/406" }],
     });
+  });
+
+  test("model overload is distinct from model access and credential cooldown", () => {
+    expect(workerStatusTaxonomy({
+      status: "dead",
+      display_status: "backend_model_overloaded",
+      needs_attention: true,
+    })).toEqual({
+      label: "model overloaded",
+      tone: "watch",
+      section: "stuck",
+    });
+
+    expect(workerNextAction({
+      status: "dead",
+      display_status: "backend_model_overloaded",
+      provider_limit_provider: "claude",
+      provider_limit_model: "claude-fable-5",
+    })).toEqual({
+      text: "claude/claude-fable-5 is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.",
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    });
+  });
+});
+
+describe("tmpfs hygiene pressure", () => {
+  test("maps the exact pressure attention code and counts host attention", () => {
+    const raw = {
+      summary: {},
+      tmpfs_hygiene: {
+        timestamp: "2026-07-21T18:00:00Z",
+        mode: "apply",
+        tmpfs: true,
+        use_pct: 87,
+        pressure: true,
+        attention_code: "tmpfs_pressure",
+        freed_bytes: 8192,
+      },
+    };
+    const mapped = mapTmpfsHygiene(raw.tmpfs_hygiene);
+    expect(mapped.attentionCode).toBe("tmpfs_pressure");
+    expect(mapped.usePct).toBe(87);
+    expect(mapFleetResponse(raw, now).attentionCount).toBe(1);
   });
 });
 
@@ -187,5 +263,67 @@ describe("provider/model credential health", () => {
     expect(formatBackendQuotaSentence(quota[0], now)).toContain(
       "claude-fable-5 unavailable: 0/2 credentials usable",
     );
+  });
+});
+
+describe("supervisor recommendation episodes", () => {
+  test("keeps latest recommendation first/last/count/disposition metadata", () => {
+    const decisions = supervisorDecisionsFromProject({
+      needsAttention: 0,
+      operatorState: {},
+      supervisor: {
+        latest: {
+          created_at: "2026-07-15T10:00:00Z",
+          first_seen_at: "2026-07-15T10:00:00Z",
+          last_seen_at: "2026-07-15T12:00:00Z",
+          seen_count: 25,
+          recommendation_id: "supervisor:held",
+          recommended_action: "monitor_open_pr",
+          summary: "Waiting on the current dispatch guard.",
+          disposition: { status: "dropped", reason: "ttl_expired_unconsumed" },
+        },
+      },
+    }, now);
+
+    expect(decisions).toHaveLength(1);
+    expect(decisions[0]).toMatchObject({
+      t: now,
+      firstSeen: Date.parse("2026-07-15T10:00:00Z"),
+      lastSeen: now,
+      seenCount: 25,
+      recommendationId: "supervisor:held",
+      disposition: { status: "dropped", reason: "ttl_expired_unconsumed" },
+    });
+  });
+});
+
+describe("Provider route mapping", () => {
+  test("preserves provider lanes, flattened route, and selection reason", () => {
+    const fleet = mapFleetResponse({
+      projects: [{
+        name: "maestro",
+        effective_config: {
+          model_policy: {
+            default: "claude",
+            provider_lanes: [
+              { provider: "anthropic", default: "claude" },
+              { provider: "openai", default: "sol", fallback_backends: ["gpt55"] },
+            ],
+            resolved_route: ["claude", "sol", "gpt55"],
+            selection_reason: "provider_lanes",
+          },
+        },
+      }],
+    }, now);
+
+    expect(fleet.projects[0].effectiveConfig.modelPolicy).toMatchObject({
+      default: "claude",
+      resolvedRoute: ["claude", "sol", "gpt55"],
+      selectionReason: "provider_lanes",
+      providerLanes: [
+        { provider: "anthropic", default: "claude", fallbackBackends: [] },
+        { provider: "openai", default: "sol", fallbackBackends: ["gpt55"] },
+      ],
+    });
   });
 });

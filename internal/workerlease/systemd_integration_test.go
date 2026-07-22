@@ -9,6 +9,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // TestSystemdLeaseForcedKillReapsReparentedDescendantAndKeepsNeighbor is a
@@ -26,31 +28,22 @@ func TestSystemdLeaseForcedKillReapsReparentedDescendantAndKeepsNeighbor(t *test
 		t.Fatal(err)
 	}
 
-	cleanupHelper := filepath.Join(filepath.Dir(root), "lease-cleanup.sh")
-	cleanupScript := fmt.Sprintf(`#!/bin/bash
-manifest=""
-lease=""
-shift
-while [ "$#" -gt 0 ]; do
-  case "$1" in
-    --manifest) manifest="$2"; shift 2 ;;
-    --lease) lease="$2"; shift 2 ;;
-    *) exit 2 ;;
-  esac
-done
-dir="${manifest%%/lease.json}"
-case "$dir" in
-  %s/mw-*) /usr/bin/rm -rf -- "$dir" ;;
-  *) exit 3 ;;
-esac
-`, root)
-	if err := os.WriteFile(cleanupHelper, []byte(cleanupScript), 0o700); err != nil {
+	repoRoot, err := filepath.Abs(filepath.Join("..", ".."))
+	if err != nil {
 		t.Fatal(err)
+	}
+	maestroBin := filepath.Join(t.TempDir(), "maestro")
+	build := exec.Command("go", "build", "-o", maestroBin, "./cmd/maestro/")
+	build.Dir = repoRoot
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build integration cleanup binary: %v\n%s", err, out)
 	}
 
 	childPIDFile := filepath.Join(target.ScratchDir, "reparented.pid")
+	runtimeEnvFile := filepath.Join(target.TempDir, "runtime-env")
 	targetPayload := filepath.Join(target.ScratchDir, "payload.sh")
 	targetScript := fmt.Sprintf(`#!/bin/bash
+printf '%%s\n' "$TMPDIR|$TMP|$TEMP|$GOTMPDIR|$CARGO_TARGET_DIR" > /tmp/runtime-env
 (
   (
     /usr/bin/setsid /usr/bin/bash -c 'echo $$ > %s; while :; do /usr/bin/sleep 1; done' </dev/null >/dev/null 2>&1 &
@@ -66,32 +59,37 @@ exec /usr/bin/sleep 300
 		t.Fatal(err)
 	}
 
-	start := func(lease Lease, payload string) *exec.Cmd {
-		binary, args, err := BuildLaunchCommand(LaunchSpec{
-			Lease: lease, UID: os.Getuid(), PATH: os.Getenv("PATH"),
-			PayloadPath: payload, MaestroBin: cleanupHelper,
-		})
+	t.Setenv("INVOCATION_ID", "maestro-worker-scratch-integration")
+	start := func(lease Lease, payload, session string) tmuxsession.ProcessLease {
+		processLease := tmuxsession.ProcessLease{
+			Unit:    lease.Unit,
+			Manager: lease.Scope,
+			Runtime: &tmuxsession.ProcessLeaseRuntime{
+				ScratchID: lease.ID, ScratchDir: lease.ScratchDir, TempDir: lease.TempDir,
+				GoTempDir: lease.GoTempDir, CargoTarget: lease.CargoTarget, ManifestPath: lease.ManifestPath,
+				CleanupExec: CleanupExec(maestroBin, lease.ManifestPath, lease.ID),
+			},
+		}
+		out, err := tmuxsession.StartDetached(session, lease.ScratchDir, payload, processLease)
 		if err != nil {
-			t.Fatal(err)
+			t.Fatalf("start %s: %v\n%s", lease.Unit, err, out)
 		}
-		cmd := exec.Command(binary, args...)
-		if err := cmd.Start(); err != nil {
-			t.Fatalf("start %s: %v", lease.Unit, err)
-		}
-		return cmd
+		return processLease
 	}
-	targetCmd := start(target, targetPayload)
-	neighborCmd := start(neighbor, neighborPayload)
+	targetSession := fmt.Sprintf("maestro-scratch-target-%d", time.Now().UnixNano())
+	neighborSession := fmt.Sprintf("maestro-scratch-neighbor-%d", time.Now().UnixNano())
+	targetProcessLease := start(target, targetPayload, targetSession)
+	neighborProcessLease := start(neighbor, neighborPayload, neighborSession)
 	t.Cleanup(func() {
-		_ = Stop(ScopeSystem, target.Unit)
-		_ = Stop(ScopeSystem, neighbor.Unit)
-		_ = targetCmd.Wait()
-		_ = neighborCmd.Wait()
+		_ = tmuxsession.TerminateProcessLease(targetProcessLease)
+		_ = tmuxsession.TerminateProcessLease(neighborProcessLease)
+		_, _ = tmuxsession.KillSession(targetSession)
+		_, _ = tmuxsession.KillSession(neighborSession)
 	})
 
 	waitForLeaseCondition(t, 15*time.Second, func() bool {
-		active, _ := Active(ScopeSystem, target.Unit)
-		neighborActive, _ := Active(ScopeSystem, neighbor.Unit)
+		active, _ := tmuxsession.ProcessLeaseActive(targetProcessLease)
+		neighborActive, _ := tmuxsession.ProcessLeaseActive(neighborProcessLease)
 		return active && neighborActive
 	}, "both worker leases active")
 
@@ -105,19 +103,19 @@ exec /usr/bin/sleep 300
 		return err == nil && childPID > 0
 	}, "reparented descendant pid")
 	waitForLeaseCondition(t, 10*time.Second, func() bool {
+		data, err := os.ReadFile(runtimeEnvFile)
+		return err == nil && strings.TrimSpace(string(data)) == "/tmp|/tmp|/tmp|/tmp/go|/tmp/cargo-target"
+	}, "private tmp mount and temp environment")
+	waitForLeaseCondition(t, 10*time.Second, func() bool {
 		ppid, err := procPPID(childPID)
 		return err == nil && ppid == 1
 	}, "descendant reparented to pid 1")
 
-	binary, args, err := systemctlCommand(ScopeSystem, "kill", "--kill-whom=all", "--signal=SIGKILL", target.Unit)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if out, err := exec.Command(binary, args...).CombinedOutput(); err != nil {
-		t.Fatalf("force-kill target lease: %v\n%s", err, out)
+	if err := tmuxsession.TerminateProcessLease(targetProcessLease); err != nil {
+		t.Fatalf("terminate target lease: %v", err)
 	}
 	waitForLeaseCondition(t, 15*time.Second, func() bool {
-		active, _ := Active(ScopeSystem, target.Unit)
+		active, _ := tmuxsession.ProcessLeaseActive(targetProcessLease)
 		return !active && !processExists(childPID)
 	}, "target lease and reparented descendant gone")
 	waitForLeaseCondition(t, 15*time.Second, func() bool {
@@ -125,7 +123,7 @@ exec /usr/bin/sleep 300
 		return os.IsNotExist(err)
 	}, "target scratch cleaned by ExecStopPost")
 
-	neighborActive, err := Active(ScopeSystem, neighbor.Unit)
+	neighborActive, err := tmuxsession.ProcessLeaseActive(neighborProcessLease)
 	if err != nil || !neighborActive {
 		t.Fatalf("neighboring worker did not survive target force-kill: active=%v err=%v", neighborActive, err)
 	}

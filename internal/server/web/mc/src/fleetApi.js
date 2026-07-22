@@ -72,11 +72,13 @@ export function mapFleetResponse(raw, now = Date.now()) {
     Number(summary.outcome_drift || 0) +
     Number(summary.no_eligible_issues || 0);
   const providerModelHealth = aggregateProviderModelHealth(raw.projects || [], now);
+  const tmpfsHygiene = mapTmpfsHygiene(raw.tmpfs_hygiene);
 
   return {
     raw,
     readOnly: raw.read_only === true,
     emergency: mapEmergency(raw.emergency),
+    tmpfsHygiene,
     refreshedAt: raw.refreshed_at || "",
     nextAction: raw.next_action || null,
     verdict: pickVerdictTuple(raw.verdict, raw.operator_brief),
@@ -93,7 +95,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     heartbeatBpm: estimateHeartbeatBpm(summary, raw.verdict?.tone),
     workerCount: Number(summary.running || 0),
     prCount: Number(summary.pr_open || 0),
-    attentionCount,
+    attentionCount: attentionCount + (tmpfsHygiene?.pressure ? 1 : 0),
     activeApprovals: Number(summary.approvals_pending || 0),
     selfResolvingCount: selfResolving,
     throughputMerged7d: Number(summary.throughput_merged_7d || 0),
@@ -106,6 +108,25 @@ export function mapFleetResponse(raw, now = Date.now()) {
     providerModelHealth,
     backendQuota: aggregateBackendQuota(raw.projects || [], providerModelHealth),
     costObservability: mapCostObservability(raw.cost_observability),
+  };
+}
+
+export function mapTmpfsHygiene(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    timestamp: String(raw.timestamp || ""),
+    mode: String(raw.mode || ""),
+    tmpfs: raw.tmpfs === true,
+    usePct: Number(raw.use_pct || 0),
+    pressure: raw.pressure === true,
+    attentionCode: String(raw.attention_code || ""),
+    reclaimableBytes: Number(raw.reclaimable_bytes || 0),
+    freedBytes: Number(raw.freed_bytes || 0),
+    protectedEntries: Number(raw.protected_entries || 0),
+    deletedEntries: Number(raw.deleted_entries || 0),
+    partialEntries: Number(raw.partial_entries || 0),
+    procScanErrors: Number(raw.proc_scan_errors || 0),
+    error: String(raw.error || ""),
   };
 }
 
@@ -777,6 +798,9 @@ function mapEffectiveConfig(raw) {
     modelPolicy: {
       default: String(policy.default || ""),
       fallbackBackends: Array.isArray(policy.fallback_backends) ? policy.fallback_backends.map(String) : [],
+      providerLanes: Array.isArray(policy.provider_lanes) ? policy.provider_lanes.map(mapProviderLane) : [],
+      resolvedRoute: arrayOfString(policy.resolved_route),
+      selectionReason: String(policy.selection_reason || ""),
       backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
       routing: {
         mode: String((policy.routing || {}).mode || ""),
@@ -834,6 +858,14 @@ function mapEffectiveConfig(raw) {
   };
 }
 
+function mapProviderLane(raw) {
+  return {
+    provider: String(raw?.provider || ""),
+    default: String(raw?.default || ""),
+    fallbackBackends: arrayOfString(raw?.fallback_backends),
+  };
+}
+
 // mapSettingSource maps one fleet-controllable cost/LLM knob (#839): its
 // effective value and the layer it came from (builtin/fleet/project). isDefault
 // drives the "non-default override" highlight in the Settings panel.
@@ -882,8 +914,11 @@ function mapEffectivePipeline(raw) {
   });
   return {
     planner: role(raw?.planner || {}),
+    advisor: role(raw?.advisor || {}),
     implementer: role(raw?.implementer || {}),
     validator: role(raw?.validator || {}),
+    advisorReviewRounds: Number(raw?.advisor_review_rounds || 0),
+    advisorBestEffort: raw?.advisor_best_effort === true,
   };
 }
 
@@ -1018,6 +1053,37 @@ function mapWorker(worker) {
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
     backendDrift: mapBackendDrift(worker.backend_drift),
+    advisor: mapAdvisor(worker),
+  };
+}
+
+export function mapAdvisor(worker) {
+  if (!worker || !(worker.advisor_backend || worker.advisor_verdict || worker.advisor_terminal_reason || worker.advisor_review_round || worker.phase === "advisor")) {
+    return null;
+  }
+  return {
+    phase: String(worker.phase || ""),
+    planVersion: Number(worker.plan_version || 0),
+    reviewRound: Number(worker.advisor_review_round || 0),
+    maxReviewRounds: Number(worker.advisor_max_review_rounds || 0),
+    backend: String(worker.advisor_backend || ""),
+    model: String(worker.advisor_model || ""),
+    verdict: String(worker.advisor_verdict || ""),
+    unresolvedFindings: String(worker.advisor_unresolved_findings || ""),
+    terminalReason: String(worker.advisor_terminal_reason || ""),
+    bestEffort: worker.advisor_best_effort === true,
+    bypassed: worker.advisor_bypassed === true,
+    reviews: Array.isArray(worker.advisor_reviews) ? worker.advisor_reviews.map(review => ({
+      planVersion: Number(review?.plan_version || 0),
+      reviewRound: Number(review?.review_round || 0),
+      backend: String(review?.backend || ""),
+      model: String(review?.model || ""),
+      verdict: String(review?.verdict || ""),
+      findings: String(review?.findings || ""),
+      terminalReason: String(review?.terminal_reason || ""),
+      bypassed: review?.bypassed === true,
+      reviewedAt: String(review?.reviewed_at || ""),
+    })) : [],
   };
 }
 
@@ -1072,6 +1138,13 @@ export function workerStatusTaxonomy(worker) {
   const status = String(worker.status || "");
   const display = String(worker.display_status || "");
 
+  // GitHub issue closure reconciles the session to terminal done. Historical
+  // worker outcomes/display tokens remain available for audit, but they must
+  // not pull the closed issue back into the SPA's stuck/actionable section.
+  if (status === "done" && String(worker.issue_closed_at || "") !== "") {
+    return { label: "done", tone: "ok", section: "done" };
+  }
+
   if (display === "token_budget_exceeded" || worker.worker_outcome === "token_budget_exceeded") {
     return { label: "token budget exceeded", tone: "stuck", section: "stuck" };
   }
@@ -1110,6 +1183,10 @@ export function workerStatusTaxonomy(worker) {
   // swaps the model id (distinct remediation from an auth outage).
   if (display === "backend_model_unavailable") {
     return { label: "model unavailable", tone: "watch", section: "stuck" };
+  }
+
+  if (display === "backend_model_overloaded") {
+    return { label: "model overloaded", tone: "watch", section: "stuck" };
   }
 
   if (display === "blocked" && !isStuckStatus(status)) {
@@ -1189,6 +1266,15 @@ export function workerNextAction(worker) {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
     return {
       text: `Backend ${backend} cannot load its configured model (unavailable or no access). Swap the model id or restore access; the retry budget is preserved.`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "backend_model_overloaded") {
+    const provider = String(worker.provider_limit_provider || worker.provider || worker.provider_limit_backend || worker.backend || "the provider");
+    const model = String(worker.provider_limit_model || worker.model || "the requested model");
+    return {
+      text: `${provider}/${model} is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.`,
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     };
   }
@@ -1525,14 +1611,19 @@ function workerActuallyRunning(worker) {
 export function supervisorDecisionsFromProject(project, now) {
   const latest = project.supervisor?.latest;
   if (!latest) return [];
-  const created = parseTimestamp(latest.created_at);
-  if (!created) return [];
+  const lastSeen = parseTimestamp(latest.last_seen_at || latest.created_at);
+  if (!lastSeen) return [];
   return [{
-    t: created,
+    t: lastSeen,
     verb: latest.recommended_action || latest.status || "decision",
     note: latest.summary || latest.operator_sentence || "",
     conf: Number(latest.confidence || 0),
     warn: project.needsAttention > 0 || project.operatorState?.kind === "monitoring_pr",
+    recommendationId: String(latest.recommendation_id || ""),
+    firstSeen: parseTimestamp(latest.first_seen_at || latest.created_at),
+    lastSeen,
+    seenCount: Math.max(1, Number(latest.seen_count || 1)),
+    disposition: latest.disposition || null,
   }];
 }
 

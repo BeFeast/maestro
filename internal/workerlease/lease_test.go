@@ -1,12 +1,16 @@
 package workerlease
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
+
+var testLeaseGeneration atomic.Uint64
 
 func diskTestDir(t *testing.T) string {
 	t.Helper()
@@ -24,9 +28,10 @@ func diskTestDir(t *testing.T) string {
 
 func prepareTestLease(t *testing.T, root, slot string) Lease {
 	t.Helper()
+	generation := testLeaseGeneration.Add(1)
 	lease, err := Prepare(Spec{
 		Root: root, ProjectKey: "project-123", Repo: "owner/repo", Slot: slot,
-		Attempt: "attempt-1", Scope: ScopeSystem,
+		Attempt: "attempt-1", Unit: fmt.Sprintf("maestro-worker-0123456789abcdef0123456789abcdef-g%d.service", generation), Scope: ScopeSystem,
 		Now: time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC),
 	})
 	if err != nil {
@@ -71,7 +76,7 @@ func TestPrepareRejectsMemoryBackedScratch(t *testing.T) {
 	}
 	_, err := Prepare(Spec{
 		Root: root, ProjectKey: "project-123", Repo: "owner/repo", Slot: "sup-memory",
-		Attempt: "attempt-1", Scope: ScopeSystem,
+		Attempt: "attempt-1", Unit: "maestro-worker-0123456789abcdef0123456789abcdef-g1.service", Scope: ScopeSystem,
 	})
 	if err == nil || !strings.Contains(err.Error(), "memory-backed") {
 		t.Fatalf("Prepare error = %v, want memory-backed rejection", err)
@@ -98,51 +103,6 @@ func TestEnsureScratchBaseRefusesSharedDirectoryWithoutChmod(t *testing.T) {
 	}
 }
 
-func TestBuildLaunchCommandBindsPrivateTmpAndBuildDirectories(t *testing.T) {
-	lease := prepareTestLease(t, filepath.Join(diskTestDir(t), "scratch"), "sup-2")
-	binary, args, err := BuildLaunchCommand(LaunchSpec{
-		Lease: lease, UID: 1000, PATH: "/usr/local/bin:/usr/bin:/bin", Home: "/home/worker", User: "worker",
-		PayloadPath: "/state/sup-2-payload.sh", MaestroBin: "/usr/local/bin/maestro", MemoryMaxMB: 4096,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if binary != "sudo" {
-		t.Fatalf("binary = %q, want sudo", binary)
-	}
-	joined := strings.Join(args, "\n")
-	for _, want := range []string{
-		"-n\nsystemd-run\n--uid=1000",
-		"--wait", "--pipe", "--collect", "--service-type=exec",
-		"--unit=" + lease.Unit,
-		"--property=Slice=" + WorkerSlice,
-		"--property=MemoryAccounting=yes",
-		"--property=KillMode=control-group",
-		"--property=TimeoutStopSec=30s",
-		"--property=OOMPolicy=stop",
-		"--property=BindPaths=" + lease.TempDir + ":/tmp",
-		"--setenv=TMPDIR=/tmp",
-		"--setenv=TMP=/tmp",
-		"--setenv=TEMP=/tmp",
-		"--setenv=GOTMPDIR=/tmp/go",
-		"--setenv=CARGO_TARGET_DIR=/tmp/cargo-target",
-		"--setenv=HOME=/home/worker",
-		"--setenv=USER=worker",
-		"--setenv=LOGNAME=worker",
-		"--setenv=SHELL=/usr/bin/bash",
-		"--property=MemoryMax=4096M",
-		"_worker-lease-cleanup",
-		lease.ManifestPath,
-	} {
-		if !strings.Contains(joined, want) {
-			t.Fatalf("launch argv missing %q:\n%s", want, joined)
-		}
-	}
-	if strings.Contains(joined, "TemporaryFileSystem=/tmp") {
-		t.Fatal("worker /tmp must be a disk-backed bind, not another tmpfs")
-	}
-}
-
 func TestWorkerSliceControlCommandPreservesControlPlaneHeadroom(t *testing.T) {
 	binary, args, err := workerSliceControlCommand(ScopeSystem)
 	if err != nil {
@@ -164,6 +124,9 @@ func TestWorkerSliceControlCommandPreservesControlPlaneHeadroom(t *testing.T) {
 	}
 	if WorkerSliceMemoryMax == "100%" {
 		t.Fatal("worker slice must preserve memory headroom for the control plane")
+	}
+	if WorkerSlice == "maestro-workers.slice" {
+		t.Fatal("isolated aggregate limits must not capture legacy process scopes during rollback")
 	}
 }
 

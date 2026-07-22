@@ -3,7 +3,9 @@ package orchestrator
 import (
 	"bufio"
 	"context"
+	cryptorand "crypto/rand"
 	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log"
@@ -13,6 +15,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -42,7 +45,12 @@ const (
 	// observes the authoritative terminal state within the 10-minute SLA even
 	// when the prior check landed immediately after a cycle boundary.
 	terminalReconcileInterval = 9 * time.Minute
-	pipelineFullLabel         = "pipeline:full"
+	// A fresh dispatch lease spans the slow pre-worker setup window. If its
+	// owner dies, the next cycle renews the same exact slot/worktree/branch;
+	// it never allocates a duplicate identity merely to retry startup.
+	freshDispatchLeaseDuration = 10 * time.Minute
+	pipelineFullLabel          = "pipeline:full"
+	pipelineAdvisedLabel       = "pipeline:advised"
 )
 
 type cycleBoolResult struct {
@@ -90,6 +98,9 @@ type Orchestrator struct {
 	authFailureFromLogFn      func(logFile string) (bool, string)
 	modelUnavailableFromLogFn func(logFile string) (bool, string)
 	usageLimitFromLogFn       func(logFile string, extraPatterns []string) (bool, string)
+	beforeWorktreeCleanupFn   func(slotName string)
+	removeWorktreeFn          func(localPath, worktreePath string) error
+	workerStopProcessFn       func(slotName string, sess *state.Session) error
 	// workerRespawnFn / respawnWorkerFn: used by respawnWorker() for dead-worker fallback (tests set one or the other)
 	workerRespawnFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
 	respawnWorkerFn func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error
@@ -105,8 +116,9 @@ type Orchestrator struct {
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
 
 	// Testing hooks for startNewWorkers
-	listOpenIssuesFn func(labels []string) ([]github.Issue, error)
-	workerStartFn    func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+	listOpenIssuesFn     func(labels []string) ([]github.Issue, error)
+	workerStartFn        func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+	workerStartClaimedFn func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -137,9 +149,9 @@ type Orchestrator struct {
 	// restart. In-flight workers are unaffected — this gate only refuses NEW work.
 	emergencyHaltFn func() bool
 
-	// Restart-required signal. Some config fields (model.default, routing.*) cannot
-	// be hot-applied because the backend router is built once at startup. When such a
-	// field changes during a config reload we do not apply it; instead we raise this
+	// Restart-required signal. Some config fields (currently routing.*) cannot be
+	// hot-applied because their runtime components are built once at startup. When
+	// such a field changes during a config reload we do not apply it; instead we raise this
 	// persistent flag so a long-running daemon surfaces "restart required" in
 	// `maestro status` and the Fleet API instead of silently ignoring the change.
 	restartRequired       bool
@@ -856,6 +868,13 @@ func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 	return worker.Stop(o.cfg, slotName, sess)
 }
 
+func (o *Orchestrator) stopWorkerProcess(slotName string, sess *state.Session) error {
+	if o.workerStopProcessFn != nil {
+		return o.workerStopProcessFn(slotName, sess)
+	}
+	return worker.StopProcess(slotName, sess)
+}
+
 func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
 	if o.getIssueFn != nil {
 		return o.getIssueFn(number)
@@ -877,6 +896,12 @@ func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue
 // the escalation ladder uses to carry a tier's per-tier effort/model override
 // (#783). It defaults to o.cfg via respawnWorker.
 func (o *Orchestrator) respawnWorkerWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnWorkerUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnWorkerUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	// Support both hook names for test compatibility (respawnWorkerFn = branch, workerRespawnFn = HEAD)
 	if o.respawnWorkerFn != nil {
 		return o.respawnWorkerFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
@@ -913,6 +938,12 @@ func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
 // per-tier effort/model override (#783/#792). Callers that have no override pass
 // o.cfg.
 func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnInPlaceUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
 	if o.respawnInPlaceFn != nil {
 		return o.respawnInPlaceFn(cfg, slotName, sess, o.repo, issue, promptBase, backendName)
 	}
@@ -926,8 +957,14 @@ func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName str
 // checkpointed into the existing resumable checkpoint contract, then the same
 // slot/branch/worktree is restarted in place on the selected backend.
 func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
+		return o.respawnPreservingWorktreeUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
+	})
+}
+
+func (o *Orchestrator) respawnPreservingWorktreeUnlocked(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
 	if sess == nil || strings.TrimSpace(sess.Worktree) == "" {
-		return o.respawnWorkerWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+		return o.respawnWorkerUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	}
 	restoreWorktree := o.restoreWorktreeFn
 	if restoreWorktree == nil && o.respawnInPlaceFn == nil {
@@ -947,7 +984,7 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 	// never has that hook and therefore still fails closed if a retained
 	// worktree cannot be inspected.
 	if _, statErr := os.Stat(sess.Worktree); errors.Is(statErr, os.ErrNotExist) && o.respawnInPlaceFn != nil {
-		return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+		return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	}
 	dirty, err := worker.WorktreeDirty(sess.Worktree)
 	if err != nil {
@@ -961,7 +998,7 @@ func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, s
 		sess.CheckpointFile = checkpoint
 		log.Printf("[orch] worker %s: checkpointed dirty worktree before in-place recovery on %s", slotName, backendName)
 	}
-	return o.respawnInPlaceWithConfig(cfg, slotName, sess, issue, promptBase, backendName)
+	return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 }
 
 func (o *Orchestrator) respawnPreservingWorktree(slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
@@ -1206,8 +1243,12 @@ func (o *Orchestrator) classifyBackendFailure(sess *state.Session, now time.Time
 	}
 	if ok, label := o.backendModelUnavailableFromLog(sess, now); ok {
 		_, model := o.providerModelRouteForSession(sess, "", "")
+		reason := state.BackendBlockModelUnavailable
+		if label == "model_overloaded" {
+			reason = state.BackendBlockModelOverloaded
+		}
 		return backendFailure{
-			reason:      state.BackendBlockModelUnavailable,
+			reason:      reason,
 			pattern:     label,
 			model:       model,
 			modelScoped: model != "",
@@ -1374,9 +1415,9 @@ func (o *Orchestrator) workerJSONLFile(slotName string, sess *state.Session) str
 // ParseClaudeUsage returns the cumulative run total across every attempt;
 // the monotonic UsageTokensWatermark persists across respawns so only the
 // new attempt's tokens are added (no double-count on retry/respawn). Cost
-// prefers the backend-reported total_cost_usd. Returns true when anything
-// changed; false (usage stays 0) when the jsonl is absent — the documented
-// degradation when the stream-splitter was unavailable.
+// prefers the backend-reported total_cost_usd. A successful terminal frame
+// with missing/zero usage marks the active attribution usage-unreliable and
+// logs once; zero never advances token counters or budget progress.
 func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1389,11 +1430,14 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		return false
 	}
 	usage, ok := worker.ParseClaudeUsage(string(data))
-	if !ok {
-		return false
-	}
 	changed := false
-	if usage.TotalTokens > sess.UsageTokensWatermark {
+	if usage.UsageUnreliable && state.MarkActiveAttributionUsageUnreliable(sess, usage.UsageUnreliableReason, usage.UsageUnreliableScope) {
+		log.Printf("[orch] %s claude usage-unreliable: scope=%s reason=%s; preserving observed counters and treating zero tokens as unavailable, not progress",
+			slotName, usage.UsageUnreliableScope, usage.UsageUnreliableReason)
+		changed = true
+	}
+	telemetryChanged := false
+	if ok && usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark
 		sess.UsageTokensWatermark = usage.TotalTokens
 		sess.TokensUsedAttempt += delta
@@ -1406,24 +1450,24 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		sess.TokensOutput = usage.Output
 		sess.TokensCacheRead = usage.CacheRead
 		sess.TokensCacheWrite = usage.CacheWrite
-		changed = true
+		telemetryChanged = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
 		sess.Model = usage.Model
-		changed = true
+		telemetryChanged = true
 	}
 	// total_cost_usd is the run-cumulative the full-jsonl parse sums across
 	// every result frame, so guard with `>` (mirrors the Pi cost fix in #732):
 	// a first-non-zero freeze would never update past the first attempt.
 	if usage.CostUSD > sess.CostUSDBackend {
 		sess.CostUSDBackend = usage.CostUSD
-		changed = true
+		telemetryChanged = true
 	}
-	if changed {
+	if telemetryChanged {
 		log.Printf("[orch] %s claude usage: model=%s tokens=%d cost=$%.4f (total=%d)",
 			slotName, usage.Model, usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
 	}
-	return changed
+	return changed || telemetryChanged
 }
 
 // updateCodexUsageFromJSONL parses the codex `exec --json` side-channel
@@ -1578,7 +1622,7 @@ func (o *Orchestrator) runAfterRunHook(sess *state.Session) {
 // It skips backends that are already in sess.TriedBackends or match the current backend.
 // Returns "" if no fallback is available.
 func (o *Orchestrator) nextFallbackBackend(sess *state.Session) string {
-	fallbacks := o.cfg.Model.FallbackBackends
+	fallbacks := o.cfg.Model.FallbackCandidates(sess.Backend)
 	if len(fallbacks) == 0 {
 		return ""
 	}
@@ -2503,18 +2547,9 @@ func (o *Orchestrator) retireStaleRetry(s *state.State, slotName string, sess *s
 	if !closed {
 		return false
 	}
-	if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed during retry backoff", sess.IssueNumber)) {
-		log.Printf("[orch] worker %s retry invalidated: issue #%d is closed, but a merge delivery/outcome gate is still pending", slotName, sess.IssueNumber)
+	if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
 		return true
 	}
-	log.Printf("[orch] worker %s retry invalidated: issue #%d is closed — marking done instead of respawning", slotName, sess.IssueNumber)
-	sess.NextRetryAt = nil
-	sess.RetryHoldReason = ""
-	sess.Status = state.StatusDone
-	now := time.Now().UTC()
-	sess.FinishedAt = &now
-	state.MarkWorkerEnded(sess, now)
-	o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 	if o.notifier != nil {
 		o.notifier.Sendf("🧟 maestro: cancelled scheduled retry for issue #%d (%s) — issue already closed", sess.IssueNumber, sess.IssueTitle)
 	}
@@ -2818,6 +2853,9 @@ func (o *Orchestrator) Run(ctx context.Context, interval time.Duration, once boo
 			case <-ctx.Done():
 				t.Stop()
 				return nil
+			case <-refreshCh:
+				t.Stop()
+				log.Printf("[orch] startup jitter interrupted by refresh (%s)", o.repo)
 			case <-t.C:
 			}
 		}
@@ -3003,7 +3041,6 @@ func (o *Orchestrator) compactTerminalSessionsOnStartup() {
 }
 
 // reloadConfig applies non-destructive config changes at runtime.
-// Fields that require a restart (repo, model.default) are logged as warnings.
 func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker) {
 	old := o.cfg
 	var changed []string
@@ -3013,15 +3050,13 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		log.Printf("[orch] config reload: repo changed (%s → %s) — requires restart", old.Repo, newCfg.Repo)
 	}
 
-	// model.default and routing.* select the backend router, which is constructed
-	// once at startup and is not safe to re-init mid-flight. Detect a change against
-	// the live (startup) config, do NOT apply it, and raise a persistent
-	// restart-required signal so the operator sees it in `maestro status` / Fleet API
-	// rather than only a one-time log line. Keep o.cfg.Model/Routing unchanged so the
-	// warning keeps firing on every subsequent reload while the config still differs.
-	if newCfg.Model.Default != old.Model.Default {
-		o.markRestartRequired(fmt.Sprintf("model.default changed (%s → %s)", old.Model.Default, newCfg.Model.Default))
-		log.Printf("[orch] config reload: model.default changed (%s → %s) — requires restart (not applied)", old.Model.Default, newCfg.Model.Default)
+	// The router keeps a pointer to o.cfg, so the complete model selector can be
+	// swapped live without reconstructing the orchestrator. Apply backend
+	// definitions with the route so a lane added in the same edit is dispatchable.
+	if !reflect.DeepEqual(newCfg.Model, old.Model) {
+		changed = append(changed, fmt.Sprintf("model policy: %s→%s",
+			old.Model.ResolvedRoute().SelectionReason, newCfg.Model.ResolvedRoute().SelectionReason))
+		o.cfg.Model = cloneModelConfig(newCfg.Model)
 	}
 	if !reflect.DeepEqual(newCfg.Routing, old.Routing) {
 		o.markRestartRequired(fmt.Sprintf("routing.* changed (router_model %s → %s, mode %s → %s)",
@@ -3163,6 +3198,50 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	log.Printf("[orch] config reloaded — changed: %s", strings.Join(changed, ", "))
 }
 
+func cloneModelConfig(in config.ModelConfig) config.ModelConfig {
+	out := in
+	out.FallbackBackends = append([]string(nil), in.FallbackBackends...)
+	out.ProviderLanes = make([]config.ProviderLane, len(in.ProviderLanes))
+	for i, lane := range in.ProviderLanes {
+		out.ProviderLanes[i] = lane
+		out.ProviderLanes[i].FallbackBackends = append([]string(nil), lane.FallbackBackends...)
+	}
+	out.Backends = make(map[string]config.BackendDef, len(in.Backends))
+	for name, def := range in.Backends {
+		if def.Enabled != nil {
+			enabled := *def.Enabled
+			def.Enabled = &enabled
+		}
+		def.ExtraArgs = append([]string(nil), def.ExtraArgs...)
+		def.UsageLimitPatterns = append([]string(nil), def.UsageLimitPatterns...)
+		def.MCP.Configs = append([]string(nil), def.MCP.Configs...)
+		if def.MCP.Servers != nil {
+			servers := make(map[string]config.MCPServerDef, len(def.MCP.Servers))
+			for serverName, server := range def.MCP.Servers {
+				server.Args = append([]string(nil), server.Args...)
+				server.AllowedTools = append([]string(nil), server.AllowedTools...)
+				server.Env = cloneStringMap(server.Env)
+				server.Headers = cloneStringMap(server.Headers)
+				servers[serverName] = server
+			}
+			def.MCP.Servers = servers
+		}
+		out.Backends[name] = def
+	}
+	return out
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if in == nil {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for key, value := range in {
+		out[key] = value
+	}
+	return out
+}
+
 // markRestartRequired records a persistent restart-required signal both in memory
 // (so the running daemon keeps emitting the warning) and in the on-disk state file
 // (so a separate `maestro status` / Fleet API process can surface it without
@@ -3300,6 +3379,17 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 		isRestartCheckpointedDead := sess.Status == state.StatusDead && sess.RestartCheckpointAt != nil
 		if sess.Status != state.StatusRunning && !isRestartCheckpointedDead {
+			// A terminal/pr_open projection can outlive its tmux pane while a
+			// double-forked tool remains in the worker cgroup. Durable ownership
+			// metadata is the restart-safe cleanup receipt: retain it on failure and
+			// retry next cycle; clear it only after exact-scope teardown succeeds.
+			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+				if err := o.stopWorkerProcess(slotName, sess); err != nil {
+					log.Printf("[orch] reconcile: %s process lease cleanup deferred: %v", slotName, err)
+					continue
+				}
+				reconciled = true
+			}
 			continue
 		}
 		// #967: a worker may die after drain starts but before the daemon's
@@ -3311,6 +3401,12 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			continue
 		}
 		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+				if err := o.stopWorkerProcess(slotName, sess); err != nil {
+					log.Printf("[orch] reconcile: %s token-budget process lease cleanup deferred: %v", slotName, err)
+					continue
+				}
+			}
 			o.runAfterRunHook(sess)
 			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
 			reconciled = true
@@ -3334,39 +3430,27 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		}
 
 		if len(reasons) == 0 {
+			// Isolated worker scopes survive maestro.service restarts (#891). A
+			// shutdown marker can therefore arrive at the replacement daemon while
+			// the original PID/tmux is still alive. Validate the exact pane/worktree
+			// identity and consume the one-shot marker without respawning or changing
+			// the attempt: the same process keeps running exactly once (#966).
 			if sess.RestartCheckpointAt != nil {
-				// The durable runtime survived the daemon restart. Consume the
-				// one-shot resume marker now; leaving it set would replay the
-				// already-running attempt after its later natural exit.
-				sess.RestartCheckpointAt = nil
-				reconciled = true
-				log.Printf("[orch] reconcile: %s worker runtime survived restart; consumed resume marker without respawn", slotName)
+				pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
+				if identityErr != nil || pid <= 0 {
+					log.Printf("[orch] reconcile: %s survived restart but pane identity is unreadable (%v); preserving restart marker for a later non-destructive retry", slotName, identityErr)
+				} else if strings.TrimSpace(sess.Worktree) == "" || filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+					log.Printf("[orch] reconcile: %s survived restart but pane worktree %q does not match retained worktree %q; preserving marker and leaving the live worker untouched", slotName, paneWorktree, sess.Worktree)
+				} else {
+					sess.PID = pid
+					sess.TmuxSession = tmuxName
+					sess.RestartCheckpointAt = nil
+					reconciled = true
+					log.Printf("[orch] reconcile: %s adopted the same surviving worker across daemon restart (issue #%d, pid=%d, tmux=%q) — no respawn, no duplicate", slotName, sess.IssueNumber, pid, tmuxName)
+				}
 			}
 			continue
 		}
-		leaseActive, leaseOwned, leaseErr := worker.WorkerLeaseActive(o.cfg, sess)
-		if leaseErr != nil {
-			sess.WorkerLeaseAttention = "worker lease liveness could not be inspected"
-			log.Printf("[orch] reconcile: %s exact worker lease is unreadable; refusing unsafe terminal transition: %v", slotName, leaseErr)
-			reconciled = true
-			continue
-		}
-		if leaseOwned && !leaseActive {
-			reasons = append(reasons, "worker lease inactive")
-		}
-		if leaseOwned && leaseActive {
-			// The lease is authoritative for descendants, while tmux remains the
-			// output/control attachment. If that attachment disappeared while the
-			// lease is still live, stop the exact cgroup before any retry so a
-			// detached descendant cannot overlap its replacement.
-			if err := worker.StopProcess(o.cfg, slotName, sess); err != nil {
-				sess.WorkerLeaseAttention = "exact detached worker lease could not be stopped"
-				log.Printf("[orch] reconcile: %s detached lease stop failed; refusing replacement: %v", slotName, err)
-				reconciled = true
-				continue
-			}
-		}
-
 		// Worker process/session is gone. Before marking dead, check whether it
 		// already opened a PR. If so, transition to pr_open — the worker succeeded.
 		// Without this check, reconcile would mark the session dead, causing
@@ -3481,6 +3565,14 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					continue
 				}
 			}
+		}
+
+		if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+			if err := o.stopWorkerProcess(slotName, sess); err != nil {
+				log.Printf("[orch] reconcile: %s stale runtime process lease cleanup deferred: %v", slotName, err)
+				continue
+			}
+			reconciled = true
 		}
 
 		// Before marking the session dead, check whether the worker died because
@@ -3828,6 +3920,9 @@ func liveRuntimeSuperseded(current, runtime *state.Session) bool {
 	if current.Status == state.StatusDone || current.Status == state.StatusCodeLanded {
 		return true
 	}
+	if current.WorkerGeneration > runtime.WorkerGeneration {
+		return true
+	}
 	if current.Status == state.StatusRunning && current.PID > 0 && current.PID != runtime.PID && !current.StartedAt.Before(runtime.StartedAt) {
 		return true
 	}
@@ -3851,6 +3946,9 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	}
 	current.PID = runtime.PID
 	current.TmuxSession = runtime.TmuxSession
+	current.ProcessLeaseUnit = runtime.ProcessLeaseUnit
+	current.ProcessLeaseManager = runtime.ProcessLeaseManager
+	current.WorkerGeneration = runtime.WorkerGeneration
 	current.LogFile = runtime.LogFile
 	current.StartedAt = runtime.StartedAt
 	current.FinishedAt = runtime.FinishedAt
@@ -3934,18 +4032,10 @@ func (o *Orchestrator) reconcilePushedBranch(s *state.State, slotName string, se
 	if closed, closedErr := o.isIssueClosed(sess.IssueNumber); closedErr != nil {
 		log.Printf("[orch] reconcile: could not check issue #%d state for %s: %v — proceeding with auto-create", sess.IssueNumber, slotName, closedErr)
 	} else if closed {
-		if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d closed after worker exit", sess.IssueNumber)) {
-			log.Printf("[orch] reconcile: %s held out of done because a merge delivery/outcome gate is pending", slotName)
+		if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
+			log.Printf("[orch] reconcile: %s issue-closed teardown deferred; not auto-creating a PR", slotName)
 			return true
 		}
-		o.updateTokensUsedFromWorkerLog(slotName, sess)
-		sess.PID = 0
-		sess.TmuxSession = ""
-		sess.Status = state.StatusDone
-		now := time.Now().UTC()
-		sess.FinishedAt = &now
-		state.MarkWorkerEnded(sess, now)
-		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
 		log.Printf("[orch] reconcile: %s running->done (issue #%d closed; not auto-creating a PR; %s)",
 			slotName, sess.IssueNumber, reasons)
 		if o.notifier != nil {
@@ -4024,6 +4114,93 @@ func terminalReconcileDue(sess *state.Session, now time.Time) bool {
 	return now.Sub(*sess.LastTerminalReconcileAt) >= terminalReconcileInterval
 }
 
+// reconcileClosedIssueSession applies GitHub's authoritative terminal issue
+// lifecycle without consulting delivery or runtime-outcome gates. Those gates
+// remain project-level facts (and their history/approvals remain durable), but
+// they must never keep a closed issue actionable or revive worker controls.
+func (o *Orchestrator) reconcileClosedIssueSession(s *state.State, slotName string, sess *state.Session, now time.Time) bool {
+	if s == nil || sess == nil {
+		return false
+	}
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	now = now.UTC()
+	previous := sess.Status
+	if sess.PRNumber <= 0 {
+		if prNumber, err := o.mergedPRForDoneLikeSession(sess); err != nil {
+			log.Printf("[orch] issue #%d is closed; merged PR audit identity could not be refreshed: %v", sess.IssueNumber, err)
+		} else if prNumber > 0 {
+			sess.PRNumber = prNumber
+		}
+	}
+	if sess.PRNumber > 0 && !sess.PRMerged {
+		switch previous {
+		case state.StatusCodeLanded:
+			// code_landed is reached only from authoritative merge evidence.
+			// Preserve that fact before replacing the lifecycle status with done.
+			sess.PRMerged = true
+		default:
+			// A manually closed issue may still have an open PR. Query the exact
+			// PR when the read path is available and retain the result so Fleet can
+			// distinguish a merged historical PR from an orphaned open PR.
+			if o.isPRMergedFn != nil || o.readSource != nil || o.gh != nil {
+				if merged, err := o.isPRMerged(sess.PRNumber); err != nil {
+					log.Printf("[orch] issue #%d is closed; PR #%d merge state could not be refreshed: %v", sess.IssueNumber, sess.PRNumber, err)
+				} else {
+					sess.PRMerged = merged
+				}
+			}
+		}
+	}
+	if sess.Status == state.StatusRunning || sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued || sess.PID > 0 || strings.TrimSpace(sess.TmuxSession) != "" || strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		if err := o.stopWorker(slotName, sess); err != nil {
+			log.Printf("[orch] issue-closed teardown deferred for %s: %v", slotName, err)
+			// Any teardown error is ambiguous. Legacy PID/tmux workers have no
+			// process-lease receipt to prove survival, and an injected/controller
+			// stop can mutate receipts before returning an error. Preserve the
+			// nonterminal lifecycle and retry instead of releasing a possibly-live
+			// worker merely because its receipt fields are now empty.
+			return false
+		}
+	}
+	sess.Status = state.StatusDone
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.RetryHoldReason = ""
+	sess.RestartCheckpointAt = nil
+	sess.ReleasedForRedispatch = true
+	sess.IssueClosedAt = &now
+	sess.LastTerminalReconcileAt = &now
+	if sess.FinishedAt == nil {
+		sess.FinishedAt = &now
+	}
+	state.MarkWorkerEnded(sess, now)
+	if o.cfg != nil {
+		o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
+	}
+
+	reason := fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", sess.IssueNumber)
+	for _, approval := range s.StaleIssueApprovalsForClosedIssue(sess.IssueNumber, now, reason) {
+		log.Printf("[orch] reconciled moot approval %s after issue #%d closed", approval.ID, sess.IssueNumber)
+	}
+	if o.cfg != nil && o.approvalsBinding.UseSQLite() {
+		binding := o.approvalsBinding
+		binding.StateDir = o.cfg.StateDir
+		binding.Repo = o.repo
+		binding.Project = o.repo
+		for _, approval := range s.MootIssueApprovalMirrorCandidates(sess.IssueNumber) {
+			if err := approvalstore.ReconcileMoot(binding, approval.ID, now, reason); err != nil {
+				log.Printf("[orch] approval %s closed-issue mirror to SQLite failed (JSON will retry on later reconciliation): %v", approval.ID, err)
+			}
+		}
+	}
+	log.Printf("[orch] issue #%d closed, transitioning session %s from %s to done; merged PR/deployment history retained", sess.IssueNumber, slotName, previous)
+	return true
+}
+
 // checkSessions inspects all sessions and updates their status
 func (o *Orchestrator) checkSessions(s *state.State) {
 	// Fetch open PRs once for the whole check cycle (shared per-cycle, #794)
@@ -4038,6 +4215,19 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
+		// GitHub issue closure is terminal external truth for every nonterminal
+		// session status, including code_landed. Check it before PR, delivery,
+		// outcome, retry, or worker reconciliation so none of those independent
+		// facts can keep the issue lifecycle artificially open.
+		if !state.IsTerminal(sess.Status) {
+			closed, err := o.isIssueClosed(sess.IssueNumber)
+			if err != nil {
+				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
+			} else if closed {
+				o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC())
+				continue
+			}
+		}
 		// NextRetryAt is meaningful only while a dead session is queued for an
 		// in-place respawn. A pr_open session already owns its canonical PR and
 		// has no pending process start; retaining an expired retry marker there
@@ -4102,7 +4292,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			// Once the forge proves the issue closed, release that lease so Fleet
 			// diagnostics do not retain a permanent active claim. A later explicit
 			// issue reopen is then eligible by design.
-			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && !sess.ReleasedForRedispatch {
+			if remoteReconcileDue && sess.Status == state.StatusDone && sess.PRNumber > 0 && sess.FinishedAt != nil && (!sess.ReleasedForRedispatch || sess.IssueClosedAt == nil) {
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
 					remoteReconcileFailed = true
@@ -4110,15 +4300,16 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					remoteReconcileSucceeded = true
 					if closed {
-						sess.ReleasedForRedispatch = true
-						log.Printf("[orch] terminal claim reconciled for issue #%d / PR #%d on %s: issue is closed", sess.IssueNumber, sess.PRNumber, slotName)
+						if !o.reconcileClosedIssueSession(s, slotName, sess, now) {
+							remoteReconcileFailed = true
+						}
 					}
 				}
 			}
 			// Zombie cleanup: if the underlying issue is closed, transition to done.
 			// This prevents conflict_failed/failed/dead/retry_exhausted sessions from lingering
 			// indefinitely when their issues are closed externally (#187).
-			if remoteReconcileDue && sess.Status != state.StatusDone {
+			if remoteReconcileDue && sess.Status != state.StatusDone && sess.Status != state.StatusCodeLanded {
 				done := false
 				closed, err := o.isIssueClosed(sess.IssueNumber)
 				if err != nil {
@@ -4127,19 +4318,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				} else {
 					remoteReconcileSucceeded = true
 					if closed {
-						if o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-							log.Printf("[orch] issue #%d closed, transitioning zombie session %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-							done = true
-						}
+						done = true
 					}
 				}
 				if done {
-					o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-					sess.Status = state.StatusDone
-					if sess.FinishedAt == nil {
-						now := time.Now().UTC()
-						sess.FinishedAt = &now
-						state.MarkWorkerEnded(sess, now)
+					if !o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC()) {
+						remoteReconcileFailed = true
 					}
 				} else if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					merged, err := o.isPRMerged(sess.PRNumber)
@@ -4166,91 +4350,66 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
 			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
-					dirty, dirtyErr := worker.WorktreeDirty(sess.Worktree)
-					if dirtyErr != nil {
-						log.Printf("[orch] refusing stale-worktree cleanup for %s: could not prove worktree clean: %v", slotName, dirtyErr)
-						continue
-					}
-					if dirty {
-						log.Printf("[orch] preserving stale worktree for %s: uncommitted work requires in-place recovery", slotName)
-						continue
+					lease := worker.CaptureCleanupLease(slotName, sess)
+					if o.beforeWorktreeCleanupFn != nil {
+						o.beforeWorktreeCleanupFn(slotName)
 					}
 					if sess.FinishedAt != nil {
 						log.Printf("[orch] cleaning up stale worktree for %s (finished %s ago)", slotName, time.Since(*sess.FinishedAt).Round(time.Minute))
 					} else {
 						log.Printf("[orch] cleaning up orphaned worktree for %s (started %s ago, no finishedAt)", slotName, time.Since(sess.StartedAt).Round(time.Minute))
 					}
-					worker.Stop(o.cfg, slotName, sess)
-					sess.Worktree = "" // Mark as cleaned
+					if cleanupErr := o.cleanupLeasedWorktree(s, lease); cleanupErr != nil {
+						if errors.Is(cleanupErr, worker.ErrCleanupConsistencyViolation) {
+							log.Printf("[orch] P0 consistency violation during stale-worktree cleanup for %s: %v", slotName, cleanupErr)
+						} else {
+							log.Printf("[orch] aborting stale-worktree cleanup for %s before filesystem mutation: %v", slotName, cleanupErr)
+						}
+					}
 				}
 			}
 			continue
 		}
 
-		// Check if issue is closed for pr_open/queued sessions —
-		// free the worker slot when the issue no longer needs work (#187).
-		if sess.Status == state.StatusPROpen || sess.Status == state.StatusQueued {
-			closed, err := o.isIssueClosed(sess.IssueNumber)
-			if err != nil {
-				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-			} else if closed {
-				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-					continue
-				}
-				log.Printf("[orch] issue #%d closed, transitioning %s from %s to done", sess.IssueNumber, slotName, sess.Status)
-				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				o.stopWorker(slotName, sess)
-				sess.Status = state.StatusDone
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
-				continue
-			}
-		}
-
-		// Check if issue is now closed (only for running sessions)
+		// Running-session lifecycle and process reconciliation. Closed issues
+		// were handled by the authoritative check at the top of this loop.
 		if sess.Status == state.StatusRunning {
 			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+					if err := o.stopWorkerProcess(slotName, sess); err != nil {
+						log.Printf("[orch] token-budget process lease cleanup deferred for %s: %v", slotName, err)
+						continue
+					}
+				}
 				o.runAfterRunHook(sess)
 				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
-				continue
-			}
-			closed, err := o.isIssueClosed(sess.IssueNumber)
-			if err != nil {
-				log.Printf("[orch] check issue #%d: %v", sess.IssueNumber, err)
-			} else if closed {
-				if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("issue #%d is closed", sess.IssueNumber)) {
-					continue
+				if sess.Phase == state.PhaseAdvisor {
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
 				}
-				log.Printf("[orch] issue #%d closed, stopping worker %s", sess.IssueNumber, slotName)
-				o.syncProject(sess.IssueNumber, github.ProjectStatusDone)
-				o.stopWorker(slotName, sess)
-				sess.Status = state.StatusDone
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
 				continue
 			}
-
 			// Check if process is still alive
 			if sess.PID > 0 && !o.pidAlive(sess.PID) {
-				leaseActive, leaseOwned, leaseErr := worker.WorkerLeaseActive(o.cfg, sess)
-				if leaseErr != nil {
-					sess.WorkerLeaseAttention = "worker lease liveness could not be inspected"
-					log.Printf("[orch] worker %s pane died but exact lease is unreadable; refusing unsafe retry: %v", slotName, leaseErr)
-					continue
+				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+					if err := o.stopWorkerProcess(slotName, sess); err != nil {
+						log.Printf("[orch] dead worker process lease cleanup deferred for %s: %v", slotName, err)
+						continue
+					}
 				}
-				if leaseOwned && leaseActive {
-					if err := worker.StopProcess(o.cfg, slotName, sess); err != nil {
-						sess.WorkerLeaseAttention = "exact detached worker lease could not be stopped"
-						log.Printf("[orch] worker %s pane died but exact lease stop failed; refusing replacement: %v", slotName, err)
+				if sess.Phase == state.PhaseAdvisor {
+					if pr, found := branchToPR[sess.Branch]; found {
+						o.runAfterRunHook(sess)
+						o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_pr_created", fmt.Sprintf("Advisor created or exposed PR #%d before implementation.", pr.Number))
+						continue
+					}
+					if o.handleAdvisorBackendDeath(s, slotName, sess) {
 						continue
 					}
 				}
 				// Pipeline phase transition: if this is a pipeline session,
 				// try to advance to the next phase before falling through
 				// to normal dead-worker handling.
-				if sess.Phase != state.PhaseNone && o.advancePipeline(slotName, sess) {
+				if sess.Phase != state.PhaseNone && o.advancePipeline(s, slotName, sess) {
 					continue
 				}
 
@@ -4417,6 +4576,14 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 			// Check if running session has opened a PR (worker still alive)
 			if pr, found := branchToPR[sess.Branch]; found {
+				if sess.Phase == state.PhaseAdvisor {
+					o.runAfterRunHook(sess)
+					if err := o.stopWorker(slotName, sess); err != nil {
+						log.Printf("[pipeline] stop Advisor %s after premature PR #%d: %v", slotName, pr.Number, err)
+					}
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_pr_created", fmt.Sprintf("Advisor created or exposed PR #%d before implementation.", pr.Number))
+					continue
+				}
 				if sess.PRNumber == pr.Number {
 					// In-place review/CI retries intentionally keep working on an
 					// already-open PR. Do not transition back to pr_open until the
@@ -4469,10 +4636,17 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							o.runAfterRunHook(sess)
 							if err := o.stopWorker(slotName, sess); err != nil {
 								log.Printf("[orch] warn: could not stop rate-limited worker %s: %v", slotName, err)
+								if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+									continue
+								}
 							}
 							now := time.Now().UTC()
 							resetAt := &resetTime
 							o.recordProviderLimit(s, slotName, sess, pattern, resetAt, now)
+							if sess.Phase == state.PhaseAdvisor {
+								o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "backend_unavailable", fmt.Sprintf("Required Advisor backend %s hit a provider limit (%s).", sess.Backend, pattern))
+								continue
+							}
 							selection := o.selectProviderLimitFallback(s, sess, now)
 							sess.BackendSelection = &selection
 
@@ -4527,7 +4701,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Soft token threshold: checkpoint + respawn ---
-					if o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
+					if sess.Phase != state.PhaseAdvisor && o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
 						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
 						if sess.TokensUsedAttempt >= softLimit {
 							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d), checkpointing",
@@ -4571,6 +4745,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
+							if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+								continue
+							}
 						}
 						now := time.Now().UTC()
 						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
@@ -4580,6 +4757,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							MaxTokens:      o.cfg.WorkerMaxTokens,
 							MeasuredAt:     now,
 						}, now)
+						if sess.Phase == state.PhaseAdvisor {
+							o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
+						}
 						continue
 					}
 
@@ -4598,16 +4778,24 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								o.runAfterRunHook(sess)
 								if err := o.stopWorker(slotName, sess); err != nil {
 									log.Printf("[orch] warn: could not stop silent worker %s: %v", slotName, err)
+									if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+										continue
+									}
 								}
 
 								// Count previous silent-timeout kills before updating this session,
 								// so the current kill is not included in the count.
 								prevSilentKills := countSilentTimeoutKillsForIssue(s, sess.IssueNumber)
 
-								sess.Status = state.StatusDead
-								sess.LastNotifiedStatus = "silent_timeout"
-								sess.FinishedAt = &now
-								state.MarkWorkerEnded(sess, now)
+								if sess.Phase == state.PhaseAdvisor {
+									o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "silent_timeout", sess.AdvisorUnresolvedFindings)
+									continue
+								} else {
+									sess.Status = state.StatusDead
+									sess.LastNotifiedStatus = "silent_timeout"
+									sess.FinishedAt = &now
+									state.MarkWorkerEnded(sess, now)
+								}
 
 								if prevSilentKills > 0 {
 									// auto-label blocked disabled
@@ -4623,7 +4811,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 
 			// Check if worker exceeded max runtime — hard fail (no retry) with diagnostics
-			maxMinutes := o.cfg.MaxRuntimeMinutes
+			maxMinutes := pipeline.MaxRuntimeForPhase(o.pipelineConfigForSession(sess), sess.Phase)
 			if sess.LongRunning {
 				maxMinutes *= 2
 			}
@@ -4641,19 +4829,50 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 				o.runAfterRunHook(sess)
 				if err := o.stopWorker(slotName, sess); err != nil {
 					log.Printf("[orch] warn: could not stop timed-out worker %s: %v", slotName, err)
+					if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
+						continue
+					}
 				}
-				// auto-label blocked disabled
-				o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
-				sess.Status = state.StatusFailed
-				now := time.Now().UTC()
-				sess.FinishedAt = &now
-				state.MarkWorkerEnded(sess, now)
+				if sess.Phase == state.PhaseAdvisor {
+					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "timeout", sess.AdvisorUnresolvedFindings)
+				} else {
+					// auto-label blocked disabled
+					o.syncProject(sess.IssueNumber, github.ProjectStatusBlocked)
+					sess.Status = state.StatusFailed
+					now := time.Now().UTC()
+					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
 
-				o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
-					slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
+					o.notifier.Sendf("⏱️ maestro: worker %s (issue #%d: %s) timed out after %d min.\nLast log lines:\n%s",
+						slotName, sess.IssueNumber, sess.IssueTitle, maxMinutes, logTail)
+				}
 			}
 		}
 	}
+}
+
+func (o *Orchestrator) cleanupLeasedWorktree(s *state.State, lease worker.WorktreeCleanupLease) error {
+	remove := o.removeWorktreeFn
+	if remove == nil {
+		remove = worker.RemoveWorktree
+	}
+	return worker.CleanupLeasedWorktree(
+		o.cfg,
+		s,
+		lease,
+		worker.CleanupProbes{PIDAlive: o.pidAlive, TmuxAlive: o.tmuxSessionExists},
+		worker.CleanupPolicy{RequireTerminal: true, RequireClean: true},
+		worker.CleanupHooks{
+			BeforeRemove: func() error {
+				return worker.RunHook(o.cfg, "before_remove", o.cfg.Hooks.BeforeRemove, worker.HookEnv{
+					IssueID:       fmt.Sprintf("%s#%d", o.cfg.Repo, lease.IssueNumber),
+					IssueNumber:   lease.IssueNumber,
+					WorkspacePath: lease.Worktree,
+				})
+			},
+			Remove: remove,
+		},
+	)
 }
 
 // autoMergePRs checks open PRs and merges ones with green CI
@@ -4751,8 +4970,10 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				log.Printf("[orch] no open PR found for branch %s (slot %s), but merge state is unavailable: %v — preserving session for retry", sess.Branch, slotName, mergedErr)
 				continue
 			}
+			closed := false
 			if !merged {
-				closed, closedErr := o.isIssueClosed(sess.IssueNumber)
+				var closedErr error
+				closed, closedErr = o.isIssueClosed(sess.IssueNumber)
 				if closedErr != nil {
 					log.Printf("[orch] no open PR found for branch %s (slot %s), but issue state is unavailable: %v — preserving session for retry", sess.Branch, slotName, closedErr)
 					continue
@@ -4762,7 +4983,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					continue
 				}
 			}
-			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge/closed outcome confirmed", sess.Branch, slotName)
+			if closed {
+				o.reconcileClosedIssueSession(s, slotName, sess, time.Now().UTC())
+				continue
+			}
+			log.Printf("[orch] no open PR found for branch %s (slot %s) — authoritative merge outcome confirmed", sess.Branch, slotName)
 			if !o.canMarkDoneForOutcome(s, sess, fmt.Sprintf("PR for branch %s is no longer open", sess.Branch)) {
 				if sess.Status != state.StatusCodeLanded && sess.PRNumber > 0 {
 					o.markCodeLanded(sess, sess.PRNumber)
@@ -5885,6 +6110,7 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	// #1013: a code_landed transition is terminal reconciliation — the PR
 	// merged, so any scheduled retry (including one deliberately held behind a
 	// current issue-guard label) is settled and must not survive. Clear it at
@@ -5918,6 +6144,7 @@ func (o *Orchestrator) markDoneAfterOutcomePass(sess *state.Session, prNumber in
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	// #443: issue-specific completion gates. Healthz alone is not enough to
 	// close UI/design work that requires live visual or deployment-status
 	// verification. When the configured gates match this issue (by label
@@ -5981,6 +6208,7 @@ func (o *Orchestrator) holdForLiveVerification(sess *state.Session, prNumber int
 	if prNumber > 0 {
 		sess.PRNumber = prNumber
 	}
+	sess.PRMerged = sess.PRNumber > 0
 	if sess.Status != state.StatusCodeLanded {
 		sess.Status = state.StatusCodeLanded
 	}
@@ -6854,8 +7082,11 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 
 	if o.cfg.ShouldCleanupWorktrees() {
 		log.Printf("[orch] cleaning up worktree for %s after merge", slotName)
-		o.stopWorker(slotName, sess)
-		sess.Worktree = "" // Mark as cleaned
+		if err := o.stopWorker(slotName, sess); err != nil {
+			log.Printf("[orch] post-merge worker teardown deferred for %s: %v", slotName, err)
+		} else {
+			sess.Worktree = "" // Mark as cleaned
+		}
 	} else {
 		log.Printf("[orch] skipping worktree cleanup for %s (cleanup_worktrees_on_merge=false)", slotName)
 	}
@@ -7817,6 +8048,16 @@ func (o *Orchestrator) startWorker(cfg *config.Config, s *state.State, issue git
 	return worker.Start(cfg, s, o.repo, issue, promptBase, backend)
 }
 
+func (o *Orchestrator) startClaimedWorker(cfg *config.Config, s *state.State, issue github.Issue, promptBase, backend, slot string) (string, error) {
+	if cfg == nil {
+		cfg = o.cfg
+	}
+	if o.workerStartClaimedFn != nil {
+		return o.workerStartClaimedFn(cfg, s, o.repo, issue, promptBase, backend, slot)
+	}
+	return worker.StartReserved(cfg, s, o.repo, issue, promptBase, backend, slot)
+}
+
 func issueHasLabel(issue github.Issue, label string) bool {
 	for _, issueLabel := range issue.Labels {
 		if strings.EqualFold(strings.TrimSpace(issueLabel.Name), label) {
@@ -7826,15 +8067,28 @@ func issueHasLabel(issue github.Issue, label string) bool {
 	return false
 }
 
-func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool) {
-	if base == nil || !issueHasLabel(issue, pipelineFullLabel) {
-		return base, false
+func isOutcomeRepairIssue(issue github.Issue) bool {
+	return issueHasLabel(issue, outcome.OutcomeRepairLabel) ||
+		strings.Contains(issue.Body, outcome.OutcomeRepairMarkerPrefix)
+}
+
+func pipelineConfigForIssue(base *config.Config, issue github.Issue) (*config.Config, bool, bool) {
+	if base == nil {
+		return base, false, false
+	}
+	pipelineFull := issueHasLabel(issue, pipelineFullLabel)
+	pipelineAdvised := issueHasLabel(issue, pipelineAdvisedLabel)
+	if !pipelineFull && !pipelineAdvised {
+		return base, false, false
 	}
 	cfg := *base
 	cfg.Pipeline.Enabled = true
 	cfg.Pipeline.Planner.Enabled = true
 	cfg.Pipeline.Validator.Enabled = true
-	return &cfg, true
+	if pipelineAdvised {
+		cfg.Pipeline.Advisor.Enabled = true
+	}
+	return &cfg, pipelineFull, pipelineAdvised
 }
 
 func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (bool, string, error) {
@@ -7848,9 +8102,6 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !o.canTreatIssueDoneForQueue(s, issueNumber, "closed issue") {
-			return false, "issue closed but outcome health is not verified", nil
-		}
 		return true, "issue closed", nil
 	}
 
@@ -7887,7 +8138,7 @@ func (o *Orchestrator) orderedQueueIssueDone(s *state.State, issueNumber int) (b
 }
 
 func (o *Orchestrator) orderedQueueIssueNumberPauseReason(s *state.State, issueNumber int) string {
-	if s.IssueInProgress(issueNumber) {
+	if s.IssueInProgress(issueNumber) && s.IssueHasNonFreshClaim(issueNumber) {
 		return fmt.Sprintf("issue #%d already has an active session", issueNumber)
 	}
 
@@ -8000,7 +8251,7 @@ func (o *Orchestrator) supervisorSelectedRepairSpawn(s *state.State, issueNumber
 		return true
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil {
+	if decision == nil || decision.RecommendationDropped() {
 		return false
 	}
 	switch decision.RecommendedAction {
@@ -8040,7 +8291,7 @@ func (o *Orchestrator) resolveSpawnRepairDispatch(s *state.State, issueNumber in
 		return &spawnRepairDispatch{target: approval.Target, approvalID: approval.ID}
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
+	if decision == nil || decision.RecommendationDropped() || decision.RecommendedAction != supervisor.ActionSpawnRepairWorker || decision.Target == nil || decision.Target.Issue != issueNumber {
 		return nil
 	}
 	if decision.RequiresApproval || decision.Risk == supervisor.RiskApprovalGated {
@@ -8165,7 +8416,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 
 	backend := strings.TrimSpace(sess.Backend)
 	if backend == "" {
-		backend = o.cfg.Model.Default
+		backend = o.cfg.Model.EffectiveDefault()
 	}
 	previousBackend := backend
 	// A current model:<backend> label is an explicit operator routing decision
@@ -8471,7 +8722,7 @@ func (o *Orchestrator) supervisorSelectedReviewRepair(s *state.State, issueNumbe
 		return nil, nil
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil || decision.RecommendedAction != supervisor.ActionSpawnReviewRepair {
+	if decision == nil || decision.RecommendationDropped() || decision.RecommendedAction != supervisor.ActionSpawnReviewRepair {
 		return nil, nil
 	}
 	if decision.Target == nil || decision.Target.Issue != issueNumber {
@@ -8628,7 +8879,7 @@ func (o *Orchestrator) supervisorOwnedReadySelectedIssue(s *state.State) (int, b
 		return 0, false
 	}
 	decision := s.LatestSupervisorDecision()
-	if decision == nil {
+	if decision == nil || decision.RecommendationDropped() {
 		return 0, false
 	}
 
@@ -8666,7 +8917,19 @@ func (o *Orchestrator) applySupervisorOwnedReadyFilter(s *state.State, issues []
 	// in awaiting_dispatch forever (#940).
 	filtered := make([]github.Issue, 0, 1)
 	for _, issue := range issues {
+		if _, claimed := s.FreshDispatchClaimFor(issue.Number); claimed {
+			filtered = append(filtered, issue)
+			continue
+		}
 		if o.supervisorSelectedRepairSpawn(s, issue.Number) {
+			filtered = append(filtered, issue)
+			continue
+		}
+		// A bounded-futility intake issue is the one fresh issue allowed through
+		// the red-outcome hold. This bypasses only supervisor-owned ready
+		// selection; the normal closed/merged, exclusion, operator-gate, retry,
+		// claim, and backend checks below still apply.
+		if isOutcomeRepairIssue(issue) {
 			filtered = append(filtered, issue)
 			continue
 		}
@@ -8707,6 +8970,25 @@ func (o *Orchestrator) augmentWithSupervisorSelectedIssue(s *state.State, issues
 	return o.appendFetchedSupervisorIssue(issues, selected)
 }
 
+func (o *Orchestrator) augmentWithFreshDispatchClaims(s *state.State, issues []github.Issue) []github.Issue {
+	if s == nil || len(s.FreshDispatchClaims) == 0 {
+		return issues
+	}
+	numbers := make([]int, 0, len(s.FreshDispatchClaims))
+	for issue := range s.FreshDispatchClaims {
+		if _, active := s.FreshDispatchClaimFor(issue); active {
+			numbers = append(numbers, issue)
+		}
+	}
+	sort.Ints(numbers)
+	for _, issue := range numbers {
+		if !containsIssueNumber(issues, issue) {
+			issues = o.appendFetchedSupervisorIssue(issues, issue)
+		}
+	}
+	return issues
+}
+
 func (o *Orchestrator) appendFetchedSupervisorIssue(issues []github.Issue, selected int) []github.Issue {
 	if selected <= 0 || containsIssueNumber(issues, selected) {
 		return issues
@@ -8722,6 +9004,113 @@ func (o *Orchestrator) appendFetchedSupervisorIssue(issues []github.Issue, selec
 	return append(issues, issue)
 }
 
+func (o *Orchestrator) durableFreshDispatchClaimsEnabled() bool {
+	if o == nil || o.cfg == nil || strings.TrimSpace(o.cfg.StateDir) == "" {
+		return false
+	}
+	// Legacy unit hooks synthesize arbitrary slot names and intentionally bypass
+	// production worker identity. A reservation-aware hook opts tests into the
+	// durable path explicitly.
+	return o.workerStartFn == nil || o.workerStartClaimedFn != nil
+}
+
+func (o *Orchestrator) claimFreshDispatch(s *state.State, issue github.Issue, now time.Time) (*state.FreshDispatchClaim, bool, error) {
+	if !o.durableFreshDispatchClaimsEnabled() {
+		return nil, true, nil
+	}
+	leaseID, err := newFreshDispatchLeaseID()
+	if err != nil {
+		return nil, false, err
+	}
+	var (
+		claim    state.FreshDispatchClaim
+		acquired bool
+	)
+	err = state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		reserved, ok, claimErr := latest.ClaimFreshDispatch(issue.Number, o.cfg.SessionPrefix, leaseID, freshDispatchLeaseDuration, now)
+		if claimErr != nil {
+			return claimErr
+		}
+		if reserved == nil {
+			return state.ErrNoStateChange
+		}
+		if ok && strings.TrimSpace(reserved.Branch) == "" {
+			reserved.Branch = worker.BranchName(reserved.Slot, issue)
+			reserved.Worktree = filepath.Join(o.cfg.WorktreeBase, reserved.Slot)
+			reserved.UpdatedAt = now.UTC()
+		}
+		claim = *reserved
+		acquired = ok
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if claim.IssueNumber > 0 {
+		if s.FreshDispatchClaims == nil {
+			s.FreshDispatchClaims = make(map[int]*state.FreshDispatchClaim)
+		}
+		copy := claim
+		s.FreshDispatchClaims[issue.Number] = &copy
+		if next := freshDispatchSlotSequence(claim.Slot, o.cfg.SessionPrefix) + 1; next > s.NextSlot {
+			s.NextSlot = next
+		}
+	}
+	return &claim, acquired, nil
+}
+
+func (o *Orchestrator) completeFreshDispatch(s *state.State, claim *state.FreshDispatchClaim, sess *state.Session, now time.Time) error {
+	if claim == nil {
+		return nil
+	}
+	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		return latest.CompleteFreshDispatch(claim.IssueNumber, claim.LeaseID, sess, now)
+	}); err != nil {
+		return err
+	}
+	copy := *claim
+	copy.Status = state.FreshDispatchClaimStatusCompleted
+	copy.UpdatedAt = now.UTC()
+	copy.CompletedAt = now.UTC()
+	copy.SessionStartedAt = sess.StartedAt.UTC()
+	copy.LeaseExpiresAt = time.Time{}
+	copy.TerminalReason = "session_committed"
+	s.FreshDispatchClaims[claim.IssueNumber] = &copy
+	return nil
+}
+
+func (o *Orchestrator) reconcileFreshDispatchClaims(s *state.State, now time.Time) {
+	if !o.durableFreshDispatchClaimsEnabled() || s == nil {
+		return
+	}
+	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		if latest.ReconcileFreshDispatchClaims(now) == 0 {
+			return state.ErrNoStateChange
+		}
+		return nil
+	}); err != nil {
+		log.Printf("[orch] reconcile fresh dispatch claims: %v", err)
+	}
+	s.ReconcileFreshDispatchClaims(now)
+}
+
+func freshDispatchSlotSequence(slot, prefix string) int {
+	prefix = strings.TrimSpace(prefix)
+	if prefix == "" || !strings.HasPrefix(slot, prefix+"-") {
+		return 0
+	}
+	n, _ := strconv.Atoi(strings.TrimPrefix(slot, prefix+"-"))
+	return n
+}
+
+func newFreshDispatchLeaseID() (string, error) {
+	var raw [16]byte
+	if _, err := cryptorand.Read(raw[:]); err != nil {
+		return "", fmt.Errorf("create fresh dispatch lease: %w", err)
+	}
+	return "dispatch:" + hex.EncodeToString(raw[:]), nil
+}
+
 func sortedStateSessionNames(s *state.State) []string {
 	names := make([]string, 0, len(s.Sessions))
 	for name := range s.Sessions {
@@ -8732,6 +9121,7 @@ func sortedStateSessionNames(s *state.State) []string {
 }
 
 func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
+	o.reconcileFreshDispatchClaims(s, time.Now().UTC())
 	// EMERGENCY STOP (#840): the fleet-wide big red button closes the spawn gate
 	// ahead of every other check. It halts ALL new worker spawns (and, since the
 	// router is only consulted inside this issue loop, every router LLM call for a
@@ -8767,12 +9157,13 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] list issues: %v", err)
 		return
 	}
-	if decision := s.LatestSupervisorDecision(); decision != nil && decision.RecommendedAction == supervisor.ActionSpawnRepairWorker && decision.Target != nil {
+	if decision := s.LatestSupervisorDecision(); decision != nil && !decision.RecommendationDropped() && decision.RecommendedAction == supervisor.ActionSpawnRepairWorker && decision.Target != nil {
 		if !decision.RequiresApproval && decision.Risk != supervisor.RiskApprovalGated {
 			issues = o.appendFetchedSupervisorIssue(issues, decision.Target.Issue)
 		}
 	}
 	issues = o.augmentWithSupervisorSelectedIssue(s, issues)
+	issues = o.augmentWithFreshDispatchClaims(s, issues)
 	if filtered, ordered := o.applyOrderedQueueFilter(s, issues); ordered {
 		issues = filtered
 	} else {
@@ -8785,10 +9176,14 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	dispatchPauseLogged := false
 	for _, issue := range issues {
 		repairSpawn := o.supervisorSelectedRepairSpawn(s, issue.Number)
-		if s.IssueInProgress(issue.Number) {
+		_, freshDispatchPending := s.FreshDispatchClaimFor(issue.Number)
+		if s.IssueInProgress(issue.Number) && !freshDispatchPending {
 			if !repairSpawn {
 				continue
 			}
+		} else if freshDispatchPending && s.IssueHasNonFreshClaim(issue.Number) {
+			log.Printf("[orch] refusing fresh dispatch renewal for issue #%d: a canonical session/PR claim appeared", issue.Number)
+			continue
 		}
 
 		// Pre-spawn guard (issue #456): never start a new worker for an issue that is
@@ -8921,6 +9316,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// any backend routing or slot allocation can create a second worktree.
 		if repairDispatch := o.resolveSpawnRepairDispatch(s, issue.Number); repairDispatch != nil {
 			if o.dispatchSpawnRepairWorker(s, issue, repairDispatch) {
+				markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 				started++
 			}
 			continue
@@ -8928,7 +9324,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 
 		// Determine initial phase and backend. A pipeline:full issue label
 		// enables the phase pipeline only for this worker's copied config.
-		workerCfg, pipelineFull := pipelineConfigForIssue(o.cfg, issue)
+		workerCfg, pipelineFull, pipelineAdvised := pipelineConfigForIssue(o.cfg, issue)
 		initialPhase := pipeline.InitialPhase(workerCfg)
 		var backendName string
 		var promptBase string
@@ -9032,8 +9428,30 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] issue #%d: policy SHADOW would pick %s — dispatching %s unchanged",
 				issue.Number, backendDecision.ShadowReason, backendName)
 		}
+		var freshClaim *state.FreshDispatchClaim
+		if !repairSpawn {
+			claimedAt := time.Now().UTC()
+			claim, acquired, claimErr := o.claimFreshDispatch(s, issue, claimedAt)
+			if claimErr != nil {
+				log.Printf("[orch] claim fresh dispatch for issue #%d: %v", issue.Number, claimErr)
+				continue
+			}
+			if !acquired {
+				if claim != nil && claim.Slot != "" {
+					log.Printf("[orch] skipping duplicate fresh dispatch for issue #%d: canonical startup lease is %s (generation=%d)", issue.Number, claim.Slot, claim.LeaseGeneration)
+				}
+				continue
+			}
+			freshClaim = claim
+		}
 		log.Printf("[orch] starting worker for issue #%d: %s (backend=%s, reason=%s, phase=%s, long_running=%v)", issue.Number, issue.Title, backendName, backendReason, initialPhase, longRunning)
-		slotName, err := o.startWorker(workerCfg, s, issue, promptBase, backendName)
+		var slotName string
+		var err error
+		if freshClaim != nil {
+			slotName, err = o.startClaimedWorker(workerCfg, s, issue, promptBase, backendName, freshClaim.Slot)
+		} else {
+			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
+		}
 		if err != nil {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
@@ -9047,6 +9465,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			continue
 		}
+		markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 
 		if longRunning {
 			s.Sessions[slotName].LongRunning = true
@@ -9057,23 +9476,43 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if pipelineFull {
 			s.Sessions[slotName].PipelineFull = true
 		}
+		if pipelineAdvised {
+			s.Sessions[slotName].PipelineAdvised = true
+		}
 		// #427/#783: stamp the backend selection reason on the session so the
 		// dashboard / fleet API can show why this backend was chosen (label /
 		// auto / default / router_error / phase / review_repair / policy:<tier>).
 		if sess := s.Sessions[slotName]; sess != nil {
+			if freshClaim != nil && !freshClaim.ClaimedAt.IsZero() && (sess.StartedAt.IsZero() || freshClaim.ClaimedAt.Before(sess.StartedAt)) {
+				sess.StartedAt = freshClaim.ClaimedAt.UTC()
+			}
 			if backendDecision.Tier != "" || backendDecision.ShadowTier != "" {
 				sel := o.policyBackendSelection(backendDecision)
 				sel.SelectedBackend = backendName
 				sess.BackendSelection = sel
 			} else {
 				sess.BackendSelection = &state.BackendSelection{
-					SelectedBackend: backendName,
-					SelectionReason: backendReason,
-					TaskType:        taskType,
+					SelectedBackend:      backendName,
+					SelectionReason:      backendReason,
+					RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
+					TaskType:             taskType,
 				}
 			}
 			if taskType != "" && len(sess.Attribution) > 0 {
 				sess.Attribution[len(sess.Attribution)-1].TaskType = taskType
+			}
+		}
+		if freshClaim != nil {
+			sess := s.Sessions[slotName]
+			if slotName != freshClaim.Slot || sess == nil {
+				log.Printf("[orch] fresh dispatch for issue #%d returned non-canonical slot %q (want %q); lease remains active", issue.Number, slotName, freshClaim.Slot)
+				started++
+				continue
+			}
+			if err := o.completeFreshDispatch(s, freshClaim, sess, time.Now().UTC()); err != nil {
+				log.Printf("[orch] persist fresh dispatch for issue #%d on %s: %v (lease remains authoritative)", issue.Number, slotName, err)
+				started++
+				continue
 			}
 		}
 		if o.syncProject(issue.Number, github.ProjectStatusInProgress) {
@@ -9099,4 +9538,24 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	if started == 0 {
 		log.Printf("[orch] no new workers started (%d issues checked)", len(issues))
 	}
+}
+
+func markSupervisorWorkerRecommendationMaterialized(s *state.State, issueNumber int, now time.Time) bool {
+	if s == nil || issueNumber <= 0 {
+		return false
+	}
+	decision := s.LatestSupervisorDecision()
+	if decision == nil || decision.RecommendationDropped() || decision.Target == nil || decision.Target.Issue != issueNumber {
+		return false
+	}
+	switch decision.RecommendedAction {
+	case supervisor.ActionSpawnWorker, supervisor.ActionSpawnRepairWorker, supervisor.ActionSpawnReviewRepair:
+	default:
+		return false
+	}
+	return s.MarkSupervisorRecommendationMaterialized(
+		decision.ID,
+		state.RecommendationDispositionWorkerStarted,
+		now,
+	)
 }

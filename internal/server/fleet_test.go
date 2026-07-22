@@ -205,11 +205,8 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 	if worker.RuntimeSeconds <= 0 {
 		t.Fatalf("worker runtime_seconds = %d, want positive runtime", worker.RuntimeSeconds)
 	}
-	if len(worker.Actions) != 5 {
-		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
-	}
-	for _, action := range worker.Actions {
-		assertFleetReadOnlyAction(t, action)
+	if len(worker.Actions) != 0 {
+		t.Fatalf("terminal worker actions = %d, want none", len(worker.Actions))
 	}
 	if len(one.Actions) != 3 {
 		t.Fatalf("project actions = %d, want 3", len(one.Actions))
@@ -620,6 +617,31 @@ func TestFleetEffectiveConfigIsSanitized(t *testing.T) {
 	}
 	if eff.Pipeline.Planner.Effort != "high" || eff.Pipeline.Implementer.Effort != "low" {
 		t.Fatalf("pipeline effort overrides = %+v", eff.Pipeline)
+	}
+}
+
+func TestFleetEffectiveConfigShowsProviderLanesAndResolvedRoute(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Provider: "anthropic"},
+			"sol":    {Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+			"gpt55":  {Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+		},
+	}}
+	eff := buildFleetEffectiveConfig(cfg)
+	if eff.ModelPolicy.SelectionReason != config.ModelRouteProviderLanes {
+		t.Fatalf("selection reason = %q", eff.ModelPolicy.SelectionReason)
+	}
+	if !reflect.DeepEqual(eff.ModelPolicy.ResolvedRoute, []string{"claude", "sol", "gpt55"}) {
+		t.Fatalf("resolved route = %v", eff.ModelPolicy.ResolvedRoute)
+	}
+	if len(eff.ModelPolicy.ProviderLanes) != 2 || eff.ModelPolicy.ProviderLanes[1].FallbackBackends[0] != "gpt55" {
+		t.Fatalf("provider lanes = %+v", eff.ModelPolicy.ProviderLanes)
 	}
 }
 
@@ -2167,6 +2189,30 @@ func TestFleetProjectOperatorStateDistinguishesBriefStates(t *testing.T) {
 		t.Fatalf("drift operator state = %+v, want runtime outcome drift", drift)
 	}
 
+	closedAt := now.Add(-time.Hour)
+	openTargetDrift := buildFleetProjectOperatorState(fleetProjectState{
+		Name: "RuntimeWithHistory",
+		Repo: "owner/runtime-with-history",
+		Outcome: outcome.Status{
+			Configured:  true,
+			Goal:        "Runtime is healthy",
+			HealthState: outcome.HealthFailing,
+		},
+		closedIssueOutcomes: []fleetClosedIssueOutcome{{IssueNumber: 5, PRNumber: 33, ClosedAt: closedAt}},
+		Supervisor: supervisorInfo{Latest: &supervisorDecisionInfo{
+			CreatedAt:         now,
+			Summary:           "Issue #6 runtime verification is still failing.",
+			RecommendedAction: "check_outcome_health",
+			Target:            &state.SupervisorTarget{Issue: 6, PR: 34, Session: "runtime-6"},
+		}},
+	})
+	if openTargetDrift.IssueNumber != 6 || openTargetDrift.PRNumber != 34 || openTargetDrift.Session != "runtime-6" {
+		t.Fatalf("open-target drift = %+v, want current issue #6 target retained", openTargetDrift)
+	}
+	if contains(openTargetDrift.Summary, "Issue #5 is closed") || !contains(openTargetDrift.Summary, "Issue #6") {
+		t.Fatalf("open-target drift summary = %q, want current target wording without unrelated closed history", openTargetDrift.Summary)
+	}
+
 	blocked := buildFleetProjectOperatorState(fleetProjectState{
 		Name:          "BlockedQueue",
 		Outcome:       configuredOutcome,
@@ -2989,6 +3035,63 @@ func TestFleetWorkerDetailIncludesMetadataAndLog(t *testing.T) {
 	}
 	if resp.Log.Lines != 2 {
 		t.Fatalf("log lines = %d, want actual tailed line count 2", resp.Log.Lines)
+	}
+}
+
+func TestFleetWorkerDetailIncludesProviderModelAggregate(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	resetAt := now.Add(90 * time.Second)
+	stateDir := filepath.Join(dir, "state")
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"one-908": {
+			IssueNumber:               908,
+			IssueTitle:                "Credential-aware fallback",
+			Status:                    state.StatusDead,
+			StartedAt:                 now.Add(-time.Minute),
+			FinishedAt:                &now,
+			Backend:                   "fable",
+			RateLimitHit:              true,
+			ProviderLimitBackend:      "fable",
+			ProviderLimitReason:       state.BackendBlockModelCooldown,
+			ProviderLimitProvider:     "claude",
+			ProviderLimitModel:        "claude-fable-5",
+			ProviderLimitResetAt:      &resetAt,
+			CredentialCandidates:      2,
+			CredentialCandidatesKnown: true,
+			CredentialUsable:          0,
+			CredentialUsableKnown:     true,
+			CredentialAggregateReason: "all_model_credentials_cooling_down",
+		},
+	})
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("One", "/tmp/one.yaml", "", &config.Config{
+			Repo:        "owner/one",
+			StateDir:    stateDir,
+			MaxParallel: 1,
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet/worker?project=One&slot=one-908", nil)
+	w := httptest.NewRecorder()
+	srv.handleFleetWorker(w, req)
+
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want %d", w.Code, http.StatusOK)
+	}
+	var resp fleetWorkerDetailResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	worker := resp.Worker
+	if worker.ProviderLimitBackend != "fable" || worker.ProviderLimitReason != state.BackendBlockModelCooldown || worker.ProviderLimitProvider != "claude" || worker.ProviderLimitModel != "claude-fable-5" {
+		t.Fatalf("provider/model route = %+v", worker)
+	}
+	if !worker.CredentialCandidatesKnown || worker.CredentialCandidates != 2 || !worker.CredentialUsableKnown || worker.CredentialUsable != 0 {
+		t.Fatalf("credential aggregate = %+v", worker)
+	}
+	if worker.CredentialAggregateReason != "all_model_credentials_cooling_down" || worker.ProviderLimitResetAt != resetAt.Format(time.RFC3339) {
+		t.Fatalf("aggregate reason/reset = %q/%q", worker.CredentialAggregateReason, worker.ProviderLimitResetAt)
 	}
 }
 
@@ -4417,8 +4520,8 @@ func TestFleetSupersedingIssueSessionSuppressesDeadSourceBehindActiveContinuatio
 
 // TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly pins the #598
 // regression. A retry_exhausted session whose linked PR is still open and
-// whose last notification is NOT a CI failure is convergence-bound: the
-// orchestrator will auto-merge it once the merge gate clears. The session
+// whose durable current-head gate snapshot is successful is convergence-bound:
+// the orchestrator will auto-merge it once the merge gate clears. The session
 // must stay surfaced (#564) AND counted in prs_open (#566), but the fleet
 // verdict tone must read calm — never the alarming "Action required — p1"
 // the legacy code path produced. The matching project card surfaces an
@@ -4456,6 +4559,10 @@ func TestFleetAPIRetryExhaustedWithOpenPRSelfResolvesCalmly(t *testing.T) {
 			},
 		},
 	})
+	recordFleetTestPRGate(t, stateDir, state.PRGateTransition{
+		Project: "befeast/maestro", IssueNumber: 442, PRNumber: 564, HeadSHA: strings.Repeat("a", 40),
+		CIObserved: true, CIRollupVerdict: state.PRGateCISuccess, CIEffectiveVerdict: state.PRGateCISuccess,
+	}, now.Add(-30*time.Second))
 
 	srv := NewFleet([]FleetProject{
 		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
@@ -4589,6 +4696,90 @@ func TestFleetAPIRetryExhaustedWithFailedChecksRemainsActionable(t *testing.T) {
 	}
 	if cta := resp.NextAction.CTALabel; cta == "" || !contains(cta, "600") {
 		t.Fatalf("next_action.cta_label = %q, want a label naming PR #600", cta)
+	}
+}
+
+// TestFleetAPIRetryExhaustedStaleSuccessLosesToCurrentFailedGate pins #955.
+// Retry/session and supervisor metadata still say the PR is green, while the
+// durable current-head rollup says required checks failed. Fleet must project
+// one conservative repair state and must never suggest auto-merge.
+func TestFleetAPIRetryExhaustedStaleSuccessLosesToCurrentFailedGate(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	stateDir := filepath.Join(dir, "state")
+	finished := now.Add(-30 * time.Minute)
+	saveFleetTestSnapshot(t, stateDir, map[string]*state.Session{
+		"ok-player-277": {
+			IssueNumber:        346,
+			IssueTitle:         "Repair Fedora package checks",
+			Status:             state.StatusRetryExhausted,
+			PRNumber:           397,
+			StartedAt:          finished.Add(-time.Hour),
+			FinishedAt:         &finished,
+			LastNotifiedStatus: "review_retry_exhausted",
+		},
+	}, []state.SupervisorDecision{
+		{
+			ID:                "dec-stale-success",
+			CreatedAt:         now.Add(-time.Minute),
+			Project:           "ok-player",
+			RecommendedAction: "monitor_open_pr",
+			Risk:              "safe",
+			StuckStates: []state.SupervisorStuckState{
+				{
+					Code:     "retry_exhausted_open_pr",
+					Target:   &state.SupervisorTarget{Issue: 346, PR: 397},
+					Evidence: []string{"Session ok-player-277 status=retry_exhausted pr=397 checks=success"},
+				},
+			},
+		},
+	})
+	recordFleetTestPRGate(t, stateDir, state.PRGateTransition{
+		Project: "BeFeast/ok-player", IssueNumber: 346, PRNumber: 397,
+		HeadSHA:    "93f4f93d41350d2e4c14eb9455e4c1ee6321f412",
+		CIObserved: true, CIRollupVerdict: state.PRGateCIFailure, CIEffectiveVerdict: state.PRGateCIFailure,
+	}, now)
+
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("ok-player", "/tmp/ok-player.yaml", "", &config.Config{
+			Repo:        "BeFeast/ok-player",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+		}),
+	}, "127.0.0.1", 8786, true)
+	resp := srv.snapshot()
+
+	project := findFleetProject(t, resp.Projects, "ok-player")
+	if project.OperatorState.Kind != "attention" || project.OperatorState.Tone != "attention" {
+		t.Fatalf("operator_state = %+v, want one attention-tone repair state", project.OperatorState)
+	}
+	if project.OperatorState.PRNumber != 397 {
+		t.Fatalf("operator_state.pr_number = %d, want 397", project.OperatorState.PRNumber)
+	}
+	operatorText := strings.ToLower(project.OperatorState.Summary + " " + project.OperatorState.NextAction)
+	for _, forbidden := range []string{"checks are green", "auto-merg", "no action needed"} {
+		if strings.Contains(operatorText, forbidden) {
+			t.Fatalf("operator_state contains unsafe %q wording: %+v", forbidden, project.OperatorState)
+		}
+	}
+	for _, required := range []string{"failing checks", "in place", "do not merge"} {
+		if !strings.Contains(operatorText, required) {
+			t.Fatalf("operator_state text = %q, want %q", operatorText, required)
+		}
+	}
+	if project.SelfResolving != 0 || resp.Summary.SelfResolving != 0 {
+		t.Fatalf("self_resolving project=%d fleet=%d, want 0 for a failed current gate", project.SelfResolving, resp.Summary.SelfResolving)
+	}
+	if resp.Verdict.Tone != "attention" {
+		t.Fatalf("verdict tone = %q, want attention", resp.Verdict.Tone)
+	}
+
+	worker := findFleetWorker(t, resp.Workers, "ok-player-277")
+	workerText := strings.ToLower(worker.StatusReason + " " + worker.NextAction)
+	for _, required := range []string{"failing checks", "current reconciled head", "in place", "do not merge"} {
+		if !strings.Contains(workerText, required) {
+			t.Fatalf("worker repair projection = %q, want %q", workerText, required)
+		}
 	}
 }
 
@@ -5085,6 +5276,214 @@ func TestFleetAPIIncludesCloseCandidatesAndBatchAction(t *testing.T) {
 	}
 }
 
+func TestFleetClosedIssueIsHistoricalWhileOutcomeAndDeliveryRemainVisible(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Now().UTC()
+	closedAt := now.Add(-time.Minute)
+	finishedAt := now.Add(-2 * time.Hour)
+	deployedAt := now.Add(-90 * time.Minute)
+	st := state.NewState()
+	st.LastMergeAt = now.Add(-3 * time.Hour)
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now.Add(-30 * time.Minute),
+		State:     outcome.HealthFailing,
+		Signal:    "healthcheck_command",
+		Summary:   "public health check failed",
+	}
+	st.Sessions["txc-17"] = &state.Session{
+		IssueNumber:           5,
+		IssueTitle:            "Closed delivery",
+		Status:                state.StatusDone,
+		PRNumber:              33,
+		PRMerged:              true,
+		StartedAt:             now.Add(-4 * time.Hour),
+		FinishedAt:            &finishedAt,
+		IssueClosedAt:         &closedAt,
+		DeploymentFinishedAt:  &deployedAt,
+		ReleasedForRedispatch: true,
+		OperatorGateName:      "stale gate",
+		WorkerOutcome:         string(state.DisplayTokenBudgetExceeded),
+	}
+	st.Approvals = []state.Approval{{
+		ID:        "deploy-33",
+		CreatedAt: now.Add(-2 * time.Hour),
+		UpdatedAt: now.Add(-2 * time.Hour),
+		Action:    state.ApprovalActionDeployProject,
+		Status:    state.ApprovalStatusPending,
+		Target:    &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		Summary:   "Deploy PR #33 for issue #5",
+		Delivery: &state.DeliveryPayload{
+			Project: "owner/repo", Repo: "owner/repo", Issue: 5, PR: 33,
+			MergedSHA: "1111111111111111111111111111111111111111",
+		},
+	}}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "stale-merge-decision",
+		CreatedAt:         now.Add(-10 * time.Minute),
+		Summary:           "Review PR #33 before issue #5 can be closed.",
+		RecommendedAction: config.SupervisorActionMergePR,
+		Target:            &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		ProjectState:      state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}, OpenIssues: 1},
+		StuckStates: []state.SupervisorStuckState{{
+			Code:              "failing_checks",
+			Severity:          "blocked",
+			Summary:           "PR #33 has failing checks.",
+			RecommendedAction: "Repair PR #33.",
+			Target:            &state.SupervisorTarget{Issue: 5, PR: 33, Session: "txc-17"},
+		}},
+	}, state.DefaultSupervisorDecisionLimit)
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save state: %v", err)
+	}
+
+	cfg := &config.Config{
+		Repo:        "owner/repo",
+		StateDir:    dir,
+		MaxParallel: 2,
+		Outcome: outcome.Brief{
+			DesiredOutcome:      "the public service is healthy",
+			HealthcheckCommand:  "check-public-service",
+			PassRequiredForDone: boolPtr(true),
+			RequiresDeploy:      true,
+		},
+	}
+	fleet := NewFleet([]FleetProject{NewFleetProject("Project", "", "", cfg)}, "127.0.0.1", 0, false)
+	resp := fleet.snapshot()
+	project := findFleetProject(t, resp.Projects, "Project")
+	worker := findFleetWorker(t, resp.Workers, "txc-17")
+
+	if worker.Status != string(state.StatusDone) || worker.NeedsAttention || worker.IssueClosedAt == "" || !worker.PRMerged || len(worker.Actions) != 0 {
+		t.Fatalf("closed worker projection = %+v, want terminal historical row without actions", worker)
+	}
+	if contains(worker.StatusReason, "before the issue can be closed") || contains(worker.StatusReason, "PR #33 is open") || contains(worker.NextAction, "close the issue") {
+		t.Fatalf("closed worker retained stale lifecycle copy: reason=%q next=%q", worker.StatusReason, worker.NextAction)
+	}
+	if project.NeedsAttention != 0 || len(project.Attention) != 0 || len(resp.Attention) != 0 {
+		t.Fatalf("closed issue leaked into attention: project=%d project_rows=%d fleet_rows=%d", project.NeedsAttention, len(project.Attention), len(resp.Attention))
+	}
+	if project.PRGates != 0 || project.CapacityUsed != 0 || project.CapacityBlockedByGates != 0 || project.PRsOpen != 0 {
+		t.Fatalf("closed merged PR leaked into gate/capacity counts: gates=%d used=%d blocked=%d prs_open=%d", project.PRGates, project.CapacityUsed, project.CapacityBlockedByGates, project.PRsOpen)
+	}
+	if len(project.IssueClaims) != 0 || len(project.CloseCandidates) != 0 {
+		t.Fatalf("closed issue retained claim/close control: claims=%+v close=%+v", project.IssueClaims, project.CloseCandidates)
+	}
+	if project.OperatorState.Kind != "outcome_drift" || !contains(project.OperatorState.Summary, "Issue #5 is closed; project outcome remains unverified") {
+		t.Fatalf("project outcome warning = %+v", project.OperatorState)
+	}
+	if project.OperatorState.IssueNumber != 0 || project.OperatorState.PRNumber != 0 || project.OperatorState.Session != "" {
+		t.Fatalf("project outcome warning retained issue/worker target: %+v", project.OperatorState)
+	}
+	approval := findFleetApproval(t, resp.Approvals, "deploy-33")
+	if approval.IssueNumber != 0 || approval.Session != "" || approval.PRNumber != 33 || !contains(approval.Summary, "Issue #5 is closed") {
+		t.Fatalf("delivery approval was not projected at project scope: %+v", approval)
+	}
+	if approval.Delivery == nil || approval.Delivery.Issue != 0 {
+		t.Fatalf("delivery API payload retained closed issue target: %+v", approval.Delivery)
+	}
+	if resp.OperatorBrief.IssueNumber != 0 || resp.OperatorBrief.Session != "" || resp.NextAction == nil || resp.NextAction.IssueNumber != 0 {
+		t.Fatalf("global brief/next action retained closed issue target: brief=%+v next=%+v", resp.OperatorBrief, resp.NextAction)
+	}
+	if contains(resp.OperatorBrief.Sentence, "on issue #5") {
+		t.Fatalf("global brief still targets the closed issue: %q", resp.OperatorBrief.Sentence)
+	}
+}
+
+func TestFleetTruthfulOpenPRCountFiltersOnlyExactMergedClosedPR(t *testing.T) {
+	now := time.Now().UTC()
+	closedAt := now
+	st := state.NewState()
+	st.Sessions["closed"] = &state.Session{
+		IssueNumber:   5,
+		Status:        state.StatusDone,
+		PRNumber:      33,
+		PRMerged:      true,
+		IssueClosedAt: &closedAt,
+	}
+
+	tests := []struct {
+		name      string
+		project   state.SupervisorProjectState
+		prMerged  bool
+		wantCount int
+	}{
+		{
+			name:      "exact merged PR removed",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}},
+			prMerged:  true,
+			wantCount: 0,
+		},
+		{
+			name:      "unrelated open PR preserved",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{34}},
+			prMerged:  true,
+			wantCount: 1,
+		},
+		{
+			name:      "closed issue still-open PR preserved",
+			project:   state.SupervisorProjectState{OpenPRs: 1, OpenPRNumbers: []int{33}},
+			prMerged:  false,
+			wantCount: 1,
+		},
+		{
+			name:      "legacy aggregate is not guessed at",
+			project:   state.SupervisorProjectState{OpenPRs: 1},
+			prMerged:  true,
+			wantCount: 1,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			st.Sessions["closed"].PRMerged = tt.prMerged
+			projectState := stateResponse{SupervisorLatest: &state.SupervisorDecision{
+				CreatedAt:    now.Add(-time.Minute),
+				ProjectState: tt.project,
+			}}
+			if got := fleetTruthfulOpenPRCount(projectState, st); got != tt.wantCount {
+				t.Fatalf("fleetTruthfulOpenPRCount = %d, want %d", got, tt.wantCount)
+			}
+		})
+	}
+}
+
+func TestFleetDeliveryApprovalForReopenedIssueKeepsFreshTarget(t *testing.T) {
+	now := time.Now().UTC()
+	closedAt := now.Add(-2 * time.Hour)
+	st := state.NewState()
+	st.Sessions["old"] = &state.Session{
+		IssueNumber:   5,
+		Status:        state.StatusDone,
+		PRNumber:      33,
+		PRMerged:      true,
+		IssueClosedAt: &closedAt,
+	}
+	st.Sessions["fresh"] = &state.Session{
+		IssueNumber: 5,
+		Status:      state.StatusCodeLanded,
+		PRNumber:    34,
+		PRMerged:    true,
+		StartedAt:   now.Add(-time.Hour),
+	}
+	approval := state.Approval{
+		ID:        "deploy-34",
+		CreatedAt: now.Add(-30 * time.Minute),
+		UpdatedAt: now.Add(-30 * time.Minute),
+		Action:    state.ApprovalActionDeployProject,
+		Status:    state.ApprovalStatusPending,
+		Target:    &state.SupervisorTarget{Issue: 5, PR: 34, Session: "fresh"},
+		Summary:   "Deploy PR #34 for reopened issue #5",
+		Delivery:  &state.DeliveryPayload{Project: "owner/repo", Repo: "owner/repo", Issue: 5, PR: 34},
+	}
+
+	item := makeFleetApprovalState(fleetProjectState{Name: "Project", Repo: "owner/repo"}, st, approval, now)
+	if item.IssueNumber != 5 || item.PRNumber != 34 {
+		t.Fatalf("fresh approval target = issue #%d PR #%d session %q, want reopened issue/PR target retained", item.IssueNumber, item.PRNumber, item.Session)
+	}
+	if contains(item.Summary, "Issue #5 is closed") || item.Delivery == nil || item.Delivery.Issue != 5 {
+		t.Fatalf("fresh approval was projected as historical closure: %+v", item)
+	}
+}
+
 func TestFleetAPIIncludesProjectBoardSnapshot(t *testing.T) {
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "one")
@@ -5205,6 +5604,20 @@ func saveFleetTestSnapshot(t *testing.T, dir string, sessions map[string]*state.
 	}
 	if err := state.Save(dir, st); err != nil {
 		t.Fatalf("save state: %v", err)
+	}
+}
+
+func recordFleetTestPRGate(t *testing.T, dir string, transition state.PRGateTransition, at time.Time) {
+	t.Helper()
+	st, err := state.Load(dir)
+	if err != nil {
+		t.Fatalf("load state for PR gate: %v", err)
+	}
+	if _, _, err := st.RecordPRGateTransition(transition, at); err != nil {
+		t.Fatalf("record PR gate: %v", err)
+	}
+	if err := state.Save(dir, st); err != nil {
+		t.Fatalf("save PR gate: %v", err)
 	}
 }
 
@@ -5514,7 +5927,8 @@ func boolPtr(b bool) *bool { return &b }
 // yet and could still be dispatched.
 func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
 	cfg := &config.Config{Model: config.ModelConfig{
-		Default: "claude",
+		Default:          "claude",
+		FallbackBackends: []string{"codex"},
 		Backends: map[string]config.BackendDef{
 			"claude": {},
 			"codex":  {},
@@ -5550,7 +5964,8 @@ func TestAllBackendsBlockedPartialHealthNotFullyBlocked(t *testing.T) {
 // is down.
 func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
 	cfg := &config.Config{Model: config.ModelConfig{
-		Default: "claude",
+		Default:          "claude",
+		FallbackBackends: []string{"codex"},
 		Backends: map[string]config.BackendDef{
 			"claude": {},
 			"codex":  {Enabled: boolPtr(false)},
@@ -5566,6 +5981,29 @@ func TestConfiguredWorkerBackendsOmitsDisabled(t *testing.T) {
 	}
 	if !allBackendsBlocked(health, configured) {
 		t.Fatal("disabled codex must not prevent blocked_by_model_limits when claude is down")
+	}
+}
+
+func TestConfiguredWorkerBackendsIgnoresBackendsOutsideResolvedRoute(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "anthropic", Default: "claude"},
+		},
+		Backends: map[string]config.BackendDef{
+			"claude": {Provider: "anthropic"},
+			"helper": {Provider: "openai"},
+		},
+	}}
+	configured := configuredWorkerBackends(cfg)
+	if !reflect.DeepEqual(configured, []string{"claude"}) {
+		t.Fatalf("configured = %v, want resolved route only", configured)
+	}
+	health := map[string]state.BackendHealth{
+		"claude": {State: state.BackendHealthCooldown},
+	}
+	if !allBackendsBlocked(health, configured) {
+		t.Fatal("unrouted helper backend must not hide a fully blocked route")
 	}
 }
 

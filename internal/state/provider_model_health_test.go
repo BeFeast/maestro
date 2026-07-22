@@ -1,6 +1,7 @@
 package state
 
 import (
+	"strings"
 	"testing"
 	"time"
 )
@@ -48,6 +49,24 @@ func TestSessionDisplayStatus_BackendModelCooldown(t *testing.T) {
 	}
 	attention := SessionAttentionFor(sess, nil)
 	if !attention.NeedsAttention || attention.Reason == "" {
+		t.Fatalf("attention = %+v", attention)
+	}
+}
+
+func TestSessionDisplayStatus_BackendModelOverloaded(t *testing.T) {
+	sess := &Session{
+		Status:                StatusDead,
+		RateLimitHit:          true,
+		ProviderLimitBackend:  "fable",
+		ProviderLimitProvider: "claude",
+		ProviderLimitModel:    "claude-fable-5",
+		ProviderLimitReason:   BackendBlockModelOverloaded,
+	}
+	if got := SessionDisplayStatusForAt(sess, nil, time.Now()); got != string(DisplayBackendModelOverloaded) {
+		t.Fatalf("display status = %q, want %q", got, DisplayBackendModelOverloaded)
+	}
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention || !strings.Contains(attention.Reason, "temporarily overloaded") {
 		t.Fatalf("attention = %+v", attention)
 	}
 }

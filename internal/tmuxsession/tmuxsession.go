@@ -2,16 +2,20 @@
 //
 // Workers use a private tmux server instead of the caller's default server.
 // When Maestro itself runs as a systemd service, the first worker starts that
-// server in a sibling transient scope.  The worker tree therefore survives a
-// restart of maestro.service instead of remaining in its KillMode=control-group
-// cgroup and being killed with the daemon.
+// server in a sibling transient scope. Each pane then launches its runner in a
+// unique per-worker unit: a scope for legacy temp behavior or the same lease in
+// service form for isolated scratch. Both survive a restart of maestro.service.
 package tmuxsession
 
 import (
 	"context"
+	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -19,14 +23,101 @@ import (
 )
 
 const (
-	tmuxName       = "tmux"
-	bashPath       = "/usr/bin/bash"
-	sudoName       = "sudo"
-	systemdRunName = "systemd-run"
-	privateSocket  = "maestro-workers"
+	tmuxName            = "tmux"
+	bashPath            = "/usr/bin/bash"
+	sudoName            = "sudo"
+	systemdRunName      = "systemd-run"
+	systemctlName       = "systemctl"
+	privateSocket       = "maestro-workers"
+	workerSlice         = "maestro-workers.slice"
+	isolatedWorkerSlice = "maestro-workers-isolated.slice"
+
+	ProcessLeaseManagerSystem = "system"
+	ProcessLeaseManagerUser   = "user"
+
+	processLeaseGracePeriod  = 2 * time.Second
+	processLeaseForcePeriod  = 1 * time.Second
+	processLeasePollInterval = 100 * time.Millisecond
 )
 
 var startMu sync.Mutex
+
+var processLeaseUnitPattern = regexp.MustCompile(`^maestro-worker-[0-9a-f]{32}-g[1-9][0-9]*\.(scope|service)$`)
+
+func ValidProcessLeaseUnit(unit string) bool {
+	return processLeaseUnitPattern.MatchString(strings.TrimSpace(unit))
+}
+
+// ProcessLeaseRuntime is present only for the config-gated isolated runtime.
+// Its service unit is still the same durable process lease; these fields add
+// the private mount, environment, cleanup hook, and per-worker memory policy
+// used when systemd launches that one unit.
+type ProcessLeaseRuntime struct {
+	ScratchID    string
+	ScratchDir   string
+	TempDir      string
+	GoTempDir    string
+	CargoTarget  string
+	ManifestPath string
+	CleanupExec  string
+	Home         string
+	User         string
+	MemoryMaxMB  int
+}
+
+// ProcessLease identifies the exact systemd unit that owns one worker
+// attempt. The unit name is deterministic for project + slot + generation, so
+// an ambiguous tmux response can be reconciled without replaying the runner.
+// Manager is persisted because production workers use the system manager while
+// non-service development launches use the user manager.
+type ProcessLease struct {
+	Unit    string
+	Manager string
+	Runtime *ProcessLeaseRuntime
+}
+
+// WorkerProcessLease returns the unique process boundary for one worker
+// generation. Hashing durable project identity + slot keeps the unit bounded and systemd-safe
+// without putting repository names or host paths into the cgroup name.
+func WorkerProcessLease(projectIdentity, slot string, generation uint64) (ProcessLease, error) {
+	return workerProcessLease(projectIdentity, slot, generation, ProcessLeaseManagerForEnvironment(), "scope")
+}
+
+// WorkerProcessServiceLease returns the same generation-specific ownership
+// receipt as WorkerProcessLease, expressed as a transient service so isolated
+// scratch can use BindPaths and ExecStopPost without creating a second unit.
+func WorkerProcessServiceLease(projectIdentity, slot string, generation uint64, manager string) (ProcessLease, error) {
+	return workerProcessLease(projectIdentity, slot, generation, manager, "service")
+}
+
+func workerProcessLease(projectIdentity, slot string, generation uint64, manager, kind string) (ProcessLease, error) {
+	projectIdentity = strings.TrimSpace(projectIdentity)
+	slot = strings.TrimSpace(slot)
+	if projectIdentity == "" || slot == "" || generation == 0 {
+		return ProcessLease{}, fmt.Errorf("worker process lease requires project identity, slot, and positive generation")
+	}
+	if kind != "scope" && kind != "service" {
+		return ProcessLease{}, fmt.Errorf("worker process lease kind %q is invalid", kind)
+	}
+	sum := sha256.Sum256([]byte(projectIdentity + "\x00" + slot))
+	unit := fmt.Sprintf("maestro-worker-%x-g%d.%s", sum[:16], generation, kind)
+	lease := ProcessLease{Unit: unit, Manager: manager}
+	if err := validateProcessLease(lease); err != nil {
+		return ProcessLease{}, err
+	}
+	return lease, nil
+}
+
+// ProcessLeaseManagerForEnvironment selects the production-valid manager.
+// maestro.service is a system unit and intentionally has no usable user bus, so
+// it must create sibling scopes through the system manager. Standalone CLI
+// development uses the user manager and never changes the production path.
+func ProcessLeaseManagerForEnvironment() string {
+	if strings.TrimSpace(os.Getenv("INVOCATION_ID")) != "" {
+		return ProcessLeaseManagerSystem
+	}
+	return ProcessLeaseManagerUser
+}
 
 // HasSession checks the restart-safe private server first and then the legacy
 // default server.  The fallback keeps reconciliation able to see sessions that
@@ -65,12 +156,18 @@ func ClientArgsForSession(name string, args ...string) (string, []string) {
 
 // StartDetached starts one worker session.  When the private tmux server does
 // not yet exist, a system-service Maestro launches it in a sibling systemd
-// scope.  Subsequent sessions are created by that already-isolated server.
-func StartDetached(name, worktree, runnerPath string) ([]byte, error) {
+// scope. Subsequent sessions are created by that already-isolated server, but
+// each pane immediately launches its runner in the supplied per-worker scope;
+// the shared tmux scope is never the worker kill boundary.
+func StartDetached(name, worktree, runnerPath string, lease ProcessLease) ([]byte, error) {
 	startMu.Lock()
 	defer startMu.Unlock()
 
-	args := []string{"new-session", "-d", "-s", name, "-c", worktree, bashPath, runnerPath}
+	workerCommand, err := processLeaseLaunchCommand(lease, runnerPath, os.Getuid(), os.Getenv("PATH"))
+	if err != nil {
+		return nil, err
+	}
+	args := append([]string{"new-session", "-d", "-s", name, "-c", worktree}, workerCommand...)
 	if privateServerAlive() {
 		return privateCommand(args...).CombinedOutput()
 	}
@@ -130,12 +227,413 @@ func scopeLaunchArgs(unit string, uid int, path string, tmuxArgs []string) []str
 		"--collect",
 		"--uid=" + strconv.Itoa(uid),
 		"--unit=" + unit,
+		"--slice=" + workerSlice,
 	}
 	if strings.TrimSpace(path) != "" {
 		args = append(args, "--setenv=PATH="+path)
 	}
 	args = append(args, resolvedPath(tmuxName), "-L", privateSocket)
 	return append(args, tmuxArgs...)
+}
+
+func processLeaseLaunchCommand(lease ProcessLease, runnerPath string, uid int, path string) ([]string, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(runnerPath) == "" {
+		return nil, fmt.Errorf("worker process lease requires runner path")
+	}
+
+	common, err := processLeaseRunArgs(lease, runnerPath, path)
+	if err != nil {
+		return nil, err
+	}
+
+	switch lease.Manager {
+	case ProcessLeaseManagerSystem:
+		return append([]string{
+			resolvedPath(sudoName),
+			"-n",
+			resolvedPath(systemdRunName),
+			"--uid=" + strconv.Itoa(uid),
+		}, common...), nil
+	case ProcessLeaseManagerUser:
+		return append([]string{resolvedPath(systemdRunName), "--user"}, common...), nil
+	default:
+		return nil, fmt.Errorf("unsupported worker process lease manager %q", lease.Manager)
+	}
+}
+
+func processLeaseRunArgs(lease ProcessLease, runnerPath, path string) ([]string, error) {
+	if strings.HasSuffix(lease.Unit, ".scope") {
+		if lease.Runtime != nil {
+			return nil, fmt.Errorf("worker process scope cannot carry isolated runtime settings")
+		}
+		common := []string{
+			"--scope",
+			"--collect",
+			"--quiet",
+			"--unit=" + lease.Unit,
+			"--slice=" + workerSlice,
+			"--property=KillMode=control-group",
+		}
+		if strings.TrimSpace(path) != "" {
+			common = append(common, "--setenv=PATH="+path)
+		}
+		return append(common, bashPath, runnerPath), nil
+	}
+
+	runtime := lease.Runtime
+	if runtime == nil || strings.TrimSpace(runtime.ScratchID) == "" || strings.TrimSpace(runtime.TempDir) == "" ||
+		strings.TrimSpace(runtime.GoTempDir) == "" || strings.TrimSpace(runtime.CargoTarget) == "" ||
+		strings.TrimSpace(runtime.ManifestPath) == "" || strings.TrimSpace(runtime.CleanupExec) == "" {
+		return nil, fmt.Errorf("worker process service requires complete isolated runtime settings")
+	}
+	if runtime.MemoryMaxMB < 0 {
+		return nil, fmt.Errorf("worker process service memory max must be >= 0")
+	}
+	common := []string{
+		"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec",
+		"--unit=" + lease.Unit,
+		"--property=Slice=" + isolatedWorkerSlice,
+		"--property=MemoryAccounting=yes",
+		"--property=KillMode=control-group",
+		"--property=TimeoutStopSec=30s",
+		"--property=OOMPolicy=stop",
+		"--property=BindPaths=" + runtime.TempDir + ":/tmp",
+		"--property=ExecStopPost=" + runtime.CleanupExec,
+		"--setenv=TMPDIR=/tmp",
+		"--setenv=TMP=/tmp",
+		"--setenv=TEMP=/tmp",
+		"--setenv=GOTMPDIR=/tmp/go",
+		"--setenv=CARGO_TARGET_DIR=/tmp/cargo-target",
+		"--setenv=MAESTRO_WORKER_LEASE_ID=" + runtime.ScratchID,
+	}
+	if strings.TrimSpace(path) != "" {
+		common = append(common, "--setenv=PATH="+path)
+	}
+	if strings.TrimSpace(runtime.Home) != "" {
+		common = append(common, "--setenv=HOME="+runtime.Home)
+	}
+	if strings.TrimSpace(runtime.User) != "" {
+		common = append(common, "--setenv=USER="+runtime.User, "--setenv=LOGNAME="+runtime.User)
+	}
+	common = append(common, "--setenv=SHELL="+bashPath)
+	if runtime.MemoryMaxMB > 0 {
+		common = append(common, fmt.Sprintf("--property=MemoryMax=%dM", runtime.MemoryMaxMB))
+	}
+	return append(common, bashPath, runnerPath), nil
+}
+
+func validateProcessLease(lease ProcessLease) error {
+	if !ValidProcessLeaseUnit(lease.Unit) {
+		return fmt.Errorf("invalid worker process lease unit %q", lease.Unit)
+	}
+	if lease.Manager != ProcessLeaseManagerSystem && lease.Manager != ProcessLeaseManagerUser {
+		return fmt.Errorf("invalid worker process lease manager %q", lease.Manager)
+	}
+	return nil
+}
+
+type processLeaseCommandRunner func(context.Context, string, ...string) ([]byte, error)
+
+func runProcessLeaseCommand(ctx context.Context, name string, args ...string) ([]byte, error) {
+	return exec.CommandContext(ctx, name, args...).CombinedOutput()
+}
+
+// ProcessLeaseActive reports whether the exact persisted unit still owns any
+// processes. A collected/missing unit is inactive, making repeated teardown
+// safe after daemon restart.
+func ProcessLeaseActive(lease ProcessLease) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	return processLeaseActive(ctx, lease, runProcessLeaseCommand)
+}
+
+// ProcessLeaseOwnsPID proves that pid is currently a member of the exact
+// persisted worker unit. Unit liveness alone is not enough for adoption: a
+// same-name tmux pane and an independently-active deterministic unit could
+// otherwise be mistaken for one another after an ambiguous launch response.
+func ProcessLeaseOwnsPID(lease ProcessLease, pid int) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	if pid <= 0 {
+		return false, fmt.Errorf("worker process lease requires positive pid")
+	}
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cgroup", pid))
+	if err != nil {
+		return false, fmt.Errorf("inspect pid %d cgroup for worker process lease %s: %w", pid, lease.Unit, err)
+	}
+	return processLeaseUnitInCgroup(data, lease.Unit), nil
+}
+
+// ProcessLeaseAnchoredAtPID proves that the pane process or one of its current
+// descendants belongs to lease. The pane may be a sudo/systemd-run wrapper in
+// the shared tmux-server scope, so requiring the pane PID itself to have moved
+// would reject a valid launch. An ancestry check is safe here because it is
+// used only to bind the newly-observed pane to its exact cgroup; all subsequent
+// ownership and teardown use the durable cgroup receipt, not PPID ancestry.
+func ProcessLeaseAnchoredAtPID(lease ProcessLease, panePID int) (bool, error) {
+	if strings.HasSuffix(lease.Unit, ".service") {
+		return processLeaseServiceAnchoredAtPID(lease, panePID, readProcessCommandLine, readProcessChildren)
+	}
+	return processLeaseAnchoredAtPID(lease, panePID, ProcessLeaseOwnsPID, readProcessChildren)
+}
+
+type processCommandLineReader func(int) ([]string, error)
+
+func processLeaseServiceAnchoredAtPID(lease ProcessLease, panePID int, commandLine processCommandLineReader, children processChildrenReader) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	if !strings.HasSuffix(lease.Unit, ".service") || panePID <= 0 {
+		return false, fmt.Errorf("worker process service requires a positive pane pid")
+	}
+	queue := []int{panePID}
+	seen := make(map[int]struct{})
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		if len(seen) > 4096 {
+			return false, fmt.Errorf("worker process lease pane tree exceeds safety limit")
+		}
+		argv, err := commandLine(pid)
+		if err == nil {
+			if len(argv) > 0 && filepath.Base(argv[0]) == systemdRunName {
+				for _, arg := range argv {
+					if arg == "--unit="+lease.Unit {
+						return true, nil
+					}
+				}
+			}
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+		descendants, err := children(pid)
+		if err == nil {
+			queue = append(queue, descendants...)
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	return false, nil
+}
+
+func readProcessCommandLine(pid int) ([]string, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/cmdline", pid))
+	if err != nil {
+		return nil, err
+	}
+	parts := strings.Split(strings.TrimRight(string(data), "\x00"), "\x00")
+	if len(parts) == 1 && parts[0] == "" {
+		return nil, fmt.Errorf("process %d has an empty command line", pid)
+	}
+	return parts, nil
+}
+
+type processLeasePIDOwner func(ProcessLease, int) (bool, error)
+type processChildrenReader func(int) ([]int, error)
+
+func processLeaseAnchoredAtPID(lease ProcessLease, panePID int, owns processLeasePIDOwner, children processChildrenReader) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	if panePID <= 0 {
+		return false, fmt.Errorf("worker process lease requires positive pane pid")
+	}
+	queue := []int{panePID}
+	seen := make(map[int]struct{})
+	for len(queue) > 0 {
+		pid := queue[0]
+		queue = queue[1:]
+		if _, ok := seen[pid]; ok {
+			continue
+		}
+		seen[pid] = struct{}{}
+		if len(seen) > 4096 {
+			return false, fmt.Errorf("worker process lease pane tree exceeds safety limit")
+		}
+		owned, err := owns(lease, pid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		if owned {
+			return true, nil
+		}
+		descendants, err := children(pid)
+		if err != nil {
+			if errors.Is(err, os.ErrNotExist) {
+				continue
+			}
+			return false, err
+		}
+		queue = append(queue, descendants...)
+	}
+	return false, nil
+}
+
+func readProcessChildren(pid int) ([]int, error) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%d/children", pid, pid))
+	if err != nil {
+		return nil, err
+	}
+	fields := strings.Fields(string(data))
+	children := make([]int, 0, len(fields))
+	for _, field := range fields {
+		child, err := strconv.Atoi(field)
+		if err != nil || child <= 0 {
+			return nil, fmt.Errorf("parse child pid %q for process %d", field, pid)
+		}
+		children = append(children, child)
+	}
+	return children, nil
+}
+
+func processLeaseUnitInCgroup(data []byte, unit string) bool {
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(line, ":", 3)
+		if len(parts) != 3 {
+			continue
+		}
+		for _, component := range strings.Split(parts[2], "/") {
+			if component == unit {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TerminateProcessLease gracefully terminates every process in lease, waits a
+// bounded interval, then SIGKILLs only survivors in that same unit. It is
+// idempotent: an already-collected unit is success.
+func TerminateProcessLease(lease ProcessLease) error {
+	ctx, cancel := context.WithTimeout(context.Background(), processLeaseGracePeriod+processLeaseForcePeriod+5*time.Second)
+	defer cancel()
+	return terminateProcessLease(ctx, lease, processLeaseGracePeriod, processLeaseForcePeriod, processLeasePollInterval, runProcessLeaseCommand)
+}
+
+func terminateProcessLease(ctx context.Context, lease ProcessLease, grace, force, poll time.Duration, run processLeaseCommandRunner) error {
+	if err := validateProcessLease(lease); err != nil {
+		return err
+	}
+	active, err := processLeaseActive(ctx, lease, run)
+	if err != nil {
+		return err
+	}
+	if !active {
+		return nil
+	}
+
+	if out, err := runProcessLeaseControl(ctx, lease, run, "kill", "--kill-whom=all", "--signal=SIGTERM", lease.Unit); err != nil {
+		if !processLeaseMissing(out, err) {
+			return fmt.Errorf("terminate worker process lease %s: %w: %s", lease.Unit, err, strings.TrimSpace(string(out)))
+		}
+	}
+	stopped, err := waitProcessLeaseInactive(ctx, lease, grace, poll, run)
+	if err != nil {
+		return err
+	}
+	if stopped {
+		return nil
+	}
+
+	if out, err := runProcessLeaseControl(ctx, lease, run, "kill", "--kill-whom=all", "--signal=SIGKILL", lease.Unit); err != nil {
+		if !processLeaseMissing(out, err) {
+			return fmt.Errorf("force-kill worker process lease %s: %w: %s", lease.Unit, err, strings.TrimSpace(string(out)))
+		}
+	}
+	stopped, err = waitProcessLeaseInactive(ctx, lease, force, poll, run)
+	if err != nil {
+		return err
+	}
+	if !stopped {
+		return fmt.Errorf("worker process lease %s still active after SIGKILL", lease.Unit)
+	}
+	return nil
+}
+
+func waitProcessLeaseInactive(ctx context.Context, lease ProcessLease, timeout, poll time.Duration, run processLeaseCommandRunner) (bool, error) {
+	if timeout <= 0 {
+		active, err := processLeaseActive(ctx, lease, run)
+		return !active, err
+	}
+	if poll <= 0 {
+		poll = processLeasePollInterval
+	}
+	deadline := time.NewTimer(timeout)
+	defer deadline.Stop()
+	ticker := time.NewTicker(poll)
+	defer ticker.Stop()
+	for {
+		active, err := processLeaseActive(ctx, lease, run)
+		if err != nil {
+			return false, err
+		}
+		if !active {
+			return true, nil
+		}
+		select {
+		case <-ctx.Done():
+			return false, ctx.Err()
+		case <-deadline.C:
+			return false, nil
+		case <-ticker.C:
+		}
+	}
+}
+
+func processLeaseActive(ctx context.Context, lease ProcessLease, run processLeaseCommandRunner) (bool, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return false, err
+	}
+	out, err := runProcessLeaseControl(ctx, lease, run, "show", "--property=ActiveState", "--value", lease.Unit)
+	if err != nil {
+		if processLeaseMissing(out, err) {
+			return false, nil
+		}
+		return false, fmt.Errorf("inspect worker process lease %s: %w: %s", lease.Unit, err, strings.TrimSpace(string(out)))
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "active", "activating", "deactivating", "reloading":
+		return true, nil
+	case "", "inactive", "failed", "dead":
+		return false, nil
+	default:
+		return false, fmt.Errorf("inspect worker process lease %s: unexpected active state %q", lease.Unit, strings.TrimSpace(string(out)))
+	}
+}
+
+func runProcessLeaseControl(ctx context.Context, lease ProcessLease, run processLeaseCommandRunner, args ...string) ([]byte, error) {
+	switch lease.Manager {
+	case ProcessLeaseManagerSystem:
+		return run(ctx, resolvedPath(sudoName), append([]string{"-n", resolvedPath(systemctlName)}, args...)...)
+	case ProcessLeaseManagerUser:
+		return run(ctx, resolvedPath(systemctlName), append([]string{"--user"}, args...)...)
+	default:
+		return nil, fmt.Errorf("unsupported worker process lease manager %q", lease.Manager)
+	}
+}
+
+func processLeaseMissing(out []byte, err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(string(out) + " " + err.Error())
+	for _, marker := range []string{"not loaded", "not found", "could not be found", "no such unit"} {
+		if strings.Contains(message, marker) {
+			return true
+		}
+	}
+	return false
 }
 
 func resolvedPath(name string) string {

@@ -137,7 +137,7 @@ func blockingOutcomeDispatchHold(s *state.State) (state.DispatchHold, bool) {
 		return state.DispatchHold{}, false
 	}
 	decision := s.LatestSupervisorDecision()
-	heldByDecision := decision != nil && decision.RecommendedAction == supervisor.ActionCheckOutcomeHealth
+	heldByDecision := decision != nil && !decision.RecommendationDropped() && decision.RecommendedAction == supervisor.ActionCheckOutcomeHealth
 	heldByCodeLanded := false
 	for _, sess := range s.Sessions {
 		if sess != nil && sess.Status == state.StatusCodeLanded && !sess.ReleasedForRedispatch {
@@ -196,7 +196,7 @@ func (o *Orchestrator) allDispatchBackendsCoolingDown(s *state.State, now time.T
 	if o == nil || o.cfg == nil {
 		return false, nil
 	}
-	candidates := o.dispatchBackendCandidates()
+	candidates := o.dispatchBackendCandidates("")
 	if len(candidates) == 0 {
 		return false, nil
 	}

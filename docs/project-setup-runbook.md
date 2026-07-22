@@ -289,7 +289,7 @@ telegram:
 | `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
 | `hooks.pre_tool` | Optional command run inside worker sessions before matching tool calls |
 
-Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker.
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker. Identical recommendations are journaled at most once per `supervisor.unchanged_decision_window_seconds` (default 3600), and an unconsumed recommendation receives a dropped disposition after `supervisor.recommendation_ttl_seconds` (default 86400).
 
 For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
 
@@ -329,6 +329,44 @@ model:
 ```
 
 `model.backends.<name>.effort` is the backend's default reasoning-effort policy for newly started workers. For Claude-compatible workers Maestro emits `--effort <value>`; for Codex-compatible workers it emits `-c model_reasoning_effort=<value>`; backends without a supported effort flag receive no effort flag. A configured backend effort replaces stale effort pins in Claude/Codex `cmd` or `extra_args`; routing-tier or pipeline phase effort overrides are narrower per-dispatch overrides and are shown in backend-selection/effective-config surfaces so an operator can tell whether the backend default or the dispatch override applied.
+
+### Provider-local defaults and fallbacks
+
+Use provider lanes when the project should exhaust models within one provider
+before advancing to the next provider:
+
+```yaml
+model:
+  provider_lanes:
+    - provider: anthropic
+      default: claude
+    - provider: openai
+      default: sol
+      fallback_backends: [gpt55]
+  backends:
+    claude:
+      cmd: claude
+      provider: anthropic
+      model: fable-5
+      effort: high
+    sol:
+      cmd: codex
+      provider: openai
+      model: gpt-5.6-sol
+      effort: high
+    gpt55:
+      cmd: codex
+      provider: openai
+      model: gpt-5.5
+      effort: high
+```
+
+The route is deterministic: `claude -> sol -> gpt55`. Existing
+`model:<backend>` labels still select their named backend, and an explicit
+`model.fallback_backends` list remains a backward-compatible project override.
+Do not leave fallback intent implicit: without either provider lanes or an
+explicit chain, Maestro uses only `model.default` and will not sort the backend
+map to invent a route.
 
 ### Optional: sub-agent model policy (`subagent_hint`)
 

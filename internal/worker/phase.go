@@ -3,29 +3,30 @@ package worker
 import (
 	"fmt"
 	"log"
-	"strconv"
-	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/state"
-	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // StartPhase launches a new worker session for a pipeline phase in an existing worktree.
 // Unlike Start, this does NOT create a new worktree or branch — it reuses the session's
 // existing workspace. The session is updated in place with a new PID and status.
 func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase transitions")
+	}
 	if sess.Worktree == "" {
 		return fmt.Errorf("session %s has no worktree", slotName)
 	}
 
-	// End the previous attempt through its exact lease before starting the next
-	// phase. Legacy sessions retain the tmux/process-tree fallback.
+	// Finish the previous phase's exact process lease before starting another
+	// generation in the same slot. This remains correct after the pane exits
+	// while a reparented tool subprocess is still alive.
 	tmuxName := TmuxSessionName(slotName)
-	if err := StopProcess(cfg, slotName, sess); err != nil {
-		return fmt.Errorf("stop previous phase: %w", err)
+	if err := StopProcess(slotName, sess); err != nil {
+		return fmt.Errorf("stop previous phase process lease: %w", err)
 	}
 
 	// Determine backend
@@ -52,6 +53,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	if effort := pipeline.EffortForPhase(cfg, sess.Phase); effort != "" {
 		backendCfg.TierEffort = effort
 	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -73,7 +75,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	logFile := fmt.Sprintf("%s/%s-%s.log", logDir, slotName, sess.Phase)
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, sess.Worktree)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
@@ -81,8 +83,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
 	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	attemptLease, err := prepareAttemptRunner(cfg, slotName, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split, "phase_transition")
-	if err != nil {
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
 
@@ -93,26 +94,17 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		WorkspacePath: sess.Worktree,
 	}
 	if err := RunHook(cfg, "before_run", cfg.Hooks.BeforeRun, hookEnv); err != nil {
-		rollbackPreparedLease(attemptLease)
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
-	if tmuxOut, err := tmuxsession.StartDetached(tmuxName, sess.Worktree, runnerPath); err != nil {
-		rollbackPreparedLease(attemptLease)
-		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID
-	pidOut, err := tmuxsession.PanePID(tmuxName)
+	nextGeneration := sess.WorkerGeneration + 1
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "phase_transition")
 	if err != nil {
-		rollbackPreparedLease(attemptLease)
-		return fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		rollbackPreparedLease(attemptLease)
-		return fmt.Errorf("parse pane pid: %w", err)
+		if processLease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
+			setSessionProcessLease(sess, processLease)
+		}
+		return err
 	}
 
 	log.Printf("[worker] started phase %s for %s in tmux %s (pane_pid=%d)", sess.Phase, slotName, tmuxName, pid)
@@ -122,7 +114,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
 	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
-	assignWorkerLease(sess, attemptLease)
+	setSessionProcessLease(sess, processLease)
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.LastNotifiedStatus = ""

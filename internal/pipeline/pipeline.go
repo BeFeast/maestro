@@ -1,10 +1,11 @@
-// Package pipeline implements the planner → implementer → validator phase pipeline
+// Package pipeline implements the planner → optional advisor → implementer → validator phase pipeline
 // and the deterministic pre-worker context preparation phases.
 //
 // Phase pipeline (when pipeline.enabled is true):
-//  1. Plan   — creates MAESTRO_PLAN.md + VALIDATION.md in the worktree
-//  2. Implement — writes code based on the plan (current worker behavior)
-//  3. Validate — checks assertions from VALIDATION.md, gates PR creation
+//  1. Plan      — creates MAESTRO_PLAN.md + VALIDATION.md in the worktree
+//  2. Advisor   — independently reviews the plan and either approves or requests revision
+//  3. Implement — writes code based on the approved plan (current worker behavior)
+//  4. Validate  — checks assertions from VALIDATION.md, gates PR creation
 //
 // Deterministic pre-worker context-prep phases (configurable independently):
 //   - Research: scans codebase for relevant patterns, writes context file
@@ -27,7 +28,7 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
-// ---- Phase-based pipeline (planner → implementer → validator) ----
+// ---- Phase-based pipeline (planner → optional advisor → implementer → validator) ----
 
 const (
 	// PlanFile is the plan artifact written by the planner phase.
@@ -49,7 +50,7 @@ func InitialPhase(cfg *config.Config) state.Phase {
 	if !cfg.Pipeline.Enabled {
 		return state.PhaseNone
 	}
-	if cfg.Pipeline.Planner.Enabled {
+	if cfg.Pipeline.Planner.Enabled || cfg.Pipeline.Advisor.Enabled {
 		return state.PhasePlan
 	}
 	return state.PhaseImplement
@@ -61,6 +62,11 @@ func InitialPhase(cfg *config.Config) state.Phase {
 func NextPhase(cfg *config.Config, completed state.Phase) state.Phase {
 	switch completed {
 	case state.PhasePlan:
+		if cfg.Pipeline.Advisor.Enabled {
+			return state.PhaseAdvisor
+		}
+		return state.PhaseImplement
+	case state.PhaseAdvisor:
 		return state.PhaseImplement
 	case state.PhaseImplement:
 		if cfg.Pipeline.Validator.Enabled {
@@ -114,6 +120,8 @@ func roleForPhase(cfg *config.Config, phase state.Phase) (config.RoleConfig, boo
 	switch phase {
 	case state.PhasePlan:
 		return cfg.Pipeline.Planner, true
+	case state.PhaseAdvisor:
+		return cfg.Pipeline.Advisor, true
 	case state.PhaseImplement:
 		return cfg.Pipeline.Implementer, true
 	case state.PhaseValidate:
@@ -124,16 +132,16 @@ func roleForPhase(cfg *config.Config, phase state.Phase) (config.RoleConfig, boo
 }
 
 // BackendForPhase returns the backend name to use for a given phase.
-// Falls back to the default backend if no role-specific backend is configured.
+// Falls back to the effective route default if no role-specific backend is configured.
 // The implement phase honors pipeline.implementer.backend when set (#841); unset
-// keeps the historical default of model.default.
+// keeps the historical default behavior unless provider lanes override it.
 func BackendForPhase(cfg *config.Config, phase state.Phase) string {
 	if role, ok := roleForPhase(cfg, phase); ok {
 		if b := strings.TrimSpace(role.Backend); b != "" {
 			return b
 		}
 	}
-	return cfg.Model.Default
+	return cfg.Model.EffectiveDefault()
 }
 
 // EffortForPhase returns the reasoning-effort override configured for a pipeline

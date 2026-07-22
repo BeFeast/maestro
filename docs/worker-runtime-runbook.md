@@ -1,7 +1,9 @@
 # Isolated worker runtime rollout
 
-`worker_runtime.mode: isolated` moves each worker attempt into its own transient
-systemd service and disk-backed scratch directory. The worker-visible `/tmp`,
+`worker_runtime.mode: isolated` adds storage lifecycle to the generation-specific
+process lease introduced by #920. The same lease is expressed as a transient
+systemd service—never a second ownership unit—and receives a disk-backed scratch
+directory. The worker-visible `/tmp`,
 `TMPDIR`, `TMP`, `TEMP`, `GOTMPDIR`, and `CARGO_TARGET_DIR` are private to that
 attempt. Shared dependency caches remain unchanged, while Cargo build output is
 never shared between workers.
@@ -26,11 +28,13 @@ worker_runtime:
   be a dedicated private (`0700`) directory; Maestro will not chmod a shared
   host directory such as `/var/tmp` itself.
 - `memory_max_mb` optionally caps one worker. All isolated workers also enter
-  `maestro-workers.slice`, configured at runtime with `MemoryHigh=70%` and
+  `maestro-workers-isolated.slice`, configured at runtime with `MemoryHigh=70%` and
   `MemoryMax=80%` so build pressure cannot evict the control plane.
+  Legacy process scopes stay outside that child slice, so rollback does not
+  place new legacy workers under the isolated aggregate budget.
 
 The system scope requires passwordless access to the exact `systemd-run` and
-`systemctl set-property/stop/is-active` operations used by the worker lease.
+`systemctl set-property/show/kill` operations used by the worker lease.
 Validate that boundary before enabling a canary; a failure is spawn-fatal and
 does not fall back silently to an unowned worker.
 
@@ -51,10 +55,11 @@ does not fall back silently to an unowned worker.
    project scratch roots must contain no per-attempt directories and global
    `/tmp` growth must not track build-output size.
 
-To roll back new launches, restore `mode: legacy`. Existing isolated attempts
-retain their persisted lease identity and still stop/clean through that exact
-lease. Keep the same `scratch_root` configured until reconciliation reports no
-remaining leases or attention; do not replace this with an age/name sweep.
+To roll back new launches, restore `mode: legacy`. New attempts return to #920's
+scope lease and existing host temp behavior; existing isolated attempts retain
+their persisted service identity and still stop/clean through that exact lease.
+Keep the same `scratch_root` configured until reconciliation reports no remaining
+leases or attention; do not replace this with an age/name sweep.
 
 ## Build benchmark
 

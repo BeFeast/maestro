@@ -517,6 +517,9 @@ func TestDecide_RunningWorkerWaits(t *testing.T) {
 	if decision.Target == nil || decision.Target.Session != "slot-1" || decision.Target.Issue != 42 {
 		t.Fatalf("target = %#v, want slot-1 issue 42", decision.Target)
 	}
+	if len(decision.ProjectState.OpenPRNumbers) != 1 || decision.ProjectState.OpenPRNumbers[0] != 55 {
+		t.Fatalf("open PR identities = %v, want [55]", decision.ProjectState.OpenPRNumbers)
+	}
 	if reader.issueCalls != 0 {
 		t.Fatalf("ListOpenIssues called %d time(s), want 0 for running-worker decision", reader.issueCalls)
 	}
@@ -1650,6 +1653,91 @@ func TestDecide_BlockedIssueWithOpenPRNeverMintsRepairApproval(t *testing.T) {
 	}
 }
 
+func TestRunOnce_BlockedIssueWithOpenPRIsQuiescentUntilGuardTransition(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 20
+	cfg.ExcludeLabels = []string{"blocked"}
+	reader := &fakeReader{
+		issues: []github.Issue{testIssue(331, "canonical PR #335", "blocked")},
+		prs: []github.PR{{
+			Number:      335,
+			HeadRefName: "feat/ok-player-247-331-fix",
+			State:       "OPEN",
+			Mergeable:   "MERGEABLE",
+			IsDraft:     true,
+		}},
+		ciStatuses: map[int]string{335: "failure"},
+	}
+	st := state.NewState()
+	st.Sessions["ok-player-247"] = &state.Session{
+		IssueNumber: 331,
+		IssueTitle:  "canonical PR #335",
+		Status:      state.StatusPROpen,
+		PRNumber:    335,
+		Branch:      "feat/ok-player-247-331-fix",
+		StartedAt:   time.Now().UTC().Add(-time.Hour),
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatalf("save initial state: %v", err)
+	}
+
+	first, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("first RunOnce: %v", err)
+	}
+	second, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	if first.JournalEvent != state.SupervisorJournalInitial || !first.Quiescent {
+		t.Fatalf("guard entry = %+v, want initial quiescent decision", first)
+	}
+	if second.JournalEvent != state.SupervisorJournalSuppressed || !second.Quiescent || second.SeenCount != 2 {
+		t.Fatalf("guard repeat = %+v, want suppressed count=2", second)
+	}
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load quiescent state: %v", err)
+	}
+	if len(loaded.SupervisorDecisions) != 1 {
+		t.Fatalf("blocked decision episodes = %d, want 1", len(loaded.SupervisorDecisions))
+	}
+
+	reader.issues = []github.Issue{testIssue(331, "canonical PR #335")}
+	edge, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("guard exit RunOnce: %v", err)
+	}
+	if edge.JournalEvent != state.SupervisorJournalInitial || edge.Quiescent || edge.RecommendedAction != ActionSpawnRepairWorker {
+		t.Fatalf("guard exit = %+v, want journaled repair transition", edge)
+	}
+	loaded, err = state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("load transitioned state: %v", err)
+	}
+	if len(loaded.SupervisorDecisions) != 2 {
+		t.Fatalf("transition episodes = %d, want blocked + unblocked", len(loaded.SupervisorDecisions))
+	}
+}
+
+func TestSupervisorDecisionQuiescentWhenEveryOpenIssueIsExcluded(t *testing.T) {
+	decision := state.SupervisorDecision{
+		RecommendedAction: ActionNone,
+		QueueAnalysis: &state.SupervisorQueueAnalysis{
+			OpenIssues:         2,
+			EligibleCandidates: 0,
+			ExcludedIssues:     2,
+		},
+	}
+	if !supervisorDecisionQuiescent(decision) {
+		t.Fatal("all-excluded queue decision should be quiescent")
+	}
+	decision.QueueAnalysis.ExcludedIssues = 1
+	if supervisorDecisionQuiescent(decision) {
+		t.Fatal("mixed queue decision must remain visible")
+	}
+}
+
 func TestDecide_MergeReadyPRRanksAheadOfOlderBlockedDraft(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.MaxParallel = 20
@@ -2218,6 +2306,40 @@ func TestRunOnceRecordsPendingApprovalForRiskyDecision(t *testing.T) {
 	}
 	if approval.Target == nil || approval.Target.Issue != 42 {
 		t.Fatalf("target = %#v, want issue 42", approval.Target)
+	}
+}
+
+func TestRunOnceRecommendationDedupKeepsApprovalMintingStable(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
+
+	first, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("first RunOnce: %v", err)
+	}
+	second, err := RunOnce(cfg, reader)
+	if err != nil {
+		t.Fatalf("second RunOnce: %v", err)
+	}
+	if first.ApprovalID == "" || second.ApprovalID != first.ApprovalID {
+		t.Fatalf("approval IDs = %q then %q, want one stable approval", first.ApprovalID, second.ApprovalID)
+	}
+	if second.JournalEvent != state.SupervisorJournalSuppressed || second.SeenCount != 2 {
+		t.Fatalf("second observation = %+v, want suppressed count=2", second)
+	}
+	if first.Disposition == nil || second.Disposition == nil ||
+		first.Disposition.Reason != state.RecommendationDispositionApprovalRecorded ||
+		!second.Disposition.At.Equal(first.Disposition.At) {
+		t.Fatalf("approval materialization changed: first=%+v second=%+v", first.Disposition, second.Disposition)
+	}
+
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if len(st.Approvals) != 1 || len(st.SupervisorDecisions) != 1 {
+		t.Fatalf("approvals=%d decisions=%d, want one of each", len(st.Approvals), len(st.SupervisorDecisions))
 	}
 }
 
@@ -3061,7 +3183,7 @@ func TestDecide_OrderedQueueSelectsFirstUnfinishedIssue(t *testing.T) {
 	}
 }
 
-func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing.T) {
+func TestOrderedQueueIssueDone_ClosedIssueAdvancesDespiteFailingOutcome(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{
 		DesiredOutcome:      "Live app works",
@@ -3081,11 +3203,11 @@ func TestOrderedQueueIssueDone_ClosedIssueWaitsForOutcomeWhenRequired(t *testing
 	if err != nil {
 		t.Fatalf("orderedQueueIssueDone: %v", err)
 	}
-	if done {
-		t.Fatalf("done = true, want false while outcome is failing")
+	if !done {
+		t.Fatalf("done = false, want true because GitHub issue closure is terminal")
 	}
-	if !strings.Contains(reason, "outcome health is not verified") {
-		t.Fatalf("reason = %q, want outcome gate reason", reason)
+	if !strings.Contains(reason, "issue is closed") {
+		t.Fatalf("reason = %q, want closed-issue reason", reason)
 	}
 }
 

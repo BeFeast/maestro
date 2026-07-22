@@ -56,6 +56,48 @@ func TestRunStreamSplit_SplitsRawAndRendered(t *testing.T) {
 	}
 }
 
+// This fixture is a sanitized 2026-07-21 live capture from Claude Code 2.1.216
+// running `--model grok-4.5` through CLIProxyAPI. Identifiers/timing were
+// removed, while the configured/init model, translated assistant model, frame
+// shapes, and usage/cost values are retained. The assistant frame reports
+// zeros; the terminal result carries the authoritative non-zero totals.
+func TestRunStreamSplit_ParsesCapturedNonAnthropicProxyStream(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "claude_proxy_grok_4_5_stream.jsonl"))
+	if err != nil {
+		t.Fatalf("read proxy fixture: %v", err)
+	}
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sup-946.jsonl")
+	var rendered strings.Builder
+	if err := RunStreamSplit("claude", jsonlPath, strings.NewReader(string(fixture)), &rendered); err != nil {
+		t.Fatalf("RunStreamSplit: %v", err)
+	}
+
+	raw, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatalf("read split side channel: %v", err)
+	}
+	if string(raw) != string(fixture) {
+		t.Fatal("stream-split did not preserve the captured proxy frames verbatim")
+	}
+	usage, ok := ParseClaudeUsage(string(raw))
+	if !ok {
+		t.Fatal("captured non-Anthropic result usage was not parsed")
+	}
+	if !usage.UsageUnreliable || usage.UsageUnreliableScope != claudeUsageScopeLiveBudget || usage.UsageUnreliableReason != claudeUsageZeroLiveAssistant {
+		t.Fatalf("captured zero assistant usage did not mark live-budget degradation: %+v", usage)
+	}
+	if usage.Model != "grok-4.5" || usage.Input != 24762 || usage.Output != 22 || usage.CacheRead != 1280 || usage.TotalTokens != 26064 {
+		t.Fatalf("parsed proxy usage = %+v, want grok-4.5 24762/22/1280 total=26064", usage)
+	}
+	if usage.CostUSD != 0.125 {
+		t.Fatalf("CostUSD = %v, want 0.125", usage.CostUSD)
+	}
+	if !strings.Contains(rendered.String(), "PONG") || !strings.Contains(rendered.String(), "[claude] result:") {
+		t.Fatalf("rendered proxy stream lost worker output:\n%s", rendered.String())
+	}
+}
+
 // If the jsonl path cannot be opened, RunStreamSplit must degrade to
 // pass-through so the worker log is never lost.
 func TestRunStreamSplit_DegradesWhenJSONLUnwritable(t *testing.T) {

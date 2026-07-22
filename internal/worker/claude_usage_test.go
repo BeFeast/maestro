@@ -55,6 +55,41 @@ not json at all
 	}
 }
 
+func TestParseClaudeUsage_MissingTerminalUsageIsExplicitlyUnreliable(t *testing.T) {
+	const stream = `{"type":"system","subtype":"init","model":"proxy-model"}
+{"type":"assistant","message":{"id":"msg-1","model":"proxy-model","usage":{"input_tokens":100,"output_tokens":5}}}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.12}
+`
+	usage, ok := ParseClaudeUsage(stream)
+	if !ok {
+		t.Fatal("assistant-frame lower bound should remain observable")
+	}
+	if usage.TotalTokens != 105 {
+		t.Fatalf("TotalTokens = %d, want lower-bound 105", usage.TotalTokens)
+	}
+	if !usage.UsageUnreliable || usage.UsageUnreliableReason != claudeUsageMissingResult || usage.UsageUnreliableScope != claudeUsageScopeAccounting {
+		t.Fatalf("usage reliability = %+v, want missing-result degradation", usage)
+	}
+	if usage.CostUSD != 0.12 {
+		t.Fatalf("CostUSD = %v, want trustworthy backend-reported 0.12", usage.CostUSD)
+	}
+}
+
+func TestParseClaudeUsage_ZeroTerminalUsageIsNotProgress(t *testing.T) {
+	const stream = `{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":0,"output_tokens":0}}
+`
+	usage, ok := ParseClaudeUsage(stream)
+	if ok {
+		t.Fatalf("zero usage returned ok=true: %+v", usage)
+	}
+	if usage.TotalTokens != 0 {
+		t.Fatalf("TotalTokens = %d, want 0", usage.TotalTokens)
+	}
+	if !usage.UsageUnreliable || usage.UsageUnreliableReason != claudeUsageZeroResult || usage.UsageUnreliableScope != claudeUsageScopeAccounting {
+		t.Fatalf("usage reliability = %+v, want zero-result degradation", usage)
+	}
+}
+
 func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
 	const live = `{"type":"system","subtype":"init","model":"claude-opus"}
 {"type":"assistant","message":{"role":"assistant","model":"claude-opus","usage":{"input_tokens":30000,"output_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":7000}}}

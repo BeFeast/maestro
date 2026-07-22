@@ -46,6 +46,7 @@ func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) 
 	if err != nil {
 		return nil, err
 	}
+	journalWindow := cfg.Supervisor.EffectiveUnchangedDecisionWindow()
 	for _, dec := range decisions {
 		if !dec.RecommendsRecovery() {
 			continue
@@ -53,6 +54,22 @@ func recordMaterialProgress(cfg *config.Config, st *state.State, now time.Time) 
 		// Reporting only: a recommendation is not an actuation attempt. The
 		// exact target and RecommendationID let a later actuator record one
 		// attempt/result without conflating evaluation with recovery.
+		target := st.MaterialProgress.Targets[dec.Target.Key()]
+		due, rollUp, count := target.RecommendationJournalDue(dec.RecommendationID, journalWindow, now)
+		if !due {
+			continue
+		}
+		if rollUp {
+			firstSeen := now
+			if target != nil && !target.RecommendationFirstSeenAt.IsZero() {
+				firstSeen = target.RecommendationFirstSeenAt
+			}
+			log.Printf("[supervisor/watchdog] stalled-progress %s still held, seen %d times since %s: %s (target=%s issue=%d slot=%s phase=%s deadline=%s recommendation=%s)",
+				dec.Action, count, firstSeen.UTC().Format(time.RFC3339), dec.Reason,
+				dec.Target.Key(), dec.Target.IssueNumber, dec.Target.Slot,
+				dec.Phase, dec.Deadline.Format(time.RFC3339), dec.RecommendationID)
+			continue
+		}
 		log.Printf("[supervisor/watchdog] stalled-progress %s: %s (target=%s issue=%d slot=%s phase=%s deadline=%s recommendation=%s)",
 			dec.Action, dec.Reason, dec.Target.Key(), dec.Target.IssueNumber, dec.Target.Slot,
 			dec.Phase, dec.Deadline.Format(time.RFC3339), dec.RecommendationID)
@@ -167,6 +184,10 @@ func workerProgressObservation(st *state.State, project, slot string, sess *stat
 		return progress.Observation{}, false
 	}
 	sessionID := materialProgressSessionID(slot, sess)
+	leaseID := strings.TrimSpace(sess.ProcessLeaseUnit)
+	if leaseID == "" {
+		leaseID = "spawn:" + sessionID
+	}
 	target := progress.Target{
 		Kind:        progress.TargetWorker,
 		IssueNumber: sess.IssueNumber,
@@ -174,7 +195,7 @@ func workerProgressObservation(st *state.State, project, slot string, sess *stat
 		SessionID:   sessionID,
 		TmuxSession: strings.TrimSpace(sess.TmuxSession),
 		ProcessID:   sess.PID,
-		LeaseID:     "spawn:" + sessionID,
+		LeaseID:     leaseID,
 	}
 	if err := target.Validate(); err != nil {
 		return progress.Observation{}, false

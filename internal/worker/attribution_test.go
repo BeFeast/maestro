@@ -67,7 +67,7 @@ func TestRecordBackendAttribution_FirstCall_SnapshotsMetadata(t *testing.T) {
 func TestBeginSessionAttemptClearsScheduledRetryMarker(t *testing.T) {
 	cfg := attribCfgWithBackends()
 	retryAt := time.Date(2026, 7, 18, 5, 43, 24, 0, time.UTC)
-	sess := &state.Session{Status: state.StatusDead, NextRetryAt: &retryAt}
+	sess := &state.Session{Status: state.StatusDead, NextRetryAt: &retryAt, WorkerGeneration: 4}
 	now := retryAt.Add(time.Second)
 
 	beginSessionAttempt(cfg, sess, "claude", "in_place_respawn", "ci_failure", now)
@@ -77,6 +77,9 @@ func TestBeginSessionAttemptClearsScheduledRetryMarker(t *testing.T) {
 	}
 	if sess.NextRetryAt != nil {
 		t.Fatalf("next_retry_at = %v, want nil once replacement attempt is running", sess.NextRetryAt)
+	}
+	if sess.WorkerGeneration != 5 {
+		t.Fatalf("worker_generation = %d, want 5", sess.WorkerGeneration)
 	}
 }
 

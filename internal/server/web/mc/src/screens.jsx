@@ -9,15 +9,17 @@ import {
   approvalSlotLabel,
   attributionSegmentDuration,
   fetchWorkerDetail,
+  formatAbsoluteTimestamp,
   formatAttributionSegment,
   formatAttributionTimeline,
-	formatCountdown,
+  formatCountdown,
   formatTokens,
   formatUSD,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
   isExecutionSkippedApproval,
   manualFollowupForApproval,
+  mapAdvisor,
   postFleetAction,
   postFleetApproval,
   postProjectApproval,
@@ -53,6 +55,28 @@ function projectFocusMatches(p, focus) {
   return (issue > 0 && Number(op.issue_number || 0) === issue) ||
     (pr > 0 && Number(op.pr_number || 0) === pr) ||
     !!focus.approval;
+}
+
+export function OutcomeCheckReceipt({ check }) {
+  const deadline = check?.deadline_at ? (formatAbsoluteTimestamp(check.deadline_at) || check.deadline_at) : "";
+  return (
+    <span className="mono" style={{ color: check?.status === "pass" ? "var(--ok)" : "var(--watch)" }}>
+      {check?.status || "unknown"}{deadline ? ` · deadline ${deadline}` : ""}
+    </span>
+  );
+}
+
+export function OutcomeRecoveryReceipt({ recovery, now }) {
+  if (!recovery) return null;
+  return (
+    <>
+      <div className="kv"><span>Recovery</span><strong className="mono">{recovery.status || "unknown"}</strong></div>
+      {recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{recovery.summary}</div>}
+      {recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(recovery.started_at), now)}</span></div>}
+      {recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(recovery.next_eligible_at), now)}</span></div>}
+      {recovery.exit_code != null && <div className="kv"><span>Exit code</span><strong className="mono">{recovery.exit_code}</strong></div>}
+    </>
+  );
 }
 
 export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
@@ -280,20 +304,13 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                   <div className="kv"><span>Dashboard</span><UrlValue url={p.dashboardUrl} /></div>
                 )}
                 <div className="kv"><span>Last check</span><span className="mono">{p.outcome?.health_checked_at ? relTime(parseTimestamp(p.outcome.health_checked_at), now) : "—"}</span></div>
-                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check) => (
-                  <div className="kv" key={check.name}>
+                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check, index) => (
+                  <div className="kv" key={`${check.name || "check"}-${index}`}>
                     <span>{check.name}</span>
-                    <span className="mono" style={{ color: check.status === "pass" ? "var(--ok)" : "var(--watch)" }}>{check.status}</span>
+                    <OutcomeCheckReceipt check={check} />
                   </div>
                 ))}
-                {p.outcome?.recovery && (
-                  <>
-                    <div className="kv"><span>Recovery</span><strong className="mono">{p.outcome.recovery.status || "unknown"}</strong></div>
-                    {p.outcome.recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{p.outcome.recovery.summary}</div>}
-                    {p.outcome.recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.started_at), now)}</span></div>}
-                    {p.outcome.recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(p.outcome.recovery.next_eligible_at), now)}</span></div>}
-                  </>
-                )}
+                <OutcomeRecoveryReceipt recovery={p.outcome?.recovery} now={now} />
                 <div className="kv"><span>Sessions</span><strong className="mono">{p.sessions}</strong></div>
               </>
             ) : (
@@ -331,6 +348,20 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                       {d.warn && <span style={{ color: "var(--watch)", marginLeft: 6 }}>· past SLA</span>}
                     </div>
                     <div className="dec-note">{d.note}</div>
+                    <div
+                      className="mono dim mt-2"
+                      style={{ fontSize: 10.5 }}
+                      title={[
+                        d.firstSeen ? `first seen ${new Date(d.firstSeen).toISOString()}` : "",
+                        d.lastSeen ? `last seen ${new Date(d.lastSeen).toISOString()}` : "",
+                        d.recommendationId ? `recommendation ${d.recommendationId}` : "",
+                      ].filter(Boolean).join(" · ")}
+                    >
+                      {d.firstSeen ? `first seen ${relTime(d.firstSeen, now)}` : "first seen unknown"}
+                      {` · last seen ${relTime(d.lastSeen, now)}`}
+                      {` · seen ${d.seenCount} time${d.seenCount === 1 ? "" : "s"}`}
+                      {d.disposition?.reason ? ` · ${String(d.disposition.reason).replaceAll("_", " ")}` : ""}
+                    </div>
                   </div>
                   <div className="dec-conf">conf {(d.conf * 100).toFixed(0)}%</div>
                 </div>
@@ -1351,6 +1382,51 @@ function AttributionTimeline({ attribution, now }) {
   );
 }
 
+export function AdvisorReviewSection({ advisor }) {
+  if (!advisor) return null;
+  const reviews = Array.isArray(advisor.reviews) ? advisor.reviews : [];
+  const tone = advisor.terminalReason && !advisor.bypassed ? "stuck" : advisor.bypassed ? "watch" : advisor.verdict === "PLAN_APPROVED" ? "ok" : "info";
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Advisor plan gate</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", borderLeft: `2px solid var(--${tone === "stuck" ? "stuck" : tone === "watch" ? "watch" : tone === "ok" ? "ok" : "accent"})` }}>
+        <div className="row gap-2" style={{ alignItems: "center", flexWrap: "wrap" }}>
+          <Pill tone={tone} noDot>{advisor.verdict || advisor.phase || "pending"}</Pill>
+          <span className="mono" style={{ fontSize: 11 }}>
+            plan v{advisor.planVersion || "—"} · round {advisor.reviewRound || "—"}/{advisor.maxReviewRounds || "—"}
+          </span>
+          <span className="mono dim" style={{ fontSize: 10.5 }}>
+            {[advisor.backend, advisor.model].filter(Boolean).join(" · ") || "backend/model pending"}
+          </span>
+        </div>
+        {advisor.terminalReason && (
+          <div className="mono mt-2" style={{ fontSize: 11, color: advisor.bypassed ? "var(--watch)" : "var(--stuck)" }}>
+            terminal: {advisor.terminalReason}{advisor.bypassed ? " · explicitly bypassed" : " · failed closed"}
+          </div>
+        )}
+        {advisor.unresolvedFindings && (
+          <pre className="mono mt-2" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 11, color: "var(--fg-1)", marginBottom: 0 }}>
+            {advisor.unresolvedFindings}
+          </pre>
+        )}
+        {reviews.length > 0 && (
+          <details className="mt-2">
+            <summary className="mono dim" style={{ fontSize: 10.5, cursor: "pointer" }}>{reviews.length} review record{reviews.length === 1 ? "" : "s"}</summary>
+            {reviews.map((review, index) => (
+              <div key={`${review.planVersion}-${review.reviewRound}-${index}`} style={{ borderTop: index === 0 ? "none" : "1px solid var(--border-1)", paddingTop: 6, marginTop: 6 }}>
+                <div className="mono dim" style={{ fontSize: 10.5 }}>
+                  v{review.planVersion} · round {review.reviewRound} · {review.verdict || "no verdict"}{review.terminalReason ? ` · ${review.terminalReason}` : ""}
+                </div>
+                {review.findings && <pre className="mono" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 10.5, marginBottom: 0 }}>{review.findings}</pre>}
+              </div>
+            ))}
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
 function BackendDriftSection({ drift }) {
   if (!drift) return null;
   return (
@@ -1528,6 +1604,15 @@ export function WorkerDrawer({ worker, onClose, now }) {
 
           <WorkerSpendSection worker={worker} fleet={fleet} />
 
+          {worker.backend_selection && (
+            <div className="drawer-sec">
+              <div className="drawer-sec-title">Backend selection</div>
+              <div className="kv"><span>Backend</span><strong className="mono">{worker.backend_selection.selected_backend || worker.backend || "—"}</strong></div>
+              <div className="kv"><span>Decision</span><span className="mono">{worker.backend_selection.selection_reason || "—"}</span></div>
+              <div className="kv"><span>Route</span><span className="mono">{worker.backend_selection.route_selection_reason || "—"}</span></div>
+            </div>
+          )}
+
           <div className="drawer-sec">
             <div className="drawer-sec-title">Next action</div>
             <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", fontSize: 12.5, color: "var(--fg-1)", borderLeft: "2px solid var(--accent)" }}>
@@ -1552,6 +1637,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
             attribution={detail?.worker?.attribution || worker.attribution}
             now={now}
           />
+          <AdvisorReviewSection advisor={mapAdvisor(detail?.worker) || worker.advisor} />
           <BackendDriftSection drift={detail?.worker?.backendDrift || worker.backendDrift} />
 
           <div className="drawer-sec" ref={logRef}>
@@ -2443,9 +2529,17 @@ function EffectiveConfigView({ project, onEdit }) {
         <div className="settings-section-title">Model policy</div>
         <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
         <div className="kv"><span>Fallbacks</span><TagList values={cfg.modelPolicy?.fallbackBackends} /></div>
+        <div className="kv"><span>Resolved route</span><TagList values={cfg.modelPolicy?.resolvedRoute} /></div>
+        <div className="kv"><span>Selection reason</span><strong className="mono">{cfg.modelPolicy?.selectionReason || "—"}</strong></div>
         <div className="kv"><span>Routing</span><span className="mono">{routingLabel(cfg.modelPolicy?.routing)}</span></div>
         <RoutingTierList tiers={cfg.modelPolicy?.routing?.tiers} />
         <PipelineOverrideList pipeline={cfg.pipeline} />
+        {(cfg.modelPolicy?.providerLanes || []).map(lane => (
+          <div className="kv" key={`${lane.provider}:${lane.default}`}>
+            <span>{lane.provider}</span>
+            <TagList values={[lane.default, ...(lane.fallbackBackends || [])]} />
+          </div>
+        ))}
         <div className="settings-backends">
           {(cfg.modelPolicy?.backends || []).map(backend => (
             <div key={backend.name} className="settings-backend">
@@ -2547,6 +2641,7 @@ function RoutingTierList({ tiers }) {
 function PipelineOverrideList({ pipeline }) {
   const roles = [
     ["planner", pipeline?.planner],
+    ["advisor", pipeline?.advisor],
     ["implementer", pipeline?.implementer],
     ["validator", pipeline?.validator],
   ].filter(([, role]) => role?.backend || role?.effort || role?.enabled);
@@ -2562,6 +2657,15 @@ function PipelineOverrideList({ pipeline }) {
           </strong>
         </div>
       ))}
+      {pipeline?.advisor?.enabled && pipeline?.advisorReviewRounds > 0 && (
+        <div className="kv">
+          <span className="mono">advisor budget</span>
+          <strong className="mono">
+            {pipeline.advisorReviewRounds} round{pipeline.advisorReviewRounds === 1 ? "" : "s"}
+            {pipeline.advisorBestEffort ? " · best effort" : " · fail closed"}
+          </strong>
+        </div>
+      )}
     </div>
   );
 }

@@ -171,6 +171,30 @@ func TestResolveBackend_DefaultFallback(t *testing.T) {
 	}
 }
 
+func TestResolveBackend_ProviderLaneDefault(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "legacy",
+			ProviderLanes: []config.ProviderLane{
+				{Provider: "anthropic", Default: "claude"},
+				{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+			},
+			Backends: map[string]config.BackendDef{
+				"legacy": {Cmd: "legacy"},
+				"claude": {Cmd: "claude", Provider: "anthropic"},
+				"sol":    {Cmd: "codex", Provider: "openai"},
+				"gpt55":  {Cmd: "codex", Provider: "openai"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "manual"},
+	}
+
+	decision := New(cfg).ResolveBackendDecision(makeIssue(909, "provider default"))
+	if decision.Backend != "claude" || decision.Reason != ReasonDefault {
+		t.Fatalf("decision = %+v, want claude/default", decision)
+	}
+}
+
 func TestResolveBackend_LabelTakesPrecedenceOverAutoRouting(t *testing.T) {
 	cfg := &config.Config{
 		Model: config.ModelConfig{

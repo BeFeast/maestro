@@ -14,27 +14,32 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/workerlease"
 )
 
 var workerRuntimeCurrentUser = user.Current
 
-func prepareAttemptRunner(cfg *config.Config, slotName, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit, reason string) (*workerlease.Lease, error) {
+func prepareWorkerScratchLease(cfg *config.Config, slotName, reason string, processLease tmuxsession.ProcessLease) (*workerlease.Lease, *tmuxsession.ProcessLeaseRuntime, error) {
 	if cfg == nil {
-		return nil, fmt.Errorf("worker config is required")
+		return nil, nil, fmt.Errorf("worker config is required")
 	}
 	if !cfg.WorkerRuntime.IsolatedEnabled() {
-		return nil, writeWorkerRunnerScript(cfg.StateDir, runnerPath, args, stdinFile, logFile, worktree, split)
+		return nil, nil, nil
 	}
 	if err := workerlease.EnsureScratchBase(cfg.WorkerRuntime.EffectiveScratchRoot()); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	if err := workerlease.EnsureWorkerSlice(cfg.WorkerRuntime.EffectiveScope()); err != nil {
-		return nil, err
+		return nil, nil, err
 	}
 	maestroBin, ok := maestroExecutablePath()
 	if !ok {
-		return nil, fmt.Errorf("resolve maestro executable for isolated worker lease")
+		return nil, nil, fmt.Errorf("resolve maestro executable for isolated worker lease")
+	}
+	currentUser, err := workerRuntimeCurrentUser()
+	if err != nil {
+		return nil, nil, fmt.Errorf("resolve worker runtime user: %w", err)
 	}
 	lease, err := workerlease.Prepare(workerlease.Spec{
 		Root:       workerLeaseProjectRoot(cfg),
@@ -42,40 +47,26 @@ func prepareAttemptRunner(cfg *config.Config, slotName, runnerPath string, args 
 		Repo:       cfg.Repo,
 		Slot:       slotName,
 		Attempt:    reason,
-		Scope:      cfg.WorkerRuntime.EffectiveScope(),
+		Unit:       processLease.Unit,
+		Scope:      processLease.Manager,
 		Now:        time.Now().UTC(),
 	})
 	if err != nil {
-		return nil, err
+		return nil, nil, err
 	}
-	rollback := true
-	defer func() {
-		if rollback {
-			_ = workerlease.CleanupManifest(lease.ManifestPath, lease.ID)
-		}
-	}()
-	currentUser, err := workerRuntimeCurrentUser()
-	if err != nil {
-		return nil, fmt.Errorf("resolve worker runtime user: %w", err)
+	runtime := &tmuxsession.ProcessLeaseRuntime{
+		ScratchID:    lease.ID,
+		ScratchDir:   lease.ScratchDir,
+		TempDir:      lease.TempDir,
+		GoTempDir:    lease.GoTempDir,
+		CargoTarget:  lease.CargoTarget,
+		ManifestPath: lease.ManifestPath,
+		CleanupExec:  workerlease.CleanupExec(maestroBin, lease.ManifestPath, lease.ID),
+		Home:         currentUser.HomeDir,
+		User:         currentUser.Username,
+		MemoryMaxMB:  cfg.WorkerRuntime.MemoryMaxMB,
 	}
-
-	payloadPath := filepath.Join(lease.ScratchDir, "payload.sh")
-	if err := writeWorkerRunnerScript(cfg.StateDir, payloadPath, args, stdinFile, logFile, worktree, split); err != nil {
-		return nil, err
-	}
-	launcher, err := workerlease.BuildLauncherScript(workerlease.LaunchSpec{
-		Lease: lease, UID: os.Getuid(), PATH: os.Getenv("PATH"), Home: currentUser.HomeDir, User: currentUser.Username,
-		PayloadPath: payloadPath,
-		MaestroBin:  maestroBin, MemoryMaxMB: cfg.WorkerRuntime.MemoryMaxMB,
-	})
-	if err != nil {
-		return nil, err
-	}
-	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, launcher, workerRunnerScriptMode); err != nil {
-		return nil, fmt.Errorf("write isolated worker launcher: %w", err)
-	}
-	rollback = false
-	return &lease, nil
+	return &lease, runtime, nil
 }
 
 func workerLeaseProjectRoot(cfg *config.Config) string {
@@ -99,6 +90,33 @@ func workerLeaseProjectKey(cfg *config.Config) string {
 	}
 	sum := sha256.Sum256([]byte(identity))
 	return hex.EncodeToString(sum[:])
+}
+
+func recoverWorkerScratchLease(cfg *config.Config, slotName string, processLease tmuxsession.ProcessLease) (*workerlease.Lease, error) {
+	if cfg == nil || !cfg.WorkerRuntime.IsolatedEnabled() {
+		return nil, nil
+	}
+	leases, _, err := workerlease.List(workerLeaseProjectRoot(cfg))
+	if err != nil {
+		return nil, fmt.Errorf("recover worker scratch receipt: %w", err)
+	}
+	var match *workerlease.Lease
+	for i := range leases {
+		lease := leases[i]
+		if lease.ProjectKey != workerLeaseProjectKey(cfg) || lease.Slot != strings.TrimSpace(slotName) ||
+			lease.Unit != processLease.Unit || lease.Scope != processLease.Manager {
+			continue
+		}
+		if match != nil {
+			return nil, fmt.Errorf("recover worker scratch receipt: multiple manifests claim process lease %s", processLease.Unit)
+		}
+		candidate := lease
+		match = &candidate
+	}
+	if match == nil {
+		return nil, fmt.Errorf("recover worker scratch receipt: active isolated process lease %s has no exact manifest", processLease.Unit)
+	}
+	return match, nil
 }
 
 func assignWorkerLease(sess *state.Session, lease *workerlease.Lease) {
@@ -152,18 +170,14 @@ func leaseFromSession(cfg *config.Config, sess *state.Session) (*workerlease.Lea
 		lease.ScratchDir != filepath.Clean(strings.TrimSpace(sess.WorkerScratchDir)) {
 		return nil, fmt.Errorf("persisted worker lease identity does not match ownership manifest")
 	}
+	if strings.TrimSpace(sess.ProcessLeaseUnit) != "" &&
+		(lease.Unit != strings.TrimSpace(sess.ProcessLeaseUnit) || lease.Scope != strings.TrimSpace(sess.ProcessLeaseManager)) {
+		return nil, fmt.Errorf("persisted worker scratch does not match process lease ownership")
+	}
 	return &lease, nil
 }
 
-func rollbackPreparedLease(lease *workerlease.Lease) {
-	if lease == nil {
-		return
-	}
-	_ = workerlease.Stop(lease.Scope, lease.Unit)
-	_ = workerlease.CleanupManifest(lease.ManifestPath, lease.ID)
-}
-
-func stopOwnedWorkerLease(cfg *config.Config, sess *state.Session) (bool, error) {
+func cleanupOwnedWorkerScratch(cfg *config.Config, sess *state.Session) (bool, error) {
 	lease, err := leaseFromSession(cfg, sess)
 	if err != nil {
 		if sess != nil {
@@ -174,14 +188,14 @@ func stopOwnedWorkerLease(cfg *config.Config, sess *state.Session) (bool, error)
 	if lease == nil {
 		return false, nil
 	}
-	if strings.TrimSpace(lease.Unit) != workerlease.UnitName(lease.ID) ||
+	if !workerlease.ValidProcessLeaseUnit(lease.Unit) ||
 		(lease.Scope != workerlease.ScopeSystem && lease.Scope != workerlease.ScopeUser) {
 		sess.WorkerLeaseAttention = "persisted lease unit or scope is invalid"
 		return true, fmt.Errorf("invalid persisted worker lease identity")
 	}
-	if err := workerlease.Stop(lease.Scope, lease.Unit); err != nil {
-		sess.WorkerLeaseAttention = "exact worker lease could not be stopped"
-		return true, err
+	if strings.TrimSpace(sess.ProcessLeaseUnit) != lease.Unit || strings.TrimSpace(sess.ProcessLeaseManager) != lease.Scope {
+		sess.WorkerLeaseAttention = "worker scratch does not match the process lease"
+		return true, fmt.Errorf("worker scratch ownership does not match process lease")
 	}
 	if err := workerlease.CleanupManifest(lease.ManifestPath, lease.ID); err != nil {
 		sess.WorkerLeaseAttention = "exact worker scratch could not be cleaned"
@@ -189,25 +203,6 @@ func stopOwnedWorkerLease(cfg *config.Config, sess *state.Session) (bool, error)
 	}
 	assignWorkerLease(sess, nil)
 	return true, nil
-}
-
-// WorkerLeaseActive reports liveness from the durable OS lease when a session
-// owns one. Callers must use this instead of pane ancestry for isolated
-// workers; the transient service remains authoritative after reparenting.
-func WorkerLeaseActive(cfg *config.Config, sess *state.Session) (active, owned bool, err error) {
-	lease, err := leaseFromSession(cfg, sess)
-	if err != nil {
-		return false, true, err
-	}
-	if lease == nil {
-		return false, false, nil
-	}
-	if strings.TrimSpace(lease.Unit) != workerlease.UnitName(lease.ID) ||
-		(lease.Scope != workerlease.ScopeSystem && lease.Scope != workerlease.ScopeUser) {
-		return false, true, fmt.Errorf("invalid persisted worker lease identity")
-	}
-	active, err = workerlease.Active(lease.Scope, lease.Unit)
-	return active, true, err
 }
 
 type WorkerLeaseReconcileResult struct {
@@ -230,11 +225,11 @@ func (systemWorkerLeaseReconcileOps) List(root string) ([]workerlease.Lease, []w
 }
 
 func (systemWorkerLeaseReconcileOps) Active(scope, unit string) (bool, error) {
-	return workerlease.Active(scope, unit)
+	return tmuxsession.ProcessLeaseActive(tmuxsession.ProcessLease{Unit: unit, Manager: scope})
 }
 
 func (systemWorkerLeaseReconcileOps) Stop(scope, unit string) error {
-	return workerlease.Stop(scope, unit)
+	return tmuxsession.TerminateProcessLease(tmuxsession.ProcessLease{Unit: unit, Manager: scope})
 }
 
 func (systemWorkerLeaseReconcileOps) Cleanup(manifestPath, leaseID string) error {
@@ -361,6 +356,22 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 			liveBySlot[slot] = append(liveBySlot[slot], workerLeaseSessionRef{slot: slot, sess: sess})
 		}
 	}
+	claimedBySlot := make(map[string]*state.FreshDispatchClaim)
+	for _, claim := range s.FreshDispatchClaims {
+		if claim != nil && claim.Status == state.FreshDispatchClaimStatusClaimed && strings.TrimSpace(claim.Slot) != "" {
+			claimedBySlot[strings.TrimSpace(claim.Slot)] = claim
+		}
+	}
+	idsByUnit := make(map[string][]string)
+	for id, lease := range leasesByID {
+		idsByUnit[lease.Unit] = append(idsByUnit[lease.Unit], id)
+	}
+	ambiguousUnits := make(map[string]bool)
+	for unit, leaseIDs := range idsByUnit {
+		if len(leaseIDs) > 1 {
+			ambiguousUnits[unit] = true
+		}
+	}
 
 	ids := make([]string, 0, len(leasesByID))
 	for id := range leasesByID {
@@ -372,6 +383,16 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 		lease := leasesByID[id]
 		seen[id] = true
 		refs := sessionsByID[id]
+		if ambiguousUnits[lease.Unit] {
+			if len(refs) == 0 {
+				addAttention(id, lease.Slot, "multiple scratch manifests claim the same process lease", nil)
+			} else {
+				for _, ref := range refs {
+					addAttention(id, ref.slot, "multiple scratch manifests claim the same process lease", ref.sess)
+				}
+			}
+			continue
+		}
 		if len(refs) > 1 {
 			for _, ref := range refs {
 				addAttention(id, ref.slot, "multiple sessions claim the same worker lease", ref.sess)
@@ -401,6 +422,7 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 			if stopAndCleanupWorkerLease(ops, lease) {
 				result.Cleaned = append(result.Cleaned, id)
 				assignWorkerLease(ref.sess, nil)
+				clearMatchingProcessLease(ref.sess, lease)
 				if expectedLive {
 					ref.sess.PID = 0
 					ref.sess.TmuxSession = ""
@@ -410,6 +432,24 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 				addAttention(id, ref.slot, "exact worker lease or scratch cleanup failed", ref.sess)
 			}
 			continue
+		}
+
+		if claimedBySlot[lease.Slot] != nil {
+			expected, err := workerProcessLease(cfg, lease.Slot, 1)
+			if err != nil || expected.Unit != lease.Unit || expected.Manager != lease.Scope {
+				addAttention(id, lease.Slot, "fresh dispatch claim and worker lease identity disagree", nil)
+				continue
+			}
+			active, err := ops.Active(lease.Scope, lease.Unit)
+			if err != nil {
+				addAttention(id, lease.Slot, "claimed worker lease liveness could not be inspected", nil)
+				continue
+			}
+			if active {
+				// StartReserved can adopt this exact launch/state-gap receipt. Killing
+				// it here would defeat the transactional fresh-dispatch lease.
+				continue
+			}
 		}
 
 		if len(liveBySlot[lease.Slot]) > 0 {
@@ -450,7 +490,7 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 				ScratchDir: sess.WorkerScratchDir, ManifestPath: sess.WorkerLeaseManifest,
 			}
 		}
-		if strings.TrimSpace(lease.Unit) != workerlease.UnitName(id) ||
+		if !workerlease.ValidProcessLeaseUnit(lease.Unit) ||
 			(lease.Scope != workerlease.ScopeSystem && lease.Scope != workerlease.ScopeUser) {
 			addAttention(id, slot, "persisted worker lease unit or scope is invalid", sess)
 			continue
@@ -466,6 +506,7 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 		}
 		expectedLive := sessionMayOwnLiveLease(sess)
 		assignWorkerLease(sess, nil)
+		clearMatchingProcessLease(sess, *lease)
 		if expectedLive {
 			sess.PID = 0
 			sess.TmuxSession = ""
@@ -490,8 +531,8 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 	return result
 }
 
-func workerLeaseSessionSnapshot(s *state.State) map[string][6]string {
-	result := make(map[string][6]string)
+func workerLeaseSessionSnapshot(s *state.State) map[string][8]string {
+	result := make(map[string][8]string)
 	if s == nil {
 		return result
 	}
@@ -499,13 +540,15 @@ func workerLeaseSessionSnapshot(s *state.State) map[string][6]string {
 		if sess == nil {
 			continue
 		}
-		result[slot] = [6]string{
+		result[slot] = [8]string{
 			sess.WorkerLeaseID,
 			sess.WorkerLeaseUnit,
 			sess.WorkerLeaseScope,
 			sess.WorkerScratchDir,
 			sess.WorkerLeaseManifest,
 			sess.WorkerLeaseAttention,
+			sess.ProcessLeaseUnit,
+			sess.ProcessLeaseManager,
 		}
 	}
 	return result
@@ -525,12 +568,17 @@ func leaseMetadataCompatible(sess *state.Session, lease workerlease.Lease) bool 
 	if sess == nil {
 		return false
 	}
+	if strings.TrimSpace(sess.ProcessLeaseUnit) == "" || strings.TrimSpace(sess.ProcessLeaseManager) == "" {
+		return false
+	}
 	checks := [][2]string{
 		{sess.WorkerLeaseID, lease.ID},
 		{sess.WorkerLeaseUnit, lease.Unit},
 		{sess.WorkerLeaseScope, lease.Scope},
 		{sess.WorkerScratchDir, lease.ScratchDir},
 		{sess.WorkerLeaseManifest, lease.ManifestPath},
+		{sess.ProcessLeaseUnit, lease.Unit},
+		{sess.ProcessLeaseManager, lease.Scope},
 	}
 	for _, check := range checks {
 		if strings.TrimSpace(check[0]) != "" && filepath.Clean(strings.TrimSpace(check[0])) != filepath.Clean(check[1]) {
@@ -541,7 +589,7 @@ func leaseMetadataCompatible(sess *state.Session, lease workerlease.Lease) bool 
 }
 
 func stopAndCleanupWorkerLease(ops workerLeaseReconcileOps, lease workerlease.Lease) bool {
-	if strings.TrimSpace(lease.Unit) != workerlease.UnitName(lease.ID) ||
+	if !workerlease.ValidProcessLeaseUnit(lease.Unit) ||
 		(lease.Scope != workerlease.ScopeSystem && lease.Scope != workerlease.ScopeUser) {
 		return false
 	}
@@ -549,6 +597,15 @@ func stopAndCleanupWorkerLease(ops workerLeaseReconcileOps, lease workerlease.Le
 		return false
 	}
 	return ops.Cleanup(lease.ManifestPath, lease.ID) == nil
+}
+
+func clearMatchingProcessLease(sess *state.Session, lease workerlease.Lease) {
+	if sess == nil {
+		return
+	}
+	if strings.TrimSpace(sess.ProcessLeaseUnit) == lease.Unit && strings.TrimSpace(sess.ProcessLeaseManager) == lease.Scope {
+		clearSessionProcessLease(sess)
+	}
 }
 
 func opaqueWorkerLeaseIdentity(value string) string {

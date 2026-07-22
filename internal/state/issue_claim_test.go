@@ -1,6 +1,7 @@
 package state
 
 import (
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -103,5 +104,130 @@ func TestIssueClaimFor_DonePRRemainsReservedUntilExplicitRelease(t *testing.T) {
 	s.Sessions["ok-player-274"].ReleasedForRedispatch = true
 	if _, ok := s.IssueClaimFor(365); ok {
 		t.Fatal("explicitly released done session must not retain terminal reconciliation lease")
+	}
+}
+
+func TestFreshDispatchClaim_ContendsThenRenewsSameCanonicalIdentity(t *testing.T) {
+	s := NewState()
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	claim, acquired, err := s.ClaimFreshDispatch(394, "ok-player", "lease-a", 10*time.Minute, now)
+	if err != nil || !acquired {
+		t.Fatalf("initial claim: acquired=%t err=%v", acquired, err)
+	}
+	claim.Branch = "feat/ok-player-1-394-canonical"
+	claim.Worktree = filepath.Join("/worktrees", claim.Slot)
+
+	contended, acquired, err := s.ClaimFreshDispatch(394, "ok-player", "lease-b", 10*time.Minute, now.Add(31*time.Second))
+	if err != nil || acquired {
+		t.Fatalf("contending claim: acquired=%t err=%v", acquired, err)
+	}
+	if contended.Slot != claim.Slot || contended.LeaseID != "lease-a" || contended.ContentionCount != 1 || contended.LastContendedAt.IsZero() {
+		t.Fatalf("contended claim = %+v", contended)
+	}
+
+	renewed, acquired, err := s.ClaimFreshDispatch(394, "ok-player", "lease-c", 10*time.Minute, now.Add(11*time.Minute))
+	if err != nil || !acquired {
+		t.Fatalf("renew claim: acquired=%t err=%v", acquired, err)
+	}
+	if renewed.Slot != claim.Slot || renewed.Branch != claim.Branch || renewed.Worktree != claim.Worktree {
+		t.Fatalf("renewed identity changed: before=%+v after=%+v", claim, renewed)
+	}
+	if renewed.LeaseGeneration != 2 || renewed.LeaseID != "lease-c" || s.NextSlot != 2 {
+		t.Fatalf("renewed lease = %+v next_slot=%d", renewed, s.NextSlot)
+	}
+}
+
+func TestFreshDispatchClaim_CompletionCreatesSessionAndRetainsEvidence(t *testing.T) {
+	s := NewState()
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	claim, acquired, err := s.ClaimFreshDispatch(394, "ok-player", "lease-a", 10*time.Minute, now)
+	if err != nil || !acquired {
+		t.Fatalf("claim: acquired=%t err=%v", acquired, err)
+	}
+	claim.Branch = "feat/ok-player-1-394-canonical"
+	claim.Worktree = filepath.Join("/worktrees", claim.Slot)
+	sess := &Session{
+		IssueNumber: 394,
+		IssueTitle:  "canonical",
+		Worktree:    claim.Worktree,
+		Branch:      claim.Branch,
+		PID:         4242,
+		TmuxSession: "maestro-" + claim.Slot,
+		StartedAt:   now.Add(time.Minute),
+		Status:      StatusRunning,
+	}
+	if err := s.CompleteFreshDispatch(394, "lease-a", sess, now.Add(time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if _, active := s.FreshDispatchClaimFor(394); active {
+		t.Fatal("completed claim remained active")
+	}
+	evidence := s.FreshDispatchClaims[394]
+	if evidence == nil || evidence.Status != FreshDispatchClaimStatusCompleted || evidence.CompletedAt.IsZero() || evidence.SessionStartedAt.IsZero() {
+		t.Fatalf("completed evidence = %+v", evidence)
+	}
+	if got := s.Sessions[claim.Slot]; got == nil || got.IssueNumber != 394 || got.PID != 4242 {
+		t.Fatalf("persisted session = %+v", got)
+	}
+	claimView, ok := s.IssueClaimFor(394)
+	if !ok || claimView.Kind != IssueClaimImplementation || claimView.Session != claim.Slot {
+		t.Fatalf("issue claim after completion = %+v, %t", claimView, ok)
+	}
+}
+
+func TestFreshDispatchClaim_ConcurrentSaveKeepsContentionAndCompletion(t *testing.T) {
+	dir := t.TempDir()
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	seed := NewState()
+	claim, _, _ := seed.ClaimFreshDispatch(394, "ok-player", "lease-a", 10*time.Minute, now)
+	claim.Branch = "feat/ok-player-1-394-canonical"
+	claim.Worktree = filepath.Join(dir, claim.Slot)
+	if err := Save(dir, seed); err != nil {
+		t.Fatal(err)
+	}
+
+	owner, _ := Load(dir)
+	contender, _ := Load(dir)
+	if _, acquired, err := contender.ClaimFreshDispatch(394, "ok-player", "lease-b", 10*time.Minute, now.Add(time.Minute)); err != nil || acquired {
+		t.Fatalf("contender: acquired=%t err=%v", acquired, err)
+	}
+	if err := Save(dir, contender); err != nil {
+		t.Fatal(err)
+	}
+	sess := &Session{IssueNumber: 394, Worktree: claim.Worktree, Branch: claim.Branch, PID: 44, StartedAt: now, Status: StatusRunning}
+	if err := owner.CompleteFreshDispatch(394, "lease-a", sess, now.Add(2*time.Minute)); err != nil {
+		t.Fatal(err)
+	}
+	if err := Save(dir, owner); err != nil {
+		t.Fatal(err)
+	}
+	loaded, _ := Load(dir)
+	evidence := loaded.FreshDispatchClaims[394]
+	if evidence.Status != FreshDispatchClaimStatusCompleted || evidence.ContentionCount != 1 {
+		t.Fatalf("merged evidence = %+v", evidence)
+	}
+	if loaded.Sessions[claim.Slot] == nil {
+		t.Fatal("completed session lost during merge")
+	}
+}
+
+func TestFreshDispatchClaim_ReconcilesCrashAfterSessionSave(t *testing.T) {
+	s := NewState()
+	now := time.Date(2026, 7, 21, 21, 0, 0, 0, time.UTC)
+	claim, _, _ := s.ClaimFreshDispatch(394, "ok-player", "lease-a", 10*time.Minute, now)
+	claim.Branch = "feat/ok-player-1-394-canonical"
+	claim.Worktree = filepath.Join("/worktrees", claim.Slot)
+	s.Sessions[claim.Slot] = &Session{
+		IssueNumber: 394,
+		Worktree:    claim.Worktree,
+		Branch:      claim.Branch,
+		StartedAt:   now.Add(time.Minute),
+		Status:      StatusRunning,
+	}
+	if got := s.ReconcileFreshDispatchClaims(now.Add(2 * time.Minute)); got != 1 {
+		t.Fatalf("reconciled = %d, want 1", got)
+	}
+	if claim.Status != FreshDispatchClaimStatusCompleted || claim.TerminalReason != "session_persisted" || claim.SessionStartedAt.IsZero() {
+		t.Fatalf("reconciled claim = %+v", claim)
 	}
 }

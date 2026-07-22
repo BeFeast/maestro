@@ -63,21 +63,69 @@ func TestCollectMaterialProgressObservations_ExactWorkersCannotMaskEachOther(t *
 	}
 }
 
+func TestMaterialProgressWatchdog_UsageUnreliableDoesNotKillHealthyWorker(t *testing.T) {
+	st := state.NewState()
+	t0 := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	st.Sessions["slot-946"] = &state.Session{
+		IssueNumber:    946,
+		Status:         state.StatusRunning,
+		PID:            946,
+		StartedAt:      t0.Add(-time.Hour),
+		LastOutputHash: "healthy-output-1",
+		Attribution: []state.BackendAttribution{{
+			Backend:               "grok",
+			UsageUnreliable:       true,
+			UsageUnreliableReason: "live_assistant_zero_input_or_output",
+			UsageUnreliableScope:  state.UsageUnreliableScopeLiveBudget,
+		}},
+	}
+
+	budget := 20 * time.Minute
+	if _, err := st.RecordMaterialProgress(collectMaterialProgressObservations(st, t0), budget, time.Minute, t0); err != nil {
+		t.Fatal(err)
+	}
+	// Token telemetry remains unavailable, but independently-observed terminal
+	// output advances. The watchdog must treat the worker as healthy.
+	st.Sessions["slot-946"].LastOutputHash = "healthy-output-2"
+	decisions, err := st.RecordMaterialProgress(
+		collectMaterialProgressObservations(st, t0.Add(budget+time.Minute)),
+		budget,
+		time.Minute,
+		t0.Add(budget+time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionNone || decisions[0].RecommendsRecovery() {
+		t.Fatalf("usage-unreliable healthy worker decision = %+v, want progress/no recovery", decisions)
+	}
+}
+
 func TestCollectMaterialProgressObservations_WorkerReplacementHasNewLease(t *testing.T) {
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
-	sess := &state.Session{IssueNumber: 9, Status: state.StatusRunning, PID: 100, StartedAt: t0}
+	sess := &state.Session{
+		IssueNumber:      9,
+		Status:           state.StatusRunning,
+		PID:              100,
+		StartedAt:        t0,
+		ProcessLeaseUnit: "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+	}
 	st.Sessions["slot-9"] = sess
 	first := collectMaterialProgressObservations(st, t0)
 
 	sess.PID = 200
 	sess.StartedAt = t0.Add(10 * time.Minute)
+	sess.ProcessLeaseUnit = "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope"
 	second := collectMaterialProgressObservations(st, t0.Add(10*time.Minute))
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("observations first=%d second=%d, want one each", len(first), len(second))
 	}
 	if first[0].Target.Key() == second[0].Target.Key() || first[0].Target.LeaseID == second[0].Target.LeaseID {
 		t.Fatalf("respawn reused old exact lease: before=%+v after=%+v", first[0].Target, second[0].Target)
+	}
+	if first[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope" || second[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope" {
+		t.Fatalf("material progress lost OS process lease identity: before=%+v after=%+v", first[0].Target, second[0].Target)
 	}
 }
 

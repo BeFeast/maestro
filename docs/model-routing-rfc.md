@@ -25,12 +25,13 @@ Every lever that influences which backend/model/effort a worker runs on lives in
 | `model.default` | the backend used when nothing else fires | `internal/config/config.go:279` (`ModelConfig.Default`) |
 | `model.backends[*]` | `cmd`, `extra_args`, `prompt_mode`, `enabled`, `provider`, `model`, `variant`, `effort`, `pricing`, `quota`, `non_agentic`, `subagent_hint`, `mcp` | `internal/config/config.go:26-90` (`BackendDef`) |
 | `model.fallback_backends` | ordered list tried when the current backend is *blocked* | `internal/config/config.go:281` |
+| `model.provider_lanes` | ordered provider defaults plus provider-local fallback chains; used when no explicit `fallback_backends` override is set | `internal/config/provider_routing.go` |
 | `routing.mode` | `"manual"` (default) or `"auto"` | `internal/config/config.go:786`, default set at `internal/config/config.go:1429-1430` |
 | `routing.router_model` / `routing.router_model_name` | which backend + model id runs the LLM router | `internal/config/config.go:787-788`, defaults at `:1432-1436` |
 | `routing.router_prompt` | router prompt template | `internal/config/config.go:789` |
 | `routing.task_type_backends` | `task_type → backend`, used **only** when `mode: auto` | `internal/config/config.go:790` |
 | `routing.{planner,implementation,validator}_backend` | per-role backend overrides | `internal/config/config.go:794-796` |
-| `pipeline.{planner,implementer,validator}.{backend,effort}` | the *other* per-role backend/effort overrides (implement phase + `effort:` added in #841) | `internal/config/config.go` (`PipelineConfig`/`RoleConfig`) |
+| `pipeline.{planner,advisor,implementer,validator}.{backend,effort}` | the phase-pipeline role overrides (Advisor is optional and review-only) | `internal/config/config.go` (`PipelineConfig`/`RoleConfig`) |
 | `supervisor.review_repair.{backend,model,effort}` | backend used when a green PR is held on blocking review findings | `internal/config/config.go:543-548` |
 
 A subtle but load-bearing fact, with one backend-specific exception: for the
@@ -158,7 +159,7 @@ code:
   `roleBackend` at `:136-148`). **This function has no non-test callers** — it is
   exercised only by `internal/router/resolve_test.go`. It is dead code on the
   dispatch path.
-- `pipeline.{planner,implementer,validator}.backend` is consumed by
+- `pipeline.{planner,advisor,implementer,validator}.backend` is consumed by
   `pipeline.BackendForPhase` (`internal/pipeline/pipeline.go`), which **is** wired
   into the dispatch loop for pipeline phases. Since #841 the implement phase
   carries its own `pipeline.implementer.backend` (empty falls back to
@@ -176,6 +177,10 @@ code:
       enabled: true
       backend: fable      # strong model plans
       effort: xhigh
+    advisor:
+      enabled: true
+      backend: codex      # independent bounded plan review
+      effort: high
     implementer:
       backend: codex      # cheap model executes the mechanical implement phase
       effort: low
@@ -189,8 +194,8 @@ code:
   still win — the per-phase effort is skipped when the flag is already present.
 
 So the "per-role backend" that actually runs is the `pipeline.*` one, and only
-for the phases of the opt-in 3-phase pipeline (`pipeline.enabled` /
-`pipeline:full` label). The `routing.*_backend` fields parse and validate but
+for the phases of the opt-in phase pipeline (`pipeline.enabled`,
+`pipeline:full`, or `pipeline:advised`). The `routing.*_backend` fields parse and validate but
 never affect a worker. Per-phase config is orthogonal to `routing.mode` — it is
 phase config, not issue routing.
 
@@ -205,12 +210,37 @@ on a work-quality failure. The three trigger classes:
 | Backend auth / account credential failure | `recordBackendFailure` writes backend-wide `backend_health` | `selectBackendFallback` with `fallback_after_backend_auth_failure` |
 | Model unavailable (model pulled/renamed/no access) | `recordBackendFailure` writes provider/model health when the requested model is known | `selectBackendFallback` with `fallback_after_backend_model_unavailable` |
 | CLIProxyAPI credential pool exhausted for one model | `internal/worker/credential_rotation.go` parses `model_cooldown`; `recordBackendFailure` writes `provider_model_health[provider][model]` with aggregate candidate/usable counts and retry time | `selectBackendFallback` with `fallback_after_backend_model_cooldown`; other models on the provider remain eligible |
+| Model overloaded (terminal HTTP 529 + `overloaded_error`) | `internal/worker/backendfailure.go` records a short provider/model cooldown without claiming credential exhaustion or a bad model id | `selectBackendFallback` with `fallback_after_backend_model_overloaded`; provider-local model fallbacks remain ahead of cross-provider fallbacks |
 
-`selectBackendFallback` walks `backendFallbackCandidates`
-(`internal/orchestrator/backend_selector.go:313-342`) — the configured
-`fallback_backends` chain, else `model.default` + remaining backends — skipping
-disabled, current, already-tried, and cooling-down candidates. Fresh dispatch
-uses the parallel `dispatchBackendCandidates` (`:275-303`).
+`selectBackendFallback` walks the exact route resolved by
+`ModelConfig.ResolvedRoute`. A project-level `fallback_backends` chain is the
+legacy explicit override. Otherwise `provider_lanes` composes each provider's
+default and local fallbacks before moving to the next provider. With neither
+configured, only `model.default` is eligible; backend-map iteration order is
+never a fallback policy. Disabled, current, already-tried, and cooling-down
+candidates are skipped. Fresh dispatch uses the same route, with wraparound only
+to recover from an unavailable label/policy pin; a live outage fallback moves
+forward and never cycles back to an earlier backend.
+
+Example:
+
+```yaml
+model:
+  provider_lanes:
+    - provider: anthropic
+      default: claude
+    - provider: openai
+      default: sol
+      fallback_backends: [gpt55]
+  backends:
+    claude: {provider: anthropic, model: fable-5, effort: high}
+    sol: {provider: openai, model: gpt-5.6-sol, effort: high}
+    gpt55: {provider: openai, model: gpt-5.5, effort: high}
+```
+
+The effective route is `claude -> sol -> gpt55`. A model-specific cooldown is
+keyed by provider and model, so cooling `openai/gpt-5.6-sol` does not block
+`openai/gpt-5.5` even though both are in the OpenAI lane.
 
 Backend-wide health and provider/model health are intentionally separate. A
 single credential entering cooldown is not a Maestro failure signal: the proxy
@@ -218,7 +248,13 @@ continues rotating compatible credentials. Maestro gates a model route only
 after the proxy returns the aggregate `model_cooldown` result, meaning no
 compatible credential is currently usable for that requested model.
 
-All three trigger classes set `sess.RateLimitHit = true`
+A terminal HTTP 529 overload is a separate route-health class. It carries no
+credential-pool count, so Maestro must not describe it as `model_cooldown` or
+infer that every credential is exhausted. It briefly cools only the requested
+provider/model route and follows the configured fallback order; CLIProxyAPI
+remains responsible for rotating compatible credentials within the request.
+
+All backend-failure trigger classes set `sess.RateLimitHit = true`
 (`internal/orchestrator/backend_selector.go:79`, `:120`), which **excludes the
 session from the per-issue retry budget**: `FailedAttemptsForIssue` counts only
 `PRNumber == 0` dead/failed/retry-exhausted sessions where `!RateLimitHit`

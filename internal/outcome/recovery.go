@@ -80,10 +80,11 @@ func (r RecoveryRunner) runCommand(ctx context.Context, command, dir string) (in
 //     the drift is still owned and an outcome-driven product repair must not
 //     race in during the cooldown window.
 //
-// A verified receipt (the outcome recovered), an uncertain receipt (no durable
-// receipt; health verification is authoritative and no cooldown fence exists),
-// or a failed attempt whose cooldown already elapsed do NOT own the failure —
-// genuine independent PR blockers remain repairable in those states.
+// A verified receipt (the outcome recovered), a capped receipt (the actuator
+// deliberately yielded to the outcome-repair issue), an uncertain receipt (no
+// durable receipt; health verification is authoritative and no cooldown fence
+// exists), or a failed attempt whose cooldown already elapsed do NOT own the
+// failure — genuine independent PR blockers remain repairable in those states.
 func (r *RecoveryState) OwnsActiveFailure(now time.Time) bool {
 	if r == nil {
 		return false

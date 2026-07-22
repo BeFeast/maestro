@@ -250,6 +250,12 @@ type supervisorDecisionInfo struct {
 	QueueAnalysis     *state.SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
 	Queue             *supervisorQueueInfo           `json:"queue,omitempty"`
 	ApprovalID        string                         `json:"approval_id,omitempty"`
+
+	RecommendationID string                           `json:"recommendation_id,omitempty"`
+	FirstSeenAt      time.Time                        `json:"first_seen_at,omitempty"`
+	LastSeenAt       time.Time                        `json:"last_seen_at,omitempty"`
+	SeenCount        int                              `json:"seen_count,omitempty"`
+	Disposition      *state.RecommendationDisposition `json:"disposition,omitempty"`
 }
 
 type supervisorActionInfo struct {
@@ -337,11 +343,42 @@ type sessionInfo struct {
 	NeedsAttention bool   `json:"needs_attention,omitempty"`
 	Live           bool   `json:"live"`
 	Backend        string `json:"backend,omitempty"`
+	// Provider-limit fields are the secret-free route/aggregate projection
+	// recorded by the orchestrator. Credential identifiers and raw proxy payloads
+	// are deliberately absent.
+	ProviderLimitBackend      string `json:"provider_limit_backend,omitempty"`
+	ProviderLimitReason       string `json:"provider_limit_reason,omitempty"`
+	ProviderLimitProvider     string `json:"provider_limit_provider,omitempty"`
+	ProviderLimitModel        string `json:"provider_limit_model,omitempty"`
+	ProviderLimitResetAt      string `json:"provider_limit_reset_at,omitempty"`
+	CredentialCandidates      int    `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool   `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int    `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool   `json:"credential_usable_known,omitempty"`
+	CredentialAggregateReason string `json:"credential_aggregate_reason,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model              string `json:"model,omitempty"`
-	PRNumber           int    `json:"pr_number,omitempty"`
-	PRURL              string `json:"pr_url,omitempty"`
+	Model                     string                `json:"model,omitempty"`
+	PRNumber                  int                   `json:"pr_number,omitempty"`
+	PRMerged                  bool                  `json:"pr_merged,omitempty"`
+	PRURL                     string                `json:"pr_url,omitempty"`
+	Phase                     string                `json:"phase,omitempty"`
+	PlanVersion               int                   `json:"plan_version,omitempty"`
+	AdvisorReviewRound        int                   `json:"advisor_review_round,omitempty"`
+	AdvisorMaxReviewRounds    int                   `json:"advisor_max_review_rounds,omitempty"`
+	AdvisorBackend            string                `json:"advisor_backend,omitempty"`
+	AdvisorModel              string                `json:"advisor_model,omitempty"`
+	AdvisorVerdict            string                `json:"advisor_verdict,omitempty"`
+	AdvisorUnresolvedFindings string                `json:"advisor_unresolved_findings,omitempty"`
+	AdvisorTerminalReason     string                `json:"advisor_terminal_reason,omitempty"`
+	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
+	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
+	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
+	// prGateSnapshot is the latest durable, reconciled gate observation for
+	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
+	// operator_state aligned with the current PR head/check rollup, but does not
+	// expose the internal snapshot on the session JSON shape.
+	prGateSnapshot     *state.PRGateSnapshot
 	TokensUsedAttempt  int    `json:"tokens_used_attempt"`
 	TokensUsedTotal    int    `json:"tokens_used_total"`
 	TokenBudgetMeasure string `json:"token_budget_measure,omitempty"`
@@ -382,7 +419,9 @@ type sessionInfo struct {
 	PROpenRuntime          string                  `json:"pr_open_runtime,omitempty"`
 	PROpenRuntimeSeconds   int64                   `json:"pr_open_runtime_seconds,omitempty"`
 	StartedAt              string                  `json:"started_at"`
+	WorkerGeneration       uint64                  `json:"worker_generation,omitempty"`
 	FinishedAt             string                  `json:"finished_at,omitempty"`
+	IssueClosedAt          string                  `json:"issue_closed_at,omitempty"`
 	WorkerEndedAt          string                  `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string                  `json:"pr_opened_at,omitempty"`
 	NextRetryAt            string                  `json:"next_retry_at,omitempty"`
@@ -448,35 +487,61 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 	now := time.Now().UTC()
 	info := sessionInfo{
-		Slot:                  slot,
-		IssueNumber:           sess.IssueNumber,
-		IssueTitle:            sess.IssueTitle,
-		IssueURL:              githubIssueURL(repo, sess.IssueNumber),
-		Status:                string(sess.Status),
-		Backend:               sess.Backend,
-		Model:                 currentSessionModel(sess),
-		PRNumber:              sess.PRNumber,
-		PRURL:                 githubPRURL(repo, sess.PRNumber),
-		TokensUsedAttempt:     sess.TokensUsedAttempt,
-		TokensUsedTotal:       sess.TokensUsedTotal,
-		TokenBudgetMeasure:    tokenBudgetMeasure,
-		WorkerOutcome:         sess.WorkerOutcome,
-		ReleasedForRedispatch: sess.ReleasedForRedispatch,
-		TokensInput:           sess.TokensInput,
-		TokensOutput:          sess.TokensOutput,
-		TokensCacheRead:       sess.TokensCacheRead,
-		TokensCacheWrite:      sess.TokensCacheWrite,
-		CostUSDBackend:        sess.CostUSDBackend,
-		StartedAt:             sess.StartedAt.Format(time.RFC3339),
-		Worktree:              sess.Worktree,
-		Branch:                sess.Branch,
-		TmuxSession:           watchSessionName(slot, sess),
-		HasLog:                strings.TrimSpace(sess.LogFile) != "",
-		RetryCount:            sess.RetryCount,
-		LastNotification:      sess.LastNotifiedStatus,
-		BackendSelection:      sess.BackendSelection,
-		Attribution:           sess.Attribution,
-		Live:                  state.SessionLiveAt(sess, now),
+		Slot:                      slot,
+		IssueNumber:               sess.IssueNumber,
+		IssueTitle:                sess.IssueTitle,
+		IssueURL:                  githubIssueURL(repo, sess.IssueNumber),
+		Status:                    string(sess.Status),
+		Backend:                   sess.Backend,
+		ProviderLimitBackend:      sess.ProviderLimitBackend,
+		ProviderLimitReason:       sess.ProviderLimitReason,
+		ProviderLimitProvider:     sess.ProviderLimitProvider,
+		ProviderLimitModel:        sess.ProviderLimitModel,
+		CredentialCandidates:      sess.CredentialCandidates,
+		CredentialCandidatesKnown: sess.CredentialCandidatesKnown,
+		CredentialUsable:          sess.CredentialUsable,
+		CredentialUsableKnown:     sess.CredentialUsableKnown,
+		CredentialAggregateReason: sess.CredentialAggregateReason,
+		Model:                     currentSessionModel(sess),
+		PRNumber:                  sess.PRNumber,
+		PRMerged:                  sess.PRMerged,
+		PRURL:                     githubPRURL(repo, sess.PRNumber),
+		Phase:                     string(sess.Phase),
+		PlanVersion:               sess.PlanVersion,
+		AdvisorReviewRound:        sess.AdvisorReviewRound,
+		AdvisorMaxReviewRounds:    sess.AdvisorMaxReviewRounds,
+		AdvisorBackend:            sess.AdvisorBackend,
+		AdvisorModel:              sess.AdvisorModel,
+		AdvisorVerdict:            sess.AdvisorVerdict,
+		AdvisorUnresolvedFindings: sess.AdvisorUnresolvedFindings,
+		AdvisorTerminalReason:     sess.AdvisorTerminalReason,
+		AdvisorBestEffort:         sess.AdvisorBestEffort,
+		AdvisorBypassed:           sess.AdvisorBypassed,
+		AdvisorReviews:            append([]state.AdvisorReview(nil), sess.AdvisorReviews...),
+		TokensUsedAttempt:         sess.TokensUsedAttempt,
+		TokensUsedTotal:           sess.TokensUsedTotal,
+		TokenBudgetMeasure:        tokenBudgetMeasure,
+		WorkerOutcome:             sess.WorkerOutcome,
+		ReleasedForRedispatch:     sess.ReleasedForRedispatch,
+		TokensInput:               sess.TokensInput,
+		TokensOutput:              sess.TokensOutput,
+		TokensCacheRead:           sess.TokensCacheRead,
+		TokensCacheWrite:          sess.TokensCacheWrite,
+		CostUSDBackend:            sess.CostUSDBackend,
+		StartedAt:                 sess.StartedAt.Format(time.RFC3339),
+		WorkerGeneration:          sess.WorkerGeneration,
+		Worktree:                  sess.Worktree,
+		Branch:                    sess.Branch,
+		TmuxSession:               watchSessionName(slot, sess),
+		HasLog:                    strings.TrimSpace(sess.LogFile) != "",
+		RetryCount:                sess.RetryCount,
+		LastNotification:          sess.LastNotifiedStatus,
+		BackendSelection:          sess.BackendSelection,
+		Attribution:               sess.Attribution,
+		Live:                      state.SessionLiveAt(sess, now),
+	}
+	if sess.ProviderLimitResetAt != nil {
+		info.ProviderLimitResetAt = sess.ProviderLimitResetAt.UTC().Format(time.RFC3339)
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the
@@ -490,6 +555,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	if sess.FinishedAt != nil {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
+	}
+	if sess.IssueClosedAt != nil {
+		info.IssueClosedAt = sess.IssueClosedAt.Format(time.RFC3339)
 	}
 	workflowDur := end.Sub(sess.StartedAt).Round(time.Second)
 	info.Runtime = workflowDur.String()
@@ -621,6 +689,11 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 	return &supervisorDecisionInfo{
 		ID:                decision.ID,
 		CreatedAt:         decision.CreatedAt,
+		RecommendationID:  decision.RecommendationID,
+		FirstSeenAt:       decision.FirstSeenAt,
+		LastSeenAt:        decision.LastSeenAt,
+		SeenCount:         decision.SeenCount,
+		Disposition:       decision.Disposition,
 		Project:           decision.Project,
 		Mode:              decision.Mode,
 		PolicyRule:        decision.PolicyRule,
@@ -982,6 +1055,9 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 }
 
 func staleSupervisorFindingResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	if state.SessionStatus(info.Status) == state.StatusDone && strings.TrimSpace(info.IssueClosedAt) != "" {
+		return true
+	}
 	if staleReviewFeedbackResolved(stuck, info) {
 		return true
 	}
@@ -1058,6 +1134,13 @@ func closeIssueBatchControlAction(readOnly bool, endpoint, target string, candid
 }
 
 func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+	// code_landed records a merged PR, and done records a terminal issue.
+	// Neither state has a live merge/restart/stop/label control surface; keep
+	// the row as audit history without describing the merged PR as open.
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusCodeLanded, state.StatusDone:
+		return nil
+	}
 	merge := newApprovalControlAction("approve_merge", "Approve merge", "Enqueue a cautious-gate approval to merge this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	if worker.PRNumber == 0 {
 		// PR-less workers can't enqueue merge_pr regardless of read-only;

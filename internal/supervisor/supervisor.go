@@ -367,6 +367,8 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	} else if decisionRequiresApproval(cfg, decision) {
 		decision.RequiresApproval = true
 	}
+	state.PrepareSupervisorRecommendation(&decision)
+	decision.Quiescent = supervisorDecisionQuiescent(decision)
 	if !cfg.Supervisor.DryRun {
 		// Execute any approvals that were transitioned to status=approved
 		// outside this loop (CLI approve already executes inline; this
@@ -383,8 +385,24 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		if mutator, ok := reader.(Mutator); ok {
 			engine.runSpecGroom(st, mutator)
 		}
-		applyOrMintDecision(cfg, st, reader, &decision)
-		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+		// Observe before acting: the recorder expires an unchanged episode at its
+		// TTL boundary, so the cycle that drops it can never race through to an
+		// actuator. A changed recommendation starts a fresh episode and remains
+		// eligible on that transition edge.
+		decision = st.RecordSupervisorDecisionWithPolicy(
+			decision,
+			state.DefaultSupervisorDecisionLimit,
+			cfg.Supervisor.EffectiveUnchangedDecisionWindow(),
+			cfg.Supervisor.EffectiveRecommendationTTL(),
+			decision.CreatedAt,
+		)
+		if !decision.RecommendationDropped() {
+			applyOrMintDecision(cfg, st, reader, &decision)
+			if disposition := supervisorDecisionMaterialization(decision); disposition != nil && decision.Disposition == nil {
+				decision.Disposition = disposition
+			}
+			st.UpdateSupervisorDecisionEpisode(decision)
+		}
 		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
 		// so the watchdog goroutine in cmd/maestro can see this cycle
 		// completed. Also clear any stale SupervisorStuck flag set by a
@@ -415,6 +433,39 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+func supervisorDecisionMaterialization(decision state.SupervisorDecision) *state.RecommendationDisposition {
+	at := decision.CreatedAt
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if strings.TrimSpace(decision.ApprovalID) != "" {
+		return &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionMaterialized,
+			Reason: state.RecommendationDispositionApprovalRecorded,
+			At:     at.UTC(),
+		}
+	}
+	for _, mutation := range decision.Mutations {
+		if mutation.Status == MutationStatusSucceeded {
+			return &state.RecommendationDisposition{
+				Status: state.RecommendationDispositionMaterialized,
+				Reason: state.RecommendationDispositionSafeAction,
+				At:     at.UTC(),
+			}
+		}
+	}
+	return nil
+}
+
+func supervisorDecisionQuiescent(decision state.SupervisorDecision) bool {
+	if decision.PolicyRule == PolicyRuleExcludedLabels {
+		return true
+	}
+	analysis := decision.QueueAnalysis
+	return analysis != nil && analysis.OpenIssues > 0 && analysis.EligibleCandidates == 0 &&
+		analysis.ExcludedIssues == analysis.OpenIssues
 }
 
 func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
@@ -615,6 +666,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open PRs: %w", err)
 	}
 	projectState.OpenPRs = len(prs)
+	projectState.OpenPRNumbers = supervisorOpenPRNumbers(prs)
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
 
@@ -1997,6 +2049,7 @@ func (e *Engine) detectPromptStuckStates() []state.SupervisorStuckState {
 		{name: "bug_prompt", path: e.cfg.BugPrompt},
 		{name: "enhancement_prompt", path: e.cfg.EnhancementPrompt},
 		{name: "pipeline.planner.prompt", path: e.cfg.Pipeline.Planner.Prompt},
+		{name: "pipeline.advisor.prompt", path: e.cfg.Pipeline.Advisor.Prompt},
 		{name: "pipeline.validator.prompt", path: e.cfg.Pipeline.Validator.Prompt},
 	}
 	for i, path := range e.cfg.PromptSections {
@@ -2090,6 +2143,23 @@ func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
 		RetryExhausted: countSessions(st, state.StatusRetryExhausted),
 		AvailableSlots: availableSlots(e.cfg, st),
 	}
+}
+
+func supervisorOpenPRNumbers(prs []github.PR) []int {
+	numbers := make([]int, 0, len(prs))
+	seen := make(map[int]struct{}, len(prs))
+	for _, pr := range prs {
+		if pr.Number <= 0 {
+			continue
+		}
+		if _, ok := seen[pr.Number]; ok {
+			continue
+		}
+		seen[pr.Number] = struct{}{}
+		numbers = append(numbers, pr.Number)
+	}
+	sort.Ints(numbers)
+	return numbers
 }
 
 type policyCandidateResult struct {
@@ -2330,9 +2400,6 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !e.canTreatIssueDoneForOutcome(st) {
-			return false, "issue is closed but outcome health is not verified", nil
-		}
 		return true, "issue is closed", nil
 	}
 
@@ -2974,28 +3041,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	// CI must be green. Production readers expose the current-head rollup so
 	// a real queued/in-progress check-run can never be confused with the
 	// legacy commit-status-only pending state handled by #425.
-	ciStatus := ""
-	pendingCheckRuns := false
-	rollupHeadSHA := ""
-	if rollupReader, ok := e.reader.(prCheckRollupReader); ok {
-		rollup, err := rollupReader.PRCheckRollup(pr.Number)
-		if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
-			return false, "", nil
-		}
-		rollupHeadSHA = strings.TrimSpace(rollup.HeadSHA)
-		ciStatus = rollup.Verdict
-		pendingCheckRuns = rollup.PendingCheckRuns
-	} else {
-		ciReader, ok := e.reader.(prCIStatusReader)
-		if !ok {
-			return false, "", nil
-		}
-		var err error
-		ciStatus, err = ciReader.PRCIStatus(pr.Number)
-		if err != nil {
-			return false, "", nil
-		}
+	rollupReader, ok := e.reader.(prCheckRollupReader)
+	if !ok {
+		// Aggregate CI alone cannot distinguish an active check-run from a
+		// stale legacy commit status. Without the current-head rollup, the
+		// merge-state override is unsafe, so fail closed.
+		return false, "", nil
 	}
+	rollup, err := rollupReader.PRCheckRollup(pr.Number)
+	if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
+		return false, "", nil
+	}
+	rollupHeadSHA := strings.TrimSpace(rollup.HeadSHA)
+	ciStatus := rollup.Verdict
+	pendingCheckRuns := rollup.PendingCheckRuns
 
 	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
 	// single-PR endpoint when reader supports it. Read it after the rollup so
@@ -3013,7 +3072,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
-		if pendingCheckRuns {
+		if pendingCheckRuns || !legacyStatusOnlyPending(rollup) {
 			return false, "", nil
 		}
 		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
@@ -3077,6 +3136,46 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
 	}
 	return true, rollupHeadSHA, reasons
+}
+
+// legacyStatusOnlyPending proves the narrow #425 exception: the aggregate
+// verdict is pending because at least one legacy commit status is pending,
+// while every observed check-run is complete and non-blocking. Any missing,
+// unfamiliar, or failed signal keeps the deterministic merge path closed.
+func legacyStatusOnlyPending(rollup github.PRCheckRollup) bool {
+	if !strings.EqualFold(strings.TrimSpace(rollup.Verdict), "pending") {
+		return false
+	}
+
+	pendingLegacyStatus := false
+	for _, signal := range rollup.Signals {
+		source := strings.ToLower(strings.TrimSpace(signal.Source))
+		status := strings.ToLower(strings.TrimSpace(signal.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(signal.Conclusion))
+
+		switch source {
+		case "check_run":
+			if status != "completed" {
+				return false
+			}
+			switch conclusion {
+			case "success", "neutral", "skipped":
+			default:
+				return false
+			}
+		case "commit_status":
+			switch status {
+			case "pending":
+				pendingLegacyStatus = true
+			case "success":
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return pendingLegacyStatus
 }
 
 // monitorOpenPRReasons returns a short list of human-readable reasons
@@ -4526,7 +4625,7 @@ func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
 			alreadyStopped := sess == nil || sess.PID <= 0 || !worker.IsAlive(sess.PID)
-			if err := worker.StopProcess(cfg, slot, sess); err != nil {
+			if err := worker.StopProcess(slot, sess); err != nil {
 				return err
 			}
 			now := time.Now().UTC()
