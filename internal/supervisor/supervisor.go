@@ -923,81 +923,86 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 
 	if len(eligible) > 0 {
-		issue := eligible[0]
-		if projectState.AvailableSlots <= 0 {
+		var openPRBlocker *github.Issue
+		for _, issue := range eligible {
+			if projectState.AvailableSlots <= 0 {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+				)
+				decision := e.decision(st, now, projectState, ActionWaitForCapacity,
+					fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
+					RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+				decision.StuckStates = stuckStates
+				return withAnalysis(decision), nil
+			}
+
+			hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+			if err != nil {
+				return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+			}
+			if hasOpenPR {
+				if openPRBlocker == nil {
+					copied := issue
+					openPRBlocker = &copied
+				}
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d already has an open PR — skip for spare-slot backlog fill", issue.Number),
+				)
+				continue
+			}
+
+			// Race protection: refuse to recommend a spawn for an issue that
+			// has already been closed since the listing snapshot (post-merge
+			// race) or whose session is already Done/code_landed.
+			if cache.isIssueClosed(issue.Number) {
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d closed between listing and dispatch — skip", issue.Number),
+				)
+				continue
+			}
+			if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d already reached Done in state — skip duplicate spawn", issue.Number),
+				)
+				continue
+			}
+
 			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+				issueLabelReason(e.requiredIssueLabels()),
+				fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
+				outcomeIssueReason(outcomeStatus, issue),
+				"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 			)
-			decision := e.decision(st, now, projectState, ActionWaitForCapacity,
-				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			if preflight, ok := e.evaluatePreflight(false, true); !ok {
+				stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+				blockedReasons := appendReasons(reasons,
+					"Preflight gate failed; refusing to recommend a worker spawn",
+					"Preflight: "+preflight.Reason,
+				)
+				decision := e.decision(st, now, projectState, ActionPreflightFailed,
+					fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+					RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, blockedReasons)
+				decision.StuckStates = stuckStates
+				return withAnalysis(decision), nil
+			}
+			decision := e.decision(st, now, projectState, ActionSpawnWorker,
+				fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
+				RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
 			return withAnalysis(decision), nil
 		}
-
-		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
-		if err != nil {
-			return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
-		}
-		if hasOpenPR {
+		if openPRBlocker != nil {
 			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", issue.Number),
+				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", openPRBlocker.Number),
+				"No later eligible issue was dispatchable without duplicating open-PR work",
 				"Supervisor mode should not dispatch duplicate work",
 			)
 			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", openPRBlocker.Number),
+				RiskSafe, 0.87, &state.SupervisorTarget{Issue: openPRBlocker.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
 			return withAnalysis(decision), nil
 		}
-
-		// Race protection: refuse to recommend a spawn for an issue that
-		// has already been closed since the listing snapshot (post-merge
-		// race) or whose session is already Done/code_landed.
-		if cache.isIssueClosed(issue.Number) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
-			)
-			decision := e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
-				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-		if e.sessionRecentlyDoneForIssue(st, issue.Number) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
-			)
-			decision := e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
-				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-
-		reasons := appendReasons(baseReasons,
-			issueLabelReason(e.requiredIssueLabels()),
-			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
-			outcomeIssueReason(outcomeStatus, issue),
-			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
-		)
-		if preflight, ok := e.evaluatePreflight(false, true); !ok {
-			stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
-			blockedReasons := appendReasons(reasons,
-				"Preflight gate failed; refusing to recommend a worker spawn",
-				"Preflight: "+preflight.Reason,
-			)
-			decision := e.decision(st, now, projectState, ActionPreflightFailed,
-				fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
-				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, blockedReasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-		decision := e.decision(st, now, projectState, ActionSpawnWorker,
-			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-		decision.StuckStates = stuckStates
-		return withAnalysis(decision), nil
 	}
 
 	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
@@ -1308,115 +1313,141 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		return withAnalysis(decision), nil
 	}
 
-	issue := candidates[0]
-	if projectState.AvailableSlots <= 0 {
+	// Walk candidates until one is dispatchable. A leading candidate that
+	// already has an open PR must NOT freeze the whole project when later
+	// candidates (and AvailableSlots) remain — that was the live ok-player
+	// failure mode (eligible=5, action=monitor_open_pr on #406, live→0).
+	var openPRBlocker *github.Issue
+	for _, issue := range candidates {
+		if projectState.AvailableSlots <= 0 {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+			)
+			decision := e.decision(st, now, projectState, ActionWaitForCapacity,
+				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
+				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			return withAnalysis(decision), nil
+		}
+
+		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+		if err != nil {
+			return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+		}
+		if hasOpenPR {
+			if openPRBlocker == nil {
+				copied := issue
+				openPRBlocker = &copied
+			}
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d already has an open PR — skip for spare-slot backlog fill", issue.Number),
+			)
+			continue
+		}
+
+		if analysis != nil {
+			analysis.SelectedCandidate = supervisorIssueCandidate(issue)
+		}
+
+		queueCandidate := e.dynamicQueueActionCandidate(st, issue, issues)
+		if queueCandidate != nil {
+			mutations := queueCandidate.plannedMutations(e.cfg)
+			reasons := appendReasons(baseReasons,
+				queueLabelReason(queueCandidate.readyLabel, ""),
+				fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+				outcomeIssueReason(outcomeStatus, issue),
+			)
+			risk := RiskMutating
+			if len(mutations) > 0 {
+				risk = RiskSafe
+				reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
+			}
+			decision := e.decision(st, now, projectState, ActionLabelIssueReady,
+				fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
+				risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			decision.Mutations = mutations
+			return withAnalysis(decision), nil
+		}
+
+		if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+				"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
+			)
+			for _, reason := range firstN(result.skipped, 3) {
+				reasons = append(reasons, reason)
+			}
+			decision := e.decision(st, now, projectState, ActionNone,
+				"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			return withAnalysis(decision), nil
+		}
+
+		// Race protection: refuse to recommend spawn for an issue that has
+		// already been closed since the issue listing snapshot was taken
+		// (post-merge close race). Cache hits are cheap because the broader
+		// supervisor cycle reuses the same resolutionCache.
+		if cache != nil && cache.isIssueClosed(issue.Number) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d closed between listing and dispatch — skip", issue.Number),
+			)
+			continue
+		}
+		if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d already has a Done/code-landed session — skip duplicate spawn", issue.Number),
+			)
+			continue
+		}
+
 		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+			outcomeIssueReason(outcomeStatus, issue),
+			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
-		decision := e.decision(st, now, projectState, ActionWaitForCapacity,
-			fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-			RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		if preflight, ok := e.evaluatePreflight(false, true); !ok {
+			stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+			blockedReasons := appendReasons(reasons,
+				"Preflight gate failed; refusing to recommend a worker spawn",
+				"Preflight: "+preflight.Reason,
+			)
+			decision := e.decision(st, now, projectState, ActionPreflightFailed,
+				fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, blockedReasons)
+			return withAnalysis(decision), nil
+		}
+		decision := e.decision(st, now, projectState, ActionSpawnWorker,
+			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
+			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
 
-	hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
-	if err != nil {
-		return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
-	}
-	if hasOpenPR {
+	if openPRBlocker != nil {
+		if deferredOpenPR != nil {
+			return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR)), nil
+		}
 		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
+			fmt.Sprintf("Dynamic wave selected issue #%d", openPRBlocker.Number),
+			fmt.Sprintf("Issue #%d already has an open PR", openPRBlocker.Number),
+			"No later dynamic-wave candidate was dispatchable without duplicating open-PR work",
 			"Supervisor mode should not dispatch duplicate work",
 		)
 		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-			RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", openPRBlocker.Number),
+			RiskSafe, 0.87, &state.SupervisorTarget{Issue: openPRBlocker.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
-
-	queueCandidate := e.dynamicQueueActionCandidate(st, issue, issues)
-	if queueCandidate != nil {
-		mutations := queueCandidate.plannedMutations(e.cfg)
-		reasons := appendReasons(baseReasons,
-			queueLabelReason(queueCandidate.readyLabel, ""),
-			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
-			outcomeIssueReason(outcomeStatus, issue),
-		)
-		risk := RiskMutating
-		if len(mutations) > 0 {
-			risk = RiskSafe
-			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
-		}
-		decision := e.decision(st, now, projectState, ActionLabelIssueReady,
-			fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
-			risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		decision.Mutations = mutations
-		return withAnalysis(decision), nil
+	if deferredOpenPR != nil {
+		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR)), nil
 	}
-
-	if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
-		if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
-			return withAnalysis(decision), nil
-		}
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
-		)
-		for _, reason := range firstN(result.skipped, 3) {
-			reasons = append(reasons, reason)
-		}
+	if deferredBudgetSess != nil {
 		decision := e.decision(st, now, projectState, ActionNone,
-			"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
+			RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, baseReasons)
+		decision.StuckStates = stuckStates
 		return withAnalysis(decision), nil
 	}
-
-	// Race protection: refuse to recommend spawn for an issue that has
-	// already been closed since the issue listing snapshot was taken
-	// (post-merge close race). Cache hits are cheap because the broader
-	// supervisor cycle reuses the same resolutionCache.
-	if cache != nil && cache.isIssueClosed(issue.Number) {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
-		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		return withAnalysis(decision), nil
-	}
-	if e.sessionRecentlyDoneForIssue(st, issue.Number) {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
-		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		return withAnalysis(decision), nil
-	}
-
-	reasons := appendReasons(baseReasons,
-		issueLabelReason(e.requiredIssueLabels()),
-		fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
-		outcomeIssueReason(outcomeStatus, issue),
-		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
-	)
-	if preflight, ok := e.evaluatePreflight(false, true); !ok {
-		stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
-		blockedReasons := appendReasons(reasons,
-			"Preflight gate failed; refusing to recommend a worker spawn",
-			"Preflight: "+preflight.Reason,
-		)
-		decision := e.decision(st, now, projectState, ActionPreflightFailed,
-			fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
-			RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, blockedReasons)
-		return withAnalysis(decision), nil
-	}
-	decision := e.decision(st, now, projectState, ActionSpawnWorker,
-		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+	decision := e.decision(st, now, projectState, ActionNone,
+		"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, baseReasons)
 	return withAnalysis(decision), nil
 }
 

@@ -107,3 +107,34 @@ func TestDecide_BlockedOpenPRDoesNotStarveSpareSlotBacklog(t *testing.T) {
 		t.Fatalf("target = %#v, want issue #546", decision.Target)
 	}
 }
+
+func TestDecide_DynamicWaveSkipsOpenPRCandidateAndSpawnsNext(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 6
+	cfg.MaxLiveWorkers = 6
+	cfg.IssueLabels = []string{"ok-player-ready"}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{
+		issues: []github.Issue{
+			testIssue(406, "flatpak continuation", "ok-player-ready"),
+			testIssue(513, "healthcheck streak", "ok-player-ready"),
+		},
+		openPRIssues: map[int]bool{406: true},
+	}
+	st := state.NewState()
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want spawn_worker (skip open-PR head candidate)", decision.RecommendedAction)
+	}
+	if decision.Target == nil || decision.Target.Issue != 513 {
+		t.Fatalf("target = %#v, want issue #513", decision.Target)
+	}
+	reasons := strings.Join(decision.Reasons, "\n")
+	if !strings.Contains(reasons, "already has an open PR — skip") {
+		t.Fatalf("reasons = %q, want open-PR skip rationale", reasons)
+	}
+}
