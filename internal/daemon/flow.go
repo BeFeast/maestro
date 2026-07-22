@@ -48,6 +48,9 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	cfg := proj.Cfg()
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+		if d.spawnLimiter != nil {
+			d.spawnLimiter.RegisterStateDir(cfg.StateDir)
+		}
 	}
 	fctx, cancel := context.WithCancel(parent)
 	flow := &projectFlow{
@@ -171,11 +174,16 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		// its own — e.g. a panic that recoverFlow cancelled — does not linger in
 		// the registry reporting as live. Guarded against a restart that reused
 		// the same key (stopFlow may have already removed and replaced it).
+		removed := false
 		d.mu.Lock()
 		if d.flows[flow.key] == flow {
 			delete(d.flows, flow.key)
+			removed = true
 		}
 		d.mu.Unlock()
+		if removed && d.spawnLimiter != nil && flow.cfg != nil {
+			d.spawnLimiter.UnregisterStateDir(flow.cfg.StateDir)
+		}
 	}()
 
 	return flow
@@ -196,6 +204,9 @@ func (d *Daemon) stopFlow(key string) {
 	}
 	flow.cancel()
 	<-flow.done
+	if d.spawnLimiter != nil && flow.cfg != nil {
+		d.spawnLimiter.UnregisterStateDir(flow.cfg.StateDir)
+	}
 	log.Printf("[daemon] stopped flow %q", flow.name)
 }
 
@@ -427,6 +438,10 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// within one poll interval. nil emergency store (open failed / test loader)
 	// leaves the closure reading a permanently-normal cache, i.e. inert.
 	orch.SetEmergencyHalt(d.emergencySpawnHalt)
+	orch.SetFleetSpawnCeiling(d.fleetSpawnCeilingReached)
+	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
+		return d.reserveFleetSpawn(orchCfg.StateDir)
+	})
 	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
 	// from the shared mirror when github_mirror.source is mirror-first, falling
 	// back to the API on a miss/stale. The closure reads &orchCfg — the live,

@@ -799,22 +799,6 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 	}
 
-	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
-		reasons := appendReasons(baseReasons,
-			stuck.Summary,
-			fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
-			"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
-		)
-		decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
-			"Verify outcome health before starting more issue work.",
-			RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		if st.OutcomeHealth != nil && st.OutcomeHealth.State == outcome.HealthFailing {
-			decision.QueueAnalysis = e.dispatchBlockerQueueAnalysis(st)
-		}
-		return decision, nil
-	}
-
 	issues, err := e.reader.ListOpenIssues(nil)
 	if err != nil {
 		return state.SupervisorDecision{}, fmt.Errorf("list open issues: %w", err)
@@ -1014,6 +998,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 	}
 
+	if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
+		return withAnalysis(decision), nil
+	}
+
 	reasons := appendReasons(baseReasons,
 		fmt.Sprintf("Checked %d open issue(s)", len(issues)),
 		"No worker is running, no PR needs attention, and no eligible issue is ready",
@@ -1108,6 +1096,9 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	}
 
 	if len(candidates) == 0 {
+		if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
+			return withAnalysis(decision), nil
+		}
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Dynamic wave checked %d open issue(s)", len(issues)),
 			fmt.Sprintf("Dynamic wave found %d eligible candidate(s), %d excluded issue(s), %d held/meta issue(s), %d blocked-by-dependency issue(s), and %d issue(s) in non-runnable project status", analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.HeldIssues, analysis.BlockedByDependencyIssues, analysis.NonRunnableProjectStatusCount),
@@ -1219,6 +1210,9 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	}
 
 	if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+		if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
+			return withAnalysis(decision), nil
+		}
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
 			"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
@@ -1277,6 +1271,29 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
 		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 	return withAnalysis(decision), nil
+}
+
+// noBacklogOutcomeDecision preserves the runtime-health recommendation only
+// after queue handling has had a chance to label or dispatch actionable work.
+// Previously this check ran before ListOpenIssues, so a failing/unknown outcome
+// plus zero active sessions starved both add_ready_label and spawn_worker and
+// could leave the whole fleet at zero workers until an operator intervened.
+func (e *Engine) noBacklogOutcomeDecision(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, stuckStates []state.SupervisorStuckState) (state.SupervisorDecision, bool) {
+	stuck := noOutcomeProgressStuckState(stuckStates)
+	if stuck == nil || len(st.ActiveSessions()) != 0 {
+		return state.SupervisorDecision{}, false
+	}
+	reasons := appendReasons(baseReasons,
+		stuck.Summary,
+		fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
+		"No actionable backlog remains after queue policy evaluation",
+		"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
+	)
+	decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
+		"Verify outcome health before starting more issue work.",
+		RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
+	decision.StuckStates = stuckStates
+	return decision, true
 }
 
 func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
@@ -2215,62 +2232,6 @@ func (e *Engine) policyCandidateIssues(st *state.State, issues []github.Issue) (
 		return e.dynamicWaveCandidateIssues(st, issues, skipped)
 	}
 	return policyCandidateResult{skipped: skipped, policyRule: PolicyRuleOrderedQueue}, nil
-}
-
-// dispatchBlockerQueueAnalysis keeps the per-issue decision plane populated
-// when the supervisor returns early for a top-level failing outcome gate. It is
-// best-effort: the red outcome finding remains more important than a transient
-// issue-list/guard read failure, so the last queue analysis is retained when a
-// fresh snapshot cannot be built.
-func (e *Engine) dispatchBlockerQueueAnalysis(st *state.State) *state.SupervisorQueueAnalysis {
-	previous := func() *state.SupervisorQueueAnalysis {
-		if st == nil {
-			return nil
-		}
-		if latest := st.LatestSupervisorDecision(); latest != nil {
-			return cloneSupervisorQueueAnalysis(latest.QueueAnalysis)
-		}
-		return nil
-	}
-	issues, err := e.reader.ListOpenIssues(nil)
-	if err != nil {
-		log.Printf("[supervisor] dispatch blocker queue snapshot: list open issues: %v", err)
-		return previous()
-	}
-	result, err := e.policyCandidateIssues(st, issues)
-	if err != nil {
-		log.Printf("[supervisor] dispatch blocker queue snapshot: classify candidates: %v", err)
-		return previous()
-	}
-	if result.dynamicWave && result.analysis != nil {
-		return cloneSupervisorQueueAnalysis(result.analysis)
-	}
-	eligible, skipped, err := e.eligibleIssues(st, result.candidates, true)
-	if err != nil {
-		log.Printf("[supervisor] dispatch blocker queue snapshot: evaluate guards: %v", err)
-		return previous()
-	}
-	skipped = append(result.skipped, skipped...)
-	return supervisorQueueAnalysis(result.policyRule, len(issues), eligible, skipped)
-}
-
-func cloneSupervisorQueueAnalysis(src *state.SupervisorQueueAnalysis) *state.SupervisorQueueAnalysis {
-	if src == nil {
-		return nil
-	}
-	cp := *src
-	if src.SelectedCandidate != nil {
-		selected := *src.SelectedCandidate
-		selected.Labels = append([]string(nil), src.SelectedCandidate.Labels...)
-		cp.SelectedCandidate = &selected
-	}
-	cp.SkippedReasons = append([]string(nil), src.SkippedReasons...)
-	cp.EligibleRanked = append([]state.SupervisorIssueCandidate(nil), src.EligibleRanked...)
-	for i := range cp.EligibleRanked {
-		cp.EligibleRanked[i].Labels = append([]string(nil), src.EligibleRanked[i].Labels...)
-	}
-	cp.SkippedCandidates = append([]state.SupervisorSkippedCandidate(nil), src.SkippedCandidates...)
-	return &cp
 }
 
 func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Issue, prefixSkipped []string) (policyCandidateResult, error) {

@@ -51,12 +51,26 @@ func (s *Store) FleetSettings(ctx context.Context) (map[string]string, error) {
 	return out, rows.Err()
 }
 
+// FleetConcurrencySettings resolves the daemon-only live-worker band from the
+// fleet settings table, applying built-in defaults to missing keys.
+func (s *Store) FleetConcurrencySettings(ctx context.Context) (config.FleetConcurrencySettings, error) {
+	settings, err := s.FleetSettings(ctx)
+	if err != nil {
+		return config.FleetConcurrencySettings{}, err
+	}
+	return config.ResolveFleetConcurrencySettings(settings)
+}
+
 // SetFleetSetting writes (or replaces) a fleet-level default for key and
 // journals the change. key must be a known fleet setting and value must match
 // its kind (config.NormalizeSettingValue). actor is the RFC3339-journaled
 // identity of who made the change. The settings row and its audit entry are
 // written in one transaction.
 func (s *Store) SetFleetSetting(ctx context.Context, key, value, actor string) error {
+	spec, ok := config.FleetSettingSpecByKey(key)
+	if !ok {
+		return fmt.Errorf("unknown setting %q", key)
+	}
 	norm, err := config.NormalizeSettingValue(key, value)
 	if err != nil {
 		return err
@@ -70,6 +84,11 @@ func (s *Store) SetFleetSetting(ctx context.Context, key, value, actor string) e
 	old, _, err := fleetSettingTx(ctx, tx, key)
 	if err != nil {
 		return err
+	}
+	if spec.FleetOnly {
+		if err := validateFleetConcurrencyBandTx(ctx, tx, key, &norm); err != nil {
+			return err
+		}
 	}
 	changedAt, err := writeSettingsAuditTx(ctx, tx, key, scopeFleet, old, norm, actor)
 	if err != nil {
@@ -90,7 +109,8 @@ ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.upd
 // no-op — no row and no audit entry — so it does not spuriously advance the
 // fingerprint.
 func (s *Store) DeleteFleetSetting(ctx context.Context, key, actor string) error {
-	if _, ok := config.FleetSettingSpecByKey(key); !ok {
+	spec, ok := config.FleetSettingSpecByKey(key)
+	if !ok {
 		return fmt.Errorf("unknown setting %q", key)
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
@@ -105,6 +125,11 @@ func (s *Store) DeleteFleetSetting(ctx context.Context, key, actor string) error
 	}
 	if !present {
 		return tx.Commit()
+	}
+	if spec.FleetOnly {
+		if err := validateFleetConcurrencyBandTx(ctx, tx, key, nil); err != nil {
+			return err
+		}
 	}
 	if _, err := writeSettingsAuditTx(ctx, tx, key, scopeFleet, old, "", actor); err != nil {
 		return err
@@ -124,6 +149,9 @@ func (s *Store) SetProjectSetting(ctx context.Context, project, key, value, acto
 	spec, ok := config.FleetSettingSpecByKey(key)
 	if !ok {
 		return fmt.Errorf("unknown setting %q", key)
+	}
+	if spec.FleetOnly {
+		return fmt.Errorf("setting %q is fleet-only; omit --project", key)
 	}
 	norm, err := config.NormalizeSettingValue(key, value)
 	if err != nil {
@@ -166,6 +194,9 @@ func (s *Store) DeleteProjectSetting(ctx context.Context, project, key, actor st
 	spec, ok := config.FleetSettingSpecByKey(key)
 	if !ok {
 		return fmt.Errorf("unknown setting %q", key)
+	}
+	if spec.FleetOnly {
+		return fmt.Errorf("setting %q is fleet-only; omit --project", key)
 	}
 	exported, err := s.ExportProject(ctx, project)
 	if err != nil {
@@ -286,6 +317,26 @@ func fleetSettingTx(ctx context.Context, tx *sql.Tx, key string) (value string, 
 	return value, true, nil
 }
 
+func validateFleetConcurrencyBandTx(ctx context.Context, tx *sql.Tx, changedKey string, changedValue *string) error {
+	settings := make(map[string]string, 2)
+	for _, key := range []string{config.FleetMinLiveWorkersKey, config.FleetMaxLiveWorkersKey} {
+		value, present, err := fleetSettingTx(ctx, tx, key)
+		if err != nil {
+			return err
+		}
+		if present {
+			settings[key] = value
+		}
+	}
+	if changedValue == nil {
+		delete(settings, changedKey)
+	} else {
+		settings[changedKey] = *changedValue
+	}
+	_, err := config.ResolveFleetConcurrencySettings(settings)
+	return err
+}
+
 // applyFleetDefaults folds the fleet-level defaults into a project's YAML and
 // returns the merged document plus the per-key source map. Precedence per key:
 // a value already present in the project YAML wins (source "project"); else a
@@ -300,6 +351,14 @@ func applyFleetDefaults(projectYAML []byte, fleet map[string]string) ([]byte, ma
 	sources := make(map[string]string, len(config.FleetSettingSpecs()))
 	changed := false
 	for _, spec := range config.FleetSettingSpecs() {
+		if spec.FleetOnly {
+			if _, ok := fleet[spec.Key]; ok {
+				sources[spec.Key] = config.SettingSourceFleet
+			} else {
+				sources[spec.Key] = config.SettingSourceBuiltin
+			}
+			continue
+		}
 		if nodeAtPath(&root, spec.YAMLPath) != nil {
 			sources[spec.Key] = config.SettingSourceProject
 			continue
@@ -530,9 +589,9 @@ func importFleetSettingsTx(ctx context.Context, tx *sql.Tx, data []byte, actor s
 INSERT INTO settings(key, value, updated_at)
 VALUES(?, ?, ?)
 ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
-`, key, norm, changedAt); err != nil {
+		`, key, norm, changedAt); err != nil {
 			return err
 		}
 	}
-	return nil
+	return validateFleetConcurrencyBandTx(ctx, tx, "", nil)
 }

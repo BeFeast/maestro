@@ -155,6 +155,13 @@ type Orchestrator struct {
 	// restart. In-flight workers are unaffected — this gate only refuses NEW work.
 	emergencyHaltFn func() bool
 
+	// fleetSpawnCeilingFn is the daemon-wide fast gate checked before issue
+	// listing. fleetSpawnReserveFn is the atomic per-worker backstop: concurrent
+	// project flows and one flow's batch dispatch must each reserve one shared
+	// slot before a worker process starts.
+	fleetSpawnCeilingFn func() bool
+	fleetSpawnReserveFn func() (commit func(slot string), release func(), ok bool)
+
 	// Restart-required signal. Some config fields (currently routing.*) cannot be
 	// hot-applied because their runtime components are built once at startup. When
 	// such a field changes during a config reload we do not apply it; instead we raise this
@@ -267,6 +274,56 @@ func (o *Orchestrator) SetReadSource(src githubReadSource) {
 // claims no new issues and spawns no new workers. Passing nil clears the gate.
 func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
 	o.emergencyHaltFn = fn
+}
+
+// SetFleetSpawnCeiling wires the daemon-wide pre-list spawn ceiling. Passing
+// nil disables the gate for legacy single-project callers and tests.
+func (o *Orchestrator) SetFleetSpawnCeiling(fn func() bool) {
+	o.fleetSpawnCeilingFn = fn
+}
+
+// SetFleetSpawnReserve wires the daemon's atomic one-worker reservation. The
+// returned commit callback receives the started slot; release is used whenever
+// dispatch aborts before a worker starts.
+func (o *Orchestrator) SetFleetSpawnReserve(fn func() (commit func(slot string), release func(), ok bool)) {
+	o.fleetSpawnReserveFn = fn
+}
+
+type fleetSpawnPermit struct {
+	commitFn  func(string)
+	releaseFn func()
+	done      bool
+}
+
+func (o *Orchestrator) reserveFleetSpawn() (*fleetSpawnPermit, bool) {
+	if o.fleetSpawnReserveFn == nil {
+		return &fleetSpawnPermit{}, true
+	}
+	commit, release, ok := o.fleetSpawnReserveFn()
+	if !ok {
+		return nil, false
+	}
+	return &fleetSpawnPermit{commitFn: commit, releaseFn: release}, true
+}
+
+func (p *fleetSpawnPermit) Commit(slot string) {
+	if p == nil || p.done {
+		return
+	}
+	p.done = true
+	if p.commitFn != nil {
+		p.commitFn(slot)
+	}
+}
+
+func (p *fleetSpawnPermit) Release() {
+	if p == nil || p.done {
+		return
+	}
+	p.done = true
+	if p.releaseFn != nil {
+		p.releaseFn()
+	}
 }
 
 // SetApprovalStore configures which approval store the orchestrator's standing
@@ -2631,6 +2688,14 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// The current issue read is authoritative: a previously persisted hold
 		// has cleared, so this exact canonical retry may proceed in place.
 		sess.RetryHoldReason = ""
+		permit, permitOK := o.reserveFleetSpawn()
+		if !permitOK {
+			retryAt := time.Now().UTC().Add(time.Minute)
+			sess.NextRetryAt = &retryAt
+			log.Printf("[orch] worker %s retry deferred until %s: fleet live-worker ceiling reached",
+				slotName, retryAt.Format(time.RFC3339))
+			return
+		}
 
 		promptBase := o.selectPrompt(issue)
 
@@ -2690,6 +2755,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 						retryAt = earliest.UTC()
 					}
 					sess.NextRetryAt = &retryAt
+					permit.Release()
 					log.Printf("[orch] worker %s retry deferred until %s: backend %s blocked (%s) and no healthy fallback is available",
 						slotName, retryAt.Format(time.RFC3339), respawnBackend, blockedBy)
 					continue
@@ -2745,6 +2811,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 
 		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
+			permit.Release()
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
 			sess.Status = state.StatusFailed
 			now := time.Now().UTC()
@@ -2754,6 +2821,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 				slotName, sess.IssueNumber, sess.IssueTitle, respawnErr)
 			continue
 		}
+		permit.Commit(slotName)
 
 		o.notifier.Sendf("🔄 maestro: retrying worker %s for issue #%d: %s (attempt %d)",
 			slotName, sess.IssueNumber, sess.IssueTitle, sess.RetryCount)
@@ -9728,6 +9796,10 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] EMERGENCY STOP active: not spawning new workers (running=%d)", s.RunningSessionCount())
 		return
 	}
+	if o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
+		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
+		return
+	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`
@@ -9912,14 +9984,22 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			log.Printf("[orch] allowing repair worker for issue #%d despite open PR because supervisor selected spawn_repair_worker", issue.Number)
 		}
+		permit, permitOK := o.reserveFleetSpawn()
+		if !permitOK {
+			log.Printf("[orch] fleet live-worker ceiling reached before routing issue #%d", issue.Number)
+			return
+		}
 
 		// A classic repair is a same-session maintenance operation, not a fresh
 		// issue dispatch. Resolve and revalidate the durable reservation before
 		// any backend routing or slot allocation can create a second worktree.
 		if repairDispatch := o.resolveSpawnRepairDispatch(s, issue.Number); repairDispatch != nil {
 			if o.dispatchSpawnRepairWorker(s, issue, repairDispatch) {
+				permit.Commit(repairDispatch.target.Session)
 				markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 				started++
+			} else {
+				permit.Release()
 			}
 			continue
 		}
@@ -9948,6 +10028,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		reviewRepair, repairTarget, reviewRepairApprovalID := o.resolveReviewRepairDispatch(s, issue.Number)
 		if reviewRepair != nil && repairTarget != nil {
 			if !o.tryClaimReviewRepairSlot(s, repairTarget, reviewRepair) {
+				permit.Release()
 				continue
 			}
 			backendName = reviewRepair.Backend
@@ -9976,6 +10057,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			// auth failure / provider limit (#695).
 			decision, dispatchable, retryAt := o.resolveDispatchBackend(s, issue, time.Now().UTC())
 			if !dispatchable {
+				permit.Release()
 				if !dispatchPauseLogged {
 					expiry := "no cooldown expiry recorded"
 					if retryAt != nil {
@@ -10035,10 +10117,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			claimedAt := time.Now().UTC()
 			claim, acquired, claimErr := o.claimFreshDispatch(s, issue, claimedAt)
 			if claimErr != nil {
+				permit.Release()
 				log.Printf("[orch] claim fresh dispatch for issue #%d: %v", issue.Number, claimErr)
 				continue
 			}
 			if !acquired {
+				permit.Release()
 				if claim != nil && claim.Slot != "" {
 					log.Printf("[orch] skipping duplicate fresh dispatch for issue #%d: canonical startup lease is %s (generation=%d)", issue.Number, claim.Slot, claim.LeaseGeneration)
 				}
@@ -10055,6 +10139,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		}
 		if err != nil {
+			permit.Release()
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
 				issue.Number, issue.Title, err)
@@ -10067,6 +10152,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			}
 			continue
 		}
+		permit.Commit(slotName)
 		markSupervisorWorkerRecommendationMaterialized(s, issue.Number, time.Now().UTC())
 
 		if longRunning {

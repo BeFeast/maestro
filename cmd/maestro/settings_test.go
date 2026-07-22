@@ -2,7 +2,10 @@ package main
 
 import (
 	"reflect"
+	"strings"
 	"testing"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 func TestSplitSettingsArgs(t *testing.T) {
@@ -61,5 +64,17 @@ func TestSettingsActor(t *testing.T) {
 	t.Setenv("USER", "")
 	if got := settingsActor(""); got != "cli:unknown" {
 		t.Errorf("empty-user actor = %q, want cli:unknown", got)
+	}
+}
+
+func TestRejectFleetOnlyProjectSetting(t *testing.T) {
+	if err := rejectFleetOnlyProjectSetting(config.FleetMaxLiveWorkersKey, "project-a"); err == nil || !strings.Contains(err.Error(), "fleet-only") {
+		t.Fatalf("error = %v, want fleet-only rejection", err)
+	}
+	if err := rejectFleetOnlyProjectSetting(config.FleetMaxLiveWorkersKey, ""); err != nil {
+		t.Fatalf("fleet scope rejected: %v", err)
+	}
+	if err := rejectFleetOnlyProjectSetting("worker_max_tokens", "project-a"); err != nil {
+		t.Fatalf("project setting rejected: %v", err)
 	}
 }

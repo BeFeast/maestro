@@ -349,6 +349,46 @@ func TestSettingValidation(t *testing.T) {
 	}
 }
 
+func TestFleetConcurrencySettingsStoredAtFleetScopeOnly(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seedProject(t, store, "p")
+
+	if err := store.SetFleetSetting(ctx, config.FleetMaxLiveWorkersKey, "10", "tester"); err != nil {
+		t.Fatalf("SetFleetSetting: %v", err)
+	}
+	if err := store.SetFleetSetting(ctx, config.FleetMaxLiveWorkersKey, "4", "tester"); err == nil {
+		t.Fatal("expected fleet max below the default min to be rejected")
+	}
+	settings, err := store.FleetConcurrencySettings(ctx)
+	if err != nil {
+		t.Fatalf("FleetConcurrencySettings: %v", err)
+	}
+	if settings.MinLiveWorkers != config.DefaultFleetMinLiveWorkers || settings.MaxLiveWorkers != 10 {
+		t.Fatalf("settings = %+v", settings)
+	}
+	if err := store.SetProjectSetting(ctx, "p", config.FleetMaxLiveWorkersKey, "7", "tester"); err == nil || !strings.Contains(err.Error(), "fleet-only") {
+		t.Fatalf("SetProjectSetting error = %v, want fleet-only rejection", err)
+	}
+	if err := store.DeleteProjectSetting(ctx, "p", config.FleetMaxLiveWorkersKey, "tester"); err == nil || !strings.Contains(err.Error(), "fleet-only") {
+		t.Fatalf("DeleteProjectSetting error = %v, want fleet-only rejection", err)
+	}
+
+	cfg, err := store.Load(ctx, "p")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if _, ok := cfg.SettingsSources[config.FleetMaxLiveWorkersKey]; !ok {
+		t.Fatalf("settings sources = %#v, want fleet-only provenance", cfg.SettingsSources)
+	}
+	if got := cfg.FleetOnlySettings[config.FleetMaxLiveWorkersKey]; got != "10" {
+		t.Fatalf("fleet-only max = %q, want 10", got)
+	}
+	if got := cfg.FleetOnlySettings[config.FleetMinLiveWorkersKey]; got != "5" {
+		t.Fatalf("fleet-only min = %q, want builtin 5", got)
+	}
+}
+
 // config-store export writes the fleet settings file; a fresh store re-imports it.
 func TestExportImportRoundTripsFleetSettings(t *testing.T) {
 	ctx := context.Background()
