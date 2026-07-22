@@ -83,6 +83,20 @@ func TestBeginSessionAttemptClearsScheduledRetryMarker(t *testing.T) {
 	}
 }
 
+func TestBeginSessionAttemptConsumesOperatorRestartHandoff(t *testing.T) {
+	cfg := attribCfgWithBackends()
+	sess := &state.Session{
+		Status:      state.StatusDead,
+		RetryReason: state.RetryReasonOperatorRestart,
+	}
+
+	beginSessionAttempt(cfg, sess, "claude", "in_place_respawn", "operator_restart", time.Now().UTC())
+
+	if sess.RetryReason != "" {
+		t.Fatalf("operator restart handoff = %q, want cleared on the live attempt", sess.RetryReason)
+	}
+}
+
 func TestRecordBackendAttribution_SecondCall_ClosesPreviousAndAppends(t *testing.T) {
 	cfg := attribCfgWithBackends()
 	sess := &state.Session{}

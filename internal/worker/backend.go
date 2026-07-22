@@ -724,7 +724,7 @@ func maestroExecutablePath() (string, bool) {
 // when its live budget needs the side channel. When the maestro binary cannot
 // be resolved this degrades to nil (plain tee). The resolved kind is passed to
 // the splitter so it renders the right human-readable form into slot.log.
-func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
+func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string, workerGeneration uint64) *streamSplit {
 	kind := resolveBackendKind(backendName, cfg)
 	if kind == config.BackendKindKimi {
 		if !kimiUsesStreamJSON(cfg) {
@@ -746,6 +746,7 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 		JSONLPath:  JSONLPathForLog(logFile),
 		MaxTokens:  cfg.TokenBudget,
 		MarkerPath: TokenBudgetMarkerPathForLog(logFile),
+		Generation: workerGeneration,
 	}
 }
 

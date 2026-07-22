@@ -1452,6 +1452,7 @@ func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			state.PrepareWorkerForOperatorRestart(sess)
 			// worker.Stop deleted the worktree; drop the stale pointers so
 			// respawnDueRetries fresh-respawns instead of RespawnInPlace
 			// against a directory that no longer exists (#874).

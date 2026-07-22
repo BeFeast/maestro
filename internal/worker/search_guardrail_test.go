@@ -782,10 +782,17 @@ func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
 		"/tmp/state/search-guardrails",
 		"",
 		"/usr/local/bin/maestro",
-		&streamSplit{MaestroBin: "/usr/local/bin/maestro", Backend: "claude", JSONLPath: "/tmp/worker.jsonl"},
+		&streamSplit{
+			MaestroBin: "/usr/local/bin/maestro",
+			Backend:    "claude",
+			JSONLPath:  "/tmp/worker.jsonl",
+			MaxTokens:  80_000,
+			MarkerPath: "/tmp/worker.token-budget.json",
+			Generation: 7,
+		},
 	)
 
-	want := "2>&1 | /usr/local/bin/maestro stream-split --backend claude --jsonl /tmp/worker.jsonl | tee -a '/tmp/worker.log'"
+	want := "2>&1 | /usr/local/bin/maestro stream-split --backend claude --jsonl /tmp/worker.jsonl --max-tokens 80000 --budget-marker '/tmp/worker.token-budget.json' --worker-generation 7 | tee -a '/tmp/worker.log'"
 	if !strings.Contains(script, want) {
 		t.Fatalf("runner script missing stream-split pipeline %q\nscript:\n%s", want, script)
 	}

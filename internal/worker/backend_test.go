@@ -101,15 +101,18 @@ func TestBuildWorkerCmd_KimiCmdBasenameAndPinnedOutput(t *testing.T) {
 	if strings.Contains(joined, "stream-json") {
 		t.Fatalf("operator-pinned output format must win: %v", cmd.Args)
 	}
-	if split := streamSplitForBackend("custom", cfg, "/tmp/slot.log"); split != nil {
+	if split := streamSplitForBackend("custom", cfg, "/tmp/slot.log", 3); split != nil {
 		t.Fatalf("text-mode Kimi must not install stream-split: %+v", split)
 	}
 }
 
 func TestStreamSplitForBackend_KimiDefaultsStructured(t *testing.T) {
-	split := streamSplitForBackend("kimi", BackendConfig{Cmd: "kimi"}, "/tmp/slot.log")
+	split := streamSplitForBackend("kimi", BackendConfig{Cmd: "kimi"}, "/tmp/slot.log", 3)
 	if split == nil {
 		t.Fatal("first-class Kimi backend should install stream-split by default")
+	}
+	if split.Generation != 3 {
+		t.Fatalf("worker generation = %d, want 3", split.Generation)
 	}
 	if split.Backend != "kimi" || split.JSONLPath != "/tmp/slot.jsonl" {
 		t.Fatalf("split = %+v, want kimi /tmp/slot.jsonl", split)

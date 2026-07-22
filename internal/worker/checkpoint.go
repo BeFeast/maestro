@@ -441,7 +441,8 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	nextGeneration := sess.WorkerGeneration + 1
+	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
@@ -460,7 +461,6 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
-	nextGeneration := sess.WorkerGeneration + 1
 	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
 	if err != nil {
 		if lease.Unit != "" {

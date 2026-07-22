@@ -32,13 +32,13 @@ func JSONLPathForLog(logFile string) string {
 // flushed per line so the orchestrator's live log polling (rate-limit /
 // silent-timeout detection) sees output in real time.
 func RunStreamSplit(backend, jsonlPath string, r io.Reader, w io.Writer) error {
-	return RunStreamSplitWithBudget(backend, jsonlPath, 0, "", r, w, nil)
+	return RunStreamSplitWithBudget(backend, jsonlPath, 0, "", 0, r, w, nil)
 }
 
 // RunStreamSplitWithBudget adds live token enforcement to the structured
 // stream. Usage is evaluated once per provider response/event, so measurement
 // lag is bounded to one backend response plus line-flush time.
-func RunStreamSplitWithBudget(backend, jsonlPath string, maxTokens int, markerPath string, r io.Reader, w io.Writer, stop func()) error {
+func RunStreamSplitWithBudget(backend, jsonlPath string, maxTokens int, markerPath string, workerGeneration uint64, r io.Reader, w io.Writer, stop func()) error {
 	var jf *os.File
 	if strings.TrimSpace(jsonlPath) != "" {
 		f, err := os.OpenFile(jsonlPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0644)
@@ -69,7 +69,7 @@ func RunStreamSplitWithBudget(backend, jsonlPath string, maxTokens int, markerPa
 			}
 			line := strings.TrimRight(chunk, "\r\n")
 			if observed, exceeded := monitor.observe(line); exceeded {
-				if err := writeTokenBudgetMarker(markerPath, backend, monitor.measure, observed, maxTokens); err != nil {
+				if err := writeTokenBudgetMarker(markerPath, backend, monitor.measure, observed, maxTokens, workerGeneration); err != nil {
 					if stop != nil {
 						stop()
 					}

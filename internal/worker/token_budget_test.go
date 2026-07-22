@@ -1,11 +1,13 @@
 package worker
 
 import (
+	"encoding/json"
 	"errors"
 	"os"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestRunStreamSplitWithBudget_StopsBeforeRunawayCompletion(t *testing.T) {
@@ -16,7 +18,7 @@ func TestRunStreamSplitWithBudget_StopsBeforeRunawayCompletion(t *testing.T) {
 		claudeAssistantUsageFrame(45_000) + "\n" +
 		claudeAssistantUsageFrame(92_038) + "\n"
 	stopped := 0
-	err := RunStreamSplitWithBudget("claude", jsonl, 80_000, markerPath, strings.NewReader(stream), &strings.Builder{}, func() {
+	err := RunStreamSplitWithBudget("claude", jsonl, 80_000, markerPath, 7, strings.NewReader(stream), &strings.Builder{}, func() {
 		stopped++
 	})
 	if !errors.Is(err, ErrTokenBudgetExceeded) {
@@ -35,12 +37,63 @@ func TestRunStreamSplitWithBudget_StopsBeforeRunawayCompletion(t *testing.T) {
 	if marker.Measure != TokenBudgetMeasureUncached {
 		t.Fatalf("marker measure = %q, want %q", marker.Measure, TokenBudgetMeasureUncached)
 	}
+	if marker.WorkerGeneration != 7 {
+		t.Fatalf("marker generation = %d, want 7", marker.WorkerGeneration)
+	}
 	data, err := os.ReadFile(jsonl)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if strings.Contains(string(data), "92038") {
 		t.Fatal("177k runaway tail was consumed after the 80k budget stop")
+	}
+}
+
+func TestReadTokenBudgetMarkerForAttemptRejectsPredecessor(t *testing.T) {
+	dir := t.TempDir()
+	logFile := dir + "/slot.log"
+	markerPath := TokenBudgetMarkerPathForLog(logFile)
+
+	if err := writeTokenBudgetMarker(markerPath, "claude", TokenBudgetMeasureUncached, 85_000, 80_000, 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadTokenBudgetMarkerForAttempt(logFile, 5, time.Now().UTC()); ok {
+		t.Fatal("generation 4 marker matched generation 5 attempt")
+	}
+	if marker, ok := ReadTokenBudgetMarkerForAttempt(logFile, 4, time.Now().UTC()); !ok || marker.WorkerGeneration != 4 {
+		t.Fatalf("matching generation marker = %+v, %v", marker, ok)
+	}
+
+	startedAt := time.Now().UTC()
+	legacy := TokenBudgetMarker{
+		Outcome:        TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		Measure:        TokenBudgetMeasureUncached,
+		MeasuredAt:     startedAt.Add(-time.Minute),
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadTokenBudgetMarkerForAttempt(logFile, 5, startedAt); ok {
+		t.Fatal("legacy marker from before the replacement start matched the new attempt")
+	}
+
+	legacy.MeasuredAt = time.Time{}
+	data, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(markerPath, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := ReadTokenBudgetMarkerForAttempt(logFile, 5, startedAt); ok {
+		t.Fatal("legacy marker without attempt time matched the replacement")
 	}
 }
 

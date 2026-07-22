@@ -82,7 +82,8 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	nextGeneration := sess.WorkerGeneration + 1
+	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
 	}
@@ -97,7 +98,6 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	nextGeneration := sess.WorkerGeneration + 1
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "phase_transition")
 	if err != nil {
 		if processLease.Unit != "" {

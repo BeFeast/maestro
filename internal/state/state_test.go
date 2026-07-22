@@ -1354,6 +1354,48 @@ func TestSessionTokenBudgetExceededAttentionAndDisplay(t *testing.T) {
 	}
 }
 
+func TestSessionRepeatedUnexpectedExitAttentionAndDisplay(t *testing.T) {
+	sess := &Session{
+		Status:                StatusFailed,
+		WorkerOutcome:         WorkerOutcomeRepeatedUnexpectedExit,
+		RetryCount:            2,
+		UnexpectedExitRetries: 1,
+	}
+	if got := SessionDisplayStatusFor(sess, nil); got != string(DisplayRepeatedUnexpectedExit) {
+		t.Fatalf("display = %q, want %q", got, DisplayRepeatedUnexpectedExit)
+	}
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention || !containsString(attention.Reason, "zombie respawn loop") || !containsString(attention.NextAction, "restart intentionally") {
+		t.Fatalf("attention = %+v, want repeated-exit terminal guidance", attention)
+	}
+}
+
+func TestPrepareWorkerForOperatorRestartClearsTerminalLatch(t *testing.T) {
+	retryAt := time.Now().UTC()
+	sess := &Session{
+		Status:                StatusFailed,
+		WorkerOutcome:         WorkerOutcomeRepeatedUnexpectedExit,
+		LastNotifiedStatus:    WorkerOutcomeRepeatedUnexpectedExit,
+		RetryHoldReason:       "old hold",
+		RetryReason:           RetryReasonStalledProgress,
+		UnexpectedExitRetries: 1,
+		NextRetryAt:           &retryAt,
+	}
+
+	PrepareWorkerForOperatorRestart(sess)
+
+	if sess.WorkerOutcome != "" || sess.LastNotifiedStatus != "" || sess.RetryHoldReason != "" || sess.UnexpectedExitRetries != 0 {
+		t.Fatalf("terminal latch survived operator restart preparation: %+v", sess)
+	}
+	if sess.RetryReason != RetryReasonOperatorRestart {
+		t.Fatalf("retry reason = %q, want %q", sess.RetryReason, RetryReasonOperatorRestart)
+	}
+	if sess.Status != StatusFailed || sess.NextRetryAt != &retryAt {
+		t.Fatal("operator restart preparation must not own status or retry timing")
+	}
+	PrepareWorkerForOperatorRestart(nil)
+}
+
 func TestSessionDisplayStatusFor_BackendRateLimited(t *testing.T) {
 	now := time.Date(2026, 5, 30, 12, 0, 0, 0, time.UTC)
 	reset := time.Date(2026, 5, 30, 20, 13, 0, 0, time.UTC)

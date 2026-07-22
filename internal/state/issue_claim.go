@@ -58,6 +58,7 @@ const (
 	IssueClaimOpenPRMaintenance    = "open_pr_maintenance"
 	IssueClaimScheduledRetry       = "scheduled_retry"
 	IssueClaimRetainedWorktree     = "retained_worktree"
+	IssueClaimTerminalFailure      = "terminal_failure"
 	IssueClaimTerminalReconcile    = "terminal_reconciliation"
 	IssueClaimOperatorGate         = "operator_gate"
 	IssueClaimRepairDispatch       = "repair_dispatch"
@@ -588,6 +589,17 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		}
 	}
 
+	// Deterministic safety outcomes are terminal until an operator explicitly
+	// releases or restarts them. Keep the issue claimed even after automatic
+	// worktree cleanup clears Worktree; otherwise an unlimited retry policy can
+	// fresh-dispatch the same over-budget/zombie issue again one cleanup cycle
+	// later and recreate the loop this terminal state was meant to stop.
+	if !sess.ReleasedForRedispatch && terminalWorkerOutcomeClaimsIssue(sess.WorkerOutcome) {
+		claim.Kind = IssueClaimTerminalFailure
+		claim.Reason = fmt.Sprintf("issue #%d is terminalized on session %s (%s)", sess.IssueNumber, slot, sess.WorkerOutcome)
+		return claim, true
+	}
+
 	// A dead/retry-exhausted/conflict session with a retained PR/worktree remains
 	// the maintenance owner until reconciliation proves the PR is closed or
 	// explicitly releases it for redispatch.
@@ -609,4 +621,13 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		return claim, true
 	}
 	return IssueClaim{}, false
+}
+
+func terminalWorkerOutcomeClaimsIssue(outcome string) bool {
+	switch strings.TrimSpace(outcome) {
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeRepeatedUnexpectedExit:
+		return true
+	default:
+		return false
+	}
 }

@@ -23,12 +23,13 @@ var ErrTokenBudgetExceeded = errors.New(TokenBudgetExceededOutcome)
 // TokenBudgetMarker is the durable, non-sensitive handoff from the worker
 // stream process to orchestrator and Fleet reconciliation.
 type TokenBudgetMarker struct {
-	Outcome        string    `json:"outcome"`
-	Backend        string    `json:"backend"`
-	TokensObserved int       `json:"tokens_observed"`
-	MaxTokens      int       `json:"max_tokens"`
-	Measure        string    `json:"measure"`
-	MeasuredAt     time.Time `json:"measured_at"`
+	Outcome          string    `json:"outcome"`
+	Backend          string    `json:"backend"`
+	TokensObserved   int       `json:"tokens_observed"`
+	MaxTokens        int       `json:"max_tokens"`
+	Measure          string    `json:"measure"`
+	WorkerGeneration uint64    `json:"worker_generation,omitempty"`
+	MeasuredAt       time.Time `json:"measured_at"`
 }
 
 func TokenBudgetMarkerPathForLog(logFile string) string {
@@ -60,7 +61,28 @@ func ReadTokenBudgetMarker(logFile string) (TokenBudgetMarker, bool) {
 	return marker, true
 }
 
-func writeTokenBudgetMarker(path, backend, measure string, observed, maxTokens int) error {
+// ReadTokenBudgetMarkerForAttempt rejects a marker written by a predecessor
+// process that reused the same stable slot log path. New markers carry the
+// exact worker generation. Timestamp matching is retained only for markers
+// written by an older Maestro version during a rolling upgrade.
+func ReadTokenBudgetMarkerForAttempt(logFile string, workerGeneration uint64, startedAt time.Time) (TokenBudgetMarker, bool) {
+	marker, ok := ReadTokenBudgetMarker(logFile)
+	if !ok {
+		return TokenBudgetMarker{}, false
+	}
+	if marker.WorkerGeneration > 0 {
+		if workerGeneration == 0 || marker.WorkerGeneration != workerGeneration {
+			return TokenBudgetMarker{}, false
+		}
+		return marker, true
+	}
+	if !startedAt.IsZero() && (marker.MeasuredAt.IsZero() || marker.MeasuredAt.Before(startedAt)) {
+		return TokenBudgetMarker{}, false
+	}
+	return marker, true
+}
+
+func writeTokenBudgetMarker(path, backend, measure string, observed, maxTokens int, workerGeneration uint64) error {
 	if path == "" {
 		return fmt.Errorf("empty token-budget marker path")
 	}
@@ -68,12 +90,13 @@ func writeTokenBudgetMarker(path, backend, measure string, observed, maxTokens i
 		observed = maxTokens
 	}
 	marker := TokenBudgetMarker{
-		Outcome:        TokenBudgetExceededOutcome,
-		Backend:        backend,
-		TokensObserved: observed,
-		MaxTokens:      maxTokens,
-		Measure:        measure,
-		MeasuredAt:     time.Now().UTC(),
+		Outcome:          TokenBudgetExceededOutcome,
+		Backend:          backend,
+		TokensObserved:   observed,
+		MaxTokens:        maxTokens,
+		Measure:          measure,
+		WorkerGeneration: workerGeneration,
+		MeasuredAt:       time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
 	if err != nil {
