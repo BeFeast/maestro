@@ -94,14 +94,11 @@ type BackendDef struct {
 	TierModel  string `yaml:"-" json:"-"`
 	TierEffort string `yaml:"-" json:"-"`
 
-	// #737: opt-in structured usage capture. When true, a claude-kind backend
-	// runs in `--output-format stream-json --verbose` mode and the worker
-	// runner pipes its NDJSON through `maestro stream-split`, which writes the
-	// raw frames to a side-channel slot.jsonl (parsed for tokens/cost) while
-	// keeping slot.log human-readable. Off by default: plain `claude -p` text
-	// mode prints no parseable token total, so usage/cost stay 0 (the #737
-	// symptom) until an operator opts in. Overridable via extra_args (a
-	// trailing --output-format wins). Only the claude kind consumes this today.
+	// #737/#947: opt-in structured usage capture for backends whose JSON mode
+	// is optional (claude/codex/opencode). The worker runner pipes NDJSON through
+	// `maestro stream-split`, which writes raw frames to slot.jsonl for usage
+	// accounting while keeping slot.log human-readable. Kimi is structured by
+	// default and does not require this flag.
 	UsageStream bool `yaml:"usage_stream,omitempty"`
 
 	// #507: NonAgentic marks a backend that is a TEXT-COMPLETION helper,

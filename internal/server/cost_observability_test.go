@@ -595,4 +595,20 @@ func TestSessionCostEstimate_Precedence(t *testing.T) {
 	}
 }
 
+func TestSessionCostEstimate_KimiSplitUsage(t *testing.T) {
+	pricing := map[string]config.BackendPricing{
+		"moonshot-primary": {
+			InputUSDPerMtok:      2,
+			OutputUSDPerMtok:     8,
+			CacheReadUSDPerMtok:  0.5,
+			CacheWriteUSDPerMtok: 2,
+		},
+	}
+	got := sessionCostEstimate("moonshot-primary", 2650, 2100, 180, 350, 20, pricing, 0)
+	want := (2100*2 + 180*8 + 350*0.5 + 20*2) / 1_000_000.0
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("Kimi split estimate = %f, want %f", got, want)
+	}
+}
+
 func timePtr(t time.Time) *time.Time { return &t }

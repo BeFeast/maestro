@@ -112,6 +112,8 @@ func renderStreamLine(backend, line string) string {
 		return renderClaudeStreamLine(line)
 	case "codex":
 		return renderCodexStreamLine(line)
+	case "kimi":
+		return renderKimiStreamLine(line)
 	case "opencode":
 		return renderOpenCodeStreamLine(line)
 	default:
@@ -131,6 +133,76 @@ func RenderClaudeStreamLine(line string) string {
 // rate-limit / auth-failure text intact).
 func RenderCodexStreamLine(line string) string {
 	return renderCodexStreamLine(line)
+}
+
+// RenderKimiStreamLine is the exported entry point for rendering one Kimi
+// Code CLI stream-json line.
+func RenderKimiStreamLine(line string) string {
+	return renderKimiStreamLine(line)
+}
+
+type kimiRenderToolCall struct {
+	Function struct {
+		Name string `json:"name"`
+	} `json:"function"`
+}
+
+// renderKimiStreamLine renders Kimi's Message-shaped JSONL into readable log
+// text while preserving unknown/error frames verbatim. Usage-only frames get a
+// compact summary; raw usage JSON remains in the side channel.
+func renderKimiStreamLine(line string) string {
+	trimmed := strings.TrimSpace(line)
+	if trimmed == "" || trimmed[0] != '{' {
+		return line
+	}
+	root, ok := decodeJSONObject([]byte(trimmed))
+	if !ok {
+		return line
+	}
+	role := firstJSONString(root, "role")
+	switch role {
+	case "assistant":
+		parts := make([]string, 0, 2)
+		if raw, ok := root["content"]; ok {
+			if content := renderClaudeContent(raw); strings.TrimSpace(content) != "" {
+				parts = append(parts, content)
+			}
+		}
+		var calls []kimiRenderToolCall
+		if raw, ok := root["tool_calls"]; ok && json.Unmarshal(raw, &calls) == nil {
+			for _, call := range calls {
+				name := strings.TrimSpace(call.Function.Name)
+				if name == "" {
+					name = "unknown"
+				}
+				parts = append(parts, "[tool_use: "+name+"]")
+			}
+		}
+		if len(parts) > 0 {
+			return strings.Join(parts, "\n")
+		}
+	case "tool":
+		content := ""
+		if raw, ok := root["content"]; ok {
+			content = renderClaudeContent(raw)
+		}
+		if strings.TrimSpace(content) == "" {
+			return "[tool_result]"
+		}
+		return "[tool_result] " + content
+	case "meta":
+		if content := firstJSONString(root, "content", "error_message"); content != "" {
+			return "[kimi] " + content
+		}
+	}
+	if usageMap, _, ok := findKimiUsageMap(root); ok {
+		usage := decodeKimiUsageBlock(usageMap)
+		if kimiUsageTotal(usage) > 0 {
+			return fmt.Sprintf("[kimi] usage: input=%d cached=%d cache_write=%d output=%d",
+				usage.Input, usage.CacheRead, usage.CacheWrite, usage.Output)
+		}
+	}
+	return line
 }
 
 type claudeRenderFrame struct {

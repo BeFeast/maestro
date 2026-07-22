@@ -159,6 +159,39 @@ func TestRunStreamSplit_Codex(t *testing.T) {
 	}
 }
 
+func TestRunStreamSplit_KimiFixture(t *testing.T) {
+	fixture, err := os.ReadFile(filepath.Join("testdata", "kimi_stream.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	jsonlPath := filepath.Join(dir, "sup-kimi.jsonl")
+	var out strings.Builder
+	if err := RunStreamSplit("kimi", jsonlPath, strings.NewReader(string(fixture)), &out); err != nil {
+		t.Fatalf("RunStreamSplit: %v", err)
+	}
+	raw, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(raw) != string(fixture) {
+		t.Fatal("Kimi stream-split did not preserve raw JSONL")
+	}
+	usage, ok := ParseKimiUsage(string(raw))
+	if !ok || usage.TotalTokens != 2650 {
+		t.Fatalf("parsed usage = %+v ok=%t, want total=2650", usage, ok)
+	}
+	rendered := out.String()
+	for _, want := range []string{"Checking the worktree.", "[kimi] usage:", "[tool_result] tests passed", "Done."} {
+		if !strings.Contains(rendered, want) {
+			t.Errorf("rendered output missing %q:\n%s", want, rendered)
+		}
+	}
+	if strings.Contains(rendered, `"input_other"`) {
+		t.Fatalf("human-readable log leaked raw usage JSON:\n%s", rendered)
+	}
+}
+
 // The codex renderer must turn item events into readable text: a command and
 // its output/exit, a file change, and an agent message — never raw item JSON.
 func TestRenderCodexStreamLine_ItemsAreReadable(t *testing.T) {
