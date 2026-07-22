@@ -88,6 +88,33 @@ func TestIssueClaimFor_DeadScheduledRetryRemainsReserved(t *testing.T) {
 	}
 }
 
+func TestIssueClaimFor_TerminalSafetyOutcomeSurvivesWorktreeCleanup(t *testing.T) {
+	for _, outcome := range []string{string(DisplayTokenBudgetExceeded), WorkerOutcomeRepeatedUnexpectedExit} {
+		t.Run(outcome, func(t *testing.T) {
+			s := NewState()
+			s.Sessions["txc-1"] = &Session{
+				IssueNumber:   1,
+				Status:        StatusFailed,
+				WorkerOutcome: outcome,
+				// Worktree is intentionally empty: automatic cleanup already ran.
+			}
+
+			claim, ok := s.IssueClaimFor(1)
+			if !ok || claim.Kind != IssueClaimTerminalFailure || claim.Session != "txc-1" {
+				t.Fatalf("claim = %+v, %v, want durable terminal-failure claim", claim, ok)
+			}
+			if !strings.Contains(claim.Reason, outcome) {
+				t.Fatalf("reason = %q, want durable outcome %q", claim.Reason, outcome)
+			}
+
+			s.Sessions["txc-1"].ReleasedForRedispatch = true
+			if _, ok := s.IssueClaimFor(1); ok {
+				t.Fatal("explicit release must drop the terminal-failure claim")
+			}
+		})
+	}
+}
+
 func TestIssueClaimFor_DonePRRemainsReservedUntilExplicitRelease(t *testing.T) {
 	s := NewState()
 	finishedAt := time.Now().UTC()

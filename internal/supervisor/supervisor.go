@@ -4667,6 +4667,7 @@ func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			state.PrepareWorkerForOperatorRestart(sess)
 			clearWorktreeAfterRestart(sess)
 			return nil
 		},

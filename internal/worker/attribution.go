@@ -38,6 +38,13 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.WorkerScratchDir = ""
 	sess.WorkerLeaseManifest = ""
 	sess.WorkerLeaseAttention = ""
+	// An approved operator restart is authority to bypass only the old
+	// attempt's terminal budget/zombie latch while it is queued. Once the new
+	// process exists, clear that handoff so ordinary live budget enforcement and
+	// unexpected-exit policy apply to this attempt normally.
+	if sess.RetryReason == state.RetryReasonOperatorRestart {
+		sess.RetryReason = ""
+	}
 	// A scheduled retry owns NextRetryAt only until a replacement process has
 	// actually started. Keeping the elapsed timestamp on a Running attempt makes
 	// Fleet report contradictory queued/running state and lets a later terminal

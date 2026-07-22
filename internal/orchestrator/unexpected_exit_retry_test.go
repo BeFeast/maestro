@@ -9,6 +9,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // A process that disappears without a PR used to become Dead without a
@@ -78,6 +79,9 @@ func TestUnexpectedWorkerExitSchedulesImmediateCanonicalRetry(t *testing.T) {
 	if sess.RetryCount != 1 || sess.RetryReason != state.RetryReasonStalledProgress {
 		t.Fatalf("retry metadata = count %d reason %q", sess.RetryCount, sess.RetryReason)
 	}
+	if sess.UnexpectedExitRetries != 1 {
+		t.Fatalf("unexpected-exit retries = %d, want 1", sess.UnexpectedExitRetries)
+	}
 	if sess.NextRetryAt.After(time.Now().UTC()) {
 		t.Fatalf("retry scheduled in the future: %s", sess.NextRetryAt)
 	}
@@ -92,6 +96,190 @@ func TestUnexpectedWorkerExitSchedulesImmediateCanonicalRetry(t *testing.T) {
 	}
 	if sess.Status != state.StatusRunning || sess.PID != 5555 {
 		t.Fatalf("resumed state = status %q pid %d", sess.Status, sess.PID)
+	}
+}
+
+func TestUnexpectedWorkerExitAtTokenBudgetTerminalizesWithoutRetry(t *testing.T) {
+	worktree := t.TempDir()
+	if out, err := exec.Command("git", "init", "-b", "main", worktree).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:               "owner/repo",
+			WorkerMaxTokens:    100,
+			MaxRetriesPerIssue: 0, // unlimited must not override a deterministic budget stop
+		},
+		repo:                 "owner/repo",
+		notifier:             &notify.Notifier{},
+		pidAliveFn:           func(int) bool { return false },
+		tmuxSessionExistsFn:  func(string) bool { return false },
+		listOpenPRsFn:        func() ([]github.PR, error) { return nil, nil },
+		remoteBranchExistsFn: func(string) (bool, error) { return false, nil },
+		isIssueClosedFn:      func(int) (bool, error) { return false, nil },
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber:       406,
+		IssueTitle:        "over budget before marker reconciliation",
+		Status:            state.StatusRunning,
+		PID:               4242,
+		TmuxSession:       "maestro-ok-player-302",
+		Branch:            "feat/ok-player-302-406-over-budget",
+		Worktree:          worktree,
+		TokensUsedAttempt: 100,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("dead over-budget process was not reconciled")
+	}
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("terminal state = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, worker.TokenBudgetExceededOutcome)
+	}
+	if sess.NextRetryAt != nil || sess.UnexpectedExitRetries != 0 {
+		t.Fatalf("budget stop scheduled retry: next=%v unexpected=%d", sess.NextRetryAt, sess.UnexpectedExitRetries)
+	}
+}
+
+func TestRepeatedUnexpectedWorkerExitTerminalizesWithUnlimitedRetries(t *testing.T) {
+	worktree := t.TempDir()
+	if out, err := exec.Command("git", "init", "-b", "main", worktree).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	respawned := 0
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:               "owner/repo",
+			MaxRetriesPerIssue: 0, // the zombie cap is independent of the general retry policy
+		},
+		repo:                 "owner/repo",
+		notifier:             &notify.Notifier{},
+		promptBase:           "test prompt",
+		pidAliveFn:           func(int) bool { return false },
+		tmuxSessionExistsFn:  func(string) bool { return false },
+		listOpenPRsFn:        func() ([]github.PR, error) { return nil, nil },
+		remoteBranchExistsFn: func(string) (bool, error) { return false, nil },
+		isIssueClosedFn:      func(int) (bool, error) { return false, nil },
+		getIssueFn:           func(number int) (github.Issue, error) { return makeIssue(number, "zombie loop"), nil },
+		respawnInPlaceFn: func(_ *config.Config, _ string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
+			respawned++
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			sess.TmuxSession = "maestro-ok-player-302"
+			return nil
+		},
+	}
+
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "zombie loop",
+		Status:      state.StatusRunning,
+		PID:         4242,
+		TmuxSession: "maestro-ok-player-302",
+		Branch:      "feat/ok-player-302-406-zombie",
+		Worktree:    worktree,
+		Backend:     "sol",
+	}
+	s.Sessions["ok-player-302"] = sess
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("first unexpected exit was not reconciled")
+	}
+	o.respawnDueRetries(s, 1)
+	if respawned != 1 || sess.Status != state.StatusRunning {
+		t.Fatalf("first recovery = respawned %d status %q, want one running replacement", respawned, sess.Status)
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("replacement exit was not reconciled")
+	}
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != state.WorkerOutcomeRepeatedUnexpectedExit {
+		t.Fatalf("replacement terminal state = %q/%q, want failed/%q", sess.Status, sess.WorkerOutcome, state.WorkerOutcomeRepeatedUnexpectedExit)
+	}
+	if sess.NextRetryAt != nil || sess.RetryCount != 1 || sess.UnexpectedExitRetries != 1 {
+		t.Fatalf("replacement retry metadata = next %v count %d unexpected %d", sess.NextRetryAt, sess.RetryCount, sess.UnexpectedExitRetries)
+	}
+
+	o.respawnDueRetries(s, 1)
+	if respawned != 1 {
+		t.Fatalf("terminal zombie respawned %d times, want exactly one recovery", respawned)
+	}
+	claim, ok := s.IssueClaimFor(406)
+	if !ok || claim.Kind != state.IssueClaimTerminalFailure {
+		t.Fatalf("terminal zombie claim = %+v, %v", claim, ok)
+	}
+}
+
+func TestRespawnDueRetries_OverBudgetTerminalizesWithoutAvailableSlot(t *testing.T) {
+	respawned := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", WorkerMaxTokens: 100, MaxRetriesPerIssue: 0},
+		notifier: &notify.Notifier{},
+		respawnWorkerFn: func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+			respawned = true
+			return nil
+		},
+	}
+	past := time.Now().UTC().Add(-time.Second)
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber:       407,
+		IssueTitle:        "queued over-budget retry",
+		Status:            state.StatusDead,
+		NextRetryAt:       &past,
+		TokensUsedAttempt: 125,
+	}
+	s.Sessions["ok-player-303"] = sess
+
+	o.respawnDueRetries(s, 0)
+	if respawned {
+		t.Fatal("over-budget retry must not respawn")
+	}
+	if sess.Status != state.StatusFailed || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome || sess.NextRetryAt != nil {
+		t.Fatalf("terminal budget retry = status %q outcome %q next %v", sess.Status, sess.WorkerOutcome, sess.NextRetryAt)
+	}
+	if claim, ok := s.IssueClaimFor(407); !ok || claim.Kind != state.IssueClaimTerminalFailure {
+		t.Fatalf("terminal budget claim = %+v, %v", claim, ok)
+	}
+}
+
+func TestRespawnDueRetries_OperatorRestartBypassesOldAttemptBudgetLatch(t *testing.T) {
+	respawned := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", WorkerMaxTokens: 100, MaxRetriesPerIssue: 0},
+		notifier: &notify.Notifier{},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "intentional restart"), nil
+		},
+		isIssueClosedFn: func(int) (bool, error) { return false, nil },
+		respawnWorkerFn: func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+			respawned = true
+			return nil
+		},
+	}
+	past := time.Now().UTC().Add(-time.Second)
+	s := state.NewState()
+	sess := &state.Session{
+		IssueNumber:       408,
+		IssueTitle:        "intentional restart",
+		Status:            state.StatusDead,
+		NextRetryAt:       &past,
+		RetryReason:       state.RetryReasonOperatorRestart,
+		TokensUsedAttempt: 125, // stale accounting from the terminal old attempt
+	}
+	s.Sessions["ok-player-304"] = sess
+
+	o.respawnDueRetries(s, 1)
+	if !respawned {
+		t.Fatal("approved operator restart was blocked by stale attempt accounting")
+	}
+	if sess.WorkerOutcome == worker.TokenBudgetExceededOutcome {
+		t.Fatal("old attempt budget latch was restored during intentional restart")
 	}
 }
 

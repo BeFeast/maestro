@@ -9596,6 +9596,9 @@ func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
 	if len(respawnedInPlace) != 1 || respawnedInPlace[0] != "mae-1" {
 		t.Fatalf("respawnedInPlace = %v, want [mae-1]", respawnedInPlace)
 	}
+	if sess.WorkerOutcome != "" || sess.UnexpectedExitRetries != 0 {
+		t.Fatalf("healthy checkpoint was terminalized: outcome=%q unexpected_retries=%d", sess.WorkerOutcome, sess.UnexpectedExitRetries)
+	}
 	// Worker should NOT be stopped (respawnInPlace handles the stop internally)
 	if len(stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty (respawnInPlace handles stop)", stopped)

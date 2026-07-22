@@ -50,8 +50,12 @@ const (
 	// owner dies, the next cycle renews the same exact slot/worktree/branch;
 	// it never allocates a duplicate identity merely to retry startup.
 	freshDispatchLeaseDuration = 10 * time.Minute
-	pipelineFullLabel          = "pipeline:full"
-	pipelineAdvisedLabel       = "pipeline:advised"
+	// A vanished worker gets one automatic recovery in its exact canonical
+	// session. If that replacement also vanishes, continuing to respawn is a
+	// zombie loop even when max_retries_per_issue is configured as unlimited.
+	maxAutomaticUnexpectedExitRetries = 1
+	pipelineFullLabel                 = "pipeline:full"
+	pipelineAdvisedLabel              = "pipeline:advised"
 )
 
 type cycleBoolResult struct {
@@ -1417,9 +1421,10 @@ func tokenBudgetObservation(sess *state.Session) (int, string) {
 }
 
 func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Session, marker worker.TokenBudgetMarker, now time.Time) {
-	if sess == nil || sess.WorkerOutcome == worker.TokenBudgetExceededOutcome {
+	if sess == nil {
 		return
 	}
+	firstTerminalization := sess.WorkerOutcome != worker.TokenBudgetExceededOutcome
 	if now.IsZero() {
 		now = time.Now().UTC()
 	}
@@ -1432,12 +1437,82 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 	sess.PID = 0
 	sess.TmuxSession = ""
 	sess.NextRetryAt = nil
-	sess.FinishedAt = &now
-	state.MarkWorkerEnded(sess, now)
+	sess.RetryHoldReason = ""
+	if sess.FinishedAt == nil {
+		sess.FinishedAt = &now
+	}
+	state.MarkWorkerEnded(sess, *sess.FinishedAt)
+	if !firstTerminalization {
+		return
+	}
 	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d measure=%s", slotName, budgetObserved, marker.MaxTokens, budgetMeasure)
 	if o.notifier != nil {
 		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s %s observed / %s configured",
 			slotName, sess.IssueNumber, worker.FormatTokens(budgetObserved), budgetMeasure, worker.FormatTokens(marker.MaxTokens))
+	}
+}
+
+// terminalizeTokenBudgetIfExceeded is the retry/reconcile backstop for a hard
+// budget stop. The live stream marker is authoritative when present; durable
+// per-attempt accounting covers the race where the process disappears before
+// the marker is consumed. An already-stamped outcome is normalized through the
+// same idempotent sink so stale Dead+NextRetryAt state cannot respawn.
+func (o *Orchestrator) terminalizeTokenBudgetIfExceeded(slotName string, sess *state.Session, now time.Time) bool {
+	if sess == nil {
+		return false
+	}
+	marker, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile)
+	maxTokens := 0
+	if o != nil && o.cfg != nil {
+		maxTokens = o.cfg.WorkerMaxTokens
+	}
+	if !markerOK {
+		alreadyTerminal := sess.WorkerOutcome == worker.TokenBudgetExceededOutcome
+		if !alreadyTerminal && (maxTokens <= 0 || sess.TokensUsedAttempt < maxTokens) {
+			return false
+		}
+		marker = worker.TokenBudgetMarker{
+			Outcome:        worker.TokenBudgetExceededOutcome,
+			Backend:        sess.Backend,
+			TokensObserved: sess.TokensUsedAttempt,
+			MaxTokens:      maxTokens,
+			MeasuredAt:     now,
+		}
+	}
+	measuredAt := marker.MeasuredAt
+	if measuredAt.IsZero() {
+		measuredAt = now
+	}
+	o.markTokenBudgetExceeded(slotName, sess, marker, measuredAt)
+	return true
+}
+
+func (o *Orchestrator) markRepeatedUnexpectedExit(slotName string, sess *state.Session, now time.Time) {
+	if sess == nil {
+		return
+	}
+	firstTerminalization := sess.WorkerOutcome != state.WorkerOutcomeRepeatedUnexpectedExit
+	if now.IsZero() {
+		now = time.Now().UTC()
+	}
+	sess.WorkerOutcome = state.WorkerOutcomeRepeatedUnexpectedExit
+	sess.LastNotifiedStatus = state.WorkerOutcomeRepeatedUnexpectedExit
+	sess.Status = state.StatusFailed
+	sess.PID = 0
+	sess.TmuxSession = ""
+	sess.NextRetryAt = nil
+	sess.RetryHoldReason = ""
+	if sess.FinishedAt == nil {
+		sess.FinishedAt = &now
+	}
+	state.MarkWorkerEnded(sess, *sess.FinishedAt)
+	if !firstTerminalization {
+		return
+	}
+	log.Printf("[orch] worker %s terminalized after repeated unexpected exits; automatic respawn disabled", slotName)
+	if o.notifier != nil {
+		o.notifier.Sendf("maestro: worker %s (issue #%d: %s) disappeared again after automatic recovery — terminalized with no further auto-respawn",
+			slotName, sess.IssueNumber, sess.IssueTitle)
 	}
 }
 
@@ -2451,18 +2526,40 @@ func pendingRetryReservations(s *state.State) int {
 // respawnDueRetries checks dead sessions with a scheduled retry time and
 // respawns them when the backoff period has elapsed.
 func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
+	slotNames := make([]string, 0, len(s.Sessions))
+	for slotName := range s.Sessions {
+		slotNames = append(slotNames, slotName)
+	}
+	sort.Strings(slotNames)
+
+	// Terminal safety outcomes do not need a free worker slot to settle. Repair
+	// stale/racy Dead+NextRetryAt projections first so an over-budget worker can
+	// never remain queued merely because capacity is full, and a previously
+	// terminalized zombie cannot re-enter the spawn path after a state merge.
+	now := time.Now().UTC()
+	for _, slotName := range slotNames {
+		sess := s.Sessions[slotName]
+		if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
+			continue
+		}
+		if sess.RetryReason == state.RetryReasonOperatorRestart {
+			continue
+		}
+		o.updateTokensUsedFromWorkerLog(slotName, sess)
+		if o.terminalizeTokenBudgetIfExceeded(slotName, sess, now) {
+			continue
+		}
+		if sess.WorkerOutcome == state.WorkerOutcomeRepeatedUnexpectedExit || sess.UnexpectedExitRetries > maxAutomaticUnexpectedExitRetries {
+			o.markRepeatedUnexpectedExit(slotName, sess, now)
+		}
+	}
+
 	if slots <= 0 {
 		if pending := pendingRetryReservations(s); pending > 0 {
 			log.Printf("[orch] retry queue has %d pending session(s), but no worker slots are available", pending)
 		}
 		return
 	}
-
-	slotNames := make([]string, 0, len(s.Sessions))
-	for slotName := range s.Sessions {
-		slotNames = append(slotNames, slotName)
-	}
-	sort.Strings(slotNames)
 
 	respawned := 0
 	for _, slotName := range slotNames {
@@ -3555,7 +3652,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		if isRestartCheckpointedDead && s.DrainActive() {
 			continue
 		}
-		if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+		if _, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile); markerOK {
 			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 				if err := o.stopWorkerProcess(slotName, sess); err != nil {
 					log.Printf("[orch] reconcile: %s token-budget process lease cleanup deferred: %v", slotName, err)
@@ -3563,7 +3660,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				}
 			}
 			o.runAfterRunHook(sess)
-			o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+			o.terminalizeTokenBudgetIfExceeded(slotName, sess, time.Now().UTC())
 			reconciled = true
 			continue
 		}
@@ -3906,6 +4003,15 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		unexpectedRetryAllowed := strings.TrimSpace(sess.Worktree) != "" && o.canRetryIssue(s, sess)
 		o.updateTokensUsedFromWorkerLog(slotName, sess)
 		now := time.Now().UTC()
+		if o.terminalizeTokenBudgetIfExceeded(slotName, sess, now) {
+			reconciled = true
+			continue
+		}
+		if !s.DrainActive() && sess.UnexpectedExitRetries >= maxAutomaticUnexpectedExitRetries {
+			o.markRepeatedUnexpectedExit(slotName, sess, now)
+			reconciled = true
+			continue
+		}
 		// #967: preserve recovery intent while this is still known to be the
 		// explicit process/tmux-gone path. Inferring the cause later from a dead
 		// session's FinishedAt would also revive ordinary provider failures and
@@ -3928,6 +4034,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				// the exact slot/branch/worktree after re-checking GitHub guards.
 				retryAt := now
 				sess.RetryCount++
+				sess.UnexpectedExitRetries++
 				sess.RetryReason = state.RetryReasonStalledProgress
 				sess.NextRetryAt = &retryAt
 				log.Printf("[orch] reconcile: %s scheduled immediate canonical in-place retry %d after unexpected worker exit", slotName, sess.RetryCount)
@@ -4532,7 +4639,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 		// Running-session lifecycle and process reconciliation. Closed issues
 		// were handled by the authoritative check at the top of this loop.
 		if sess.Status == state.StatusRunning {
-			if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok {
+			if _, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile); markerOK {
 				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 					if err := o.stopWorkerProcess(slotName, sess); err != nil {
 						log.Printf("[orch] token-budget process lease cleanup deferred for %s: %v", slotName, err)
@@ -4540,7 +4647,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 				}
 				o.runAfterRunHook(sess)
-				o.markTokenBudgetExceeded(slotName, sess, marker, marker.MeasuredAt)
+				o.terminalizeTokenBudgetIfExceeded(slotName, sess, time.Now().UTC())
 				if sess.Phase == state.PhaseAdvisor {
 					o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
 				}
@@ -4573,6 +4680,13 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 				// Worker process died — run after_run hook
 				o.runAfterRunHook(sess)
+				o.updateTokensUsedFromWorkerLog(slotName, sess)
+				if o.terminalizeTokenBudgetIfExceeded(slotName, sess, time.Now().UTC()) {
+					if sess.Phase == state.PhaseAdvisor {
+						o.finishAdvisorGate(o.pipelineConfigForSession(sess), slotName, sess, pipeline.AdvisorVerdictInvalid, "token_budget_exceeded", fmt.Sprintf("Advisor reached its configured token budget before producing %s.", pipeline.AdvisorReviewFile))
+					}
+					continue
+				}
 
 				// Check if there's an open PR for this branch BEFORE marking dead
 				if pr, found := branchToPR[sess.Branch]; found {
@@ -4701,10 +4815,14 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 					o.notifier.Sendf("🔄 maestro: worker %s (issue #%d) backend %s %s (%s), switched to %s — retry budget preserved",
 						slotName, sess.IssueNumber, previousBackend, cp.desc, failure.pattern, nextBackend)
+				} else if sess.UnexpectedExitRetries >= maxAutomaticUnexpectedExitRetries {
+					o.markRepeatedUnexpectedExit(slotName, sess, time.Now().UTC())
 				} else if o.canRetryIssue(s, sess) {
 					// Schedule retry with exponential backoff (respects max_retries_per_issue)
 					o.updateTokensUsedFromWorkerLog(slotName, sess)
 					sess.RetryCount++
+					sess.UnexpectedExitRetries++
+					sess.RetryReason = state.RetryReasonStalledProgress
 					backoffMs := retryBackoffMs(sess.RetryCount, o.cfg.MaxRetryBackoffMs)
 					retryAt := time.Now().UTC().Add(time.Duration(backoffMs) * time.Millisecond)
 					sess.NextRetryAt = &retryAt

@@ -80,12 +80,22 @@ const (
 	// DisplayTokenBudgetExceeded is a deterministic worker stop, not a retryable
 	// process death or provider outage.
 	DisplayTokenBudgetExceeded SessionDisplayStatus = "token_budget_exceeded"
-	LiveSessionRecentWindow                         = 24 * time.Hour
+	// DisplayRepeatedUnexpectedExit marks a worker whose one automatic
+	// unexpected-exit recovery also disappeared without producing a PR. This is
+	// terminal: another automatic spawn would be a zombie loop, not recovery.
+	DisplayRepeatedUnexpectedExit SessionDisplayStatus = WorkerOutcomeRepeatedUnexpectedExit
+	LiveSessionRecentWindow                            = 24 * time.Hour
 )
 
 const (
 	RetryReasonReviewFeedback  = "review_feedback"
 	RetryReasonStalledProgress = "stalled_progress"
+	RetryReasonOperatorRestart = "operator_restart"
+
+	// WorkerOutcomeRepeatedUnexpectedExit is the durable terminal reason for a
+	// worker that disappeared again after Maestro already gave the same
+	// canonical session one automatic unexpected-exit recovery.
+	WorkerOutcomeRepeatedUnexpectedExit = "repeated_unexpected_exit"
 )
 
 const (
@@ -268,6 +278,7 @@ type Session struct {
 	LastNotifiedStatus         string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
 	LiveVerificationNotified   bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
 	RetryCount                 int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	UnexpectedExitRetries      int        `json:"unexpected_exit_retries,omitempty"`    // automatic recoveries consumed by process/tmux disappearance; independently capped to prevent zombie respawn loops
 	MaintenanceRetryCount      int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
 	NextRetryAt                *time.Time `json:"next_retry_at,omitempty"`
 	RetryHoldReason            string     `json:"retry_hold_reason,omitempty"` // current dispatch guard holding a scheduled canonical retry; does not release its issue/worktree lease
@@ -483,6 +494,13 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 			NeedsAttention: true,
 		}
 	}
+	if sess.WorkerOutcome == WorkerOutcomeRepeatedUnexpectedExit {
+		return SessionAttention{
+			Reason:         "Worker disappeared again after its automatic unexpected-exit recovery; Maestro terminalized the session to stop a zombie respawn loop.",
+			NextAction:     "Inspect the retained log/worktree and restart intentionally only after correcting the repeated exit cause.",
+			NeedsAttention: true,
+		}
+	}
 	if attention, ok := OperatorGateAttention(sess); ok {
 		return attention
 	}
@@ -684,6 +702,9 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
 		return string(DisplayTokenBudgetExceeded)
 	}
+	if sess.WorkerOutcome == WorkerOutcomeRepeatedUnexpectedExit {
+		return string(DisplayRepeatedUnexpectedExit)
+	}
 	if sess.Status == StatusRunning && alive != nil && !*alive {
 		return string(sess.Status)
 	}
@@ -716,6 +737,21 @@ func formatSessionTokens(tokens int) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%d", tokens)
+}
+
+// PrepareWorkerForOperatorRestart clears automatic terminal latches from the
+// previous attempt and marks the queued retry as an explicit operator action.
+// The restart controller still owns Status/NextRetryAt/worktree mutation; this
+// helper only distinguishes intentional recovery from automatic respawn.
+func PrepareWorkerForOperatorRestart(sess *Session) {
+	if sess == nil {
+		return
+	}
+	sess.WorkerOutcome = ""
+	sess.LastNotifiedStatus = ""
+	sess.RetryHoldReason = ""
+	sess.UnexpectedExitRetries = 0
+	sess.RetryReason = RetryReasonOperatorRestart
 }
 
 // backendRateLimitedDisplayStatus reports whether a session represents a worker
