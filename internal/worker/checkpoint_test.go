@@ -265,20 +265,23 @@ func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.
 	ended := time.Date(2026, 7, 17, 11, 5, 0, 0, time.UTC)
 	started := ended.Add(time.Hour)
 	sess := &state.Session{
-		IssueNumber:          346,
-		PRNumber:             335,
-		Worktree:             "/tmp/kept-worktree",
-		Branch:               "feat/kept-branch",
-		Backend:              "claude",
-		Model:                "claude-fable-5",
-		Status:               state.StatusDead,
-		FinishedAt:           &ended,
-		WorkerEndedAt:        &ended,
-		CostUSDBackend:       1.25,
-		UsageTokensWatermark: 1_730_413,
-		TokensUsedAttempt:    1_730_413,
-		TokensUsedTotal:      1_730_413,
-		WorkerOutcome:        "failed",
+		IssueNumber:                346,
+		PRNumber:                   335,
+		Worktree:                   "/tmp/kept-worktree",
+		Branch:                     "feat/kept-branch",
+		Backend:                    "claude",
+		Model:                      "claude-fable-5",
+		Status:                     state.StatusDead,
+		FinishedAt:                 &ended,
+		WorkerEndedAt:              &ended,
+		CostUSDBackend:             1.25,
+		UsageTokensWatermark:       1_730_413,
+		TokensUsedAttempt:          1_730_413,
+		TokensUsedTotal:            1_730_413,
+		TokenBudgetTokensWatermark: 120_000,
+		TokenBudgetTokensAttempt:   120_000,
+		TokenBudgetMeasure:         TokenBudgetMeasureUncached,
+		WorkerOutcome:              "failed",
 		Attribution: []state.BackendAttribution{{
 			Backend: "claude", Model: "claude-fable-5", StartedAt: ended.Add(-time.Minute),
 		}},
@@ -295,8 +298,8 @@ func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.
 	if sess.FinishedAt != nil || sess.WorkerEndedAt != nil || sess.Model != "" || sess.CostUSDBackend != 0 {
 		t.Fatalf("stale projection retained: finished=%v ended=%v model=%q cost=%v", sess.FinishedAt, sess.WorkerEndedAt, sess.Model, sess.CostUSDBackend)
 	}
-	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.WorkerOutcome != "" {
-		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.WorkerOutcome)
+	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.TokenBudgetTokensAttempt != 0 || sess.TokenBudgetTokensWatermark != 0 || sess.TokenBudgetMeasure != "" || sess.WorkerOutcome != "" {
+		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d budget=%d budget_watermark=%d measure=%q outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, sess.WorkerOutcome)
 	}
 	if sess.TokensUsedTotal != 1_730_413 || sess.Worktree != "/tmp/kept-worktree" || sess.Branch != "feat/kept-branch" || sess.PRNumber != 335 {
 		t.Fatalf("cumulative/session identity changed: total=%d worktree=%q branch=%q PR=%d", sess.TokensUsedTotal, sess.Worktree, sess.Branch, sess.PRNumber)

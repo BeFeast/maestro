@@ -35,6 +35,9 @@ func TestParsePiUsage_SingleTurn(t *testing.T) {
 	if usage.TotalTokens != 773 {
 		t.Errorf("TotalTokens = %d, want 773", usage.TotalTokens)
 	}
+	if usage.BudgetTokens != 773 {
+		t.Errorf("BudgetTokens = %d, want 773", usage.BudgetTokens)
+	}
 	if math.Abs(usage.CostUSD-0.0010912) > 1e-9 {
 		t.Errorf("CostUSD = %v, want 0.0010912", usage.CostUSD)
 	}
@@ -55,6 +58,9 @@ func TestParsePiUsage_MultiTurnSums(t *testing.T) {
 	}
 	if usage.TotalTokens != 3480 {
 		t.Errorf("TotalTokens = %d, want 3480", usage.TotalTokens)
+	}
+	if usage.BudgetTokens != 3280 {
+		t.Errorf("BudgetTokens = %d, want 3280 (cache reads excluded)", usage.BudgetTokens)
 	}
 	if math.Abs(usage.CostUSD-(0.001444+0.003168)) > 1e-9 {
 		t.Errorf("CostUSD = %v, want %v", usage.CostUSD, 0.001444+0.003168)

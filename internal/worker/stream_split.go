@@ -69,7 +69,7 @@ func RunStreamSplitWithBudget(backend, jsonlPath string, maxTokens int, markerPa
 			}
 			line := strings.TrimRight(chunk, "\r\n")
 			if observed, exceeded := monitor.observe(line); exceeded {
-				if err := writeTokenBudgetMarker(markerPath, backend, observed, maxTokens); err != nil {
+				if err := writeTokenBudgetMarker(markerPath, backend, monitor.measure, observed, maxTokens); err != nil {
 					if stop != nil {
 						stop()
 					}

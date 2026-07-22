@@ -259,23 +259,26 @@ type Session struct {
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                    string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
-	CostUSDBackend           float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
-	LongRunning              bool       `json:"long_running,omitempty"`
-	RebaseAttempted          bool       `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail           bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus       string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
-	LiveVerificationNotified bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
-	RetryCount               int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
-	MaintenanceRetryCount    int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
-	NextRetryAt              *time.Time `json:"next_retry_at,omitempty"`
-	RetryHoldReason          string     `json:"retry_hold_reason,omitempty"` // current dispatch guard holding a scheduled canonical retry; does not release its issue/worktree lease
-	LastOutputHash           string     `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
-	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
-	TokensUsedTotal          int        `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
-	WorkerOutcome            string     `json:"worker_outcome,omitempty"`      // deterministic terminal worker outcome, e.g. token_budget_exceeded
+	Model                      string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
+	CostUSDBackend             float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
+	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
+	LongRunning                bool       `json:"long_running,omitempty"`
+	RebaseAttempted            bool       `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail             bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus         string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
+	LiveVerificationNotified   bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
+	RetryCount                 int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	MaintenanceRetryCount      int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
+	NextRetryAt                *time.Time `json:"next_retry_at,omitempty"`
+	RetryHoldReason            string     `json:"retry_hold_reason,omitempty"` // current dispatch guard holding a scheduled canonical retry; does not release its issue/worktree lease
+	LastOutputHash             string     `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt        time.Time  `json:"last_output_changed_at,omitempty"`
+	TokensUsedAttempt          int        `json:"tokens_used_attempt,omitempty"`           // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal            int        `json:"tokens_used_total,omitempty"`             // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
+	TokenBudgetTokensAttempt   int        `json:"token_budget_tokens_attempt,omitempty"`   // current-attempt usage under TokenBudgetMeasure; kept separate from inclusive cost telemetry
+	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // high-water mark for the current attempt's cumulative budget measure
+	TokenBudgetMeasure         string     `json:"token_budget_measure,omitempty"`          // explicit live-ceiling measure, e.g. uncached_tokens
+	WorkerOutcome              string     `json:"worker_outcome,omitempty"`                // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
 	// the cost panel can price each dimension separately — cache_read tokens
@@ -465,8 +468,17 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 		}
 	}
 	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		observed := sess.TokenBudgetTokensAttempt
+		measure := strings.TrimSpace(sess.TokenBudgetMeasure)
+		if observed <= 0 {
+			observed = sess.TokensUsedAttempt
+		}
+		measureLabel := "tokens"
+		if measure != "" {
+			measureLabel = measure
+		}
 		return SessionAttention{
-			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s tokens observed).", formatSessionTokens(sess.TokensUsedAttempt)),
+			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s %s observed).", formatSessionTokens(observed), measureLabel),
 			NextAction:     "Review the partial work and raise or disable worker_max_tokens only if a larger run is intentional.",
 			NeedsAttention: true,
 		}

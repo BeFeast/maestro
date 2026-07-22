@@ -478,8 +478,11 @@ func TestFleetTokenBudgetMarkerShowsStoppedWorkerAndConfiguredBudget(t *testing.
 	if got.Status != string(state.StatusFailed) || got.DisplayStatus != worker.TokenBudgetExceededOutcome {
 		t.Fatalf("status/display = %q/%q, want failed/token_budget_exceeded", got.Status, got.DisplayStatus)
 	}
-	if got.WorkerMaxTokens != 80_000 || got.TokensUsedAttempt != 85_000 || got.WorkerOutcome != worker.TokenBudgetExceededOutcome {
-		t.Fatalf("budget view = %+v, want max=80000 usage=85000 outcome", got)
+	if got.WorkerMaxTokens != 80_000 || got.TokenBudgetTokensAttempt != 85_000 || got.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		t.Fatalf("budget view = %+v, want max=80000 budget_usage=85000 outcome", got)
+	}
+	if got.TokensUsedAttempt != 0 || got.TokensUsedTotal != 0 {
+		t.Fatalf("uncached marker polluted inclusive telemetry: attempt=%d total=%d", got.TokensUsedAttempt, got.TokensUsedTotal)
 	}
 	if got.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
 		t.Fatalf("budget measure = %q, want %q", got.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)

@@ -1364,17 +1364,56 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	delta := tokens - sess.TokensUsedAttempt
 	sess.TokensUsedAttempt = tokens
 	sess.TokensUsedTotal += delta
+	updateTokenBudgetUsage(sess, tokens, worker.TokenBudgetMeasureProviderTotal)
 	log.Printf("[orch] %s tokens_used updated: attempt=%d total=%d", slotName, tokens, sess.TokensUsedTotal)
 	return true
 }
 
-func applyTokenBudgetObservation(sess *state.Session, observed int) {
-	if sess == nil || observed <= sess.TokensUsedAttempt {
+func updateTokenBudgetUsage(sess *state.Session, cumulative int, measure string) bool {
+	if sess == nil {
+		return false
+	}
+	changed := false
+	if measure = strings.TrimSpace(measure); measure != "" && sess.TokenBudgetMeasure != measure {
+		sess.TokenBudgetMeasure = measure
+		changed = true
+	}
+	if cumulative > sess.TokenBudgetTokensWatermark {
+		delta := cumulative - sess.TokenBudgetTokensWatermark
+		sess.TokenBudgetTokensWatermark = cumulative
+		sess.TokenBudgetTokensAttempt += delta
+		changed = true
+	}
+	return changed
+}
+
+func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetMarker) {
+	if sess == nil {
 		return
 	}
-	delta := observed - sess.TokensUsedAttempt
-	sess.TokensUsedAttempt = observed
-	sess.TokensUsedTotal += delta
+	measure := strings.TrimSpace(marker.Measure)
+	if measure == "" {
+		measure = worker.TokenBudgetMeasureProviderTotalLegacy
+	}
+	updateTokenBudgetUsage(sess, marker.TokensObserved, measure)
+	// Markers written before measure-aware accounting used the inclusive
+	// provider total. Preserve that legacy projection without mixing a new
+	// uncached observation into cost telemetry.
+	if measure == worker.TokenBudgetMeasureProviderTotalLegacy && marker.TokensObserved > sess.TokensUsedAttempt {
+		delta := marker.TokensObserved - sess.TokensUsedAttempt
+		sess.TokensUsedAttempt = marker.TokensObserved
+		sess.TokensUsedTotal += delta
+	}
+}
+
+func tokenBudgetObservation(sess *state.Session) (int, string) {
+	if sess == nil {
+		return 0, worker.TokenBudgetMeasureProviderTotalLegacy
+	}
+	if strings.TrimSpace(sess.TokenBudgetMeasure) != "" || sess.TokenBudgetTokensWatermark > 0 || sess.TokenBudgetTokensAttempt > 0 {
+		return sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure
+	}
+	return sess.TokensUsedAttempt, worker.TokenBudgetMeasureProviderTotalLegacy
 }
 
 func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Session, marker worker.TokenBudgetMarker, now time.Time) {
@@ -1385,7 +1424,8 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 		now = time.Now().UTC()
 	}
 	o.updateTokensUsedFromWorkerLog(slotName, sess)
-	applyTokenBudgetObservation(sess, marker.TokensObserved)
+	applyTokenBudgetObservation(sess, marker)
+	budgetObserved, budgetMeasure := tokenBudgetObservation(sess)
 	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
 	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
 	sess.Status = state.StatusFailed
@@ -1394,10 +1434,10 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 	sess.NextRetryAt = nil
 	sess.FinishedAt = &now
 	state.MarkWorkerEnded(sess, now)
-	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d", slotName, sess.TokensUsedAttempt, marker.MaxTokens)
+	log.Printf("[orch] worker %s stopped by token budget: observed=%d max=%d measure=%s", slotName, budgetObserved, marker.MaxTokens, budgetMeasure)
 	if o.notifier != nil {
-		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s observed / %s configured",
-			slotName, sess.IssueNumber, worker.FormatTokens(sess.TokensUsedAttempt), worker.FormatTokens(marker.MaxTokens))
+		o.notifier.Sendf("maestro: worker %s (issue #%d) stopped at its token budget: %s %s observed / %s configured",
+			slotName, sess.IssueNumber, worker.FormatTokens(budgetObserved), budgetMeasure, worker.FormatTokens(marker.MaxTokens))
 	}
 }
 
@@ -1431,6 +1471,9 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 		sess.TokensOutput = usage.Output
 		sess.TokensCacheRead = usage.CacheRead
 		sess.TokensCacheWrite = usage.CacheWrite
+		changed = true
+	}
+	if updateTokenBudgetUsage(sess, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
 		changed = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
@@ -1505,6 +1548,9 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		sess.TokensCacheWrite = usage.CacheWrite
 		telemetryChanged = true
 	}
+	if ok && updateTokenBudgetUsage(sess, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
+		telemetryChanged = true
+	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
 		sess.Model = usage.Model
 		telemetryChanged = true
@@ -1550,16 +1596,22 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	if !ok {
 		return false
 	}
-	if usage.TotalTokens <= sess.UsageTokensWatermark {
-		return false
+	changed := false
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
+		sess.TokensUsedTotal += delta
+		changed = true
 	}
-	delta := usage.TotalTokens - sess.UsageTokensWatermark
-	sess.UsageTokensWatermark = usage.TotalTokens
-	sess.TokensUsedAttempt += delta
-	sess.TokensUsedTotal += delta
-	log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
-		slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
-	return true
+	if updateTokenBudgetUsage(sess, usage.TotalTokens, worker.TokenBudgetMeasureCodexRollout) {
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
+			slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
+	}
+	return changed
 }
 
 // updateKimiUsageFromJSONL parses Kimi's first-class stream-json side channel
@@ -1645,6 +1697,9 @@ func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state
 		sess.TokensOutput = usage.Output + usage.Reasoning
 		sess.TokensCacheRead = usage.CacheRead
 		sess.TokensCacheWrite = usage.CacheWrite
+		changed = true
+	}
+	if updateTokenBudgetUsage(sess, usage.TotalTokens, worker.TokenBudgetMeasureInputOutputReasoning) {
 		changed = true
 	}
 	if usage.CostUSD > sess.CostUSDBackend {
@@ -4059,6 +4114,9 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	current.CostUSDBackend = runtime.CostUSDBackend
 	current.UsageTokensWatermark = runtime.UsageTokensWatermark
 	current.TokensUsedAttempt = runtime.TokensUsedAttempt
+	current.TokenBudgetTokensWatermark = runtime.TokenBudgetTokensWatermark
+	current.TokenBudgetTokensAttempt = runtime.TokenBudgetTokensAttempt
+	current.TokenBudgetMeasure = runtime.TokenBudgetMeasure
 	current.WorkerOutcome = runtime.WorkerOutcome
 	current.WorkerLeaseID = runtime.WorkerLeaseID
 	current.WorkerLeaseUnit = runtime.WorkerLeaseUnit
@@ -4801,11 +4859,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Soft token threshold: checkpoint + respawn ---
+					budgetTokens, budgetMeasure := tokenBudgetObservation(sess)
 					if sess.Phase != state.PhaseAdvisor && o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
 						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
-						if sess.TokensUsedAttempt >= softLimit {
-							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d), checkpointing",
-								slotName, sess.TokensUsedAttempt, softLimit)
+						if budgetTokens >= softLimit {
+							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d, measure=%s), checkpointing",
+								slotName, budgetTokens, softLimit, budgetMeasure)
 
 							// Save checkpoint
 							cpFile, cpErr := o.saveCheckpoint(sess)
@@ -4839,9 +4898,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 
 					// --- Token limit enforcement ---
-					if o.cfg.WorkerMaxTokens > 0 && sess.TokensUsedAttempt >= o.cfg.WorkerMaxTokens && sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
-						log.Printf("[orch] worker %s reached token limit (%d >= %d), killing",
-							slotName, sess.TokensUsedAttempt, o.cfg.WorkerMaxTokens)
+					if o.cfg.WorkerMaxTokens > 0 && budgetTokens >= o.cfg.WorkerMaxTokens && sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+						log.Printf("[orch] worker %s reached token limit (%d >= %d, measure=%s), killing",
+							slotName, budgetTokens, o.cfg.WorkerMaxTokens, budgetMeasure)
 						o.runAfterRunHook(sess)
 						if err := o.stopWorker(slotName, sess); err != nil {
 							log.Printf("[orch] warn: could not stop token-limit worker %s: %v", slotName, err)
@@ -4853,8 +4912,9 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						o.markTokenBudgetExceeded(slotName, sess, worker.TokenBudgetMarker{
 							Outcome:        worker.TokenBudgetExceededOutcome,
 							Backend:        sess.Backend,
-							TokensObserved: sess.TokensUsedAttempt,
+							TokensObserved: budgetTokens,
 							MaxTokens:      o.cfg.WorkerMaxTokens,
+							Measure:        budgetMeasure,
 							MeasuredAt:     now,
 						}, now)
 						if sess.Phase == state.PhaseAdvisor {

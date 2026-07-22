@@ -38,7 +38,7 @@ overrides.
 | `supervisor.unchanged_decision_window_seconds` | int | roll up identical recommendation journal lines (default 3600) |
 | `supervisor.recommendation_ttl_seconds` | int | drop unconsumed recommendations with a disposition after this age (default 86400) |
 | `poll_interval_seconds` | int | supervise/orchestrate poll cadence |
-| `worker_max_tokens` | int | enforce a per-attempt live token ceiling (0 = unlimited) |
+| `worker_max_tokens` | int | enforce a per-attempt live token ceiling; Claude/Pi exclude cache reads (0 = unlimited) |
 
 ## Commands
 
@@ -90,9 +90,16 @@ new cache-write tokens. Cache reads remain visible in cost/usage telemetry but
 are excluded from the ceiling because they replay previously produced context;
 counting the full cached context on every turn can kill a healthy worker after
 only a few new tokens. Repeated Claude stream frames for the same assistant
-message are de-duplicated by message id. Token-budget markers and Fleet worker
-rows expose `token_budget_measure: uncached_tokens`; total session/cost counters
-continue to retain the provider's full cache-aware usage.
+message are de-duplicated by message id. The orchestrator's soft-checkpoint and
+hard-stop paths consume the same cache-read-excluding counter as the stream
+monitor; they never compare the ceiling to the inclusive cost-telemetry total.
+Token-budget markers and Fleet worker rows expose
+`token_budget_measure: uncached_tokens` plus the current
+`token_budget_tokens_attempt`; total session/cost counters continue to retain
+the provider's full cache-aware usage. Codex markers use
+`codex_rollout_tokens`, while OpenCode uses
+`input_output_reasoning_tokens`, so Fleet never presents those native measures
+as Claude/Pi uncached accounting.
 
 The measurement lag and maximum overshoot are therefore **one provider
 response**, plus the time needed to flush one JSONL line. There is no additional

@@ -266,7 +266,7 @@ stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
   enabled: true
   max_silence_minutes: 20          # exact-lease worker recovery; runtime-live contract remains canary-gated
   eval_interval_seconds: 60        # independent local evaluation cadence
-worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
+worker_max_tokens: 0               # per-attempt live budget; Claude/Pi exclude cache reads (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between merges in sequential mode
@@ -468,6 +468,12 @@ stream; Codex combines cumulative rollout `token_count` telemetry with its
 native rollout budget inside the agent loop (`--ephemeral` is rejected).
 Enforcement lags by at most one provider response, not by the orchestration poll
 interval.
+
+For Claude and Pi, `worker_max_tokens` counts input + output + newly written
+cache tokens and excludes cache reads. Cache reads remain in session and cost
+telemetry, but replaying the same cached context on later turns does not consume
+the live ceiling again. Fleet exposes the current budget numerator separately as
+`token_budget_tokens_attempt` with `token_budget_measure: uncached_tokens`.
 
 ### Optional worker MCP tools
 

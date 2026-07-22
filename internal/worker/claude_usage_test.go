@@ -34,6 +34,9 @@ func TestParseClaudeUsage_RealSmokeCapture(t *testing.T) {
 	if usage.TotalTokens != 20076 {
 		t.Errorf("TotalTokens = %d, want 20076", usage.TotalTokens)
 	}
+	if usage.BudgetTokens != 4415 {
+		t.Errorf("BudgetTokens = %d, want 4415 (cache reads excluded)", usage.BudgetTokens)
+	}
 	if usage.CostUSD != 0.0401785 {
 		t.Errorf("CostUSD = %v, want 0.0401785", usage.CostUSD)
 	}
@@ -101,6 +104,9 @@ func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
 	}
 	if usage.TotalTokens != 80_000 {
 		t.Fatalf("TotalTokens = %d, want 80000", usage.TotalTokens)
+	}
+	if usage.BudgetTokens != 59_000 {
+		t.Fatalf("BudgetTokens = %d, want 59000", usage.BudgetTokens)
 	}
 }
 
