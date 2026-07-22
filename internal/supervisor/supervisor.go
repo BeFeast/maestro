@@ -1370,16 +1370,10 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		}
 
 		if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-				"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is waiting for a ready label mutation to appear — skip for later candidates", issue.Number),
 			)
-			for _, reason := range firstN(result.skipped, 3) {
-				reasons = append(reasons, reason)
-			}
-			decision := e.decision(st, now, projectState, ActionNone,
-				"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-			return withAnalysis(decision), nil
+			continue
 		}
 
 		// Race protection: refuse to recommend spawn for an issue that has
