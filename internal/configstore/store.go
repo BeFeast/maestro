@@ -673,7 +673,33 @@ func upsertProjectTx(ctx context.Context, tx *sql.Tx, name, configYAML string) e
 	if err := upsertSharedBackendsTx(ctx, tx, backends, now); err != nil {
 		return err
 	}
-	projectYAML, err := marshalNode(&root)
+	return upsertProjectRootTx(ctx, tx, name, &root, now)
+}
+
+// upsertPreparedProjectTx writes a project document that genesis already
+// strict-validated against the target store in the same transaction. Genesis
+// never owns fleet backend values, so an attached backend block is an internal
+// error rather than something this path may detach and upsert.
+func upsertPreparedProjectTx(ctx context.Context, tx *sql.Tx, name, configYAML string) error {
+	if strings.TrimSpace(name) == "" {
+		return errors.New("project name is required")
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal([]byte(configYAML), &root); err != nil {
+		return err
+	}
+	if backends := detachBackends(&root); len(backends) > 0 {
+		return errors.New("internal: prepared project still contains model.backends")
+	}
+	if err := enforceImmutableProjectID(ctx, tx, name, &root); err != nil {
+		return err
+	}
+	now := time.Now().UTC().Format(time.RFC3339Nano)
+	return upsertProjectRootTx(ctx, tx, name, &root, now)
+}
+
+func upsertProjectRootTx(ctx context.Context, tx *sql.Tx, name string, root *yaml.Node, now string) error {
+	projectYAML, err := marshalNode(root)
 	if err != nil {
 		return err
 	}
