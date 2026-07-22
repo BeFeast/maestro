@@ -7784,6 +7784,47 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	}
 }
 
+func TestDispatchCapacityConfigEqualIncludesEveryCapacityInput(t *testing.T) {
+	base := &config.Config{
+		MaxParallel:          4,
+		MaxLiveWorkers:       2,
+		MaxConcurrentByState: map[string]int{"running": 3},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{name: "max_parallel", mutate: func(c *config.Config) { c.MaxParallel++ }},
+		{name: "max_live_workers", mutate: func(c *config.Config) { c.MaxLiveWorkers++ }},
+		{name: "max_concurrent_by_state", mutate: func(c *config.Config) {
+			c.MaxConcurrentByState = map[string]int{"running": 4}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := *base
+			changed.MaxConcurrentByState = map[string]int{"running": 3}
+			tt.mutate(&changed)
+			if dispatchCapacityConfigEqual(base, &changed) {
+				t.Fatalf("dispatch capacity configs compare equal after %s changed", tt.name)
+			}
+		})
+	}
+
+	nonCapacity := *base
+	nonCapacity.MaxRuntimeMinutes = 90
+	if !dispatchCapacityConfigEqual(base, &nonCapacity) {
+		t.Fatal("non-capacity config change affected capacity equality")
+	}
+	emptyMap := *base
+	emptyMap.MaxConcurrentByState = map[string]int{}
+	nilMap := emptyMap
+	nilMap.MaxConcurrentByState = nil
+	if !dispatchCapacityConfigEqual(&emptyMap, &nilMap) {
+		t.Fatal("nil and empty per-state limits should be capacity-equivalent")
+	}
+}
+
 func TestReloadConfig_MaxLiveWorkersIncreaseExpandsCapacity(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
 	cfg.MaxParallel = 3
@@ -7851,6 +7892,48 @@ func TestReloadConfig_MaxLiveWorkersDecreaseStopsNewDispatch(t *testing.T) {
 	}
 	if got := s.Capacity(capacityInput(o.cfg)).LiveWorkers; got != 2 {
 		t.Fatalf("live workers after blocked dispatch = %d, want existing workers only", got)
+	}
+}
+
+func TestReloadConfig_AppliesEveryDispatchCapacityField(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 4
+	cfg.MaxLiveWorkers = 0
+	cfg.MaxConcurrentByState = map[string]int{"running": 1}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+
+	s := state.NewState()
+	s.Sessions["existing"] = &state.Session{IssueNumber: 900, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 0 {
+		t.Fatalf("initial available slots = %d, want 0 at running limit 1", got)
+	}
+
+	// max_concurrent_by_state is the third input to the shared dispatch-capacity
+	// calculation. A reload comparison that enumerates only the two scalar limits
+	// leaves the orchestrator stale even though Fleet reads the new store config.
+	newCfg := *cfg
+	newCfg.MaxConcurrentByState = map[string]int{"running": 3}
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	if got := o.cfg.MaxConcurrentByState["running"]; got != 3 {
+		t.Fatalf("reloaded running limit = %d, want 3", got)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 2 {
+		t.Fatalf("available slots after reload = %d, want 2", got)
+	}
+
+	// The orchestrator owns a private config snapshot. A caller mutating the
+	// reload object later must not silently change live dispatch capacity.
+	newCfg.MaxConcurrentByState["running"] = 9
+	if got := o.cfg.MaxConcurrentByState["running"]; got != 3 {
+		t.Fatalf("live running limit aliased reload input: got %d, want 3", got)
 	}
 }
 

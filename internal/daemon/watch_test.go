@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // fakeWatchStore is an in-memory store that satisfies both ConfigLoader (so it
@@ -222,6 +223,115 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 
 	cancel()
 	<-done
+}
+
+// #884: a config-store write that changes only max_live_workers must reach the
+// already-running orchestrator loop within one watch interval. The same flow
+// must survive both an effective no-op write and the capacity reconfiguration:
+// cancelling it would stop every in-flight worker owned by that flow.
+func TestWatchStoreMaxLiveWorkersOnlyReconfiguresRunningOrchestrator(t *testing.T) {
+	store := newFakeWatchStore()
+	cfg := testConfig(t, "owner/alpha")
+	cfg.MaxParallel = 1
+	store.Set("alpha", cfg)
+
+	capacityState := state.NewState()
+	capacityState.Sessions["gate"] = &state.Session{Status: state.StatusPROpen}
+
+	var started, stopped, reloads int64
+	var availableSlots, separated int64
+	publishCapacity := func(current *config.Config) {
+		cap := capacityState.Capacity(state.CapacityInput{
+			MaxParallel:          current.MaxParallel,
+			MaxLiveWorkers:       current.MaxLiveWorkers,
+			MaxConcurrentByState: current.MaxConcurrentByState,
+		})
+		atomic.StoreInt64(&availableSlots, int64(cap.AvailableSlots))
+		if cap.Separated {
+			atomic.StoreInt64(&separated, 1)
+		} else {
+			atomic.StoreInt64(&separated, 0)
+		}
+	}
+	run := func(ctx context.Context, current *config.Config, opts Options, reloadCh <-chan *config.Config) {
+		atomic.AddInt64(&started, 1)
+		defer atomic.AddInt64(&stopped, 1)
+		publishCapacity(current)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case next := <-reloadCh:
+				if next == nil {
+					continue
+				}
+				publishCapacity(next)
+				atomic.AddInt64(&reloads, 1)
+			}
+		}
+	}
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+		<-ctx.Done()
+	}
+	d := newWatchDaemon(store, run, sup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitForNames(t, d, "alpha")
+	waitFor(t, func() bool { return atomic.LoadInt64(&started) == 1 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&availableSlots) == 0 })
+	if got := atomic.LoadInt64(&separated); got != 0 {
+		t.Fatalf("initial separated = %d, want 0", got)
+	}
+	// Let the per-project watcher seed its initial fingerprint before advancing
+	// updated_at; otherwise an unusually slow goroutine start could absorb the
+	// first write into its baseline instead of emitting it.
+	time.Sleep(2 * d.opts.WatchStoreInterval)
+
+	// A timestamp-only/no-op store write still produces a reload event, but it
+	// must not replace or cancel the running flow.
+	noOp := *cfg
+	store.Set("alpha", &noOp)
+	waitFor(t, func() bool { return atomic.LoadInt64(&reloads) >= 1 })
+	if got := atomic.LoadInt64(&started); got != 1 {
+		t.Fatalf("run loops started after no-op reload = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&stopped); got != 0 {
+		t.Fatalf("run loops stopped after no-op reload = %d, want 0", got)
+	}
+
+	// Change only max_live_workers. With one PR gate and max_parallel=1, the
+	// legacy model has no slot; separated accounting must expose one immediately.
+	edited := noOp
+	edited.MaxLiveWorkers = 1
+	store.Set("alpha", &edited)
+	waitFor(t, func() bool {
+		return atomic.LoadInt64(&reloads) >= 2 &&
+			atomic.LoadInt64(&separated) == 1 &&
+			atomic.LoadInt64(&availableSlots) == 1
+	})
+	waitFor(t, func() bool { return fleetProjectLiveWorkerLimit(t, d, "alpha") == 1 })
+	if got := atomic.LoadInt64(&started); got != 1 {
+		t.Fatalf("run loops started after effective reload = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&stopped); got != 0 {
+		t.Fatalf("run loops stopped after effective reload = %d, want 0", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got := atomic.LoadInt64(&stopped); got != 1 {
+		t.Fatalf("run loops stopped after daemon shutdown = %d, want 1", got)
+	}
 }
 
 func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testing.T) {
