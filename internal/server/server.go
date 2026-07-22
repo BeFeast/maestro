@@ -17,6 +17,7 @@ import (
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
@@ -434,6 +435,8 @@ type sessionInfo struct {
 	HasLog                 bool                    `json:"has_log"`
 	RetryCount             int                     `json:"retry_count,omitempty"`
 	LastNotification       string                  `json:"last_notification,omitempty"`
+	OperatorGateName       string                  `json:"operator_gate_name,omitempty"`
+	OperatorGateAction     string                  `json:"operator_gate_required_action,omitempty"`
 	BackendSelection       *state.BackendSelection `json:"backend_selection,omitempty"`
 	// Attribution is the per-segment provider/model/variant/effort timeline
 	// recorded across spawn / respawn / fallover (#513, PR #518). The SPA
@@ -537,6 +540,8 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		HasLog:                    strings.TrimSpace(sess.LogFile) != "",
 		RetryCount:                sess.RetryCount,
 		LastNotification:          sess.LastNotifiedStatus,
+		OperatorGateName:          sess.OperatorGateName,
+		OperatorGateAction:        sess.OperatorGateRequiredAction,
 		BackendSelection:          sess.BackendSelection,
 		Attribution:               sess.Attribution,
 		Live:                      state.SessionLiveAt(sess, now),
@@ -919,6 +924,9 @@ func allSessionInfos(cfg *config.Config, st *state.State) []sessionInfo {
 	}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	applyProjectStatusDisplay(infos, st)
+	for i := range infos {
+		applyMergeControlProjection(cfg, st, &infos[i])
+	}
 	sort.Slice(infos, func(i, j int) bool {
 		left, right := infos[i], infos[j]
 		li := state.StatusPriority(state.SessionStatus(left.Status))
@@ -932,6 +940,34 @@ func allSessionInfos(cfg *config.Config, st *state.State) []sessionInfo {
 		return left.Slot < right.Slot
 	})
 	return infos
+}
+
+func applyMergeControlProjection(cfg *config.Config, st *state.State, info *sessionInfo) {
+	if st == nil || info == nil || info.PRNumber <= 0 {
+		return
+	}
+	control, ok := st.MergeControlForPR(info.PRNumber)
+	if !ok || (control.IssueNumber > 0 && control.IssueNumber != info.IssueNumber) {
+		return
+	}
+	gateName := "label:" + mergegate.PrimaryHoldLabel(cfg)
+	if control.Held {
+		info.OperatorGateName = gateName
+		info.OperatorGateAction = "Use Release merge after the operator hold is cleared and every review thread is resolved."
+		info.NeedsAttention = true
+		info.StatusReason = fmt.Sprintf("PR #%d is held by explicit merge control: %s", info.PRNumber, firstNonEmpty(control.HoldReason, "operator hold"))
+		info.NextAction = info.OperatorGateAction
+		return
+	}
+	if control.LastResult == "released" && strings.EqualFold(info.OperatorGateName, gateName) {
+		info.OperatorGateName = ""
+		info.OperatorGateAction = ""
+		if info.Status == string(state.StatusPROpen) {
+			info.NeedsAttention = false
+			info.StatusReason = ""
+			info.NextAction = "Wait for current CI, review threads, and merge labels to be re-evaluated."
+		}
+	}
 }
 
 func applyBackendDrift(cfg *config.Config, info *sessionInfo) {
@@ -1111,7 +1147,7 @@ func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
 func sessionInfosWithActions(cfg *config.Config, st *state.State, readOnly bool, endpoint string) []sessionInfo {
 	infos := allSessionInfos(cfg, st)
 	for i := range infos {
-		infos[i].Actions = workerActionAffordances(readOnly, endpoint, infos[i])
+		infos[i].Actions = workerActionAffordances(cfg, readOnly, endpoint, infos[i])
 	}
 	return infos
 }
@@ -1134,7 +1170,7 @@ func closeIssueBatchControlAction(readOnly bool, endpoint, target string, candid
 	return a
 }
 
-func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+func workerActionAffordances(cfg *config.Config, readOnly bool, endpoint string, worker sessionInfo) []controlAction {
 	// code_landed records a merged PR, and done records a terminal issue.
 	// Neither state has a live merge/restart/stop/label control surface; keep
 	// the row as audit history without describing the merged PR as open.
@@ -1143,6 +1179,8 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		return nil
 	}
 	merge := newApprovalControlAction("approve_merge", "Approve merge", "Enqueue a cautious-gate approval to merge this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	holdMerge := newSafeControlAction(config.SupervisorActionHoldMerge, "Hold merge", "Immediately place an audited merge hold on this issue and PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	releaseMerge := newSafeControlAction(config.SupervisorActionReleaseMerge, "Release merge", "Explicitly remove the audited merge hold; normal live gates are re-read before merge.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	if worker.PRNumber == 0 {
 		// PR-less workers can't enqueue merge_pr regardless of read-only;
 		// surface a verb-specific reason. In read-only mode this still
@@ -1154,6 +1192,8 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			merge.DisabledReason = "No PR is associated with this worker; approve merge becomes available once a PR is open."
 		}
+		setControlDisabled(&holdMerge, "No PR is associated with this worker; merge hold becomes available once a PR is open.")
+		setControlDisabled(&releaseMerge, "No PR is associated with this worker; merge hold becomes available once a PR is open.")
 	} else if gate := worker.PRGate; gate != nil {
 		switch {
 		case gate.Merged:
@@ -1172,6 +1212,12 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 			merge.Disabled = true
 			merge.DisabledReason = firstNonEmpty(gate.ReviewSummary, "The review gate is still pending.")
 		}
+	}
+	holdLabel := mergegate.PrimaryHoldLabel(cfg)
+	if strings.EqualFold(worker.OperatorGateName, "label:"+holdLabel) {
+		setControlDisabled(&holdMerge, fmt.Sprintf("PR #%d is already held by %s.", worker.PRNumber, holdLabel))
+	} else if worker.PRNumber > 0 {
+		setControlDisabled(&releaseMerge, fmt.Sprintf("PR #%d has no explicit %s merge hold to release.", worker.PRNumber, holdLabel))
 	}
 	restart := newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	var repair *controlAction
@@ -1212,12 +1258,27 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		newApprovalControlAction("stop_worker", "Stop", "Enqueue a cautious-gate approval to stop this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		holdMerge,
+		releaseMerge,
 		merge,
 	}
 	if repair != nil {
 		actions = append(actions, *repair)
 	}
 	return actions
+}
+
+func setControlDisabled(action *controlAction, reason string) {
+	if action == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if action.Disabled && strings.TrimSpace(action.DisabledReason) != "" {
+		action.DisabledReason = strings.TrimSpace(action.DisabledReason) + " Additionally, " + reason
+		return
+	}
+	action.Disabled = true
+	action.DisabledReason = reason
 }
 
 func fleetMergeActionSuppressesDuplicate(status string) bool {

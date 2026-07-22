@@ -1923,6 +1923,8 @@ type fleetWorkerState struct {
 	PRNumber           int                     `json:"pr_number,omitempty"`
 	PRMerged           bool                    `json:"pr_merged,omitempty"`
 	PRURL              string                  `json:"pr_url,omitempty"`
+	OperatorGateName   string                  `json:"operator_gate_name,omitempty"`
+	OperatorGateAction string                  `json:"operator_gate_required_action,omitempty"`
 	TokensUsedAttempt  int                     `json:"tokens_used_attempt"`
 	TokensUsedTotal    int                     `json:"tokens_used_total"`
 	WorkerMaxTokens    int                     `json:"worker_max_tokens,omitempty"`
@@ -2054,10 +2056,11 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
 	applyBackendDrift(project.cfg, &infos[0])
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	applyMergeControlProjection(project.cfg, st, &infos[0])
 	infos[0] = reconcileFleetWorkerPRGate(infos[0], st, project.cfg.Repo)
 	pricing := backendPricingMap(project.cfg)
 	infos[0].CostUSDEstimate = sessionCostUSD(sess, pricing)
-	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
+	infos[0].Actions = workerActionAffordances(project.cfg, projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
 	if lines > 1000 {
@@ -4536,7 +4539,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		if worker.PRGate != nil && fleetWorkerPRStateCurrent(worker) {
 			item.PRStates = appendFleetProjectPRState(item.PRStates, *worker.PRGate)
 		}
-		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		worker.Actions = workerActionAffordances(cfg, item.ReadOnly, "/api/v1/fleet/actions", worker)
 		if worker.BackendDrift != nil && worker.BackendDrift.Stale {
 			target := controlActionWorkerTarget{
 				Slot:        worker.Slot,
@@ -6244,6 +6247,8 @@ func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWo
 		PRNumber:                  worker.PRNumber,
 		PRMerged:                  worker.PRMerged,
 		PRURL:                     worker.PRURL,
+		OperatorGateName:          worker.OperatorGateName,
+		OperatorGateAction:        worker.OperatorGateAction,
 		TokensUsedAttempt:         worker.TokensUsedAttempt,
 		TokensUsedTotal:           worker.TokensUsedTotal,
 		WorkerMaxTokens:           project.EffectiveConfig.CostCaps.WorkerMaxTokens,

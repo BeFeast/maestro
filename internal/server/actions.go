@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -19,6 +21,7 @@ import (
 // a fake. Keeping the interface here (next to the dispatcher) avoids dragging
 // internal/server into a hard dep on internal/github.
 type actionGitHubClient interface {
+	GetIssue(issueNumber int) (github.Issue, error)
 	AddIssueLabel(issueNumber int, label string) error
 	RemoveIssueLabel(issueNumber int, label string) error
 	CommentIssue(issueNumber int, body string) error
@@ -90,12 +93,20 @@ func dispatchSafeAction(req controlActionRequest, cfg *config.Config, gh actionG
 	if req.IssueNumber <= 0 {
 		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "issue_number is required for safe actions"}, err: errors.New("missing issue_number")}
 	}
+	if (id == config.SupervisorActionHoldMerge || id == config.SupervisorActionReleaseMerge) && req.PRNumber <= 0 {
+		return safeActionResult{handled: true, status: http.StatusBadRequest, body: map[string]string{"error": "pr_number is required for merge hold/release actions"}, err: errors.New("missing pr_number")}
+	}
 
 	readyLabel := safeActionReadyLabel(cfg)
 	blockedLabel := safeActionBlockedLabel(cfg)
+	mergeHoldLabel := mergegate.PrimaryHoldLabel(cfg)
 	target := fmt.Sprintf("issue #%d", req.IssueNumber)
 
 	switch id {
+	case config.SupervisorActionHoldMerge:
+		return dispatchMergeHold(req, cfg, gh, audit, authenticatedActor, mergeHoldLabel, true)
+	case config.SupervisorActionReleaseMerge:
+		return dispatchMergeHold(req, cfg, gh, audit, authenticatedActor, mergeHoldLabel, false)
 	case config.SupervisorActionAddReadyLabel:
 		if readyLabel == "" {
 			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no ready label configured (cfg.Supervisor.ReadyLabel / cfg.IssueLabels)"}, err: errors.New("no ready label")}
@@ -170,6 +181,8 @@ func isSafeAction(id string) bool {
 		config.SupervisorActionRemoveReadyLabel,
 		config.SupervisorActionAddBlockedLabel,
 		config.SupervisorActionRemoveBlockedLabel,
+		config.SupervisorActionHoldMerge,
+		config.SupervisorActionReleaseMerge,
 		config.SupervisorActionAddIssueComment:
 		return true
 	}
@@ -257,6 +270,84 @@ func safeActionBlockedLabel(cfg *config.Config) string {
 		return ""
 	}
 	return strings.TrimSpace(cfg.Supervisor.BlockedLabel)
+}
+
+func dispatchMergeHold(req controlActionRequest, cfg *config.Config, gh actionGitHubClient, audit actionAuditRecorder, authenticatedActor, holdLabel string, held bool) safeActionResult {
+	if cfg == nil || strings.TrimSpace(cfg.StateDir) == "" {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no state dir is available to record merge hold evidence"}, err: errors.New("empty state dir")}
+	}
+	if strings.TrimSpace(holdLabel) == "" {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no merge hold label is configured"}, err: errors.New("no merge hold label")}
+	}
+	action := config.SupervisorActionHoldMerge
+	summary := "+merge hold label " + holdLabel
+	if !held {
+		action = config.SupervisorActionReleaseMerge
+		summary = "-merge hold label " + holdLabel
+	}
+	target := fmt.Sprintf("issue #%d / PR #%d", req.IssueNumber, req.PRNumber)
+	if err := auditOrAbort(audit, req, authenticatedActor, action, target, summary); err != nil {
+		return auditFailureResult(action, target, err)
+	}
+
+	actor := resolveActor(authenticatedActor, req.Actor, "dashboard")
+	reason := strings.TrimSpace(req.Reason)
+	if reason == "" {
+		if held {
+			reason = "explicit Mission Control merge hold"
+		} else {
+			reason = "explicit Mission Control merge release"
+		}
+	}
+
+	// Publish hold intent before waiting on the same boundary lock used by
+	// merge execution. A merge already inside final validation observes this
+	// flag before its side effect and refuses deterministically.
+	mergegate.SetHoldIntent(cfg.Repo, req.PRNumber, true)
+	unlock := mergegate.Lock(cfg.Repo, req.PRNumber)
+	defer unlock()
+	if held {
+		if err := state.Update(cfg.StateDir, func(st *state.State) error {
+			st.HoldMerge(req.IssueNumber, req.PRNumber, actor, reason, time.Now().UTC())
+			return nil
+		}); err != nil {
+			mergegate.SetHoldIntent(cfg.Repo, req.PRNumber, false)
+			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("record merge hold: %v", err)}, err: err}
+		}
+		if err := gh.AddIssueLabel(req.IssueNumber, holdLabel); err != nil {
+			// The durable hold and process intent deliberately remain active. A
+			// failed label write must fail safe rather than reopening merge.
+			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("add merge hold label: %v; durable hold remains active", err)}, err: err}
+		}
+		return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(action, target)}
+	}
+
+	issue, err := gh.GetIssue(req.IssueNumber)
+	if err != nil {
+		return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("read merge hold label before release: %v", err)}, err: err}
+	}
+	if issueHasLabel(issue, holdLabel) {
+		if err := gh.RemoveIssueLabel(req.IssueNumber, holdLabel); err != nil {
+			return safeActionResult{handled: true, status: http.StatusBadGateway, body: map[string]string{"error": fmt.Sprintf("remove merge hold label: %v", err)}, err: err}
+		}
+	}
+	if err := state.Update(cfg.StateDir, func(st *state.State) error {
+		st.ReleaseMergeHold(req.IssueNumber, req.PRNumber, actor, reason, time.Now().UTC())
+		return nil
+	}); err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("record merge release: %v", err)}, err: err}
+	}
+	mergegate.SetHoldIntent(cfg.Repo, req.PRNumber, false)
+	return safeActionResult{handled: true, status: http.StatusOK, body: makeSafeOK(action, target)}
+}
+
+func issueHasLabel(issue github.Issue, wanted string) bool {
+	for _, label := range issue.Labels {
+		if strings.EqualFold(strings.TrimSpace(label.Name), strings.TrimSpace(wanted)) {
+			return true
+		}
+	}
+	return false
 }
 
 // auditOrAbort writes the "attempted" audit entry for a write-path

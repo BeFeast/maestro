@@ -366,8 +366,8 @@ func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	}
 
 	worker := findSessionInfo(t, resp.All, "slot-2")
-	if len(worker.Actions) != 5 {
-		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
+	if len(worker.Actions) != 7 {
+		t.Fatalf("worker actions = %d, want 7", len(worker.Actions))
 	}
 	for _, action := range worker.Actions {
 		assertReadOnlyAction(t, action)
@@ -1504,6 +1504,8 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 		"stop_worker":        "Stop",
 		"mark_issue_ready":   "Mark ready",
 		"mark_issue_blocked": "Mark blocked",
+		"hold_merge":         "Hold merge",
+		"release_merge":      "Release merge",
 		"approve_merge":      "Approve merge",
 	}
 	if want, ok := wantLabels[action.ID]; ok && action.Label != want {
@@ -1525,7 +1527,7 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 	// dispatcher (requires_approval=false / safe_direct policy);
 	// restart_worker / stop_worker / approve_merge stay approval-gated.
 	switch action.ID {
-	case "mark_issue_ready", "mark_issue_blocked":
+	case "mark_issue_ready", "mark_issue_blocked", "hold_merge", "release_merge":
 		if action.RequiresApproval {
 			t.Fatalf("safe action %s should not require approval", action.ID)
 		}
@@ -1556,7 +1558,7 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 // disabled reason must name the supported in-place alternative. Stop stays
 // enabled. A PR-less worker keeps Restart enabled.
 func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
-	withPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-0", IssueNumber: 42, PRNumber: 867})
+	withPR := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{Slot: "slot-0", IssueNumber: 42, PRNumber: 867})
 	restart := findControlAction(t, withPR, "restart_worker")
 	if !restart.Disabled {
 		t.Fatalf("restart_worker for an open-PR worker should be disabled, got %+v", restart)
@@ -1571,14 +1573,25 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 	if stop.Disabled {
 		t.Fatalf("stop_worker for an open-PR worker should stay enabled, got %+v", stop)
 	}
+	hold := findControlAction(t, withPR, config.SupervisorActionHoldMerge)
+	release := findControlAction(t, withPR, config.SupervisorActionReleaseMerge)
+	if hold.Disabled || !release.Disabled || hold.RequiresApproval || release.RequiresApproval {
+		t.Fatalf("merge hold/release affordances = hold %+v release %+v", hold, release)
+	}
+	heldActions := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
+		Slot: "slot-0", IssueNumber: 42, PRNumber: 867, OperatorGateName: "label:blocked",
+	})
+	if !findControlAction(t, heldActions, config.SupervisorActionHoldMerge).Disabled || findControlAction(t, heldActions, config.SupervisorActionReleaseMerge).Disabled {
+		t.Fatalf("held merge actions = %+v", heldActions)
+	}
 
-	noPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
+	noPR := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
 	restartNoPR := findControlAction(t, noPR, "restart_worker")
 	if restartNoPR.Disabled {
 		t.Fatalf("restart_worker for a PR-less worker without a retained worktree should be enabled, got %+v", restartNoPR)
 	}
 
-	retained := workerActionAffordances(false, "/api/v1/actions", sessionInfo{
+	retained := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
 		Slot: "slot-2", IssueNumber: 44, Worktree: "/srv/wt/slot-2",
 	})
 	restartRetained := findControlAction(t, retained, "restart_worker")
@@ -1602,7 +1615,7 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 
 func TestWorkerActionAffordances_MergedAndClosedSessionsHaveNoLifecycleControls(t *testing.T) {
 	for _, status := range []state.SessionStatus{state.StatusCodeLanded, state.StatusDone} {
-		actions := workerActionAffordances(false, "/api/v1/actions", sessionInfo{
+		actions := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
 			Slot: "slot-merged", IssueNumber: 42, PRNumber: 867, Status: string(status),
 		})
 		if len(actions) != 0 {
