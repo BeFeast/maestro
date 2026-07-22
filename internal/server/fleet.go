@@ -1997,6 +1997,14 @@ func (s *FleetServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 		return
 	}
+	if r.Header.Get(outcome.HealthProbeHeader) == outcome.HealthProbeHeaderValue {
+		// The outcome checker only needs the HTTP status. Building the full Fleet
+		// response loads and mirrors every project state, which can exceed health
+		// deadlines during startup/restart contention and falsely mark Maestro's
+		// self-check red. Authentication has already run in buildHandler.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+		return
+	}
 	writeJSON(w, http.StatusOK, s.snapshot())
 }
 

@@ -21,6 +21,12 @@ const (
 	maxCheckDetailBytes       = 4000
 	maxCheckOutputBytes       = 64 * 1024
 	maxStructuredHealthChecks = 16
+
+	// HealthProbeHeader marks a request as a lightweight Maestro outcome probe.
+	// Maestro HTTP servers may use it to avoid building an expensive diagnostic
+	// snapshot when the checker only needs an HTTP status.
+	HealthProbeHeader      = "X-Maestro-Outcome-Probe"
+	HealthProbeHeaderValue = "1"
 )
 
 var errCheckOutputTooLarge = errors.New("outcome check output exceeded safe limit")
@@ -78,6 +84,7 @@ func (c Checker) checkURL(ctx context.Context, rawURL string) HealthCheckResult 
 		return c.result(start, "healthcheck_url", HealthFailing, fmt.Sprintf("Invalid healthcheck URL: %v", err), "", 0)
 	}
 	req.Header.Set("User-Agent", "maestro-outcome-check/1")
+	req.Header.Set(HealthProbeHeader, HealthProbeHeaderValue)
 
 	client := c.HTTPClient
 	if client == nil {
