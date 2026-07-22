@@ -4,6 +4,7 @@ import {
   aggregateProviderModelHealth,
   formatBackendQuotaSentence,
   formatProviderModelHealthSentence,
+  isPendingApproval,
   mapFleetResponse,
   mapTmpfsHygiene,
   supervisorDecisionsFromProject,
@@ -325,5 +326,87 @@ describe("Provider route mapping", () => {
         { provider: "openai", default: "sol", fallbackBackends: ["gpt55"] },
       ],
     });
+  });
+});
+
+describe("PR lifecycle precedence", () => {
+  test("maps Greptile score and pending merge intent into worker/project copy", () => {
+    const raw = {
+      summary: { approvals_pending: 1 },
+      projects: [{
+        name: "pcp",
+        repo: "BeFeast/project-control-plane",
+        outcome: { configured: true },
+        operator_state: { kind: "merge_action_required", label: "Merge requested", summary: "Merge requested. Greptile 4/5 · passed." },
+        pr_states: [{
+          pr_number: 26,
+          ci: "success",
+          review: "passed",
+          review_summary: "Greptile 4/5 · passed",
+          review_streams: [{ name: "greptile", passed: true, score: 4, score_max: 5, verdict: "ok_to_merge", summary: "Greptile 4/5 · passed" }],
+          merge_action: { approval_id: "approval-26", status: "pending", label: "Merge requested", summary: "Merge requested for PR #26", next_action: "Approve or reject.", action_required: true },
+          summary: "Merge requested for PR #26. Greptile 4/5 · passed.",
+        }],
+      }],
+      workers: [worker("pcp-11", {
+        project_name: "pcp",
+        status: "pr_open",
+        display_status: "merge_requested",
+        needs_attention: true,
+        pr_number: 26,
+        pr_url: "https://github.com/BeFeast/project-control-plane/pull/26",
+        next_action: "Merge requested for PR #26. Greptile 4/5 · passed. Approve or reject.",
+        pr_gate: {
+          pr_number: 26,
+          review_summary: "Greptile 4/5 · passed",
+          review_streams: [{ name: "greptile", passed: true, score: 4, score_max: 5, verdict: "ok_to_merge", summary: "Greptile 4/5 · passed" }],
+          merge_action: { approval_id: "approval-26", status: "pending", label: "Merge requested", next_action: "Approve or reject.", action_required: true },
+          summary: "Merge requested for PR #26. Greptile 4/5 · passed.",
+        },
+      })],
+    };
+
+    const fleet = mapFleetResponse(raw, now);
+    expect(fleet.projects[0].prStates[0].reviewStreams[0]).toMatchObject({ score: 4, scoreMax: 5, passed: true });
+    expect(fleet.projects[0].state.state).toBe("stuck");
+    expect(fleet.workers[0].status).toBe("merge requested");
+    expect(fleet.workers[0].summary).toContain("Greptile 4/5 · passed");
+    expect(workerNextAction(fleet.workers[0])).toEqual({
+      text: "Merge requested for PR #26. Greptile 4/5 · passed. Approve or reject.",
+      buttons: [
+        { label: "Open approval →", href: "/approvals?id=approval-26" },
+        { label: "Open PR →", href: "https://github.com/BeFeast/project-control-plane/pull/26" },
+      ],
+    });
+  });
+
+  test("merged truth suppresses pending approval and repair/merge guidance", () => {
+    const fleet = mapFleetResponse({
+      summary: { approvals_pending: 0 },
+      approvals: [{ id: "approval-26", action: "merge_pr", status: "pending", target_terminal: true, pr_number: 26 }],
+      projects: [{
+        name: "pcp",
+        repo: "BeFeast/project-control-plane",
+        outcome: { configured: true },
+        operator_state: { kind: "code_landed", label: "Merged · code landed", summary: "Greptile 4/5 · passed · PR merged" },
+      }],
+      workers: [worker("pcp-11", {
+        project_name: "pcp",
+        status: "code_landed",
+        pr_number: 26,
+        pr_url: "https://github.com/BeFeast/project-control-plane/pull/26",
+        next_action: "Greptile 4/5 · passed · PR merged. No merge or review-repair action is available.",
+        pr_gate: { pr_number: 26, merged: true, review_summary: "Greptile 4/5 · passed", summary: "Greptile 4/5 · passed · PR merged" },
+      })],
+    }, now);
+
+    expect(fleet.pendingApprovals).toHaveLength(0);
+    expect(fleet.historicalApprovals).toHaveLength(1);
+    expect(isPendingApproval(fleet.approvals[0])).toBe(false);
+    expect(fleet.projects[0].state.state).toBe("ok");
+    const next = workerNextAction(fleet.workers[0]);
+    expect(next.text).toContain("PR merged");
+    expect(next.text).not.toContain("Address Greptile feedback");
+    expect(next.buttons).toEqual([{ label: "Open PR →", href: "https://github.com/BeFeast/project-control-plane/pull/26" }]);
   });
 });

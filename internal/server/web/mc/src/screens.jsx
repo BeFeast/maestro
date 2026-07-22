@@ -20,6 +20,7 @@ import {
   isExecutionSkippedApproval,
   manualFollowupForApproval,
   mapAdvisor,
+  mapPRGate,
   postFleetAction,
   postFleetApproval,
   postProjectApproval,
@@ -76,6 +77,38 @@ export function OutcomeRecoveryReceipt({ recovery, now }) {
       {recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(recovery.next_eligible_at), now)}</span></div>}
       {recovery.exit_code != null && <div className="kv"><span>Exit code</span><strong className="mono">{recovery.exit_code}</strong></div>}
     </>
+  );
+}
+
+export function PRGateFacts({ gates }) {
+  const rows = (Array.isArray(gates) ? gates : [gates]).filter(Boolean);
+  if (!rows.length) return null;
+  return (
+    <Panel title="PR gates" sub={`${rows.length} current`}>
+      <div style={{ padding: "var(--s-3) var(--s-5)" }}>
+        {rows.map(gate => (
+          <div key={gate.prNumber || gate.pr_number} style={{ padding: "var(--s-3) 0", borderTop: "1px solid var(--grid-line)" }}>
+            <div className="row gap-2" style={{ alignItems: "center", flexWrap: "wrap" }}>
+              <strong className="mono">PR #{gate.prNumber || gate.pr_number}</strong>
+              {gate.ci && <Pill tone={gate.ci === "success" ? "ok" : gate.ci === "failure" ? "stuck" : "watch"} noDot>CI {gate.ci}</Pill>}
+              {(gate.reviewStreams || []).map(stream => (
+                <Pill key={stream.name} tone={stream.passed ? "ok" : stream.pending ? "watch" : "stuck"} noDot>
+                  {stream.summary || `${stream.name} ${stream.scoreMax ? `${stream.score}/${stream.scoreMax}` : ""}`.trim()}
+                </Pill>
+              ))}
+              {gate.mergeAction && <Pill tone={gate.mergeAction.actionRequired ? "watch" : "info"} noDot>{gate.mergeAction.label}</Pill>}
+              {gate.merged && <Pill tone="ok" noDot>PR merged</Pill>}
+            </div>
+            {gate.summary && <div className="mono dim mt-2" style={{ fontSize: 11 }}>{gate.summary}</div>}
+            {gate.mergeAction?.approvalId && (
+              <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+                approval <a href={`/approvals?id=${encodeURIComponent(gate.mergeAction.approvalId)}`}>{gate.mergeAction.approvalId}</a> · {gate.mergeAction.status}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </Panel>
   );
 }
 
@@ -153,6 +186,8 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
       </div>
 
       <ProjectActionsPanel project={p} refresh={refresh} />
+
+      <PRGateFacts gates={p.prStates} />
 
       <DispatchBlockersPanel project={p} now={now} />
 
@@ -1638,6 +1673,9 @@ export function WorkerDrawer({ worker, onClose, now }) {
             now={now}
           />
           <AdvisorReviewSection advisor={mapAdvisor(detail?.worker) || worker.advisor} />
+          <div className="drawer-sec">
+            <PRGateFacts gates={mapPRGate(detail?.worker?.pr_gate) || worker.prGate} />
+          </div>
           <BackendDriftSection drift={detail?.worker?.backendDrift || worker.backendDrift} />
 
           <div className="drawer-sec" ref={logRef}>

@@ -694,6 +694,7 @@ function mapProject(project, workers, now) {
     needsAttention: Number(project.needs_attention || 0),
     actions: Array.isArray(project.actions) ? project.actions : [],
     operatorState: project.operator_state || {},
+    prStates: Array.isArray(project.pr_states) ? project.pr_states.map(mapPRGate).filter(Boolean) : [],
     outcome,
     queueSnapshot: queue,
     dispatchHold: {
@@ -962,6 +963,18 @@ export function projectBoardIssueURL(board, issueNumber) {
 }
 
 export function mapProjectState(project) {
+	const op = project.operator_state || {};
+	const kind = op.kind || "idle";
+	const label = op.label || "idle";
+	if (kind === "code_landed") {
+		return { state: "ok", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
+	if (kind === "merge_in_progress") {
+		return { state: "watch", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
+	if (kind === "merge_action_required" || kind === "review_repair") {
+		return { state: "stuck", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
   if (!(project.outcome || {}).configured) {
     return { state: "idle", label: "unconfigured" };
   }
@@ -971,9 +984,6 @@ export function mapProjectState(project) {
   if (project.freshness?.stale) {
     return { state: "unknown", label: "stale" };
   }
-  const op = project.operator_state || {};
-  const label = op.label || "idle";
-  const kind = op.kind || "idle";
 
   if (Number(project.running || 0) > 0 || kind === "working") {
     return { state: "live", label, count: project.running };
@@ -994,6 +1004,8 @@ export function mapProjectState(project) {
   if (
     kind === "stale_worker" ||
     kind === "dispatch_failure" ||
+    kind === "merge_action_required" ||
+    kind === "review_repair" ||
     Number(project.needs_attention || 0) > Number(project.self_resolving || 0)
   ) {
     return { state: "stuck", label };
@@ -1012,6 +1024,9 @@ export function mapProjectState(project) {
 
 function projectSummaryLine(project) {
   const op = project.operator_state || {};
+	if (["code_landed", "merge_in_progress", "merge_action_required", "review_repair"].includes(String(op.kind || "")) && op.summary) {
+		return op.summary;
+	}
   if (!(project.outcome || {}).configured) {
     return "No outcome configured";
   }
@@ -1052,8 +1067,48 @@ function mapWorker(worker) {
     done: worker.status === "done",
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
+    prGate: mapPRGate(worker.pr_gate),
     backendDrift: mapBackendDrift(worker.backend_drift),
     advisor: mapAdvisor(worker),
+  };
+}
+
+export function mapPRGate(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const streams = Array.isArray(raw.review_streams)
+    ? raw.review_streams.map(stream => ({
+      name: String(stream?.name || ""),
+      passed: stream?.passed === true,
+      pending: stream?.pending === true,
+      score: Number(stream?.score || 0),
+      scoreMax: Number(stream?.score_max || 0),
+      verdict: String(stream?.verdict || ""),
+      findingsCount: Number(stream?.findings_count || 0),
+      summary: String(stream?.summary || ""),
+    }))
+    : [];
+  const merge = raw.merge_action && typeof raw.merge_action === "object"
+    ? {
+      approvalId: String(raw.merge_action.approval_id || ""),
+      status: String(raw.merge_action.status || ""),
+      label: String(raw.merge_action.label || ""),
+      summary: String(raw.merge_action.summary || ""),
+      nextAction: String(raw.merge_action.next_action || ""),
+      actionRequired: raw.merge_action.action_required === true,
+      updatedAt: String(raw.merge_action.updated_at || ""),
+    }
+    : null;
+  return {
+    prNumber: Number(raw.pr_number || 0),
+    ci: String(raw.ci || ""),
+    review: String(raw.review || ""),
+    reviewSummary: String(raw.review_summary || ""),
+    reviewStreams: streams,
+    mergeAction: merge,
+    merged: raw.merged === true,
+    mergedAt: String(raw.merged_at || ""),
+    summary: String(raw.summary || ""),
+    updatedAt: String(raw.updated_at || ""),
   };
 }
 
@@ -1165,6 +1220,14 @@ export function workerStatusTaxonomy(worker) {
     return { label: "waiting for issue guard", tone: "policy", section: "recent" };
   }
 
+  if (display.startsWith("merge_")) {
+    const label = display.replace(/_/g, " ");
+    if (display === "merge_requested" || display === "merge_rejected" || display === "merge_execution_failed" || display === "merge_deferred") {
+      return { label, tone: display === "merge_execution_failed" ? "stuck" : "watch", section: "stuck" };
+    }
+    return { label, tone: display === "merge_executed" ? "ok" : "info", section: "recent" };
+  }
+
   if (display === "backend_rate_limited") {
     return { label: "rate limited", tone: "watch", section: "stuck" };
   }
@@ -1236,6 +1299,26 @@ export function workerNextAction(worker) {
   const status = String(worker.rawStatus || worker.status || "");
   const display = String(worker.displayStatus || worker.display_status || "");
   const fallback = worker.next_action || worker.status_reason || "";
+  const gate = worker.prGate || mapPRGate(worker.pr_gate);
+
+  if (gate?.merged) {
+    return {
+      text: fallback || gate.summary || "PR merged and code landed.",
+      buttons: worker.pr_url ? [{ label: "Open PR →", href: worker.pr_url }] : [],
+    };
+  }
+
+  if (gate?.mergeAction) {
+    const buttons = [];
+    if (gate.mergeAction.status === "pending" && gate.mergeAction.approvalId) {
+      buttons.push({ label: "Open approval →", href: `/approvals?id=${encodeURIComponent(gate.mergeAction.approvalId)}` });
+    }
+    if (worker.pr_url) buttons.push({ label: "Open PR →", href: worker.pr_url });
+    return {
+      text: fallback || gate.mergeAction.nextAction || gate.summary,
+      buttons,
+    };
+  }
 
   if (display === "waiting_for_issue_guard") {
     return {
@@ -1388,7 +1471,7 @@ export function mapDeliveryApproval(raw) {
 }
 
 export function isPendingApproval(approval) {
-  return (approval.status || "") === "pending";
+  return (approval.status || "") === "pending" && approval.target_terminal !== true;
 }
 
 // isExecutionSkippedApproval is the SPA-side predicate for the post-#492
@@ -1445,6 +1528,7 @@ function slugifyProjectForCommand(name) {
 }
 
 function approvalTone(approval) {
+  if (approval.target_terminal === true) return "idle";
   if (String(approval.action || "").trim() === "apply_lesson_proposal") return "idle";
   if (approval.past_sla) return "stuck";
   if ((approval.status || "") === "pending") return "watch";

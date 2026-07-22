@@ -5024,6 +5024,13 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 						persistGate()
 						continue
 					}
+					// Preserve the provider's real score/verdict alongside the
+					// actionable feedback fingerprint. Otherwise the early repair
+					// branch records only a generic blocked decision and Fleet loses
+					// the concrete Greptile 3/5 fact that caused the retry.
+					if currentReviewVerdict != nil {
+						addPRGateReviewVerdict(&gateTransition, *currentReviewVerdict)
+					}
 					addPRGateLateFeedback(&gateTransition, reviewFeedback)
 					persistGate()
 					// #556: once we've already marked this PR retry-exhausted

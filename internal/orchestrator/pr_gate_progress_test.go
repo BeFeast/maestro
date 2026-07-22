@@ -65,7 +65,7 @@ func TestAutoMergePRs_PersistsAuthoritativePRGateTransitions(t *testing.T) {
 	reviewVerdict = github.ReviewGateVerdict{
 		Passed: false,
 		Streams: []github.ReviewStreamVerdict{
-			{Name: "greptile", Passed: true},
+			{Name: "greptile", Passed: true, Score: 4, ScoreMax: 5, Verdict: "ok_to_merge"},
 			{Name: "simplicity", Passed: false, Findings: []github.ReviewComment{{
 				Path: "/home/god/private/internal.go", Line: 42,
 				Body: "late actionable feedback with private detail", User: "review-bot",
@@ -76,6 +76,9 @@ func TestAutoMergePRs_PersistsAuthoritativePRGateTransitions(t *testing.T) {
 	blocked := mustLatestPRGateSnapshot(t, st, 100, 7)
 	if blocked.Generation <= newHead.Generation || blocked.ReviewDecision != state.PRGateReviewBlocked || blocked.ActionableFindingsCount != 1 || blocked.FeedbackGeneration != 1 {
 		t.Fatalf("late-feedback snapshot = %+v, newHead=%+v", blocked, newHead)
+	}
+	if len(blocked.ReviewStreams) != 2 || blocked.ReviewStreams[0].Name != "greptile" || blocked.ReviewStreams[0].Score != 4 || !blocked.ReviewStreams[0].Passed {
+		t.Fatalf("review stream facts = %+v, want Greptile 4/5 pass plus blocking simplicity", blocked.ReviewStreams)
 	}
 	encoded, err := json.Marshal(st.PRGateSnapshots)
 	if err != nil {
@@ -269,7 +272,7 @@ func TestAutoMergePRs_PassingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	}
 	o.ghPRHeadSHAFn = func(int) (string, error) { return currentHead, nil }
 	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
-		return github.ReviewGateVerdict{Passed: true, Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: true}}}, nil
+		return github.ReviewGateVerdict{Passed: true, Streams: []github.ReviewStreamVerdict{{Name: "greptile", Passed: true, Score: 5, ScoreMax: 5, Verdict: "passed"}}}, nil
 	}
 	st := makeTestState([]github.PR{pr})
 	sess := st.Sessions["slot-0"]
@@ -280,6 +283,9 @@ func TestAutoMergePRs_PassingGateDoesNotInvokeAttributionAmend(t *testing.T) {
 	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, pr.Number)
 	if snapshot.HeadSHA != currentHead || snapshot.CIEffectiveVerdict != state.PRGateCISuccess || snapshot.ReviewDecision != state.PRGateReviewPassed {
 		t.Fatalf("deferred passing-review snapshot = %+v", snapshot)
+	}
+	if len(snapshot.ReviewStreams) != 1 || snapshot.ReviewStreams[0].Score != 5 {
+		t.Fatalf("passing review score not persisted: %+v", snapshot.ReviewStreams)
 	}
 	if len(*merged) != 1 || (*merged)[0] != pr.Number {
 		t.Fatalf("passing PR was not merged normally: %v", *merged)

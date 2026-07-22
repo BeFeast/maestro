@@ -43,9 +43,12 @@ type fakeGH struct {
 	mergeState     string
 	mergeStatusErr error
 	// updateErr is returned by UpdateBranch.
-	updateErr error
-	headSHA   string
-	headErr   error
+	updateErr                 error
+	headSHA                   string
+	headErr                   error
+	merged                    bool
+	mergedErr                 error
+	mergedAfterConcurrentCall bool
 }
 
 const testMergeHeadSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -81,6 +84,12 @@ func (f *fakeGH) PRHeadSHA(int) (string, error) {
 		return f.headSHA, nil
 	}
 	return testMergeHeadSHA, nil
+}
+func (f *fakeGH) IsPRMerged(int) (bool, error) {
+	if f.mergedErr != nil {
+		return false, f.mergedErr
+	}
+	return f.merged || (f.mergedAfterConcurrentCall && len(f.mergeCalls) > 0), nil
 }
 func (f *fakeGH) CloseIssue(issue int, comment string) error {
 	f.closeCalls = append(f.closeCalls, closeCall{issue: issue, comment: comment})
@@ -263,6 +272,40 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 	}
 	if len(gh.mergeHeads) != 1 || gh.mergeHeads[0] != testMergeHeadSHA {
 		t.Fatalf("mergeHeads = %v, want atomic merge at %s", gh.mergeHeads, testMergeHeadSHA)
+	}
+}
+
+func TestExecute_MergePR_AlreadyMergedIsIdempotentSuccess(t *testing.T) {
+	gh := &fakeGH{merged: true}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted || res.Err != nil {
+		t.Fatalf("already-merged result = %+v, want executed idempotent success", res)
+	}
+	if len(gh.mergeCalls) != 0 || len(gh.mergeHeads) != 0 {
+		t.Fatalf("already-merged PR was merged again: calls=%v heads=%v", gh.mergeCalls, gh.mergeHeads)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "already merged") {
+		t.Fatalf("summary = %q, want already-merged truth", res.Summary)
+	}
+}
+
+func TestExecute_MergePR_ConcurrentMergeAfterClickConvergesToExecuted(t *testing.T) {
+	gh := &fakeGH{mergeErr: errors.New("pull request is already merged"), mergedAfterConcurrentCall: true}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted || res.Err != nil {
+		t.Fatalf("concurrent-merge result = %+v, want executed idempotent success", res)
+	}
+	if len(gh.mergeCalls) != 1 {
+		t.Fatalf("merge calls = %v, want one raced call", gh.mergeCalls)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "concurrently") {
+		t.Fatalf("summary = %q, want concurrent merge truth", res.Summary)
 	}
 }
 

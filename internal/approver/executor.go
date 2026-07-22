@@ -70,6 +70,10 @@ type prHeadBoundMerger interface {
 	MergePRAtHead(prNumber int, expectedHeadSHA string) error
 }
 
+type prMergedReader interface {
+	IsPRMerged(prNumber int) (bool, error)
+}
+
 // WorktreeRemover removes a git worktree. *worker.RemoveWorktree-shaped
 // callers satisfy this. Tests inject a fake.
 type WorktreeRemover interface {
@@ -452,6 +456,12 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
 	}
 	pr := approval.Target.PR
+	if merged, ok := readPRMerged(e.GH, pr); ok && merged {
+		return Result{
+			Status:  state.ApprovalStatusExecuted,
+			Summary: fmt.Sprintf("PR #%d was already merged; merge request converged idempotently", pr),
+		}
+	}
 	expectedHead := strings.TrimSpace(approval.Target.HeadSHA)
 	if expectedHead != "" {
 		headReader, ok := e.GH.(prHeadSHAReader)
@@ -535,6 +545,12 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		mergeErr = e.GH.MergePR(pr)
 	}
 	if mergeErr != nil {
+		if merged, ok := readPRMerged(e.GH, pr); ok && merged {
+			return Result{
+				Status:  state.ApprovalStatusExecuted,
+				Summary: fmt.Sprintf("PR #%d merged concurrently; merge request converged idempotently", pr),
+			}
+		}
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
 			Summary: fmt.Sprintf("merge PR #%d: %v", pr, mergeErr),
@@ -545,6 +561,18 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("merged PR #%d", pr),
 	}
+}
+
+func readPRMerged(client GitHubClient, prNumber int) (bool, bool) {
+	reader, ok := client.(prMergedReader)
+	if !ok {
+		return false, false
+	}
+	merged, err := reader.IsPRMerged(prNumber)
+	if err != nil {
+		return false, false
+	}
+	return merged, true
 }
 
 func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
