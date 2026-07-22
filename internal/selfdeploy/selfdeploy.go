@@ -307,6 +307,106 @@ func MainAdvanced(runningVersion, mainHeadSHA string) bool {
 	return !strings.HasPrefix(head, built)
 }
 
+// stagedDeployScriptName is the state-dir copy of scripts/self-deploy.sh taken
+// from origin/main before launch (#1077). The running binary may pass flags the
+// checkout's stale branch copy does not understand; staging from origin/main
+// breaks that chicken-and-egg.
+const stagedDeployScriptName = "self-deploy.sh"
+
+const originMainDeployScriptRef = "origin/main:scripts/self-deploy.sh"
+
+// ResolveDeployScript returns the script path Trigger should invoke.
+//
+// When self_deploy.script is unset (default), it stages origin/main's
+// scripts/self-deploy.sh into the state dir after a best-effort fetch so a
+// feature-branch checkout cannot brick deploys with "unknown argument".
+// An explicit Script override is used as-is. If staging fails, Resolve falls
+// back to the checkout copy (pre-#1077 behavior) so tests and air-gapped hosts
+// still work.
+func ResolveDeployScript(cfg *config.Config) (string, error) {
+	if cfg == nil {
+		return "", fmt.Errorf("self-deploy: nil config")
+	}
+	localPath := strings.TrimSpace(cfg.LocalPath)
+	fallback := cfg.SelfDeploy.EffectiveScript(localPath)
+	if fallback == "" {
+		return "", fmt.Errorf("self-deploy: no deploy script configured")
+	}
+	if strings.TrimSpace(cfg.SelfDeploy.Script) != "" {
+		if _, err := os.Stat(fallback); err != nil {
+			return "", fmt.Errorf("self-deploy: script %s: %w", fallback, err)
+		}
+		return fallback, nil
+	}
+	stateDir := strings.TrimSpace(cfg.StateDir)
+	if stateDir == "" {
+		if _, err := os.Stat(fallback); err != nil {
+			return "", fmt.Errorf("self-deploy: script %s: %w", fallback, err)
+		}
+		return fallback, nil
+	}
+	dest := filepath.Join(stateDir, stagedDeployScriptName)
+	if err := stageOriginMainDeployScript(localPath, dest); err != nil {
+		if _, statErr := os.Stat(fallback); statErr != nil {
+			return "", fmt.Errorf("self-deploy: stage origin/main script: %w (checkout fallback also missing: %v)", err, statErr)
+		}
+		return fallback, nil
+	}
+	return dest, nil
+}
+
+// stageOriginMainDeployScript fetches origin and writes origin/main's
+// self-deploy.sh to dest atomically.
+func stageOriginMainDeployScript(repoDir, dest string) error {
+	repoDir = strings.TrimSpace(repoDir)
+	if repoDir == "" {
+		return fmt.Errorf("empty repo dir")
+	}
+	if _, err := os.Stat(filepath.Join(repoDir, ".git")); err != nil {
+		return fmt.Errorf("not a git checkout: %w", err)
+	}
+	fetch := exec.Command("git", "-C", repoDir, "fetch", "--prune", "origin")
+	if out, err := fetch.CombinedOutput(); err != nil {
+		// Fetch can fail offline; still try show in case origin/main is current.
+		_ = out
+	}
+	show := exec.Command("git", "-C", repoDir, "show", originMainDeployScriptRef)
+	body, err := show.Output()
+	if err != nil {
+		if ee, ok := err.(*exec.ExitError); ok {
+			return fmt.Errorf("git show %s: %w\n%s", originMainDeployScriptRef, err, ee.Stderr)
+		}
+		return fmt.Errorf("git show %s: %w", originMainDeployScriptRef, err)
+	}
+	if len(body) == 0 {
+		return fmt.Errorf("git show %s: empty", originMainDeployScriptRef)
+	}
+	if err := os.MkdirAll(filepath.Dir(dest), 0o755); err != nil {
+		return err
+	}
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "self-deploy-*.sh")
+	if err != nil {
+		return err
+	}
+	tmpName := tmp.Name()
+	defer func() { _ = os.Remove(tmpName) }()
+	if _, err := tmp.Write(body); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Chmod(0o755); err != nil {
+		_ = tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	if err := os.Rename(tmpName, dest); err != nil {
+		return err
+	}
+	return nil
+}
+
 // TriggerCommand builds the detached systemd-run invocation for a deploy
 // after the given merged PR. Split from Trigger so tests can assert the
 // argv without systemd.
@@ -318,12 +418,9 @@ func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []
 	if localPath == "" {
 		return "", nil, fmt.Errorf("self-deploy: local_path is required")
 	}
-	script := cfg.SelfDeploy.EffectiveScript(localPath)
-	if script == "" {
-		return "", nil, fmt.Errorf("self-deploy: no deploy script configured")
-	}
-	if _, err := os.Stat(script); err != nil {
-		return "", nil, fmt.Errorf("self-deploy: script %s: %w", script, err)
+	script, err := ResolveDeployScript(cfg)
+	if err != nil {
+		return "", nil, err
 	}
 	bin := strings.TrimSpace(cfg.SelfDeploy.BinPath)
 	if bin == "" {

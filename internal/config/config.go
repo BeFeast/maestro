@@ -502,7 +502,7 @@ func (c GitHubMirrorConfig) ReconcileInterval() time.Duration {
 // unit's ExecStop drain semantics intact.
 type SelfDeployConfig struct {
 	Enabled        bool     `yaml:"enabled"`          // default false (opt-in)
-	Script         string   `yaml:"script"`           // deploy script path (default: <local_path>/scripts/self-deploy.sh)
+	Script         string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
 	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
 	InstallViaSudo bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
 	Scope          string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
