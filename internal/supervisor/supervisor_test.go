@@ -1916,12 +1916,12 @@ func TestDecide_NoOutcomeProgressRecommendsRuntimeCheck(t *testing.T) {
 	if !strings.Contains(stuck.Summary, "Hosted app responds to users") || !strings.Contains(stuck.Summary, "unknown") {
 		t.Fatalf("stuck summary = %q, want outcome and unknown health", stuck.Summary)
 	}
-	if reader.issueCalls != 0 {
-		t.Fatalf("ListOpenIssues called %d time(s), want runtime check before more issue throughput", reader.issueCalls)
+	if reader.issueCalls != 1 {
+		t.Fatalf("ListOpenIssues called %d time(s), want one backlog evaluation before the runtime check", reader.issueCalls)
 	}
 }
 
-func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
+func TestDecide_FailingOutcomeWithReadyIssueSpawnsWorker(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.Outcome = outcome.Brief{
 		DesiredOutcome: "Hosted app responds to users",
@@ -1946,8 +1946,11 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 		t.Fatalf("Decide: %v", err)
 	}
 
-	if decision.RecommendedAction != ActionCheckOutcomeHealth {
-		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionCheckOutcomeHealth)
+	if decision.RecommendedAction != ActionSpawnWorker {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionSpawnWorker)
+	}
+	if decision.Target == nil || decision.Target.Issue != 1023 {
+		t.Fatalf("target = %#v, want ready issue #1023", decision.Target)
 	}
 	stuck := requireStuckState(t, decision, state.StuckNoOutcomeProgress)
 	if stuck.Severity != SeverityBlocked {
@@ -1957,14 +1960,97 @@ func TestDecide_FailingOutcomeImmediatelyBlocksFalseGreen(t *testing.T) {
 		t.Fatalf("stuck summary = %q, want failing outcome", stuck.Summary)
 	}
 	if reader.issueCalls != 1 {
-		t.Fatalf("ListOpenIssues called %d time(s), want one blocker-panel snapshot read", reader.issueCalls)
+		t.Fatalf("ListOpenIssues called %d time(s), want one backlog evaluation", reader.issueCalls)
 	}
 	if decision.QueueAnalysis == nil || decision.QueueAnalysis.EligibleCandidates != 1 || len(decision.QueueAnalysis.EligibleRanked) != 1 || decision.QueueAnalysis.EligibleRanked[0].Number != 1023 {
-		t.Fatalf("queue analysis = %#v, want ready issue #1023 preserved behind the outcome hold", decision.QueueAnalysis)
+		t.Fatalf("queue analysis = %#v, want ready issue #1023 selected despite the outcome hold", decision.QueueAnalysis)
+	}
+	if decision.Outcome == nil || decision.Outcome.HealthState != outcome.HealthFailing {
+		t.Fatalf("outcome = %#v, want failing health retained on spawn decision", decision.Outcome)
+	}
+}
+
+func TestDecide_FailingOutcomeWithLabelableIssueAddsReadyLabel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(1024, "label next repair step")}}
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, Summary: "GET returned 500"}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
+	}
+	if decision.Target == nil || decision.Target.Issue != 1024 {
+		t.Fatalf("target = %#v, want labelable issue #1024", decision.Target)
+	}
+	if len(decision.Mutations) != 1 || decision.Mutations[0].Type != MutationAddReadyLabel {
+		t.Fatalf("mutations = %#v, want add_ready_label", decision.Mutations)
+	}
+}
+
+func TestDecide_FailingOutcomeDynamicWaveAddsReadyLabel(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	enableDynamicWave(cfg)
+	reader := &fakeReader{issues: []github.Issue{testIssue(1025, "dynamic repair step", "p0")}}
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{State: outcome.HealthFailing, Summary: "GET returned 500"}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionLabelIssueReady {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
+	}
+	if decision.Target == nil || decision.Target.Issue != 1025 {
+		t.Fatalf("target = %#v, want dynamic-wave issue #1025", decision.Target)
+	}
+}
+
+func TestDecide_FailingOutcomeWithEmptyBacklogStillChecksHealth(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.Outcome = outcome.Brief{
+		DesiredOutcome: "Hosted app responds to users",
+		RuntimeTarget:  "https://app.example.com",
+		HealthcheckURL: "https://app.example.com/healthz",
+	}
+	reader := &fakeReader{}
+	st := state.NewState()
+	st.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: time.Now().UTC(),
+		Signal:    "healthcheck_url",
+		State:     outcome.HealthFailing,
+		Summary:   "GET returned 500",
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionCheckOutcomeHealth {
+		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionCheckOutcomeHealth)
+	}
+	if decision.QueueAnalysis == nil || decision.QueueAnalysis.OpenIssues != 0 || decision.QueueAnalysis.EligibleCandidates != 0 {
+		t.Fatalf("queue analysis = %#v, want empty backlog", decision.QueueAnalysis)
 	}
 	reasons := strings.Join(decision.Reasons, "\n")
-	if !strings.Contains(reasons, "Open PRs observed: 1") {
-		t.Fatalf("reasons = %q, want open PRs to be treated as insufficient proof", reasons)
+	if !strings.Contains(reasons, "No actionable backlog remains") {
+		t.Fatalf("reasons = %q, want empty-backlog outcome rationale", reasons)
 	}
 }
 
