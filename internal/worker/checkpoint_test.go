@@ -99,6 +99,48 @@ func TestStartOrReconcileTmuxSession_ObservesAfterConfirmedSpawnWithoutReplay(t 
 	}
 }
 
+func TestStartOrReconcileTmuxSession_ProcessLeasePaneUsesStartPath(t *testing.T) {
+	originalSpawn := runTmuxNewSession
+	originalRead := readTmuxPaneIdentity
+	t.Cleanup(func() {
+		runTmuxNewSession = originalSpawn
+		readTmuxPaneIdentity = originalRead
+	})
+	runTmuxNewSession = func(tmuxName, worktree, runnerPath string, lease tmuxsession.ProcessLease) ([]byte, error) {
+		return nil, nil
+	}
+	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
+		return parseTmuxPaneIdentity([]byte("505\t\t/worktrees/slot-1\n"))
+	}
+
+	pid, err := startOrReconcileTmuxSession("maestro-slot-1", "/worktrees/slot-1", "/state/slot-1-run.sh", checkpointTestLease, 0)
+	if err != nil || pid != 505 {
+		t.Fatalf("observed process-lease pane: pid=%d err=%v", pid, err)
+	}
+}
+
+func TestParseTmuxPaneIdentity_PrefersStartPathAndFallsBackToCurrentPath(t *testing.T) {
+	tests := []struct {
+		name string
+		out  string
+		want string
+	}{
+		{name: "start path", out: "606\t/worktrees/current\t/worktrees/start\n", want: "/worktrees/start"},
+		{name: "current path fallback", out: "707\t/worktrees/current\t\n", want: "/worktrees/current"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			_, got, err := parseTmuxPaneIdentity([]byte(tt.out))
+			if err != nil {
+				t.Fatalf("parse pane identity: %v", err)
+			}
+			if got != tt.want {
+				t.Fatalf("pane path = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 func TestRestoreMissingWorktreePreservesExistingBranchHead(t *testing.T) {
 	root := t.TempDir()
 	repo := filepath.Join(root, "repo")
