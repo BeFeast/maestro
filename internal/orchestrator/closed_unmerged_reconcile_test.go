@@ -50,6 +50,140 @@ func TestReconcileFalseDoneSessionAdoptsSoleOpenCanonicalPR(t *testing.T) {
 	}
 }
 
+func TestReconcileClosedUnmergedPRGateRoutesAwaitingRepairToCanonicalPR(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	issues := []github.Issue{makeIssue(345, "repair canonical PR", "maestro-ready")}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.isPRMergedFn = func(pr int) (bool, error) {
+		if pr != 389 {
+			t.Fatalf("merge check PR = %d, want closed duplicate #389", pr)
+		}
+		return false, nil
+	}
+	o.isIssueClosedFn = func(issue int) (bool, error) {
+		if issue != 345 {
+			t.Fatalf("issue close check = %d, want 345", issue)
+		}
+		return false, nil
+	}
+	o.hasOpenPRForIssueFn = func(issue int) (bool, error) { return issue == 345, nil }
+	authorizeCurrentFailedRepairGate(o, 388)
+
+	respawns := 0
+	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, issue github.Issue, _, _ string) error {
+		respawns++
+		if slot != "ok-player-273" || issue.Number != 345 {
+			t.Fatalf("repair target = slot %q issue #%d, want ok-player-273 / #345", slot, issue.Number)
+		}
+		if sess.PRNumber != 388 || sess.Branch != "feat/ok-player-345-flatpak-beta-retry" {
+			t.Fatalf("repair resumed stale identity: %+v", sess)
+		}
+		sess.Status = state.StatusRunning
+		return nil
+	}
+
+	now := time.Date(2026, 7, 17, 19, 21, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "repair canonical PR",
+		Status:      state.StatusPROpen,
+		PRNumber:    389,
+		Branch:      "feat/duplicate-389",
+		Worktree:    "/work/ok-player-273",
+		Backend:     "codex",
+	}
+	repair := repairApproval("repair-345", 345, 388, state.ApprovalStatusAwaitingDispatch, now)
+	repair.Target.Session = "ok-player-273"
+	s.Approvals = []state.Approval{repair}
+	canonical := github.PR{
+		Number:      388,
+		HeadRefName: "feat/ok-player-345-flatpak-beta-retry",
+		Title:       "Linux packaging for #345",
+	}
+
+	o.reconcileTerminalSessionsWithOpenPRs(s, []github.PR{canonical})
+
+	sess := s.Sessions["ok-player-273"]
+	if sess.Status != state.StatusPROpen || sess.PRNumber != 388 || sess.Branch != canonical.HeadRefName {
+		t.Fatalf("canonical PR was not adopted atomically: %+v", sess)
+	}
+	if sess.LastClosedPRNumber != 389 || sess.ReleasedForRedispatch {
+		t.Fatalf("closed duplicate settlement = %+v, want retained audit and active canonical lease", sess)
+	}
+	if got := approvalStatus(t, s, "repair-345"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("repair approval = %q, want awaiting_dispatch before canonical repair", got)
+	}
+
+	o.startNewWorkers(s, 1)
+
+	if respawns != 1 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("canonical repair did not stay in place: respawns=%d fresh=%v sessions=%v", respawns, *freshStarts, s.Sessions)
+	}
+	if got := approvalStatus(t, s, "repair-345"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
+	}
+}
+
+func TestReconcileFalseDoneCanonicalRecoverySurvivesRestart(t *testing.T) {
+	stateDir := t.TempDir()
+	finished := time.Date(2026, 7, 17, 17, 13, 56, 0, time.UTC)
+	now := time.Date(2026, 7, 17, 19, 22, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		Status:      state.StatusDone,
+		PRNumber:    389,
+		Branch:      "feat/duplicate-389",
+		FinishedAt:  &finished,
+	}
+	repair := repairApproval("repair-345", 345, 388, state.ApprovalStatusAwaitingDispatch, now)
+	repair.Target.Session = "ok-player-273"
+	s.Approvals = []state.Approval{repair}
+	if err := state.Save(stateDir, s); err != nil {
+		t.Fatalf("save false-done state: %v", err)
+	}
+
+	restarted, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("load false-done state after restart: %v", err)
+	}
+	o := &Orchestrator{
+		isPRMergedFn:          func(int) (bool, error) { return false, nil },
+		isIssueClosedFn:       func(int) (bool, error) { return false, nil },
+		hasMergedPRForIssueFn: func(int) (bool, error) { return false, nil },
+	}
+	canonical := []github.PR{{
+		Number:      388,
+		HeadRefName: "feat/ok-player-345-flatpak-beta-retry",
+		Title:       "Linux packaging for #345",
+	}}
+	o.reconcileTerminalSessionsWithOpenPRs(restarted, canonical)
+	o.reconcileResolvedRepairApprovals(restarted)
+	if err := state.Save(stateDir, restarted); err != nil {
+		t.Fatalf("save reconciled state: %v", err)
+	}
+
+	reloaded, err := state.Load(stateDir)
+	if err != nil {
+		t.Fatalf("reload reconciled state: %v", err)
+	}
+	o.reconcileTerminalSessionsWithOpenPRs(reloaded, canonical)
+	o.reconcileResolvedRepairApprovals(reloaded)
+
+	sess := reloaded.Sessions["ok-player-273"]
+	if sess.Status != state.StatusPROpen || sess.PRNumber != 388 || sess.Branch != canonical[0].HeadRefName || sess.FinishedAt != nil {
+		t.Fatalf("restart-safe canonical recovery = %+v, want active PR #388", sess)
+	}
+	if got := approvalStatus(t, reloaded, "repair-345"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("restart-safe approval = %q, want awaiting_dispatch", got)
+	}
+	approval, _ := reloaded.FindApproval("repair-345")
+	if len(approval.Audit) != 1 {
+		t.Fatalf("idempotent restart reconciliation appended audit entries: %+v", approval.Audit)
+	}
+}
+
 func TestReconcileFalseDoneSessionRefusesAmbiguousOpenPRs(t *testing.T) {
 	s := state.NewState()
 	s.Sessions["slot"] = &state.Session{IssueNumber: 345, Status: state.StatusDone, PRNumber: 389}

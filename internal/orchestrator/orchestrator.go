@@ -5280,8 +5280,7 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			continue
 		}
 		canonical := matches[0]
-		var allSlots, exactSlots []string
-		activeOther := ""
+		var allSlots, exactSlots, activeSlots []string
 		for _, slotName := range sortedStateSessionNames(s) {
 			sess := s.Sessions[slotName]
 			if sess == nil || sess.IssueNumber != issue {
@@ -5289,24 +5288,57 @@ func (o *Orchestrator) reconcileTerminalSessionsWithOpenPRs(s *state.State, prs 
 			}
 			allSlots = append(allSlots, slotName)
 			if repairIssueSessionActive(sess.Status) || (sess.PRNumber == canonical.Number && sess.Status == state.StatusRetryExhausted) {
-				activeOther = slotName
+				activeSlots = append(activeSlots, slotName)
 			}
 			if terminalOpenPRAdoptionCandidate(sess) &&
 				(sess.PRNumber == canonical.Number || sess.LastClosedPRNumber == canonical.Number || sess.Branch == canonical.HeadRefName) {
 				exactSlots = append(exactSlots, slotName)
 			}
 		}
-		if activeOther != "" {
+		if len(activeSlots) > 1 {
+			log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / PR #%d: %d active sessions claim the issue", issue, canonical.Number, len(activeSlots))
+			continue
+		}
+		if len(activeSlots) == 1 {
 			// Never activate a second session while another issue-level lease is
 			// live, even if the open PR points at an older canonical branch. The
 			// active canonical session still needs a durable handoff from terminal
 			// sibling branches, however: otherwise work preserved by a duplicate
 			// worker remains invisible once the canonical PR is reattached.
-			active := s.Sessions[activeOther]
+			activeSlot := activeSlots[0]
+			active := s.Sessions[activeSlot]
 			if active != nil && (active.PRNumber == canonical.Number || active.Branch == canonical.HeadRefName) {
-				o.attachPreservedSiblingHandoffs(s, issue, activeOther, active, canonical, allSlots)
+				o.attachPreservedSiblingHandoffs(s, issue, activeSlot, active, canonical, allSlots)
+				continue
 			}
-			continue
+			// A disappearing duplicate can still be recorded as pr_open/queued
+			// during this first reconciliation pass. Do not defer canonical
+			// adoption to the next cycle: an awaiting repair approval for the sole
+			// open canonical PR runs later in this same cycle and would otherwise
+			// see the stale duplicate PR identity and be rejected. Verify the exact
+			// recorded PR did not merge and the issue remains open, release that
+			// stale gate truthfully, then fall through to the normal deterministic
+			// canonical-session selection below.
+			if !staleOpenPRGateAdoptionCandidate(active, canonical) {
+				continue
+			}
+			merged, err := o.isPRMerged(active.PRNumber)
+			if err != nil {
+				log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: stale PR #%d merge state unavailable: %v", issue, activeSlot, active.PRNumber, err)
+				continue
+			}
+			if merged {
+				continue
+			}
+			closed, err := o.isIssueClosed(issue)
+			if err != nil {
+				log.Printf("[orch] terminal/open-PR reconcile held for issue #%d / session %s: authoritative issue state unavailable: %v", issue, activeSlot, err)
+				continue
+			}
+			if closed {
+				continue
+			}
+			o.releaseClosedUnmergedSession(active, activeSlot)
 		}
 
 		candidateSlot := ""
@@ -5392,13 +5424,27 @@ func terminalOpenPRAdoptionCandidate(sess *state.Session) bool {
 		return false
 	}
 	switch sess.Status {
-	case state.StatusDone, state.StatusFailed:
+	case state.StatusDone, state.StatusFailed, state.StatusRetryExhausted:
 		return true
 	case state.StatusDead:
 		return sess.NextRetryAt == nil
 	default:
 		return false
 	}
+}
+
+// staleOpenPRGateAdoptionCandidate reports whether a non-running PR gate may be
+// settled and rebound to the sole open canonical PR in the same reconciliation
+// pass. Running/code_landed sessions are deliberately excluded: only GitHub's
+// authoritative terminal reconciliation may move those active lifecycles.
+func staleOpenPRGateAdoptionCandidate(sess *state.Session, canonical github.PR) bool {
+	if sess == nil || sess.PRNumber <= 0 {
+		return false
+	}
+	if sess.Status != state.StatusPROpen && sess.Status != state.StatusQueued {
+		return false
+	}
+	return sess.PRNumber != canonical.Number && sess.Branch != canonical.HeadRefName
 }
 
 func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int, canonicalSlot string, canonicalSession *state.Session, canonical github.PR, allSlots []string) {
