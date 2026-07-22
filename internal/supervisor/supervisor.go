@@ -873,8 +873,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 				"Verify outcome health before starting more issue work.",
 				RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
 			decision.StuckStates = stuckStates
-			if st.OutcomeHealth != nil && st.OutcomeHealth.State == outcome.HealthFailing {
-				decision.QueueAnalysis = e.dispatchBlockerQueueAnalysis(st)
+			decision.QueueAnalysis = &state.SupervisorQueueAnalysis{
+				PolicyRule:         e.defaultPolicyRule(),
+				OpenIssues:         len(issues),
+				EligibleCandidates: 0,
 			}
 			return decision, nil
 		}
