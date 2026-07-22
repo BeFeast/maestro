@@ -382,6 +382,14 @@ func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 		return nil, err
 	}
 	cfg.SettingsSources = sources
+	cfg.FleetOnlySettings = make(map[string]string)
+	for _, spec := range config.FleetSettingSpecs() {
+		if !spec.FleetOnly {
+			continue
+		}
+		value, _ := config.FleetSettingDisplayValue(spec, fleet)
+		cfg.FleetOnlySettings[spec.Key] = value
+	}
 	if strings.TrimSpace(sourcePath) == "" {
 		// No originating file (write-API row): report the store row itself so
 		// path consumers surface "store:<name>" instead of inventing a

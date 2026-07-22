@@ -2269,6 +2269,11 @@ type Config struct {
 	// configstore.Load; nil for file-loaded configs. Not serialized and ignored
 	// by config equality — it is display provenance for effective_config only.
 	SettingsSources map[string]string `yaml:"-" json:"-"`
+	// FleetOnlySettings carries the resolved values of daemon/control-plane
+	// settings that have no project-YAML field. Config-store loads populate it
+	// for Mission Control display; file-loaded configs leave it nil and use the
+	// registered built-in defaults.
+	FleetOnlySettings map[string]string `yaml:"-" json:"-"`
 }
 
 // LoadFrom loads config from a specific path.

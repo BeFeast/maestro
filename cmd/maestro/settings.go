@@ -98,6 +98,17 @@ func openSettingsStore(dbPath string) *configstore.Store {
 	return store
 }
 
+func rejectFleetOnlyProjectSetting(key, project string) error {
+	if strings.TrimSpace(project) == "" {
+		return nil
+	}
+	spec, ok := config.FleetSettingSpecByKey(key)
+	if ok && spec.FleetOnly {
+		return fmt.Errorf("setting %q is fleet-only; omit --project", key)
+	}
+	return nil
+}
+
 func settingsList(args []string) {
 	fs := flag.NewFlagSet("settings list", flag.ExitOnError)
 	dbPath := configStoreDBFlag(fs)
@@ -115,12 +126,14 @@ func settingsList(args []string) {
 			log.Fatalf("settings list: %v", err)
 		}
 		fmt.Fprintln(tw, "KEY\tFLEET DEFAULT")
-		for _, key := range config.FleetSettingKeys() {
-			v, ok := fleet[key]
-			if !ok {
+		for _, spec := range config.FleetSettingSpecs() {
+			v, stored := config.FleetSettingDisplayValue(spec, fleet)
+			if !stored && !spec.FleetOnly {
 				v = "— (built-in)"
+			} else if !stored {
+				v += " (built-in)"
 			}
-			fmt.Fprintf(tw, "%s\t%s\n", key, v)
+			fmt.Fprintf(tw, "%s\t%s\n", spec.Key, v)
 		}
 		tw.Flush()
 		return
@@ -130,8 +143,21 @@ func settingsList(args []string) {
 	if err != nil {
 		log.Fatalf("settings list: %v", err)
 	}
+	fleet, err := store.FleetSettings(ctx)
+	if err != nil {
+		log.Fatalf("settings list: %v", err)
+	}
 	fmt.Fprintln(tw, "KEY\tVALUE\tSOURCE")
 	for _, spec := range config.FleetSettingSpecs() {
+		if spec.FleetOnly {
+			v, stored := config.FleetSettingDisplayValue(spec, fleet)
+			src := config.SettingSourceBuiltin
+			if stored {
+				src = config.SettingSourceFleet
+			}
+			fmt.Fprintf(tw, "%s\t%s\t%s\n", spec.Key, v, src)
+			continue
+		}
 		src := cfg.SettingsSources[spec.Key]
 		if src == "" {
 			src = config.SettingSourceBuiltin
@@ -155,6 +181,9 @@ func settingsGet(args []string) {
 	if _, ok := config.FleetSettingSpecByKey(key); !ok {
 		log.Fatalf("settings get: unknown key %q (known: %s)", key, strings.Join(config.FleetSettingKeys(), ", "))
 	}
+	if err := rejectFleetOnlyProjectSetting(key, *project); err != nil {
+		log.Fatalf("settings get: %v", err)
+	}
 
 	ctx := context.Background()
 	store := openSettingsStore(*dbPath)
@@ -165,8 +194,11 @@ func settingsGet(args []string) {
 		if err != nil {
 			log.Fatalf("settings get: %v", err)
 		}
+		spec, _ := config.FleetSettingSpecByKey(key)
 		if v, ok := fleet[key]; ok {
 			fmt.Printf("%s = %s (fleet default)\n", key, v)
+		} else if spec.FleetOnly {
+			fmt.Printf("%s = %s (built-in)\n", key, spec.Default)
 		} else {
 			fmt.Printf("%s: unset — the built-in default applies\n", key)
 		}
@@ -201,6 +233,9 @@ func settingsSet(args []string) {
 	if _, ok := config.FleetSettingSpecByKey(key); !ok {
 		log.Fatalf("settings set: unknown key %q (known: %s)", key, strings.Join(config.FleetSettingKeys(), ", "))
 	}
+	if err := rejectFleetOnlyProjectSetting(key, *project); err != nil {
+		log.Fatalf("settings set: %v", err)
+	}
 
 	ctx := context.Background()
 	store := openSettingsStore(*dbPath)
@@ -234,6 +269,9 @@ func settingsRm(args []string) {
 	key := strings.TrimSpace(rest[0])
 	if _, ok := config.FleetSettingSpecByKey(key); !ok {
 		log.Fatalf("settings rm: unknown key %q (known: %s)", key, strings.Join(config.FleetSettingKeys(), ", "))
+	}
+	if err := rejectFleetOnlyProjectSetting(key, *project); err != nil {
+		log.Fatalf("settings rm: %v", err)
 	}
 
 	ctx := context.Background()

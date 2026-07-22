@@ -4418,9 +4418,15 @@ func buildFleetSettingSources(cfg *config.Config) []fleetSettingSource {
 		if src == "" {
 			src = config.SettingSourceBuiltin
 		}
+		value := ""
+		if spec.FleetOnly {
+			value, _ = config.FleetSettingDisplayValue(spec, cfg.FleetOnlySettings)
+		} else {
+			value = spec.Value(cfg)
+		}
 		out = append(out, fleetSettingSource{
 			Key:       spec.Key,
-			Value:     spec.Value(cfg),
+			Value:     value,
 			Source:    src,
 			IsDefault: src == config.SettingSourceBuiltin,
 		})

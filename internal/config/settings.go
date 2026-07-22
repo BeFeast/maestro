@@ -38,12 +38,16 @@ const (
 // CLI / audit identifier), the path to it in a project YAML document (used by
 // the config store to detect a per-project override and to inject a fleet
 // default), its value kind (validation + scalar tag), and an accessor that
-// returns the resolved value as a display string.
+// returns the resolved value as a display string. FleetOnly specs live solely
+// in the settings table: they have no YAMLPath or project Config accessor, and
+// their registered Default is used when the fleet row is absent.
 type FleetSettingSpec struct {
-	Key      string
-	YAMLPath []string
-	Kind     string
-	Value    func(*Config) string
+	Key       string
+	YAMLPath  []string
+	Kind      string
+	FleetOnly bool
+	Default   string
+	Value     func(*Config) string
 }
 
 // FleetSettingSpecs returns the ordered registry of fleet-controllable settings.
@@ -138,6 +142,18 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			Value:    func(c *Config) string { return strconv.Itoa(c.WorkerMaxTokens) },
 		},
 		{
+			Key:       FleetMinLiveWorkersKey,
+			Kind:      SettingKindInt,
+			FleetOnly: true,
+			Default:   strconv.Itoa(DefaultFleetMinLiveWorkers),
+		},
+		{
+			Key:       FleetMaxLiveWorkersKey,
+			Kind:      SettingKindInt,
+			FleetOnly: true,
+			Default:   strconv.Itoa(DefaultFleetMaxLiveWorkers),
+		},
+		{
 			Key:      "stalled_progress_watchdog.enabled",
 			YAMLPath: []string{"stalled_progress_watchdog", "enabled"},
 			Kind:     SettingKindBool,
@@ -201,6 +217,9 @@ func NormalizeSettingValue(key, value string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("setting %q wants an integer, got %q", key, value)
 		}
+		if spec.FleetOnly && n < 0 {
+			return "", fmt.Errorf("setting %q wants a non-negative integer, got %q", key, value)
+		}
 		return strconv.Itoa(n), nil
 	case SettingKindJSON:
 		var lanes []ProviderLane
@@ -239,4 +258,65 @@ func NormalizeSettingValue(key, value string) (string, error) {
 	default:
 		return v, nil
 	}
+}
+
+const (
+	FleetMinLiveWorkersKey = "fleet.min_live_workers"
+	FleetMaxLiveWorkersKey = "fleet.max_live_workers"
+
+	DefaultFleetMinLiveWorkers = 5
+	DefaultFleetMaxLiveWorkers = 10
+)
+
+// FleetConcurrencySettings is the daemon-wide live-worker band. The minimum is
+// a soft operating target; the maximum is a hard spawn ceiling shared by every
+// project flow. A stored zero disables that side of the band.
+type FleetConcurrencySettings struct {
+	MinLiveWorkers int
+	MaxLiveWorkers int
+}
+
+// ResolveFleetConcurrencySettings applies built-in defaults to missing keys and
+// validates the stored fleet-only values. Settings writes already normalize
+// values, but this read-side validation keeps the daemon fail-closed if the DB
+// was edited out of band.
+func ResolveFleetConcurrencySettings(settings map[string]string) (FleetConcurrencySettings, error) {
+	resolved := FleetConcurrencySettings{
+		MinLiveWorkers: DefaultFleetMinLiveWorkers,
+		MaxLiveWorkers: DefaultFleetMaxLiveWorkers,
+	}
+	for key, target := range map[string]*int{
+		FleetMinLiveWorkersKey: &resolved.MinLiveWorkers,
+		FleetMaxLiveWorkersKey: &resolved.MaxLiveWorkers,
+	} {
+		raw, ok := settings[key]
+		if !ok {
+			continue
+		}
+		norm, err := NormalizeSettingValue(key, raw)
+		if err != nil {
+			return FleetConcurrencySettings{}, err
+		}
+		n, err := strconv.Atoi(norm)
+		if err != nil {
+			return FleetConcurrencySettings{}, err
+		}
+		*target = n
+	}
+	if resolved.MinLiveWorkers > 0 && resolved.MaxLiveWorkers > 0 && resolved.MinLiveWorkers > resolved.MaxLiveWorkers {
+		return FleetConcurrencySettings{}, fmt.Errorf("%s (%d) cannot exceed %s (%d)", FleetMinLiveWorkersKey, resolved.MinLiveWorkers, FleetMaxLiveWorkersKey, resolved.MaxLiveWorkers)
+	}
+	return resolved, nil
+}
+
+// FleetSettingDisplayValue returns a stored fleet setting or its built-in
+// fleet-only default. The boolean reports whether the value came from the DB.
+func FleetSettingDisplayValue(spec FleetSettingSpec, settings map[string]string) (string, bool) {
+	if value, ok := settings[spec.Key]; ok {
+		return value, true
+	}
+	if spec.FleetOnly {
+		return spec.Default, false
+	}
+	return "", false
 }

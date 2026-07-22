@@ -321,6 +321,10 @@ type Daemon struct {
 	emergencyState    emergencystore.State
 	emergencyNotifier *notify.Notifier
 
+	// spawnLimiter owns the daemon-wide live-worker budget. It is shared by all
+	// project orchestrators so concurrent flows reserve against one atomic max.
+	spawnLimiter *fleetSpawnLimiter
+
 	// tmpfsHygiene owns the host-level scheduled sweep and latest Fleet-facing
 	// summary. It is independent of per-project flow state.
 	tmpfsHygiene *tmpfsHygieneRuntime
@@ -410,9 +414,10 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		opts.DrainTimeout = DefaultDrainTimeout
 	}
 	d := &Daemon{
-		store: store,
-		opts:  opts,
-		flows: make(map[string]*projectFlow),
+		store:        store,
+		opts:         opts,
+		flows:        make(map[string]*projectFlow),
+		spawnLimiter: newFleetSpawnLimiter(store),
 	}
 	d.tmpfsHygiene = newTmpfsHygieneRuntime(d)
 	if opts.WatchStore {
@@ -623,6 +628,13 @@ func (d *Daemon) Run(ctx context.Context) error {
 		return err
 	}
 
+	for i := range projects {
+		if cfg := projects[i].Cfg(); cfg != nil {
+			if d.spawnLimiter != nil {
+				d.spawnLimiter.RegisterStateDir(cfg.StateDir)
+			}
+		}
+	}
 	for i := range projects {
 		flow := d.startFlow(ctx, storeNames[i], projects[i])
 		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, flow.cfg.Repo, flow.cfg.StateDir)

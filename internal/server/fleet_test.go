@@ -660,9 +660,11 @@ func TestFleetEffectiveConfigSettingsSource(t *testing.T) {
 		WorkerMaxTokens: 250000,
 		Supervisor:      config.SupervisorConfig{Enabled: false},
 		SettingsSources: map[string]string{
-			"supervisor.enabled": config.SettingSourceProject,
-			"worker_max_tokens":  config.SettingSourceFleet,
+			"supervisor.enabled":          config.SettingSourceProject,
+			"worker_max_tokens":           config.SettingSourceFleet,
+			config.FleetMaxLiveWorkersKey: config.SettingSourceFleet,
 		},
+		FleetOnlySettings: map[string]string{config.FleetMaxLiveWorkersKey: "7"},
 	}
 	srv := NewFleet([]FleetProject{NewFleetProject("Settings", "/tmp/settings.yaml", "", cfg)}, "127.0.0.1", 8786, true)
 
@@ -688,6 +690,12 @@ func TestFleetEffectiveConfigSettingsSource(t *testing.T) {
 	}
 	if s := byKey["worker_max_tokens"]; s.Source != config.SettingSourceFleet || s.Value != "250000" || s.IsDefault {
 		t.Fatalf("worker_max_tokens = %+v", s)
+	}
+	if s := byKey[config.FleetMaxLiveWorkersKey]; s.Source != config.SettingSourceFleet || s.Value != "7" || s.IsDefault {
+		t.Fatalf("fleet.max_live_workers = %+v", s)
+	}
+	if s := byKey[config.FleetMinLiveWorkersKey]; s.Source != config.SettingSourceBuiltin || s.Value != "5" || !s.IsDefault {
+		t.Fatalf("fleet.min_live_workers = %+v", s)
 	}
 	// An unmapped key falls back to builtin + is_default.
 	if s := byKey["poll_interval_seconds"]; s.Source != config.SettingSourceBuiltin || !s.IsDefault {

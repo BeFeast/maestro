@@ -69,7 +69,8 @@ supervisor:
 	}
 	fromYAML.SourcePath = ""
 	fromStore.SourcePath = ""
-	fromStore.SettingsSources = nil // provenance map is set by Load, absent from Parse
+	fromStore.SettingsSources = nil   // provenance map is set by Load, absent from Parse
+	fromStore.FleetOnlySettings = nil // daemon-only settings are set by Load, absent from Parse
 	if !reflect.DeepEqual(fromStore, fromYAML) {
 		t.Fatalf("store config differs from yaml\nstore=%#v\nyaml=%#v", fromStore.Model, fromYAML.Model)
 	}
