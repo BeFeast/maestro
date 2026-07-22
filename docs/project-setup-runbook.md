@@ -525,6 +525,12 @@ stop that never overwrites a row by name. Both emit a machine-readable receipt
 (store, project id, fingerprint, effect, daemon-reconciliation expectation, exact
 next commands) for scripted bootstrap adapters.
 
+For an existing row, the input may be either its backend-free stored project
+YAML or a `config-store export` that re-attaches fleet-shared `model.backends`.
+Plan resolves backend references from the target store without writing it. Any
+definition carried by an export must exactly match that store; missing or
+divergent definitions fail closed and must be changed at fleet scope instead.
+
 The running `maestro daemon --watch-store` observes the new row within one poll
 interval and starts exactly one flow — no restart, no `systemctl` step per project.
 Removal/rollback stays a separate explicit operator action:

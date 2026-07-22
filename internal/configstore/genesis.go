@@ -52,12 +52,18 @@ type PreparedProject struct {
 	ManagementHome config.ManagementHomeConfig
 	Fingerprint    string
 	// Canonical is the deterministic project document the fingerprint is taken
-	// over (backends normalized, re-marshaled). Raw is the original file bytes,
-	// stored verbatim on apply so comments/ordering survive the round-trip that
-	// UpsertProject itself performs.
+	// over (backends normalized, re-marshaled). Raw is the project-only document
+	// passed to apply; it preserves the original bytes unless preparation had to
+	// detach a matching model.backends block from a config-store export.
 	Canonical []byte
 	Raw       []byte
 	Warnings  []string
+
+	// portableBackends records definitions supplied by an exported portable
+	// document. They are never written by genesis: a target-store preparation
+	// accepts them only when they exactly match the fleet-shared definitions,
+	// then ApplyProject re-checks that equality in its write transaction.
+	portableBackends map[string]*yaml.Node
 }
 
 // ExistingRow is the identity summary of a config-store row that a plan/apply
@@ -97,8 +103,61 @@ type GenesisReport struct {
 //   - a valid, present project_id (the durable identity the flow is built around);
 //   - local_path and worktree_base required (a genesis row must be runnable).
 func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
-	cfg, err := config.ParseStrict(data)
+	return prepareProject(sourcePath, data, nil, false)
+}
+
+// PrepareProject validates a portable project document against the shared
+// backend definitions already present in this target store. This is the
+// store-aware entry point used by project plan/apply for existing stores:
+// project-only rows may reference shared backends without embedding them, while
+// config-store exports may carry definitions only as an exact, read-only proof
+// of what the target store already contains.
+func (s *Store) PrepareProject(ctx context.Context, sourcePath string, data []byte) (*PreparedProject, error) {
+	backends, err := s.loadBackends(ctx)
 	if err != nil {
+		return nil, fmt.Errorf("load target shared backends: %w", err)
+	}
+	return prepareProject(sourcePath, data, backends, true)
+}
+
+func prepareProject(sourcePath string, data []byte, sharedBackends map[string]*yaml.Node, storeAware bool) (*PreparedProject, error) {
+	var source yaml.Node
+	if err := yaml.Unmarshal(data, &source); err != nil {
+		return nil, err
+	}
+	portableBackends := detachBackends(&source)
+	if !storeAware && len(portableBackends) > 0 {
+		return nil, fmt.Errorf("portable project genesis must not define shared model.backends; configure fleet backends separately before plan/apply")
+	}
+	if storeAware {
+		if err := validatePortableBackends(portableBackends, sharedBackends); err != nil {
+			return nil, err
+		}
+	}
+
+	projectData := data
+	if len(portableBackends) > 0 {
+		removeEmptyTopLevelMapping(&source, "model")
+		var err error
+		projectData, err = marshalNode(&source)
+		if err != nil {
+			return nil, fmt.Errorf("detach portable model.backends: %w", err)
+		}
+	}
+
+	effective := cloneNode(&source)
+	if storeAware {
+		attachBackends(effective, sharedBackends)
+	}
+	effectiveData, err := marshalNode(effective)
+	if err != nil {
+		return nil, fmt.Errorf("attach target shared backends: %w", err)
+	}
+	cfg, err := config.ParseStrict(effectiveData)
+	if err != nil {
+		if storeAware && missingSharedBackendError(err) {
+			return nil, fmt.Errorf("target config store is missing a shared backend required by this project; configure it at fleet scope before plan/apply: %w", err)
+		}
 		return nil, err
 	}
 	id := strings.TrimSpace(cfg.ProjectID)
@@ -107,13 +166,6 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 	}
 	if id != strings.ToLower(id) {
 		return nil, fmt.Errorf("project_id must use canonical lowercase UUID form; got %q", id)
-	}
-	var source yaml.Node
-	if err := yaml.Unmarshal(data, &source); err != nil {
-		return nil, err
-	}
-	if backends := detachBackends(&source); len(backends) > 0 {
-		return nil, fmt.Errorf("portable project genesis must not define shared model.backends; configure fleet backends separately before plan/apply")
 	}
 	repo := strings.TrimSpace(cfg.Repo)
 	parts := strings.Split(repo, "/")
@@ -152,15 +204,74 @@ func PrepareProject(sourcePath string, data []byte) (*PreparedProject, error) {
 		ManagementHome: cfg.ManagementHome,
 		Fingerprint:    fp,
 		Canonical:      canonical,
-		Raw:            data,
+		Raw:            projectData,
 		// Surface config load-time warnings on the genesis receipt so an
 		// operator sees them at plan/apply. This is where the #872 delivery
 		// deprecation nudges a legacy deploy_cmd (or an explicit
 		// delivery.mode: automatic) toward the safe approval_required default —
 		// new genesis output that names a delivery command defaults to
 		// approval_required, and an unattended automatic mode is called out.
-		Warnings: cfg.Warnings(),
+		Warnings:         cfg.Warnings(),
+		portableBackends: cloneBackendMap(portableBackends),
 	}, nil
+}
+
+func validatePortableBackends(portable, shared map[string]*yaml.Node) error {
+	names := make([]string, 0, len(portable))
+	for name := range portable {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	for _, name := range names {
+		portableDef := portable[name]
+		sharedDef, ok := shared[name]
+		if !ok {
+			return fmt.Errorf("portable model.backends.%s is not defined in the target config store; configure that fleet backend before plan/apply", name)
+		}
+		equal, err := backendDefinitionsEqual(portableDef, sharedDef)
+		if err != nil {
+			return fmt.Errorf("compare portable model.backends.%s with target store: %w", name, err)
+		}
+		if !equal {
+			return fmt.Errorf("portable model.backends.%s diverges from the target config store; shared backend values cannot be redefined by project genesis (update the fleet backend separately or export the project again)", name)
+		}
+	}
+	return nil
+}
+
+func backendDefinitionsEqual(a, b *yaml.Node) (bool, error) {
+	left := cloneNode(a)
+	right := cloneNode(b)
+	normalizeYAMLPresentation(left)
+	normalizeYAMLPresentation(right)
+	sortMappingKeys(left)
+	sortMappingKeys(right)
+	leftYAML, err := marshalNode(left)
+	if err != nil {
+		return false, err
+	}
+	rightYAML, err := marshalNode(right)
+	if err != nil {
+		return false, err
+	}
+	return string(leftYAML) == string(rightYAML), nil
+}
+
+func cloneBackendMap(in map[string]*yaml.Node) map[string]*yaml.Node {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*yaml.Node, len(in))
+	for name, def := range in {
+		out[name] = cloneNode(def)
+	}
+	return out
+}
+
+func missingSharedBackendError(err error) bool {
+	message := err.Error()
+	return strings.Contains(message, "model.backends") &&
+		(strings.Contains(message, "not defined") || strings.Contains(message, "not declared"))
 }
 
 // canonicalProjectDoc returns the deterministic project document and its
@@ -365,7 +476,7 @@ func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, w
 		if wb != report.BaselineFingerprint {
 			return report, fmt.Errorf("config store changed since plan (approved baseline %s, current %s); re-run `maestro project plan` and review before applying", wb, report.BaselineFingerprint)
 		}
-		if err := upsertProjectTx(ctx, tx, p.Name, string(p.Raw)); err != nil {
+		if err := upsertPreparedProjectTx(ctx, tx, p.Name, string(p.Raw)); err != nil {
 			return nil, err
 		}
 		if err := tx.Commit(); err != nil {
@@ -379,6 +490,9 @@ func (s *Store) ApplyProject(ctx context.Context, p *PreparedProject, confirm, w
 }
 
 func evaluateProjectTx(ctx context.Context, tx *sql.Tx, p *PreparedProject) (effect, conflict string, existing *ExistingRow, err error) {
+	if err := validatePreparedProjectTx(ctx, tx, p); err != nil {
+		return "", "", nil, err
+	}
 	row, err := existingRowTx(ctx, tx, p.Name)
 	if err != nil {
 		return "", "", nil, err
@@ -409,6 +523,53 @@ func evaluateProjectTx(ctx context.Context, tx *sql.Tx, p *PreparedProject) (eff
 		return EffectNoOp, "", row, nil
 	}
 	return EffectUpdate, "", row, nil
+}
+
+func validatePreparedProjectTx(ctx context.Context, tx *sql.Tx, p *PreparedProject) error {
+	backends, err := loadBackendsTx(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("load target shared backends: %w", err)
+	}
+	if err := validatePortableBackends(p.portableBackends, backends); err != nil {
+		return err
+	}
+	var root yaml.Node
+	if err := yaml.Unmarshal(p.Raw, &root); err != nil {
+		return err
+	}
+	attachBackends(&root, backends)
+	effective, err := marshalNode(&root)
+	if err != nil {
+		return err
+	}
+	if _, err := config.ParseStrict(effective); err != nil {
+		if missingSharedBackendError(err) {
+			return fmt.Errorf("target config store is missing a shared backend required by this project; configure it at fleet scope before plan/apply: %w", err)
+		}
+		return err
+	}
+	return nil
+}
+
+func loadBackendsTx(ctx context.Context, tx *sql.Tx) (map[string]*yaml.Node, error) {
+	rows, err := tx.QueryContext(ctx, `SELECT name, definition_yaml FROM backends ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]*yaml.Node{}
+	for rows.Next() {
+		var name, data string
+		if err := rows.Scan(&name, &data); err != nil {
+			return nil, err
+		}
+		var doc yaml.Node
+		if err := yaml.Unmarshal([]byte(data), &doc); err != nil {
+			return nil, fmt.Errorf("parse backend %s: %w", name, err)
+		}
+		out[name] = documentValue(&doc)
+	}
+	return out, rows.Err()
 }
 
 func existingRowTx(ctx context.Context, tx *sql.Tx, name string) (*ExistingRow, error) {

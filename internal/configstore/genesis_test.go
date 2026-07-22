@@ -20,6 +20,18 @@ management_home:
   vault_path: Dev/Areas/maestro
 `
 
+const genesisSharedBackendYAML = genesisYAML + `model:
+  default: claude
+  fallback_backends: [codex]
+  backends:
+    claude:
+      cmd: claude
+      prompt_mode: arg
+    codex:
+      cmd: codex
+      prompt_mode: stdin
+`
+
 func TestPrepareProjectValid(t *testing.T) {
 	p, err := PrepareProject("portable.yaml", []byte(genesisYAML))
 	if err != nil {
@@ -135,6 +147,213 @@ func TestPrepareProjectSurfacesDeliveryWarnings(t *testing.T) {
 	if containsSubstr(q.Warnings, "deploy_cmd is deprecated") || containsSubstr(q.Warnings, "delivery.mode: automatic") {
 		t.Fatalf("approval_required delivery must not emit a delivery deprecation/automatic warning; warnings=%v", q.Warnings)
 	}
+}
+
+func TestPrepareProjectAgainstSharedBackends(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("raw stored YAML", func(t *testing.T) {
+		store := openTestStore(t)
+		seedGenesisSharedBackends(t, store)
+		raw := storedProjectYAML(t, store, "befeast-maestro")
+		desired := strings.Replace(raw, "/srv/example-src/maestro", "/srv/updated-src/maestro", 1)
+
+		if _, err := PrepareProject("raw.yaml", []byte(desired)); err == nil || !strings.Contains(err.Error(), "fallback_backends") {
+			t.Fatalf("standalone prepare err = %v, want unresolved fallback backend", err)
+		}
+		p, err := store.PrepareProject(ctx, "raw.yaml", []byte(desired))
+		if err != nil {
+			t.Fatalf("store-aware PrepareProject: %v", err)
+		}
+		plan, err := store.PlanProject(ctx, p)
+		if err != nil {
+			t.Fatalf("PlanProject: %v", err)
+		}
+		if plan.Effect != EffectUpdate || plan.Wrote {
+			t.Fatalf("plan = %+v, want update+!wrote", plan)
+		}
+	})
+
+	t.Run("exported YAML with matching definitions", func(t *testing.T) {
+		store := openTestStore(t)
+		seedGenesisSharedBackends(t, store)
+		exported, err := store.ExportProject(ctx, "befeast-maestro")
+		if err != nil {
+			t.Fatalf("ExportProject: %v", err)
+		}
+		desired := strings.Replace(string(exported), "/srv/example-src/maestro", "/srv/updated-src/maestro", 1)
+
+		if _, err := PrepareProject("exported.yaml", []byte(desired)); err == nil || !strings.Contains(err.Error(), "must not define shared model.backends") {
+			t.Fatalf("standalone prepare err = %v, want portable backend rejection", err)
+		}
+		p, err := store.PrepareProject(ctx, "exported.yaml", []byte(desired))
+		if err != nil {
+			t.Fatalf("store-aware PrepareProject: %v", err)
+		}
+		if strings.Contains(string(p.Raw), "\n  backends:") {
+			t.Fatalf("prepared project retained shared backend definitions:\n%s", p.Raw)
+		}
+		plan, err := store.PlanProject(ctx, p)
+		if err != nil {
+			t.Fatalf("PlanProject: %v", err)
+		}
+		if plan.Effect != EffectUpdate {
+			t.Fatalf("plan effect = %q, want update", plan.Effect)
+		}
+	})
+
+	t.Run("missing target definition", func(t *testing.T) {
+		store := openTestStore(t)
+		seedGenesisSharedBackends(t, store)
+		exported, err := store.ExportProject(ctx, "befeast-maestro")
+		if err != nil {
+			t.Fatalf("ExportProject: %v", err)
+		}
+		raw := storedProjectYAML(t, store, "befeast-maestro")
+		if _, err := store.db.ExecContext(ctx, `DELETE FROM backends WHERE name = 'codex'`); err != nil {
+			t.Fatalf("delete codex fixture: %v", err)
+		}
+
+		_, err = store.PrepareProject(ctx, "raw.yaml", []byte(raw))
+		if err == nil || !strings.Contains(err.Error(), "target config store is missing") || !strings.Contains(err.Error(), "codex") {
+			t.Fatalf("raw missing-definition err = %v, want actionable codex error", err)
+		}
+		_, err = store.PrepareProject(ctx, "exported.yaml", exported)
+		if err == nil || !strings.Contains(err.Error(), "model.backends.codex") || !strings.Contains(err.Error(), "target config store") {
+			t.Fatalf("export missing-definition err = %v, want target-store error", err)
+		}
+	})
+
+	t.Run("divergent exported definition", func(t *testing.T) {
+		store := openTestStore(t)
+		seedGenesisSharedBackends(t, store)
+		exported, err := store.ExportProject(ctx, "befeast-maestro")
+		if err != nil {
+			t.Fatalf("ExportProject: %v", err)
+		}
+		divergent := strings.Replace(string(exported), "cmd: codex", "cmd: other-codex", 1)
+		_, err = store.PrepareProject(ctx, "exported.yaml", []byte(divergent))
+		if err == nil || !strings.Contains(err.Error(), "model.backends.codex diverges") || !strings.Contains(err.Error(), "cannot be redefined") {
+			t.Fatalf("divergent-definition err = %v, want fail-closed redefinition error", err)
+		}
+	})
+}
+
+func TestApplyProjectSharedBackendUpdatePreservesFleetTableAndIdentity(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seedGenesisSharedBackends(t, store)
+	before := backendTableSnapshot(t, store)
+	exported, err := store.ExportProject(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("ExportProject: %v", err)
+	}
+	desired := strings.Replace(string(exported), "/srv/example-src/maestro", "/srv/updated-src/maestro", 1)
+	p, err := store.PrepareProject(ctx, "exported.yaml", []byte(desired))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	plan, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("PlanProject: %v", err)
+	}
+	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint)
+	if err != nil {
+		t.Fatalf("ApplyProject: %v", err)
+	}
+	if report.Effect != EffectUpdate || !report.Wrote {
+		t.Fatalf("apply = %+v, want update+wrote", report)
+	}
+	if after := backendTableSnapshot(t, store); !reflect.DeepEqual(after, before) {
+		t.Fatalf("genesis update changed shared backend table:\nbefore=%v\nafter=%v", before, after)
+	}
+	cfg, err := store.Load(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.ProjectID != "3f2504e0-4f89-41d3-9a0c-0305e82c3301" {
+		t.Fatalf("project identity changed to %q", cfg.ProjectID)
+	}
+	if cfg.LocalPath != "/srv/updated-src/maestro" {
+		t.Fatalf("local_path = %q, want updated value", cfg.LocalPath)
+	}
+	if got := cfg.Model.Backends["codex"].Cmd; got != "codex" {
+		t.Fatalf("shared codex backend cmd = %q, want codex", got)
+	}
+}
+
+func TestApplyProjectRejectsSharedBackendDriftSinceExport(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	seedGenesisSharedBackends(t, store)
+	exported, err := store.ExportProject(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("ExportProject: %v", err)
+	}
+	desired := strings.Replace(string(exported), "/srv/example-src/maestro", "/srv/updated-src/maestro", 1)
+	p, err := store.PrepareProject(ctx, "exported.yaml", []byte(desired))
+	if err != nil {
+		t.Fatalf("PrepareProject: %v", err)
+	}
+	plan, err := store.PlanProject(ctx, p)
+	if err != nil {
+		t.Fatalf("PlanProject: %v", err)
+	}
+	if _, err := store.db.ExecContext(ctx, `UPDATE backends SET definition_yaml = 'cmd: other-codex' WHERE name = 'codex'`); err != nil {
+		t.Fatalf("change shared backend fixture: %v", err)
+	}
+
+	report, err := store.ApplyProject(ctx, p, p.ProjectID, p.Fingerprint, plan.BaselineFingerprint)
+	if err == nil || !strings.Contains(err.Error(), "model.backends.codex diverges") {
+		t.Fatalf("ApplyProject err = %v, want shared-backend drift refusal", err)
+	}
+	if report != nil {
+		t.Fatalf("drifted apply report = %+v, want validation failure before evaluation", report)
+	}
+	cfg, err := store.Load(ctx, "befeast-maestro")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if cfg.LocalPath != "/srv/example-src/maestro" {
+		t.Fatalf("drifted apply changed project local_path to %q", cfg.LocalPath)
+	}
+}
+
+func seedGenesisSharedBackends(t *testing.T, store *Store) {
+	t.Helper()
+	if err := store.UpsertProject(context.Background(), "befeast-maestro", genesisSharedBackendYAML); err != nil {
+		t.Fatalf("seed shared-backend project: %v", err)
+	}
+}
+
+func storedProjectYAML(t *testing.T, store *Store, name string) string {
+	t.Helper()
+	var data string
+	if err := store.db.QueryRow(`SELECT config_yaml FROM project WHERE name = ?`, name).Scan(&data); err != nil {
+		t.Fatalf("query stored project YAML: %v", err)
+	}
+	return data
+}
+
+func backendTableSnapshot(t *testing.T, store *Store) map[string][2]string {
+	t.Helper()
+	rows, err := store.db.Query(`SELECT name, definition_yaml, updated_at FROM backends ORDER BY name`)
+	if err != nil {
+		t.Fatalf("query backend table: %v", err)
+	}
+	defer rows.Close()
+	out := map[string][2]string{}
+	for rows.Next() {
+		var name, definition, updatedAt string
+		if err := rows.Scan(&name, &definition, &updatedAt); err != nil {
+			t.Fatalf("scan backend table: %v", err)
+		}
+		out[name] = [2]string{definition, updatedAt}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate backend table: %v", err)
+	}
+	return out
 }
 
 func containsSubstr(ss []string, sub string) bool {

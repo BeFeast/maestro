@@ -25,6 +25,22 @@ management_home:
   vault_path: Dev/Areas/demo
 `
 
+const projectTestSharedBackendYAML = projectTestYAML + `model:
+  default: claude
+  fallback_backends: [codex]
+  backends:
+    claude:
+      cmd: claude
+    codex:
+      cmd: codex
+      prompt_mode: stdin
+`
+
+const projectTestSharedBackendRawYAML = projectTestYAML + `model:
+  default: claude
+  fallback_backends: [codex]
+`
+
 func TestUnifiedDefaultStorePath(t *testing.T) {
 	t.Setenv("HOME", "/srv/example-home")
 	want := "/srv/example-home/.maestro/maestro.db"
@@ -415,6 +431,48 @@ func TestPlanReportActiveWALChangesNoDatabaseFiles(t *testing.T) {
 		}
 		if !bytes.Equal(before[path], after) {
 			t.Fatalf("project plan changed active SQLite file %s", path)
+		}
+	}
+}
+
+func TestPlanSharedBackendUpdateChangesNoDatabaseFiles(t *testing.T) {
+	dir := t.TempDir()
+	dbPath := filepath.Join(dir, "config.db")
+	store, err := configstore.Open(dbPath)
+	if err != nil {
+		t.Fatalf("open writable fixture: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertProject(context.Background(), "befeast-demo", projectTestSharedBackendYAML); err != nil {
+		t.Fatalf("seed shared-backend fixture: %v", err)
+	}
+	file := filepath.Join(dir, "project.yaml")
+	desired := strings.Replace(projectTestSharedBackendRawYAML, "/srv/example-src/demo", "/srv/updated-src/demo", 1)
+	if err := os.WriteFile(file, []byte(desired), 0o644); err != nil {
+		t.Fatalf("write desired project: %v", err)
+	}
+
+	paths := []string{dbPath, dbPath + "-wal", dbPath + "-shm"}
+	before := make(map[string][]byte, len(paths))
+	for _, path := range paths {
+		before[path], err = os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read active shared-backend fixture %s: %v", path, err)
+		}
+	}
+
+	prepared := prepareGenesisFile(file, dbPath, "project plan", false)
+	report := planReport(dbPath, prepared, false)
+	if report.Effect != configstore.EffectUpdate || report.Wrote {
+		t.Fatalf("shared-backend plan = %+v, want update+!wrote", report)
+	}
+	for _, path := range paths {
+		after, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatalf("read after shared-backend plan %s: %v", path, err)
+		}
+		if !bytes.Equal(before[path], after) {
+			t.Fatalf("shared-backend project plan changed active SQLite file %s", path)
 		}
 	}
 }
