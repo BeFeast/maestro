@@ -10435,6 +10435,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
@@ -10470,7 +10473,47 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *testing.T) {
+func TestAutoMergePRs_NoPRRetryExhaustedGenuinelyStuckIssueBlocksOnceAcrossSlots(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 836,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 1 {
+		t.Fatalf("blocked label calls = %d, want one aggregate issue action", labelCalls)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		if got := s.Sessions[slot].LastNotifiedStatus; got != noPRReconciledStatus {
+			t.Fatalf("%s LastNotifiedStatus = %q, want %q", slot, got, noPRReconciledStatus)
+		}
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedSlotsDoNotBlockSiblingOpenPR(t *testing.T) {
 	cfg := &config.Config{
 		Repo:       "owner/repo",
 		ReviewGate: "none",
@@ -10481,9 +10524,12 @@ func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *te
 		cfg:      cfg,
 		notifier: &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) {
-			return []github.PR{{Number: 397, HeadRefName: "canonical", Title: "Fedora fix for #346"}}, nil
+			// Deliberately omit an issue reference: aggregate ownership must come
+			// from the sibling session's issue/PR/branch identity, not PR text.
+			return []github.PR{{Number: 850, HeadRefName: "slot-d"}}, nil
 		},
-		ghPRCIStatusFn: func(int) (string, error) { return "pending", nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		ghPRCIStatusFn:  func(int) (string, error) { return "pending", nil },
 		ghPRMergeStatusFn: func(int) (string, string, error) {
 			return "MERGEABLE", "blocked", nil
 		},
@@ -10493,25 +10539,171 @@ func TestAutoMergePRs_NoPRRetryExhaustedSiblingDoesNotBlockCanonicalOpenPR(t *te
 		},
 	}
 	s := state.NewState()
-	s.Sessions["canonical-slot"] = &state.Session{
-		IssueNumber: 346,
-		Status:      state.StatusRetryExhausted,
-		PRNumber:    397,
-		Branch:      "canonical",
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
 	}
-	s.Sessions["preserved-sibling"] = &state.Session{
-		IssueNumber: 346,
-		Status:      state.StatusRetryExhausted,
-		Branch:      "preserved-sibling",
+	s.Sessions["slot-d"] = &state.Session{
+		IssueNumber: 835,
+		Status:      state.StatusPROpen,
+		PRNumber:    850,
+		Branch:      "slot-d",
 	}
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
 
 	o.autoMergePRs(s)
 
 	if len(addedLabels) != 0 {
-		t.Fatalf("terminal sibling applied labels behind canonical PR: %v", addedLabels)
+		t.Fatalf("dead sibling slots applied labels behind open PR: %v", addedLabels)
 	}
-	if got := s.Sessions["preserved-sibling"].LastNotifiedStatus; got == noPRReconciledStatus {
-		t.Fatalf("terminal sibling was falsely reconciled as a blocking no-PR outcome")
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusRetryExhausted {
+			t.Fatalf("%s status = %q, want retry_exhausted while sibling PR is in flight", slot, sess.Status)
+		}
+		if sess.LastNotifiedStatus == noPRReconciledStatus {
+			t.Fatalf("%s was falsely reconciled as a blocking no-PR outcome", slot)
+		}
+	}
+	if !strings.Contains(logs.String(), "issue #835 has open PR #850 in aggregate session state") ||
+		!strings.Contains(logs.String(), "without applying blocked") {
+		t.Fatalf("journal does not explain aggregate open-PR suppression:\n%s", logs.String())
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedClosedIssueSettlesAllStaleSlots(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 1,
+		},
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	var projectStatuses []github.ProjectStatus
+	o := &Orchestrator{
+		cfg:                  cfg,
+		notifier:             &notify.Notifier{},
+		projectRateAllowed:   true,
+		projectRateCheckedAt: now,
+		listOpenPRsFn:        func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:      func(issueNumber int) (bool, error) { return true, nil },
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			projectStatuses = append(projectStatuses, status)
+			return true
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			t.Fatalf("merged-PR lookup must not run after authoritative issue closure")
+			return false, nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 0 {
+		t.Fatalf("closed issue received %d blocked-label call(s), want 0", labelCalls)
+	}
+	if len(projectStatuses) != 0 {
+		t.Fatalf("closed issue received stale-slot project syncs %v, want none", projectStatuses)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.LastNotifiedStatus != noPRReconciledStatus {
+			t.Fatalf("%s = status %q closed_at=%v notified=%q, want reconciled done", slot, sess.Status, sess.IssueClosedAt, sess.LastNotifiedStatus)
+		}
+	}
+	if !strings.Contains(logs.String(), "already closed; reconciled 3 stale no-PR slot(s) to done") {
+		t.Fatalf("journal missing closed-issue reconciliation reason:\n%s", logs.String())
+	}
+
+	logBefore := logs.Len()
+	o.autoMergePRs(s)
+	if labelCalls != 0 || len(projectStatuses) != 0 || logs.Len() != logBefore {
+		t.Fatalf("second cycle was not quiet: labels=%d statuses=%v logs=%q", labelCalls, projectStatuses, logs.String()[logBefore:])
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedMergedSiblingSettlesAllStaleSlots(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 850, nil },
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			t.Fatalf("same-issue session PR identity should establish aggregate merge state")
+			return false, nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+	// The canonical slot already settled after its non-closing `Refs #835` PR
+	// merged. The stale no-PR slots must use that durable PR identity rather
+	// than the legacy closing-keyword lookup.
+	s.Sessions["slot-d"] = &state.Session{
+		IssueNumber: 835,
+		Status:      state.StatusDone,
+		PRNumber:    850,
+		PRMerged:    true,
+		Branch:      "slot-d",
+	}
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 0 {
+		t.Fatalf("merged sibling PR still allowed %d blocked-label call(s)", labelCalls)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusDone || sess.LastNotifiedStatus != noPRReconciledStatus {
+			t.Fatalf("%s = status %q notified=%q, want reconciled done", slot, sess.Status, sess.LastNotifiedStatus)
+		}
+	}
+
+	o.autoMergePRs(s)
+	if labelCalls != 0 {
+		t.Fatalf("second cycle re-applied blocked label after merged sibling reconciliation")
 	}
 }
 
@@ -10533,6 +10725,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedAutoClosesWhenMergedPRDetected(t *testin
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return issueNumber == 490, nil
 		},
@@ -10587,6 +10782,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedMergedPRSurfacesCloseCandidate(t *testin
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return true, nil
 		},
@@ -10635,6 +10833,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedHasMergedPRErrorDefersReconcile(t *testi
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, fmt.Errorf("gh: transient API failure")
 		},
