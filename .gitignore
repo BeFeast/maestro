@@ -25,3 +25,10 @@ internal/server/web/mc/node_modules/
 
 # Generated test/verify artifacts
 .maestro/
+
+# Entire local checkpoint state (only settings.json is committed)
+/.entire/metadata/
+/.entire/logs/
+/.entire/tmp/
+/.entire/settings.local.json
+/.entire/redactors/local/
