@@ -77,6 +77,14 @@ func TestDispatchHoldForCycleCoversRequiredReasonClasses(t *testing.T) {
 			t.Fatalf("hold = %+v, want PR-gate capacity blocker", hold)
 		}
 	})
+
+	t.Run("queue empty with zero live workers", func(t *testing.T) {
+		s := state.NewState()
+		hold := o.dispatchHoldForCycle(s, s.Capacity(capacityInput(cfg)), 0, now)
+		if !hold.Active || hold.ReasonClass != state.DispatchHoldQueueEmpty {
+			t.Fatalf("hold = %+v, want queue_empty idle stall", hold)
+		}
+	})
 }
 
 func TestRunOnceEmitsOneIdleStallAfterTwoOutcomeHeldCycles(t *testing.T) {

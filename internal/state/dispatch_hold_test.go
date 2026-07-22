@@ -37,6 +37,26 @@ func TestRecordDispatchCycleAlertsOnceAfterTwoConsecutiveCycles(t *testing.T) {
 	}
 }
 
+func TestRecordDispatchCycleAlertsOnEmptyReadyQueue(t *testing.T) {
+	// F8 companion: empty ready + 0 live must still notify after two cycles.
+	now := time.Date(2026, 7, 22, 14, 0, 0, 0, time.UTC)
+	s := NewState()
+	hold := DispatchHold{
+		Active:      true,
+		ReasonClass: DispatchHoldQueueEmpty,
+		Detail:      "no live workers and no eligible ready issues to dispatch",
+	}
+	if s.RecordDispatchCycle(hold, 0, 0, now) {
+		t.Fatal("first empty-ready idle cycle must not alert")
+	}
+	if !s.RecordDispatchCycle(hold, 0, 0, now.Add(time.Minute)) {
+		t.Fatal("second empty-ready idle cycle must alert")
+	}
+	if s.IdleStall.ReasonClass != DispatchHoldQueueEmpty {
+		t.Fatalf("reason = %q, want %q", s.IdleStall.ReasonClass, DispatchHoldQueueEmpty)
+	}
+}
+
 func TestRecordDispatchCycleBoundsPublicHoldText(t *testing.T) {
 	s := NewState()
 	now := time.Date(2026, 7, 21, 18, 0, 0, 0, time.UTC)

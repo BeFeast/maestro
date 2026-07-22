@@ -16,6 +16,7 @@ const (
 	DispatchHoldPRGateCapacity       = "capacity_blocked_by_pr_gates"
 	DispatchHoldPaused               = "paused"
 	DispatchHoldAwaitingDispatch     = "awaiting_dispatch"
+	DispatchHoldQueueEmpty           = "queue_empty"
 )
 
 // DispatchHold is the bounded, command/output-free explanation for why fresh
@@ -44,6 +45,11 @@ type IdleStallState struct {
 // the project has met the idle-stall condition for two consecutive cycles and
 // its current reason class has not been notified yet. The caller marks the
 // receipt only after the notify layer succeeds.
+//
+// Idle means 0 live workers for two cycles — including the empty-ready case
+// (queue_empty). Requiring readyIssues>0 previously silenced the boom/bust
+// failure mode where the ready queue drained under outcome hold and the fleet
+// sat at 0 with no alert (2026-07-22).
 func (s *State) RecordDispatchCycle(hold DispatchHold, liveWorkers, readyIssues int, now time.Time) bool {
 	if s == nil {
 		return false
@@ -52,14 +58,18 @@ func (s *State) RecordDispatchCycle(hold DispatchHold, liveWorkers, readyIssues 
 	hold = normalizeDispatchHold(hold, s.DispatchHold, now)
 	s.DispatchHold = hold
 
-	if liveWorkers != 0 || readyIssues <= 0 {
+	if liveWorkers != 0 {
 		s.IdleStall = IdleStallState{LastEvaluatedAt: now}
 		return false
 	}
 
 	reasonClass := strings.TrimSpace(hold.ReasonClass)
 	if reasonClass == "" {
-		reasonClass = DispatchHoldAwaitingDispatch
+		if readyIssues <= 0 {
+			reasonClass = DispatchHoldQueueEmpty
+		} else {
+			reasonClass = DispatchHoldAwaitingDispatch
+		}
 	}
 	if s.IdleStall.ReasonClass == reasonClass && s.IdleStall.ConsecutiveCycles > 0 {
 		s.IdleStall.ConsecutiveCycles++
