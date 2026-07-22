@@ -28,23 +28,31 @@ var (
 		return tmuxsession.StartDetached(tmuxName, worktree, runnerPath, lease)
 	}
 	readTmuxPaneIdentity = func(tmuxName string) (int, string, error) {
-		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}").Output()
+		out, err := tmuxsession.CommandForSession(tmuxName, "list-panes", "-t", "="+strings.TrimSpace(tmuxName)+":", "-F", "#{pane_pid}\t#{pane_current_path}\t#{pane_start_path}").Output()
 		if err != nil {
 			return 0, "", err
 		}
-		parts := strings.SplitN(strings.TrimSpace(string(out)), "\t", 2)
-		if len(parts) != 2 {
-			return 0, "", fmt.Errorf("unexpected tmux pane identity")
-		}
-		pid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
-		if err != nil || pid <= 0 {
-			return 0, "", fmt.Errorf("invalid tmux pane pid")
-		}
-		return pid, filepath.Clean(strings.TrimSpace(parts[1])), nil
+		return parseTmuxPaneIdentity(out)
 	}
 )
 
-// TmuxPaneIdentity returns the live pane PID and its current worktree for an
+func parseTmuxPaneIdentity(out []byte) (int, string, error) {
+	parts := strings.SplitN(strings.TrimRight(string(out), "\r\n"), "\t", 3)
+	if len(parts) != 3 {
+		return 0, "", fmt.Errorf("unexpected tmux pane identity")
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(parts[0]))
+	if err != nil || pid <= 0 {
+		return 0, "", fmt.Errorf("invalid tmux pane pid")
+	}
+	panePath := strings.TrimSpace(parts[2])
+	if panePath == "" {
+		panePath = strings.TrimSpace(parts[1])
+	}
+	return pid, filepath.Clean(panePath), nil
+}
+
+// TmuxPaneIdentity returns the live pane PID and its originating worktree for an
 // exact tmux session. Recovery callers must validate both values before
 // adopting a pane: a deterministic session name alone is not sufficient proof
 // that the pane belongs to the retained worker after a failed respawn.
