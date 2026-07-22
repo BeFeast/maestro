@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"maps"
 	"math/rand"
 	"os"
 	"os/exec"
@@ -3320,15 +3321,25 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 			old.Routing.RouterModel, newCfg.Routing.RouterModel, old.Routing.Mode, newCfg.Routing.Mode)
 	}
 
-	// Hot-reloadable fields
-	if newCfg.MaxParallel != old.MaxParallel {
-		changed = append(changed, fmt.Sprintf("max_parallel: %d→%d", old.MaxParallel, newCfg.MaxParallel))
-		o.cfg.MaxParallel = newCfg.MaxParallel
+	// Capacity is one dispatch decision, so compare and apply every input as one
+	// unit. Keeping max_parallel, max_live_workers, and max_concurrent_by_state
+	// behind one equality boundary prevents Fleet from publishing a freshly
+	// loaded capacity model while the running orchestrator retains one omitted
+	// field (#884).
+	if !dispatchCapacityConfigEqual(newCfg, old) {
+		if newCfg.MaxParallel != old.MaxParallel {
+			changed = append(changed, fmt.Sprintf("max_parallel: %d→%d", old.MaxParallel, newCfg.MaxParallel))
+		}
+		if newCfg.MaxLiveWorkers != old.MaxLiveWorkers {
+			changed = append(changed, fmt.Sprintf("max_live_workers: %d→%d", old.MaxLiveWorkers, newCfg.MaxLiveWorkers))
+		}
+		if !maps.Equal(newCfg.MaxConcurrentByState, old.MaxConcurrentByState) {
+			changed = append(changed, "max_concurrent_by_state")
+		}
+		applyDispatchCapacityConfig(o.cfg, newCfg)
 	}
-	if newCfg.MaxLiveWorkers != old.MaxLiveWorkers {
-		changed = append(changed, fmt.Sprintf("max_live_workers: %d→%d", old.MaxLiveWorkers, newCfg.MaxLiveWorkers))
-		o.cfg.MaxLiveWorkers = newCfg.MaxLiveWorkers
-	}
+
+	// Other hot-reloadable fields
 	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
 		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
 		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes
@@ -3495,6 +3506,30 @@ func cloneStringMap(in map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+// dispatchCapacityConfigEqual compares every config field consumed by
+// capacityInput. Keep this as the single reload-detection boundary for dispatch
+// capacity so adding a capacity input cannot silently update only Fleet's view.
+func dispatchCapacityConfigEqual(a, b *config.Config) bool {
+	if a == nil || b == nil {
+		return a == b
+	}
+	return a.MaxParallel == b.MaxParallel &&
+		a.MaxLiveWorkers == b.MaxLiveWorkers &&
+		maps.Equal(a.MaxConcurrentByState, b.MaxConcurrentByState)
+}
+
+// applyDispatchCapacityConfig replaces the running orchestrator's complete
+// capacity model. Clone the map so the orchestrator keeps its private config
+// snapshot instead of aliasing the watcher/Fleet snapshot.
+func applyDispatchCapacityConfig(dst, src *config.Config) {
+	if dst == nil || src == nil {
+		return
+	}
+	dst.MaxParallel = src.MaxParallel
+	dst.MaxLiveWorkers = src.MaxLiveWorkers
+	dst.MaxConcurrentByState = maps.Clone(src.MaxConcurrentByState)
 }
 
 // markRestartRequired records a persistent restart-required signal both in memory
