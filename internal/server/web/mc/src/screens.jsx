@@ -1738,7 +1738,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
 // approval-gate semantics explicit in the body so the operator knows
 // the click enqueues a pending Approval rather than executing
 // immediately.
-function WorkerActionsPanel({ worker, readOnly, refresh }) {
+export function WorkerActionsPanel({ worker, readOnly, refresh }) {
   const actions = Array.isArray(worker?.actions) ? worker.actions : [];
   const [busyId, setBusyId] = React.useState("");
   const [message, setMessage] = React.useState(null);
@@ -1800,8 +1800,8 @@ function WorkerActionsPanel({ worker, readOnly, refresh }) {
     project && `project ${project}`,
   ].filter(Boolean).join(" · ");
 
-  const isDangerVerb = (id) => id === "stop_worker";
-  const isRecoveryVerb = (id) => id === "restart_worker";
+	const isDangerVerb = (id) => id === "stop_worker" || id === "hold_merge";
+	const isRecoveryVerb = (id) => id === "restart_worker" || id === "release_merge";
 
   return (
     <div className="drawer-sec">

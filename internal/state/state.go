@@ -1470,6 +1470,7 @@ type WorkerLeaseAttention struct {
 type State struct {
 	Sessions            map[string]*Session         `json:"sessions"`
 	FreshDispatchClaims map[int]*FreshDispatchClaim `json:"fresh_dispatch_claims,omitempty"`
+	MergeControls       map[int]MergeControl        `json:"merge_controls,omitempty"`
 	Missions            map[int]*Mission            `json:"missions,omitempty"` // parent issue number → mission
 	SupervisorDecisions []SupervisorDecision        `json:"supervisor_decisions,omitempty"`
 	Approvals           []Approval                  `json:"approvals,omitempty"`
@@ -2032,6 +2033,9 @@ func (s *State) normalize() {
 	if s.FreshDispatchClaims == nil {
 		s.FreshDispatchClaims = make(map[int]*FreshDispatchClaim)
 	}
+	if s.MergeControls == nil {
+		s.MergeControls = make(map[int]MergeControl)
+	}
 	if s.Missions == nil {
 		s.Missions = make(map[int]*Mission)
 	}
@@ -2058,6 +2062,7 @@ func (s *State) normalize() {
 func (s *State) copyFrom(src *State) {
 	s.Sessions = src.Sessions
 	s.FreshDispatchClaims = src.FreshDispatchClaims
+	s.MergeControls = src.MergeControls
 	s.Missions = src.Missions
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
@@ -2121,6 +2126,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 		return nil, err
 	}
 	merged.FreshDispatchClaims = mergeFreshDispatchClaims(current.FreshDispatchClaims, ours.FreshDispatchClaims)
+	merged.MergeControls = mergeMergeControls(current.MergeControls, ours.MergeControls)
 	if err := mergeMissions(merged, base, current, ours); err != nil {
 		return nil, err
 	}

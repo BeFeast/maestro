@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -135,15 +136,10 @@ func clearOperatorGateHold(sess *state.Session) {
 }
 
 func (o *Orchestrator) operatorGateLabels() []string {
-	if o == nil || o.cfg == nil {
+	if o == nil {
 		return nil
 	}
-	labels := []string{"operator-decision", "blocked"}
-	if blocked := strings.TrimSpace(o.cfg.Supervisor.BlockedLabel); blocked != "" {
-		labels = append(labels, blocked)
-	}
-	labels = append(labels, o.cfg.Supervisor.OperatorGate.Labels...)
-	return normalizeGateTokens(labels)
+	return mergegate.ConfiguredHoldLabels(o.cfg)
 }
 
 func (o *Orchestrator) operatorGateRetryLabels() []string {

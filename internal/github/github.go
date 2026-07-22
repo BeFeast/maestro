@@ -3011,19 +3011,6 @@ func formatFailureAnnotations(anns []checkAnnotation) string {
 	return strings.Join(lines, "\n")
 }
 
-// MergePR squash-merges a PR
-func (c *Client) MergePR(prNumber int) error {
-	out, err := ghCommand("pr", "merge",
-		fmt.Sprint(prNumber),
-		"--repo", c.Repo,
-		"--squash",
-		"--delete-branch").CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("gh pr merge %d: %w\n%s", prNumber, err, out)
-	}
-	return nil
-}
-
 // MergePRAtHead squash-merges a PR only when its current head still matches
 // expectedHeadSHA. GitHub enforces the comparison atomically with the merge,
 // closing the force-push race between a gate/approval read and execution.

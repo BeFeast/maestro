@@ -21,6 +21,8 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
@@ -29,7 +31,6 @@ import (
 // GitHubClient is the surface the executor needs from a GitHub client.
 // *github.Client satisfies this; tests inject fakes.
 type GitHubClient interface {
-	MergePR(prNumber int) error
 	CloseIssue(number int, comment string) error
 
 	// AddIssueLabel applies a label to an issue. executeLabelIssueReady
@@ -72,6 +73,12 @@ type prHeadBoundMerger interface {
 
 type prMergedReader interface {
 	IsPRMerged(prNumber int) (bool, error)
+}
+
+type finalMergeReader interface {
+	GetIssue(number int) (github.Issue, error)
+	PRLabels(prNumber int) ([]string, error)
+	PRUnresolvedReviewThreadsOnHead(prNumber int) (string, []github.ReviewThread, error)
 }
 
 // WorktreeRemover removes a git worktree. *worker.RemoveWorktree-shaped
@@ -455,6 +462,9 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 	if e.GH == nil {
 		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
 	}
+	if e.Cfg == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no project config wired into executor")}
+	}
 	pr := approval.Target.PR
 	if merged, ok := readPRMerged(e.GH, pr); ok && merged {
 		return Result{
@@ -531,20 +541,37 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		}
 	}
 
-	var mergeErr error
-	if expectedHead != "" {
-		headMerger, ok := e.GH.(prHeadBoundMerger)
-		if !ok {
-			return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot atomically bind merge to PR head SHA")}
-		}
-		mergeErr = headMerger.MergePRAtHead(pr, expectedHead)
-	} else {
-		// Backward compatibility for operator-authored and pre-upgrade approvals.
-		// Fresh supervisor approvals always carry HeadSHA and take the atomic
-		// path above; the next decision supersedes an older unstamped approval.
-		mergeErr = e.GH.MergePR(pr)
+	reader, ok := e.GH.(finalMergeReader)
+	if !ok {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot perform final issue-label and review-thread merge checks")}
 	}
-	if mergeErr != nil {
+	headMerger, ok := e.GH.(prHeadBoundMerger)
+	if !ok {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot atomically bind merge to PR head SHA")}
+	}
+	mergeResult := mergegate.Execute(mergegate.Request{
+		StateDir:     e.Cfg.StateDir,
+		Repo:         e.Cfg.Repo,
+		IssueNumber:  approval.Target.Issue,
+		PRNumber:     pr,
+		ExpectedHead: expectedHead,
+		Owner:        "supervisor",
+		HoldLabels:   mergegate.ConfiguredHoldLabels(e.Cfg),
+	}, mergegate.ReadFuncs{
+		Issue:         reader.GetIssue,
+		PRLabels:      reader.PRLabels,
+		ReviewThreads: reader.PRUnresolvedReviewThreadsOnHead,
+	}, func(headSHA string) error {
+		return headMerger.MergePRAtHead(pr, headSHA)
+	})
+	if mergeResult.Refused {
+		e.recordMergeRefusal(approval.Target.Issue, pr, mergeResult.RefusalName)
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: fmt.Sprintf("refused merge of PR #%d at final compare/claim boundary: %s", pr, mergeResult.RefusalReason),
+		}
+	}
+	if mergeResult.Err != nil {
 		if merged, ok := readPRMerged(e.GH, pr); ok && merged {
 			return Result{
 				Status:  state.ApprovalStatusExecuted,
@@ -553,13 +580,29 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		}
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
-			Summary: fmt.Sprintf("merge PR #%d: %v", pr, mergeErr),
-			Err:     fmt.Errorf("merge PR #%d: %w", pr, mergeErr),
+			Summary: fmt.Sprintf("merge PR #%d: %v", pr, mergeResult.Err),
+			Err:     fmt.Errorf("merge PR #%d: %w", pr, mergeResult.Err),
 		}
 	}
 	return Result{
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("merged PR #%d", pr),
+	}
+}
+
+func (e *Executor) recordMergeRefusal(issueNumber, prNumber int, name string) {
+	if e == nil || e.State == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	for _, sess := range e.State.Sessions {
+		if sess == nil || sess.PRNumber != prNumber || (issueNumber > 0 && sess.IssueNumber != issueNumber) {
+			continue
+		}
+		sess.OperatorGateName = name
+		sess.OperatorGateRequiredAction = "Remove the merge hold or resolve every current-head review thread, then request merge again."
+		if sess.Status != state.StatusCodeLanded && sess.Status != state.StatusDone {
+			sess.Status = state.StatusPROpen
+		}
 	}
 }
 

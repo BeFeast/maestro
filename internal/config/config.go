@@ -634,6 +634,8 @@ const (
 	SupervisorActionRemoveReadyLabel    = "remove_ready_label"
 	SupervisorActionAddBlockedLabel     = "add_blocked_label"
 	SupervisorActionRemoveBlockedLabel  = "remove_blocked_label"
+	SupervisorActionHoldMerge           = "hold_merge"
+	SupervisorActionReleaseMerge        = "release_merge"
 	SupervisorActionAddIssueComment     = "add_issue_comment"
 	SupervisorActionMergePR             = "merge_pr"
 	SupervisorActionCloseIssue          = "close_issue"
@@ -3294,6 +3296,8 @@ func knownSupervisorActions() map[string]bool {
 		SupervisorActionRemoveReadyLabel:           true,
 		SupervisorActionAddBlockedLabel:            true,
 		SupervisorActionRemoveBlockedLabel:         true,
+		SupervisorActionHoldMerge:                  true,
+		SupervisorActionReleaseMerge:               true,
 		SupervisorActionAddIssueComment:            true,
 		SupervisorActionMergePR:                    true,
 		SupervisorActionCloseIssue:                 true,
@@ -3316,6 +3320,8 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionRemoveReadyLabel,
 		SupervisorActionAddBlockedLabel,
 		SupervisorActionRemoveBlockedLabel,
+		SupervisorActionHoldMerge,
+		SupervisorActionReleaseMerge,
 		SupervisorActionAddIssueComment,
 		SupervisorActionMergePR,
 		SupervisorActionCloseIssue,

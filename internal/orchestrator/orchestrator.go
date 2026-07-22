@@ -23,6 +23,7 @@ import (
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/mission"
 	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
@@ -164,9 +165,11 @@ type Orchestrator struct {
 	ghPRGreptileApprovedFn       func(prNumber int) (approved bool, pending bool, err error)
 	ghPRReviewGateVerdictFn      func(prNumber int, streams []string) (github.ReviewGateVerdict, error)
 	ghPRHasCriticalReviewFn      func(prNumber int) (bool, error)
+	ghPRUnresolvedThreadsFn      func(prNumber int) (string, []github.ReviewThread, error)
 	ghUpdateBranchFn             func(prNumber int) error
 	ghMarkPRReadyFn              func(prNumber int) error
 	ghMergePRFn                  func(prNumber int) error
+	ghMergePRAtHeadFn            func(prNumber int, expectedHeadSHA string) error
 	ghClosePRFn                  func(prNumber int, comment string) error
 	ghPRChecksOutputFn           func(prNumber int) (string, error)
 	ghPRFailingChecksFn          func(prNumber int) ([]github.FailingCheck, error)
@@ -755,6 +758,44 @@ func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
 	return o.gh.PRHasCriticalReviewOnHead(prNumber)
 }
 
+func (o *Orchestrator) prUnresolvedReviewThreadsOnHead(prNumber int) (string, []github.ReviewThread, error) {
+	if o.ghPRUnresolvedThreadsFn != nil {
+		return o.ghPRUnresolvedThreadsFn(prNumber)
+	}
+	if o.gh == nil {
+		return "", nil, fmt.Errorf("no github client configured for review-thread check")
+	}
+	return o.gh.PRUnresolvedReviewThreadsOnHead(prNumber)
+}
+
+// finalMerge* wrappers preserve the existing narrow merge test hooks without
+// weakening production. A real orchestrator always has o.gh; only unit fakes
+// that inject ghMergePRFn alone receive an empty safe snapshot.
+func (o *Orchestrator) finalMergeIssue(number int) (github.Issue, error) {
+	if o.getIssueFn == nil && o.ghMergePRFn != nil {
+		return github.Issue{Number: number}, nil
+	}
+	return o.getIssue(number)
+}
+
+func (o *Orchestrator) finalMergePRLabels(prNumber int) ([]string, error) {
+	if o.ghPRLabelsFn == nil && o.ghMergePRFn != nil {
+		return nil, nil
+	}
+	return o.prLabels(prNumber)
+}
+
+func (o *Orchestrator) finalMergeReviewThreads(prNumber int) (string, []github.ReviewThread, error) {
+	if o.ghPRUnresolvedThreadsFn == nil && o.ghMergePRFn != nil {
+		if o.ghPRHeadSHAFn != nil {
+			head, err := o.ghPRHeadSHAFn(prNumber)
+			return head, nil, err
+		}
+		return strings.Repeat("a", 40), nil, nil
+	}
+	return o.prUnresolvedReviewThreadsOnHead(prNumber)
+}
+
 func (o *Orchestrator) updateBranch(prNumber int) error {
 	if o.ghUpdateBranchFn != nil {
 		return o.ghUpdateBranchFn(prNumber)
@@ -775,15 +816,20 @@ func (o *Orchestrator) markPRReady(prNumber int) error {
 	return o.gh.MarkPRReady(prNumber)
 }
 
-func (o *Orchestrator) mergePR(prNumber int) error {
+func (o *Orchestrator) mergePRAtHead(prNumber int, expectedHeadSHA string) error {
 	var err error
-	if o.ghMergePRFn != nil {
+	switch {
+	case o.ghMergePRAtHeadFn != nil:
+		err = o.ghMergePRAtHeadFn(prNumber, expectedHeadSHA)
+	case o.ghMergePRFn != nil:
+		// Legacy test hook compatibility. Production always takes the atomic
+		// *github.Client.MergePRAtHead path below.
 		err = o.ghMergePRFn(prNumber)
-	} else {
-		err = o.gh.MergePR(prNumber)
+	case o.gh == nil:
+		err = fmt.Errorf("no github client configured for head-bound merge")
+	default:
+		err = o.gh.MergePRAtHead(prNumber, expectedHeadSHA)
 	}
-	// A merge removes the PR from the open-PR set; drop the per-cycle cache so
-	// a later step (rebaseConflicts) re-fetches a current view (#794 review).
 	if err == nil {
 		o.invalidateCyclePRs()
 	}
@@ -4910,6 +4956,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		slotName string
 		sess     *state.Session
 		pr       github.PR
+		headSHA  string
 	}
 
 	ready := make([]mergeCandidate, 0)
@@ -5079,7 +5126,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 								log.Printf("[orch] convergence: critical-review check PR #%d failed: %v", pr.Number, cerr)
 							} else if !hasCritical {
 								log.Printf("[orch] convergence-merge: PR #%d retry-exhausted on review feedback but no P0 on head — merging green PR with residual advisory findings (#565)", pr.Number)
-								ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
+								ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA})
 								continue
 							}
 							log.Printf("[orch] PR #%d retry-exhausted with a P0 finding on head — holding for operator/repair", pr.Number)
@@ -5095,7 +5142,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			if o.reviewGate() == "none" {
 				addPRGateReviewDisabled(&gateTransition)
 				persistGate()
-				ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
+				ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA})
 				continue
 			}
 
@@ -5129,7 +5176,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				continue
 			}
 
-			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr})
+			ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA})
 		case "failure":
 			persistGate()
 			if sess.Status == state.StatusQueued {
@@ -5193,7 +5240,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	strategy := o.mergeStrategy()
 	if strategy == "parallel" {
 		for _, candidate := range ready {
-			o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
+			o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
 		}
 		return
 	}
@@ -5229,7 +5276,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 
 	candidate := ready[0]
-	o.mergeReadyPR(s, candidate.slotName, candidate.sess, candidate.pr)
+	o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
@@ -7253,6 +7300,10 @@ func outcomeHealthChecks(s *state.State) []outcome.HealthCheckResult {
 }
 
 func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state.Session, pr github.PR) bool {
+	return o.mergeReadyPRAtExpectedHead(s, slotName, sess, pr, "")
+}
+
+func (o *Orchestrator) mergeReadyPRAtExpectedHead(s *state.State, slotName string, sess *state.Session, pr github.PR, expectedHead string) bool {
 	// #697: `gh pr merge` on a draft fails with "still a draft", wedging the
 	// pipeline until a human runs `gh pr ready`. A PR that reached this point
 	// is green (CI pass + review gate resolved), so an unmarked draft is an
@@ -7275,7 +7326,28 @@ func (o *Orchestrator) mergeReadyPR(s *state.State, slotName string, sess *state
 	}
 
 	log.Printf("[orch] merging PR #%d (branch %s)", pr.Number, sess.Branch)
-	if err := o.mergePR(pr.Number); err != nil {
+	mergeResult := mergegate.Execute(mergegate.Request{
+		StateDir:     o.cfg.StateDir,
+		Repo:         o.cfg.Repo,
+		IssueNumber:  sess.IssueNumber,
+		PRNumber:     pr.Number,
+		ExpectedHead: expectedHead,
+		Owner:        "orchestrator",
+		HoldLabels:   o.operatorGateLabels(),
+	}, mergegate.ReadFuncs{
+		Issue:         o.finalMergeIssue,
+		PRLabels:      o.finalMergePRLabels,
+		ReviewThreads: o.finalMergeReviewThreads,
+	}, func(headSHA string) error {
+		return o.mergePRAtHead(pr.Number, headSHA)
+	})
+	if mergeResult.Refused {
+		action := "Remove the merge hold or resolve every current-head review thread, then let Maestro re-evaluate the PR."
+		o.applyOperatorGateHold(sess, pr, operatorGateHold{Name: mergeResult.RefusalName, RequiredAction: action})
+		log.Printf("[orch] refusing final merge of PR #%d at compare/claim boundary: %s", pr.Number, mergeResult.RefusalReason)
+		return false
+	}
+	if err := mergeResult.Err; err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
 
 		// If the branch is behind main (not conflicting, just outdated),
