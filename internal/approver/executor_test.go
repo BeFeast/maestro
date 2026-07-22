@@ -851,6 +851,66 @@ func TestExecute_RestartWorker_StaleTargetStateSkipped(t *testing.T) {
 	}
 }
 
+// #964: a replacement worker can return the session projection to the same
+// running status, branch, retry count, and next-retry state that existed when
+// restart_worker was approved. The durable attempt generation and start time
+// distinguish that replacement even if the OS reuses the same PID. A delayed
+// approval for the earlier attempt must be skipped before the retained-worktree
+// refusal or worker controller can run.
+func TestExecute_RestartWorker_StaleAfterRespawnDeathCycleSkipped(t *testing.T) {
+	wc := &fakeWorkers{}
+	target := &state.SupervisorTarget{Session: "slot-1", Issue: 42}
+	firstStarted := time.Date(2026, 7, 17, 23, 30, 0, 0, time.UTC)
+	sess := &state.Session{
+		IssueNumber:      42,
+		Status:           state.StatusRunning,
+		Worktree:         "/srv/wt/slot-1",
+		Branch:           "issue-42",
+		PID:              4242,
+		StartedAt:        firstStarted,
+		WorkerGeneration: 7,
+		RetryCount:       1,
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = sess
+	a := mkApproval(config.SupervisorActionRestartWorker, target, "restart me", "")
+	a.TargetStateHash = st.ApprovalTargetStateHash(target)
+
+	// The approved attempt dies and is repaired in place. The replacement is
+	// running in the same slot/worktree/branch with the same retry projection;
+	// retain the PID too to prove process-ID reuse cannot defeat the fence.
+	finished := firstStarted.Add(10 * time.Minute)
+	sess.Status = state.StatusDead
+	sess.FinishedAt = &finished
+	sess.PID = 0
+	sess.Status = state.StatusRunning
+	sess.StartedAt = finished.Add(time.Minute)
+	sess.WorkerGeneration++
+	sess.FinishedAt = nil
+	sess.PID = 4242
+
+	if current := st.ApprovalTargetStateHash(target); current == a.TargetStateHash {
+		t.Fatal("target-state hash did not change across an intervening death and in-place respawn")
+	}
+	ex := &Executor{
+		Cfg:      newCfg(),
+		Workers:  wc,
+		Sessions: fakeSessions{"slot-1": sess},
+		State:    st,
+	}
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("stale approval must not touch the replacement worker; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "changed after approval") || !strings.Contains(res.Summary, "no worker or worktree was touched") {
+		t.Fatalf("summary = %q, want stale-state and no-side-effect explanation", res.Summary)
+	}
+}
+
 // #964: a PR-less retained worktree is still canonical durable work. The
 // destructive restart controller must not run; repair resumes it in place.
 func TestExecute_RestartWorker_RefusedForRetainedWorktree(t *testing.T) {
