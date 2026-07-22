@@ -74,8 +74,11 @@ func SyncBaseBranch(localPath, branch string) error {
 
 	head, _ := runGit(localPath, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if strings.TrimSpace(head) == branch {
-		// Base branch is checked out: refuse a dirty tree, then fast-forward merge.
-		if dirty, err := worktreeDirty(localPath); err != nil {
+		// Base branch is checked out: refuse a dirty *tracked* tree, then
+		// fast-forward merge. Untracked agent harness dirs (.claude/.codex/…)
+		// must not block sync — merge --ff-only does not touch them, and
+		// workers commonly leave those dirs in the shared base checkout (#1100).
+		if dirty, err := baseCheckoutBlockingDirt(localPath); err != nil {
 			return fmt.Errorf("sync base branch %q: %w", branch, err)
 		} else if dirty != "" {
 			return fmt.Errorf("base branch %q checkout at %s is dirty; cannot fast-forward to %s:\n%s",
@@ -93,6 +96,57 @@ func SyncBaseBranch(localPath, branch string) error {
 		return fmt.Errorf("fast-forward base branch %q to %s: %w", branch, remoteRef, err)
 	}
 	return nil
+}
+
+// ignorableBaseUntrackedPrefixes are untracked top-level paths workers and
+// agent harnesses commonly leave in the shared local_path checkout. They do
+// not block git merge --ff-only and must not freeze fleet spawn (#1100).
+var ignorableBaseUntrackedPrefixes = []string{
+	".claude/",
+	".codex/",
+	".cursor/",
+	".entire/",
+	".agents/",
+	".windsurf/",
+	".clinerules",
+}
+
+// baseCheckoutBlockingDirt returns porcelain lines that should block SyncBaseBranch.
+// Tracked modifications always block. Untracked agent harness dirs are ignored.
+func baseCheckoutBlockingDirt(localPath string) (string, error) {
+	out, err := worktreeDirty(localPath)
+	if err != nil {
+		return "", err
+	}
+	if out == "" {
+		return "", nil
+	}
+	var blocking []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "?? ") {
+			path := strings.TrimPrefix(line, "?? ")
+			if isIgnorableBaseUntracked(path) {
+				continue
+			}
+		}
+		blocking = append(blocking, line)
+	}
+	return strings.Join(blocking, "\n"), nil
+}
+
+func isIgnorableBaseUntracked(path string) bool {
+	path = strings.TrimSpace(path)
+	path = strings.ReplaceAll(path, "\\", "/")
+	for _, prefix := range ignorableBaseUntrackedPrefixes {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // addWorktreeFromBase creates worktreePath as a fresh checkout on branchName,

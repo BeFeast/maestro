@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -107,6 +108,39 @@ func TestSyncBaseBranch_DirtyCheckoutFailsLoudly(t *testing.T) {
 	err := SyncBaseBranch(local, "main")
 	if err == nil {
 		t.Fatal("expected error for dirty base checkout")
+	}
+	if !strings.Contains(err.Error(), "dirty") {
+		t.Fatalf("expected dirty error, got: %v", err)
+	}
+}
+
+func TestSyncBaseBranch_IgnoresUntrackedAgentHarnessDirs(t *testing.T) {
+	_, local, seed := setupOriginAndClone(t)
+	advanceOrigin(t, seed, "v2\n")
+
+	for _, dir := range []string{".claude", ".codex", ".cursor", ".entire"} {
+		if err := os.MkdirAll(filepath.Join(local, dir), 0o755); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+		writeTestFile(t, filepath.Join(local, dir), "junk.txt", "agent junk\n")
+	}
+
+	if err := SyncBaseBranch(local, "main"); err != nil {
+		t.Fatalf("SyncBaseBranch with agent junk: %v", err)
+	}
+	if got, want := revParse(t, local, "main"), revParse(t, local, "origin/main"); got != want {
+		t.Fatalf("local main = %s, want origin/main %s", got, want)
+	}
+}
+
+func TestSyncBaseBranch_UntrackedNonAgentStillBlocks(t *testing.T) {
+	_, local, seed := setupOriginAndClone(t)
+	advanceOrigin(t, seed, "v2\n")
+
+	writeTestFile(t, local, "mystery-untracked.txt", "nope\n")
+	err := SyncBaseBranch(local, "main")
+	if err == nil {
+		t.Fatal("expected error for non-agent untracked dirt")
 	}
 	if !strings.Contains(err.Error(), "dirty") {
 		t.Fatalf("expected dirty error, got: %v", err)

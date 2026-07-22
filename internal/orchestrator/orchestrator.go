@@ -9744,6 +9744,31 @@ func (o *Orchestrator) completeFreshDispatch(s *state.State, claim *state.FreshD
 	return nil
 }
 
+func (o *Orchestrator) releaseFreshDispatch(s *state.State, claim *state.FreshDispatchClaim, reason string) {
+	if claim == nil || !o.durableFreshDispatchClaimsEnabled() {
+		return
+	}
+	now := time.Now().UTC()
+	if err := state.Update(o.cfg.StateDir, func(latest *state.State) error {
+		return latest.SupersedeFreshDispatch(claim.IssueNumber, claim.LeaseID, reason, now)
+	}); err != nil {
+		log.Printf("[orch] release fresh dispatch for issue #%d: %v", claim.IssueNumber, err)
+		return
+	}
+	if s.FreshDispatchClaims == nil {
+		return
+	}
+	copy := *claim
+	copy.Status = state.FreshDispatchClaimStatusSuperseded
+	copy.UpdatedAt = now
+	copy.LeaseExpiresAt = time.Time{}
+	if strings.TrimSpace(reason) == "" {
+		reason = "start_failed"
+	}
+	copy.TerminalReason = reason
+	s.FreshDispatchClaims[claim.IssueNumber] = &copy
+}
+
 func (o *Orchestrator) reconcileFreshDispatchClaims(s *state.State, now time.Time) {
 	if !o.durableFreshDispatchClaimsEnabled() || s == nil {
 		return
@@ -10143,6 +10168,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			o.notifier.Sendf("❌ maestro: failed to start worker for issue #%d (%s): %v",
 				issue.Number, issue.Title, err)
+			// #1100: release the pre-spawn lease immediately so a failed start
+			// (dirty base, worktree create, hooks, …) does not leave status=claimed
+			// for freshDispatchLeaseDuration and starve the issue as "in progress".
+			if freshClaim != nil {
+				o.releaseFreshDispatch(s, freshClaim, "start_failed")
+			}
 			// #874: a review-repair dispatch claimed a (pr,head) attempt via
 			// tryClaimReviewRepairSlot BEFORE this start; release it so a failed
 			// start does not burn a slot from the bounded repair budget and leave
