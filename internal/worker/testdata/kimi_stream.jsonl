@@ -1,0 +1,5 @@
+{"role":"assistant","content":"Checking the worktree."}
+{"timestamp":1,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":1200,"output":80,"input_cache_read":300,"input_cache_creation":20},"message_id":"msg_1","model":"kimi-k2.5"}}}
+{"timestamp":1.1,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":1200,"output":80,"input_cache_read":300,"input_cache_creation":20},"message_id":"msg_1","model":"kimi-k2.5"}}}
+{"role":"tool","tool_call_id":"tool_1","content":"tests passed"}
+{"role":"assistant","content":"Done.","message_id":"msg_2","model":"kimi-k2.5","usage":{"inputOther":900,"output":100,"inputCacheRead":50,"inputCacheCreation":0}}

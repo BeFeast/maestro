@@ -11651,6 +11651,48 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 	}
 }
 
+func TestUpdateTokensUsedFromOutput_KimiFixtureStampsWatermarkAndSplitTokens(t *testing.T) {
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default: "moonshot-primary",
+				Backends: map[string]config.BackendDef{
+					"moonshot-primary": {Cmd: "kimi", Provider: "moonshot"},
+				},
+			},
+		},
+	}
+	logFile := filepath.Join(dir, "sup-kimi.log")
+	sess := &state.Session{Backend: "moonshot-primary", LogFile: logFile}
+	fixture, err := os.ReadFile(filepath.Join("..", "worker", "testdata", "kimi_stream.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.JSONLPathForLog(logFile), fixture, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !o.updateTokensUsedFromOutput("sup-kimi", sess, "rendered Kimi output") {
+		t.Fatal("expected Kimi JSONL usage to update the session")
+	}
+	if sess.TokensUsedAttempt != 2650 || sess.TokensUsedTotal != 2650 || sess.UsageTokensWatermark != 2650 {
+		t.Fatalf("tokens attempt/total/watermark = %d/%d/%d, want 2650/2650/2650",
+			sess.TokensUsedAttempt, sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+	if sess.TokensInput != 2100 || sess.TokensOutput != 180 || sess.TokensCacheRead != 350 || sess.TokensCacheWrite != 20 {
+		t.Fatalf("split tokens = %d/%d/%d/%d, want 2100/180/350/20",
+			sess.TokensInput, sess.TokensOutput, sess.TokensCacheRead, sess.TokensCacheWrite)
+	}
+	if sess.Model != "kimi-k2.5" {
+		t.Fatalf("Model = %q, want kimi-k2.5", sess.Model)
+	}
+	if o.updateTokensUsedFromOutput("sup-kimi", sess, "same rendered output") {
+		t.Fatal("unchanged cumulative Kimi usage must not advance the watermark")
+	}
+}
+
 // codexTurnFrame builds one terminal codex `exec --json` turn.completed event
 // with the given token totals, as the stream-splitter would append it.
 // cached_input_tokens is a subset of input_tokens (OpenAI semantics).

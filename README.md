@@ -312,6 +312,9 @@ model:
       cmd: codex         # OpenAI Codex CLI
     gemini:
       cmd: gemini        # Google Gemini CLI
+    kimi:
+      cmd: kimi          # MoonshotAI Kimi Code CLI
+      provider: moonshot
     cline:
       cmd: cline         # Cline CLI (e.g. SAP AI Core / any OpenAI-compatible provider)
 ```
@@ -333,6 +336,12 @@ model:
 > Auth: `gemini auth` or set `GEMINI_API_KEY`
 
 > [!NOTE]
+> **Kimi** — MoonshotAI Kimi Code CLI
+> Install: `uv tool install --python 3.13 kimi-cli` | `kimi --version`
+> Worker mode: prompt via stdin, `--print --output-format=stream-json`.
+> Auth and proxy routing: see [`docs/kimi-backend.md`](docs/kimi-backend.md).
+
+> [!NOTE]
 > **Cline** — Cline CLI, supports any OpenAI-compatible provider (including SAP AI Core, Azure OpenAI, etc.)
 > Install: `bun add -g cline` | `cline --version`
 > Config: `~/.cline/data/globalState.json` + `secrets.json` — configure provider and model before use.
@@ -343,9 +352,9 @@ model:
 
 Backends do not have to be named after the CLI they run. A custom key (e.g. a model nickname) keeps full CLI-specific behaviour — permission-bypass flags and stdin prompt delivery — as long as Maestro can tell which CLI it wraps. Resolution order:
 
-1. the backend name itself (`claude`, `codex`, `gemini`, `cline`),
-2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `cline` → Cline),
-3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `cline`).
+1. the backend name itself (`claude`, `codex`, `gemini`, `kimi`, `cline`),
+2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `moonshot`/`kimi` → Kimi, `cline` → Cline),
+3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `kimi`, `cline`).
 
 ```yaml
 model:
@@ -361,7 +370,7 @@ model:
 
 A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
 
-### Claude / Codex usage capture (tokens + cost)
+### Structured usage capture (tokens + cost)
 
 Plain `claude -p` text mode prints no parseable token total, and `codex exec` text mode only prints a fuzzy single total — so a worker's `tokens_used_total` and USD cost are unreliable or `0`. Opt a `claude` or `codex` backend into structured usage capture with `usage_stream: true`:
 
@@ -381,6 +390,12 @@ model:
 ```
 
 When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
+
+Kimi uses stream-json by default and needs no `usage_stream` opt-in. When its
+stream carries native `input_other`, `output`, `input_cache_read`, and
+`input_cache_creation` usage, Maestro feeds those fields into the same
+watermark and split-cost path. See the Kimi runbook for the upstream telemetry
+and live-budget limitations.
 
 #### Claude harness through CLIProxyAPI: non-Anthropic telemetry smoke (2026-07-21)
 

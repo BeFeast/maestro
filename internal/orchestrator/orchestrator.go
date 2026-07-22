@@ -1347,6 +1347,13 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	if kind == config.BackendKindCodex && o.sessionUsageStream(sess) {
 		return o.updateCodexUsageFromJSONL(slotName, sess)
 	}
+	// Kimi's first-class worker command always defaults to stream-json, so it
+	// uses the side channel without requiring the claude/codex usage_stream
+	// opt-in. An operator-pinned text output produces no side channel and this
+	// path simply leaves usage unchanged.
+	if kind == config.BackendKindKimi {
+		return o.updateKimiUsageFromJSONL(slotName, sess)
+	}
 	if kind == config.BackendKindOpencode && o.sessionUsageStream(sess) {
 		return o.updateOpenCodeUsageFromJSONL(slotName, sess)
 	}
@@ -1603,6 +1610,53 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	if changed {
 		log.Printf("[orch] %s codex usage: input=%d output=%d cache_read=%d tokens=%d (total=%d)",
 			slotName, usage.Input, usage.Output, usage.CacheRead, usage.TotalTokens, sess.TokensUsedTotal)
+	}
+	return changed
+}
+
+// updateKimiUsageFromJSONL parses Kimi's first-class stream-json side channel
+// and stamps split tokens onto the session. ParseKimiUsage returns cumulative
+// usage across the append-only file, so UsageTokensWatermark keeps retries and
+// respawns from double-counting. Native Kimi usage normally has no USD field;
+// when absent, Fleet cost observability applies the backend's configured split
+// pricing to these counters.
+func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Session) bool {
+	jsonlPath := o.workerJSONLFile(slotName, sess)
+	if jsonlPath == "" {
+		return false
+	}
+	data, err := os.ReadFile(jsonlPath)
+	if err != nil {
+		return false
+	}
+	usage, ok := worker.ParseKimiUsage(string(data))
+	if !ok {
+		return false
+	}
+	changed := false
+	if usage.TotalTokens > sess.UsageTokensWatermark {
+		delta := usage.TotalTokens - sess.UsageTokensWatermark
+		sess.UsageTokensWatermark = usage.TotalTokens
+		sess.TokensUsedAttempt += delta
+		sess.TokensUsedTotal += delta
+		sess.TokensInput = usage.Input
+		sess.TokensOutput = usage.Output
+		sess.TokensCacheRead = usage.CacheRead
+		sess.TokensCacheWrite = usage.CacheWrite
+		changed = true
+	}
+	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
+		sess.Model = usage.Model
+		changed = true
+	}
+	if usage.CostUSD > sess.CostUSDBackend {
+		sess.CostUSDBackend = usage.CostUSD
+		changed = true
+	}
+	if changed {
+		log.Printf("[orch] %s kimi usage: input=%d output=%d cache_read=%d cache_write=%d tokens=%d cost=$%.4f (total=%d)",
+			slotName, usage.Input, usage.Output, usage.CacheRead, usage.CacheWrite,
+			usage.TotalTokens, usage.CostUSD, sess.TokensUsedTotal)
 	}
 	return changed
 }

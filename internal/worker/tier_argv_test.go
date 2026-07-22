@@ -67,6 +67,16 @@ func TestTierArgv_GeminiModelEffort(t *testing.T) {
 	}
 }
 
+func TestTierArgv_KimiModelAndDropsEffort(t *testing.T) {
+	args := buildArgs(t, "kimi", BackendConfig{Cmd: "kimi", TierModel: "kimi-k2.5", TierEffort: "high"})
+	if !strings.Contains(args, "--model kimi-k2.5") {
+		t.Errorf("kimi args missing tier model: %s", args)
+	}
+	if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
+		t.Errorf("kimi must not emit an unsupported effort flag: %s", args)
+	}
+}
+
 func TestTierArgv_NoOverrideWhenEmpty(t *testing.T) {
 	// Without a tier override the argv is unchanged — no spurious --model/--effort.
 	args := buildArgs(t, "claude", BackendConfig{Cmd: "claude"})
@@ -83,7 +93,7 @@ func TestTierArgv_NoOverrideWhenEmpty(t *testing.T) {
 // TierModel/TierEffort carriers (set solely by a real policy tier override) may
 // thread, so a non-policy #513-metadata config dispatches byte-for-byte as before.
 func TestTierArgv_AttributionMetadataDoesNotLeak(t *testing.T) {
-	for _, backend := range []string{"claude", "codex", "gemini"} {
+	for _, backend := range []string{"claude", "codex", "gemini", "kimi"} {
 		cfg := BackendConfig{Cmd: backend, Provider: "anthropic", Model: "opus-4.8", Effort: "xhigh"}
 		args := buildArgs(t, backend, cfg)
 		if strings.Contains(args, "--model") || strings.Contains(args, "opus-4.8") {
