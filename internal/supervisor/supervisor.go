@@ -1144,6 +1144,11 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 		if sess == nil || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
 			continue
 		}
+		// Operator/orchestrator already released this stop for redispatch —
+		// do not keep surfacing ActionNone / freezing fill on a settled budget.
+		if sess.ReleasedForRedispatch {
+			continue
+		}
 		if best == nil || sess.StartedAt.After(best.StartedAt) {
 			bestSlot, best = slot, sess
 		}

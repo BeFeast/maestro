@@ -117,6 +117,27 @@ func TestDonePRCount(t *testing.T) {
 	}
 }
 
+func TestIssueDone_RequiresForgeClose(t *testing.T) {
+	s := NewState()
+	closedAt := time.Now().UTC()
+	s.Sessions["hist"] = &Session{IssueNumber: 406, Status: StatusDone, WorkerOutcome: "duplicate_dispatch_reconciled"}
+	if s.IssueDone(406) {
+		t.Fatal("historical done without IssueClosedAt must not starve ready redispatch")
+	}
+	s.Sessions["merged-open"] = &Session{IssueNumber: 439, Status: StatusDone, PRNumber: 560, FinishedAt: &closedAt}
+	if s.IssueDone(439) {
+		t.Fatal("done+PR with open forge issue must not report IssueDone (terminal_reconcile owns the lease)")
+	}
+	s.Sessions["closed"] = &Session{IssueNumber: 99, Status: StatusDone, IssueClosedAt: &closedAt}
+	if !s.IssueDone(99) {
+		t.Fatal("forge-closed done session must report IssueDone")
+	}
+	s.Sessions["closed"].ReleasedForRedispatch = true
+	if s.IssueDone(99) {
+		t.Fatal("released session must not report IssueDone")
+	}
+}
+
 func TestProjectStatusSynced(t *testing.T) {
 	s := NewState()
 	if s.ProjectStatusSynced(42, "in_progress") {
