@@ -472,6 +472,7 @@ type streamSplit struct {
 	JSONLPath  string // side-channel file for raw NDJSON frames (slot.jsonl)
 	MaxTokens  int    // active per-attempt hard ceiling (0 = accounting only)
 	MarkerPath string // deterministic budget-stop marker written before termination
+	Generation uint64 // durable worker generation stamped into the marker
 }
 
 // logPipeline builds the trailing `| ... | tee -a LOG` stage. When split is
@@ -490,6 +491,9 @@ func logPipeline(split *streamSplit, logFile string) string {
 	if split.MaxTokens > 0 {
 		splitter += " --max-tokens " + strconv.Itoa(split.MaxTokens)
 		splitter += " --budget-marker " + shellQuote(split.MarkerPath)
+		if split.Generation > 0 {
+			splitter += " --worker-generation " + strconv.FormatUint(split.Generation, 10)
+		}
 	}
 	return "2>&1 | " + splitter + " | " + tee
 }

@@ -468,7 +468,7 @@ type backendDriftInfo struct {
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	tokenBudgetMeasure := sess.TokenBudgetMeasure
-	marker, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile)
+	marker, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt)
 	if markerOK {
 		tokenBudgetMeasure = marker.Measure
 	}

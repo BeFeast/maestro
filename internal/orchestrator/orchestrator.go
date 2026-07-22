@@ -1461,22 +1461,25 @@ func (o *Orchestrator) terminalizeTokenBudgetIfExceeded(slotName string, sess *s
 	if sess == nil {
 		return false
 	}
-	marker, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile)
+	marker, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt)
+	budgetObserved, budgetMeasure := tokenBudgetObservation(sess)
 	maxTokens := 0
 	if o != nil && o.cfg != nil {
 		maxTokens = o.cfg.WorkerMaxTokens
 	}
 	if !markerOK {
 		alreadyTerminal := sess.WorkerOutcome == worker.TokenBudgetExceededOutcome
-		if !alreadyTerminal && (maxTokens <= 0 || sess.TokensUsedAttempt < maxTokens) {
+		if !alreadyTerminal && (maxTokens <= 0 || budgetObserved < maxTokens) {
 			return false
 		}
 		marker = worker.TokenBudgetMarker{
-			Outcome:        worker.TokenBudgetExceededOutcome,
-			Backend:        sess.Backend,
-			TokensObserved: sess.TokensUsedAttempt,
-			MaxTokens:      maxTokens,
-			MeasuredAt:     now,
+			Outcome:          worker.TokenBudgetExceededOutcome,
+			Backend:          sess.Backend,
+			TokensObserved:   budgetObserved,
+			MaxTokens:        maxTokens,
+			Measure:          budgetMeasure,
+			WorkerGeneration: sess.WorkerGeneration,
+			MeasuredAt:       now,
 		}
 	}
 	measuredAt := marker.MeasuredAt
@@ -3652,7 +3655,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 		if isRestartCheckpointedDead && s.DrainActive() {
 			continue
 		}
-		if _, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile); markerOK {
+		if _, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt); markerOK {
 			if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 				if err := o.stopWorkerProcess(slotName, sess); err != nil {
 					log.Printf("[orch] reconcile: %s token-budget process lease cleanup deferred: %v", slotName, err)
@@ -4639,7 +4642,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 		// Running-session lifecycle and process reconciliation. Closed issues
 		// were handled by the authoritative check at the top of this loop.
 		if sess.Status == state.StatusRunning {
-			if _, markerOK := worker.ReadTokenBudgetMarker(sess.LogFile); markerOK {
+			if _, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt); markerOK {
 				if strings.TrimSpace(sess.ProcessLeaseUnit) != "" {
 					if err := o.stopWorkerProcess(slotName, sess); err != nil {
 						log.Printf("[orch] token-budget process lease cleanup deferred for %s: %v", slotName, err)

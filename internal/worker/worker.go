@@ -257,7 +257,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	split := streamSplitForBackend(backendName, backendCfg, logFile, 1)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return "", err
 	}
@@ -479,7 +479,8 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
+	nextGeneration := sess.WorkerGeneration + 1
+	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return err
 	}
@@ -491,7 +492,6 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
-	nextGeneration := sess.WorkerGeneration + 1
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID, "fallover")
 	if err != nil {
 		if processLease.Unit != "" {

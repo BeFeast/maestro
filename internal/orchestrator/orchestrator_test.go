@@ -3651,6 +3651,56 @@ func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) 
 	}
 }
 
+func TestCheckSessions_StaleTokenBudgetMarkerDoesNotTerminateReplacement(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "sup-906.log")
+	startedAt := time.Now().UTC()
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
+		MeasuredAt:     startedAt.Add(-time.Minute),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o, stopped := newCheckSessionsOrchestrator(&config.Config{
+		Repo:              "owner/repo",
+		StateDir:          dir,
+		WorkerMaxTokens:   80_000,
+		MaxRuntimeMinutes: 999,
+	}, "replacement still working")
+	s := state.NewState()
+	s.Sessions["sup-906"] = &state.Session{
+		IssueNumber:      906,
+		Status:           state.StatusRunning,
+		PID:              1234,
+		TmuxSession:      "maestro-sup-906",
+		Branch:           "feat/sup-906",
+		LogFile:          logFile,
+		Backend:          "claude",
+		WorkerGeneration: 2,
+		StartedAt:        startedAt,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["sup-906"]
+	if sess.Status != state.StatusRunning || sess.WorkerOutcome != "" {
+		t.Fatalf("replacement = status %q outcome %q, want running with no terminal outcome", sess.Status, sess.WorkerOutcome)
+	}
+	if sess.TokenBudgetTokensAttempt != 0 || len(*stopped) != 0 {
+		t.Fatalf("stale marker affected replacement: budget=%d stopped=%v", sess.TokenBudgetTokensAttempt, *stopped)
+	}
+}
+
 func TestAutoMergePRs_ParallelStatePersistence(t *testing.T) {
 	// Verify that state survives a save/load cycle after parallel merges.
 	// This addresses the "race conditions on the state file" concern from issue #159.

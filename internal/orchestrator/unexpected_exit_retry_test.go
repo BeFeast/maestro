@@ -144,6 +144,55 @@ func TestUnexpectedWorkerExitAtTokenBudgetTerminalizesWithoutRetry(t *testing.T)
 	}
 }
 
+func TestUnexpectedWorkerExitBelowUncachedBudgetStillGetsOneRecovery(t *testing.T) {
+	worktree := t.TempDir()
+	if out, err := exec.Command("git", "init", "-b", "main", worktree).CombinedOutput(); err != nil {
+		t.Fatalf("git init: %v\n%s", err, out)
+	}
+
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:               "owner/repo",
+			StateDir:           t.TempDir(),
+			WorkerMaxTokens:    160_000,
+			MaxRetriesPerIssue: 1,
+		},
+		repo:                 "owner/repo",
+		notifier:             &notify.Notifier{},
+		pidAliveFn:           func(int) bool { return false },
+		tmuxSessionExistsFn:  func(string) bool { return false },
+		listOpenPRsFn:        func() ([]github.PR, error) { return nil, nil },
+		remoteBranchExistsFn: func(string) (bool, error) { return false, nil },
+		isIssueClosedFn:      func(int) (bool, error) { return false, nil },
+	}
+
+	s := state.NewState()
+	s.Sessions["fin-26"] = &state.Session{
+		IssueNumber:              409,
+		IssueTitle:               "cache-heavy healthy attempt",
+		Status:                   state.StatusRunning,
+		PID:                      4242,
+		TmuxSession:              "maestro-fin-26",
+		Branch:                   "feat/fin-26-409-cache-heavy",
+		Worktree:                 worktree,
+		Backend:                  "claude",
+		TokensUsedAttempt:        200_506,
+		TokenBudgetTokensAttempt: 77_030,
+		TokenBudgetMeasure:       worker.TokenBudgetMeasureUncached,
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("cache-heavy dead process was not reconciled")
+	}
+	sess := s.Sessions["fin-26"]
+	if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
+		t.Fatalf("reconciled state = %q retry=%v, want one canonical recovery", sess.Status, sess.NextRetryAt)
+	}
+	if sess.WorkerOutcome != "" || sess.UnexpectedExitRetries != 1 {
+		t.Fatalf("cache-heavy exit outcome=%q unexpected=%d, want non-terminal first recovery", sess.WorkerOutcome, sess.UnexpectedExitRetries)
+	}
+}
+
 func TestRepeatedUnexpectedWorkerExitTerminalizesWithUnlimitedRetries(t *testing.T) {
 	worktree := t.TempDir()
 	if out, err := exec.Command("git", "init", "-b", "main", worktree).CombinedOutput(); err != nil {
