@@ -49,7 +49,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 		if d.spawnLimiter != nil {
-			d.spawnLimiter.RegisterStateDir(cfg.StateDir)
+			d.spawnLimiter.RegisterProject(cfg.StateDir, cfg.Repo, d.opts.SuperviseInterval)
 		}
 	}
 	fctx, cancel := context.WithCancel(parent)

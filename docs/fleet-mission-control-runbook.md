@@ -244,6 +244,15 @@ Dynamic wave policy:
 
 Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.
 
+Fleet capacity contention is product-first. The shared spawn limiter treats the
+`BeFeast/maestro` dogfood project as background work: it defers a dogfood spawn
+while the fleet is below `fleet.min_live_workers` and another registered
+project has runnable supervisor backlog, and also when such a product queue has
+no live worker. The signal comes from fresh persisted queue analysis and
+durable issue claims. Empty, stale, locally capacity-blocked, or fully claimed
+product queues do not suppress dogfood, and the policy never preempts a running
+worker.
+
 The Settings view also surfaces the effective model route as provider lanes, a
 flattened backend order, and its exact source (`provider_lanes`,
 `explicit_backend_chain`, or `model_default_only`). Worker drawers show the
