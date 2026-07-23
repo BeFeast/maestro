@@ -201,8 +201,9 @@ func (s *State) IssueHasNonFreshClaim(issueNumber int) bool {
 
 // ClaimFreshDispatch atomically reserves or renews one exact fresh-worker
 // identity. An unexpired lease records contention and refuses a second owner.
-// An expired lease is renewed in place on the same slot/branch/worktree; it
-// never allocates a replacement identity merely to retry startup.
+// An expired lease, or a lease superseded after a failed start, is renewed in
+// place on the same slot/branch/worktree; it never allocates a replacement
+// identity merely to retry startup.
 //
 // The caller may fill Branch and Worktree on a newly returned claim before the
 // enclosing State.Update callback returns.
@@ -232,6 +233,20 @@ func (s *State) ClaimFreshDispatch(issueNumber int, slotPrefix, leaseID string, 
 	}
 	if s.IssueHasNonFreshClaim(issueNumber) {
 		return nil, false, nil
+	}
+	if existing := s.FreshDispatchClaims[issueNumber]; existing != nil &&
+		existing.Status == FreshDispatchClaimStatusSuperseded &&
+		existing.TerminalReason == "start_failed" {
+		existing.Status = FreshDispatchClaimStatusClaimed
+		existing.LeaseID = leaseID
+		existing.LeaseGeneration++
+		existing.ClaimedAt = now
+		existing.UpdatedAt = now
+		existing.LeaseExpiresAt = now.Add(leaseDuration)
+		existing.CompletedAt = time.Time{}
+		existing.SessionStartedAt = time.Time{}
+		existing.TerminalReason = ""
+		return existing, true, nil
 	}
 	claim := &FreshDispatchClaim{
 		IssueNumber:     issueNumber,
@@ -277,29 +292,24 @@ func (s *State) CompleteFreshDispatch(issueNumber int, leaseID string, sess *Ses
 	return nil
 }
 
-// SupersedeFreshDispatch marks a pre-spawn lease terminal without a Session.
-// Call this when worker start fails after ClaimFreshDispatch so the issue does
-// not stay status=claimed for the full lease window and block re-dispatch
-// (zombie leases → "already in progress" with zero live workers).
-func (s *State) SupersedeFreshDispatch(issueNumber int, leaseID, reason string, now time.Time) error {
-	if s == nil || issueNumber <= 0 {
-		return nil
-	}
+// SupersedeFreshDispatch releases an exact pre-spawn lease after its worker
+// fails to start. The lease ID guard prevents a stale startup owner from
+// releasing a newer generation acquired by another orchestrator process.
+func (s *State) SupersedeFreshDispatch(issueNumber int, leaseID, terminalReason string, now time.Time) error {
 	claim, ok := s.FreshDispatchClaimFor(issueNumber)
-	if !ok {
-		return nil
-	}
-	if strings.TrimSpace(leaseID) != "" && claim.LeaseID != leaseID {
+	if !ok || strings.TrimSpace(leaseID) == "" || claim.LeaseID != leaseID {
 		return fmt.Errorf("fresh dispatch lease changed")
+	}
+	terminalReason = strings.TrimSpace(terminalReason)
+	if terminalReason == "" {
+		return fmt.Errorf("fresh dispatch terminal reason is required")
 	}
 	now = now.UTC()
 	claim.Status = FreshDispatchClaimStatusSuperseded
 	claim.UpdatedAt = now
+	claim.CompletedAt = now
 	claim.LeaseExpiresAt = time.Time{}
-	if strings.TrimSpace(reason) == "" {
-		reason = "start_failed"
-	}
-	claim.TerminalReason = reason
+	claim.TerminalReason = terminalReason
 	return nil
 }
 
@@ -358,7 +368,7 @@ func mergeFreshDispatchClaims(current, ours map[int]*FreshDispatchClaim) map[int
 		prior := merged[issue]
 		if prior == nil || candidate.UpdatedAt.After(prior.UpdatedAt) ||
 			(candidate.UpdatedAt.Equal(prior.UpdatedAt) && candidate.LeaseGeneration > prior.LeaseGeneration) ||
-			(candidate.UpdatedAt.Equal(prior.UpdatedAt) && candidate.LeaseGeneration == prior.LeaseGeneration && candidate.Status == FreshDispatchClaimStatusCompleted) {
+			(candidate.UpdatedAt.Equal(prior.UpdatedAt) && candidate.LeaseGeneration == prior.LeaseGeneration && candidate.LeaseID == prior.LeaseID && freshDispatchClaimStatusRank(candidate.Status) > freshDispatchClaimStatusRank(prior.Status)) {
 			chosen := copyClaim(candidate)
 			if prior != nil {
 				if prior.ContentionCount > chosen.ContentionCount {
@@ -379,6 +389,17 @@ func mergeFreshDispatchClaims(current, ours map[int]*FreshDispatchClaim) map[int
 		}
 	}
 	return merged
+}
+
+func freshDispatchClaimStatusRank(status string) int {
+	switch status {
+	case FreshDispatchClaimStatusCompleted:
+		return 2
+	case FreshDispatchClaimStatusSuperseded:
+		return 1
+	default:
+		return 0
+	}
 }
 
 // IssueClaimFor returns the first durable claim for issueNumber.

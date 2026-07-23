@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"errors"
 	"path/filepath"
 	"sync/atomic"
 	"testing"
@@ -226,5 +227,75 @@ func TestFreshDispatchClaim_PreventsConcurrentDuplicateBeforeSessionRegistration
 	}
 	if loaded.NextSlot != 2 {
 		t.Fatalf("next_slot = %d, want 2 (no duplicate allocation)", loaded.NextSlot)
+	}
+}
+
+func TestFreshDispatchClaim_StartFailureSupersedesLease(t *testing.T) {
+	dir := t.TempDir()
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.StateDir = dir
+	cfg.WorktreeBase = filepath.Join(dir, "worktrees")
+	cfg.SessionPrefix = "ok-player"
+	if err := state.Save(dir, state.NewState()); err != nil {
+		t.Fatal(err)
+	}
+	issue := makeIssue(394, "release failed startup", "maestro-ready")
+	orch, _, _ := newStartWorkersOrchestrator(cfg, []github.Issue{issue})
+	orch.workerStartFn = nil
+	var attemptedSlots []string
+	orch.workerStartClaimedFn = func(_ *config.Config, _ *state.State, _ string, _ github.Issue, _ string, _ string, slot string) (string, error) {
+		attemptedSlots = append(attemptedSlots, slot)
+		return "", errors.New("base checkout blocked")
+	}
+
+	cycle, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	orch.startNewWorkers(cycle, 1)
+	if _, active := cycle.FreshDispatchClaimFor(394); active {
+		t.Fatal("failed startup remained active in cycle state")
+	}
+	if err := state.Save(dir, cycle); err != nil {
+		t.Fatalf("post-failure cycle save: %v", err)
+	}
+
+	loaded, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim := loaded.FreshDispatchClaims[394]
+	if claim == nil || claim.Status != state.FreshDispatchClaimStatusSuperseded || claim.TerminalReason != "start_failed" {
+		t.Fatalf("failed startup claim = %+v", claim)
+	}
+	if !claim.LeaseExpiresAt.IsZero() || claim.CompletedAt.IsZero() {
+		t.Fatalf("failed startup claim retained lease = %+v", claim)
+	}
+	if len(loaded.Sessions) != 0 {
+		t.Fatalf("sessions after pre-launch failure = %+v, want none", loaded.Sessions)
+	}
+	if loaded.NextSlot != 2 {
+		t.Fatalf("next_slot = %d, want 2", loaded.NextSlot)
+	}
+
+	firstBranch := claim.Branch
+	firstWorktree := claim.Worktree
+	orch.startNewWorkers(loaded, 1)
+	if err := state.Save(dir, loaded); err != nil {
+		t.Fatalf("post-retry cycle save: %v", err)
+	}
+	retried, err := state.Load(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	claim = retried.FreshDispatchClaims[394]
+	if len(attemptedSlots) != 2 || attemptedSlots[0] != "ok-player-1" || attemptedSlots[1] != attemptedSlots[0] {
+		t.Fatalf("failed startup slots = %v, want the reserved slot reused", attemptedSlots)
+	}
+	if claim == nil || claim.Status != state.FreshDispatchClaimStatusSuperseded || claim.TerminalReason != "start_failed" || claim.LeaseGeneration != 2 {
+		t.Fatalf("retried failed startup claim = %+v", claim)
+	}
+	if claim.Branch != firstBranch || claim.Worktree != firstWorktree || retried.NextSlot != 2 {
+		t.Fatalf("retry changed reserved identity: claim=%+v next_slot=%d", claim, retried.NextSlot)
 	}
 }

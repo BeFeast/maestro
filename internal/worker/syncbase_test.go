@@ -1,7 +1,6 @@
 package worker
 
 import (
-	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -118,32 +117,40 @@ func TestSyncBaseBranch_IgnoresUntrackedAgentHarnessDirs(t *testing.T) {
 	_, local, seed := setupOriginAndClone(t)
 	advanceOrigin(t, seed, "v2\n")
 
-	for _, dir := range []string{".claude", ".codex", ".cursor", ".entire"} {
-		if err := os.MkdirAll(filepath.Join(local, dir), 0o755); err != nil {
-			t.Fatalf("mkdir %s: %v", dir, err)
-		}
-		writeTestFile(t, filepath.Join(local, dir), "junk.txt", "agent junk\n")
+	harnessFiles := map[string]string{
+		".claude/settings.json": "{}\n",
+		".codex/session.json":   "{}\n",
+		".cursor/rules.md":      "local rules\n",
+		".entire/state.json":    "{}\n",
+	}
+	for path, content := range harnessFiles {
+		writeTestFile(t, local, path, content)
 	}
 
 	if err := SyncBaseBranch(local, "main"); err != nil {
-		t.Fatalf("SyncBaseBranch with agent junk: %v", err)
+		t.Fatalf("SyncBaseBranch with agent harness dirs: %v", err)
 	}
 	if got, want := revParse(t, local, "main"), revParse(t, local, "origin/main"); got != want {
 		t.Fatalf("local main = %s, want origin/main %s", got, want)
 	}
+	for path, want := range harnessFiles {
+		if got := readTestFile(t, local, path); got != want {
+			t.Fatalf("harness file %s = %q, want preserved %q", path, got, want)
+		}
+	}
 }
 
-func TestSyncBaseBranch_UntrackedNonAgentStillBlocks(t *testing.T) {
+func TestSyncBaseBranch_UnrelatedUntrackedFileStillFails(t *testing.T) {
 	_, local, seed := setupOriginAndClone(t)
 	advanceOrigin(t, seed, "v2\n")
+	writeTestFile(t, local, "scratch.txt", "local scratch\n")
 
-	writeTestFile(t, local, "mystery-untracked.txt", "nope\n")
 	err := SyncBaseBranch(local, "main")
 	if err == nil {
-		t.Fatal("expected error for non-agent untracked dirt")
+		t.Fatal("expected error for unrelated untracked file")
 	}
-	if !strings.Contains(err.Error(), "dirty") {
-		t.Fatalf("expected dirty error, got: %v", err)
+	if !strings.Contains(err.Error(), "dirty") || !strings.Contains(err.Error(), "scratch.txt") {
+		t.Fatalf("expected dirty scratch.txt error, got: %v", err)
 	}
 }
 
