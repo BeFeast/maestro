@@ -1012,6 +1012,9 @@ const (
 	// surfaced as evidence. NEVER a silent dead-end (#565).
 	StuckReviewRepairExhausted = "review_repair_exhausted"
 	StuckSearchGuardrailTrip   = "search_guardrail_trip"
+	// StuckTokenBudgetExceeded keeps an issue-scoped budget stop visible without
+	// turning historical worker spend into a project-wide dispatch hold.
+	StuckTokenBudgetExceeded = "token_budget_exceeded"
 	// StuckSupervisorMeteredBackend is emitted when the supervisor LLM path is
 	// refused because supervisor.backend (or its model.default fallback) resolves
 	// to a metered (per-token) backend and supervisor.allow_metered_backend is not
@@ -5050,15 +5053,16 @@ func (s *State) IssueDone(issueNum int) bool {
 // without producing a PR (dead, failed, or retry_exhausted).
 //
 // Sessions marked as backend-blocked (RateLimitHit — provider capacity limit
-// or backend auth failure) are NOT counted as failed attempts: a transient
-// backend block must not consume the per-issue retry budget.
+// or backend auth failure) and deterministic token-budget stops are NOT counted
+// as failed attempts: neither condition proves the implementation itself failed,
+// and both must remain runnable after their independent hold/release policy.
 // See #432 / #458 / #466 / #693.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit {
+			!sess.RateLimitHit && sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) {
 			count++
 		}
 	}
