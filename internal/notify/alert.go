@@ -17,6 +17,9 @@ const (
 	// AlertBackendCooldownExhausted: every backend is cooling down / quota-gated
 	// and dispatch has nothing to run.
 	AlertBackendCooldownExhausted AlertClass = "backend_cooldown_exhausted"
+	// AlertFloorBreach: fleet live workers dropped below fleet.min_live_workers.
+	// Priority 5 / CRITICAL — operator must hear this without polling (#1106).
+	AlertFloorBreach AlertClass = "floor_breach"
 	// AlertDeliveryAdvance: a positive event — the delivery/feed advanced.
 	AlertDeliveryAdvance AlertClass = "delivery_advance"
 	// AlertEmergency: notify_red-grade — emergency stop / supervisor degraded.
@@ -38,6 +41,7 @@ var alertRoutes = map[AlertClass]AlertRoute{
 	AlertIdleStall:                {Priority: 4, Tags: []string{"hourglass", "warning"}},
 	AlertFutileRecovery:           {Priority: 4, Tags: []string{"recycle", "warning"}},
 	AlertBackendCooldownExhausted: {Priority: 4, Tags: []string{"battery", "warning"}},
+	AlertFloorBreach:              {Priority: 5, Tags: []string{"rotating_light", "sos", "warning"}},
 	AlertDeliveryAdvance:          {Priority: 3, Tags: []string{"white_check_mark", "rocket"}},
 	AlertEmergency:                {Priority: 5, Tags: []string{"rotating_light", "sos"}},
 }

@@ -685,6 +685,22 @@ func (d *Daemon) Run(ctx context.Context) error {
 			<-emergencyDone
 		}
 	}
+	// #1106: CRITICAL floor breach watch — live < fleet.min_live_workers must
+	// ntfy the operator without waiting for a status poll.
+	var stopFloorWatch func()
+	if d.spawnLimiter != nil {
+		fctx, floorCancel := context.WithCancel(ctx)
+		floorDone := make(chan struct{})
+		go func() {
+			defer close(floorDone)
+			d.watchFloorBreachLoop(fctx, DefaultFloorWatchInterval)
+		}()
+		log.Printf("[daemon] floor breach watch enabled — poll every %s (CRITICAL when live < min)", DefaultFloorWatchInterval)
+		stopFloorWatch = func() {
+			floorCancel()
+			<-floorDone
+		}
+	}
 	// Protect-aware /tmp sweep: one host-level apply loop for the single daemon,
 	// not one per project. The first run occurs after one interval, avoiding a
 	// surprise startup prune while still bounding abandoned residue to 10m past
@@ -709,6 +725,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		if stopEmergencyWatch != nil {
 			stopEmergencyWatch()
+		}
+		if stopFloorWatch != nil {
+			stopFloorWatch()
 		}
 		if stopTmpfsHygiene != nil {
 			stopTmpfsHygiene()
