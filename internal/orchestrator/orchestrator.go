@@ -4624,6 +4624,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 		switch sess.Status {
 		case state.StatusDone, state.StatusCodeLanded, state.StatusDead, state.StatusConflictFailed, state.StatusFailed, state.StatusRetryExhausted:
 			now := time.Now().UTC()
+			// #1106: aged token_budget_exceeded must not hold a permanent issue
+			// claim that freezes redispatch / supervisor attention forever.
+			// After grace, release for redispatch while keeping history.
+			o.releaseAgedTokenBudgetClaim(s, sess, now)
 			remoteReconcileDue := terminalReconcileDue(sess, now)
 			remoteReconcileSucceeded := false
 			remoteReconcileFailed := false
@@ -7319,6 +7323,39 @@ func (o *Orchestrator) releaseDoneMergedOpenIssueForRedispatch(s *state.State, s
 	if strings.TrimSpace(o.cfg.StateDir) != "" {
 		if err := state.Save(o.cfg.StateDir, s); err != nil {
 			log.Printf("[orch] release done+merged open issue: state save failed for issue #%d: %v", sess.IssueNumber, err)
+		}
+	}
+}
+
+// tokenBudgetClaimGrace is how long a deterministic token_budget_exceeded stop
+// may keep an exclusive issue claim before hands-off fill releases it (#1106).
+const tokenBudgetClaimGrace = 30 * time.Minute
+
+func (o *Orchestrator) releaseAgedTokenBudgetClaim(s *state.State, sess *state.Session, now time.Time) {
+	if sess == nil || sess.ReleasedForRedispatch {
+		return
+	}
+	if sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
+		return
+	}
+	finished := sess.FinishedAt
+	if finished == nil || finished.IsZero() {
+		if sess.StartedAt.IsZero() {
+			return
+		}
+		t := sess.StartedAt.UTC()
+		finished = &t
+	}
+	if now.Sub(finished.UTC()) < tokenBudgetClaimGrace {
+		return
+	}
+	sess.ReleasedForRedispatch = true
+	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
+	log.Printf("[orch] token_budget_exceeded: issue #%d session aged past %s — released for redispatch",
+		sess.IssueNumber, tokenBudgetClaimGrace)
+	if strings.TrimSpace(o.cfg.StateDir) != "" {
+		if err := state.Save(o.cfg.StateDir, s); err != nil {
+			log.Printf("[orch] release aged token budget: state save failed for issue #%d: %v", sess.IssueNumber, err)
 		}
 	}
 }

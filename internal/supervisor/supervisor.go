@@ -790,25 +790,15 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 
 	if slot, sess, ok := tokenBudgetExceededSession(st); ok {
-		// Hands-off fill (2026-07-22): a historical token-budget stop on one
-		// issue must not freeze the whole project. Only halt immediately when
-		// there is no spare capacity; otherwise continue and only surface the
-		// budget stop if no other backlog remains.
-		if projectState.AvailableSlots <= 0 {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s for issue #%d stopped deterministically at worker_max_tokens", slot, sess.IssueNumber),
-				"Restarting or re-planning automatically would spend more tokens without an operator budget decision",
-			)
-			decision := e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", sess.IssueNumber),
-				RiskSafe, 0.99, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
-			return decision, nil
-		}
+		// Hands-off fill (#1106): a historical token-budget stop on one issue
+		// must never freeze the whole project with exclusive ActionNone. Always
+		// continue; surface the budget stop as a stuck-state note if no other
+		// backlog remains. Capacity-full cases fall through to wait_for_capacity
+		// / monitor_open_pr like any other fill path.
 		deferredBudgetSlot, deferredBudgetSess = slot, sess
 		baseReasons = appendReasons(baseReasons,
 			fmt.Sprintf("Session %s for issue #%d previously hit worker_max_tokens", slot, sess.IssueNumber),
-			"Spare capacity remains — continue backlog fill instead of freezing the project on a budget stop",
+			"Continue backlog fill instead of freezing the project on a budget stop",
 		)
 	}
 
@@ -1098,13 +1088,9 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	if deferredOpenPR != nil {
 		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)), nil
 	}
-	if deferredBudgetSess != nil {
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
-			RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		return withAnalysis(decision), nil
-	}
+	// #1106: historical token_budget with spare slots must stay a stuck-state
+	// note, never an exclusive ActionNone that looks like a project freeze.
+	stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
 	decision := e.decision(st, now, projectState, ActionNone,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
@@ -1154,6 +1140,21 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 		}
 	}
 	return bestSlot, best, best != nil
+}
+
+// appendTokenBudgetStuck records a historical token-budget stop as a stuck
+// state without turning it into the exclusive recommended action (#1106).
+func appendTokenBudgetStuck(base []state.SupervisorStuckState, slot string, sess *state.Session) []state.SupervisorStuckState {
+	if sess == nil || sess.IssueNumber <= 0 {
+		return base
+	}
+	return appendStuck(base, stuckState("token_budget_exceeded", SeverityWarning,
+		fmt.Sprintf("Issue #%d previously stopped at worker_max_tokens on session %s; spare capacity must still fill other backlog", sess.IssueNumber, slot),
+		"Continue label/spawn for other eligible issues; raise worker_max_tokens only for intentional redispatch of this issue",
+		false,
+		&state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot},
+		fmt.Sprintf("worker_outcome=%s", sess.WorkerOutcome),
+	))
 }
 
 // deferredOpenPRMonitor holds a non-urgent open-PR monitor decision that is
@@ -1307,16 +1308,13 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			return withAnalysis(decision), nil
 		}
 
+		stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
 		decision := e.decision(st, now, projectState, ActionNone,
 			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
 		if deferredOpenPR != nil {
 			decision = e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)
-		} else if deferredBudgetSess != nil {
-			decision = e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
-				RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
 		}
+		decision.StuckStates = stuckStates
 		return withAnalysis(decision), nil
 	}
 
@@ -1440,15 +1438,10 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	if deferredOpenPR != nil {
 		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR)), nil
 	}
-	if deferredBudgetSess != nil {
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", deferredBudgetSess.IssueNumber),
-			RiskSafe, 0.99, &state.SupervisorTarget{Issue: deferredBudgetSess.IssueNumber, Session: deferredBudgetSlot}, PolicyRuleRuntimeState, baseReasons)
-		decision.StuckStates = stuckStates
-		return withAnalysis(decision), nil
-	}
+	stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
 	decision := e.decision(st, now, projectState, ActionNone,
 		"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, baseReasons)
+	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
 }
 

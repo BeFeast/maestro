@@ -138,6 +138,28 @@ func (l *fleetSpawnLimiter) CeilingReached() bool {
 	return false
 }
 
+// FloorStatus reports current live worker count against fleet.min_live_workers.
+// below=true means live < min (CRITICAL floor breach, #1106).
+func (l *fleetSpawnLimiter) FloorStatus() (live, min, max int, below bool, err error) {
+	if l == nil {
+		return 0, 0, 0, false, nil
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	settings, err := l.settingsLocked()
+	if err != nil {
+		return 0, 0, 0, false, err
+	}
+	live, err = l.liveLocked()
+	if err != nil {
+		return 0, settings.MinLiveWorkers, settings.MaxLiveWorkers, false, err
+	}
+	min = settings.MinLiveWorkers
+	max = settings.MaxLiveWorkers
+	below = min > 0 && live < min
+	return live, min, max, below, nil
+}
+
 func (l *fleetSpawnLimiter) Reserve(stateDir string) (commit func(string), release func(), ok bool) {
 	if l == nil {
 		return func(string) {}, func() {}, true

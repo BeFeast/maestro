@@ -71,6 +71,40 @@ func TestDecide_TokenBudgetDoesNotStarveSpareSlotBacklog(t *testing.T) {
 	}
 }
 
+func TestDecide_TokenBudgetEmptyQueueIsNotExclusiveFreeze(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 4
+	enableDynamicWave(cfg)
+	reader := &fakeReader{issues: nil}
+	st := state.NewState()
+	st.Sessions["sup-old"] = &state.Session{
+		IssueNumber: 1010, IssueTitle: "budgeted out", Status: state.StatusDone,
+		WorkerOutcome: worker.TokenBudgetExceededOutcome,
+		StartedAt:     time.Date(2026, 7, 18, 11, 0, 0, 0, time.UTC),
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionNone {
+		t.Fatalf("action = %q, want none (empty queue)", decision.RecommendedAction)
+	}
+	if decision.Target != nil && decision.Target.Issue == 1010 {
+		t.Fatalf("exclusive budget freeze target leaked: %#v", decision.Target)
+	}
+	found := false
+	for _, stuck := range decision.StuckStates {
+		if stuck.Code == "token_budget_exceeded" {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("stuck states = %#v, want token_budget_exceeded note", decision.StuckStates)
+	}
+}
+
 func TestDecide_BlockedOpenPRDoesNotStarveSpareSlotBacklog(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.MaxParallel = 6
