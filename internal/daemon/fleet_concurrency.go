@@ -99,7 +99,7 @@ func fleetWorkerKey(stateDir, slot string) string {
 	return stateDir + "\x00" + slot
 }
 
-func (l *fleetSpawnLimiter) liveLocked() (int, error) {
+func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
 	dirs := make([]string, 0, len(l.stateDirs))
 	for dir := range l.stateDirs {
 		dirs = append(dirs, dir)
@@ -110,7 +110,7 @@ func (l *fleetSpawnLimiter) liveLocked() (int, error) {
 	for _, dir := range dirs {
 		st, err := l.loadState(dir)
 		if err != nil {
-			return 0, fmt.Errorf("load fleet state %s: %w", dir, err)
+			return nil, fmt.Errorf("load fleet state %s: %w", dir, err)
 		}
 		for slot, sess := range st.Sessions {
 			if sess != nil && sess.Status == state.StatusRunning {
@@ -118,7 +118,10 @@ func (l *fleetSpawnLimiter) liveLocked() (int, error) {
 			}
 		}
 	}
+	return running, nil
+}
 
+func (l *fleetSpawnLimiter) reconcileReservationsLocked(running map[string]struct{}) {
 	// Once a committed reservation appears as a running state session, the
 	// durable state count replaces it. Pending or not-yet-persisted commits stay
 	// reserved, so no other flow can consume the same global slot.
@@ -130,6 +133,14 @@ func (l *fleetSpawnLimiter) liveLocked() (int, error) {
 			delete(l.reservations, id)
 		}
 	}
+}
+
+func (l *fleetSpawnLimiter) liveLocked() (int, error) {
+	running, err := l.runningLocked()
+	if err != nil {
+		return 0, err
+	}
+	l.reconcileReservationsLocked(running)
 	return len(running) + len(l.reservations), nil
 }
 
@@ -159,8 +170,9 @@ func (l *fleetSpawnLimiter) CeilingReached() bool {
 	return false
 }
 
-// FloorStatus reports current live worker count against fleet.min_live_workers.
-// below=true means live < min (CRITICAL floor breach, #1106).
+// FloorStatus reports the durable StatusRunning count against
+// fleet.min_live_workers. Pending spawn reservations still protect the hard
+// ceiling but are not live workers and cannot mask a CRITICAL floor breach.
 func (l *fleetSpawnLimiter) FloorStatus() (live, min, max int, below bool, err error) {
 	if l == nil {
 		return 0, 0, 0, false, nil
@@ -171,10 +183,12 @@ func (l *fleetSpawnLimiter) FloorStatus() (live, min, max int, below bool, err e
 	if err != nil {
 		return 0, 0, 0, false, err
 	}
-	live, err = l.liveLocked()
+	running, err := l.runningLocked()
 	if err != nil {
 		return 0, settings.MinLiveWorkers, settings.MaxLiveWorkers, false, err
 	}
+	l.reconcileReservationsLocked(running)
+	live = len(running)
 	min = settings.MinLiveWorkers
 	max = settings.MaxLiveWorkers
 	below = min > 0 && live < min

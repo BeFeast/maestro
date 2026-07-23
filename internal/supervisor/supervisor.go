@@ -1148,7 +1148,12 @@ func appendTokenBudgetStuck(base []state.SupervisorStuckState, slot string, sess
 	if sess == nil || sess.IssueNumber <= 0 {
 		return base
 	}
-	return appendStuck(base, stuckState("token_budget_exceeded", SeverityWarning,
+	for _, existing := range base {
+		if existing.Code == state.StuckTokenBudgetExceeded && existing.Target != nil && existing.Target.Session == slot {
+			return base
+		}
+	}
+	return appendStuck(base, stuckState(state.StuckTokenBudgetExceeded, SeverityWarning,
 		fmt.Sprintf("Issue #%d previously stopped at worker_max_tokens on session %s; spare capacity must still fill other backlog", sess.IssueNumber, slot),
 		"Continue label/spawn for other eligible issues; raise worker_max_tokens only for intentional redispatch of this issue",
 		false,
@@ -1910,6 +1915,13 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
 				fmt.Sprintf("Session %s status=retry_exhausted retry_count=%d", slot, sess.RetryCount)))
+		}
+
+		if sess.WorkerOutcome == worker.TokenBudgetExceededOutcome && !sess.ReleasedForRedispatch {
+			findings = append(findings, stuckState(state.StuckTokenBudgetExceeded, SeverityWarning,
+				fmt.Sprintf("Issue #%d previously stopped at worker_max_tokens on session %s.", sess.IssueNumber, slot),
+				"Continue label/spawn for other eligible issues; raise worker_max_tokens only for intentional redispatch of this issue.", false, target,
+				fmt.Sprintf("worker_outcome=%s", sess.WorkerOutcome)))
 		}
 
 		if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback && e.staleReviewFeedbackNeedsAttention(sess) {

@@ -320,6 +320,9 @@ type Daemon struct {
 	emergencyMu       sync.RWMutex
 	emergencyState    emergencystore.State
 	emergencyNotifier *notify.Notifier
+	// floorNotifier is selected independently of the emergency switch store so
+	// an unavailable safety DB cannot silence the fleet-capacity CRITICAL alert.
+	floorNotifier *notify.Notifier
 
 	// spawnLimiter owns the daemon-wide live-worker budget. It is shared by all
 	// project orchestrators so concurrent flows reserve against one atomic max.
@@ -582,6 +585,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// the daemon logs it loudly and comes up without ingestion (the fleet keeps
 	// polling), rather than aborting startup over an unreadable secret.
 	d.configureWebhookIngestion(fleet)
+	// The fleet floor is daemon-wide and must retain an ntfy route even if the
+	// independent emergency-switch store cannot be opened.
+	d.floorNotifier = fleetFloorNotifierFor(importCfgs)
 
 	// #840: open the fleet-wide EMERGENCY STOP switch, seed the gate cache from
 	// the current value (so a switch set while the daemon was down is honored on
