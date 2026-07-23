@@ -131,10 +131,10 @@ func TestDecideWithLLM_TokenBudgetExceeded_SkipsLLM(t *testing.T) {
 	if llm.calls != 0 {
 		t.Fatalf("LLM calls = %d, want 0 for deterministic token budget state", llm.calls)
 	}
-	if decision.RecommendedAction != ActionNone {
-		t.Fatalf("decision = %+v, want action=none when only a historical budget stop remains", decision)
+	if decision.RecommendedAction != ActionNone || decision.Target != nil {
+		t.Fatalf("decision = %+v, want untargeted action=none when only historical budget history remains", decision)
 	}
-	// #1106: exclusive budget freeze targeting is gone; queue-empty/none is fine.
+	requireStuckState(t, decision, state.StuckTokenBudgetExceeded)
 }
 
 // TestDecideWithLLM_SpawnCandidate_CallsLLM pins the counterpart AC: a mutating

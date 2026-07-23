@@ -7349,6 +7349,12 @@ func (o *Orchestrator) releaseAgedTokenBudgetClaim(s *state.State, sess *state.S
 	if now.Sub(finished.UTC()) < tokenBudgetClaimGrace {
 		return
 	}
+	// A legacy cycle may already have promoted this deterministic budget stop to
+	// retry_exhausted. Normalize it before release so IssueRetryExhausted cannot
+	// outlive the claim and keep selectors blocked forever.
+	if sess.Status == state.StatusRetryExhausted {
+		sess.Status = state.StatusFailed
+	}
 	sess.ReleasedForRedispatch = true
 	o.syncProject(sess.IssueNumber, github.ProjectStatusTodo)
 	log.Printf("[orch] token_budget_exceeded: issue #%d session aged past %s — released for redispatch",

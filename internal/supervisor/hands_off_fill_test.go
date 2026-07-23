@@ -69,6 +69,33 @@ func TestDecide_TokenBudgetDoesNotStarveSpareSlotBacklog(t *testing.T) {
 	if decision.Target == nil || decision.Target.Issue != 30 {
 		t.Fatalf("target = %#v, want issue #30", decision.Target)
 	}
+	requireStuckState(t, decision, state.StuckTokenBudgetExceeded)
+}
+
+func TestDecide_ReleasedTokenBudgetIssueCanRedispatchAtRetryLimit(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.MaxParallel = 2
+	cfg.MaxRetriesPerIssue = 1
+	cfg.IssueLabels = []string{"maestro-ready"}
+	reader := &fakeReader{issues: []github.Issue{testIssue(9, "retry with raised budget", "maestro-ready")}}
+	st := state.NewState()
+	finished := time.Date(2026, 4, 29, 10, 0, 0, 0, time.UTC)
+	st.Sessions["sup-old"] = &state.Session{
+		IssueNumber:           9,
+		Status:                state.StatusFailed,
+		WorkerOutcome:         worker.TokenBudgetExceededOutcome,
+		StartedAt:             finished.Add(-time.Hour),
+		FinishedAt:            &finished,
+		ReleasedForRedispatch: true,
+	}
+
+	decision, err := testEngine(cfg, reader).Decide(st)
+	if err != nil {
+		t.Fatalf("Decide: %v", err)
+	}
+	if decision.RecommendedAction != ActionSpawnWorker || decision.Target == nil || decision.Target.Issue != 9 {
+		t.Fatalf("decision = %+v, want released budget issue #9 redispatched despite max_retries_per_issue=1", decision)
+	}
 }
 
 func TestDecide_TokenBudgetEmptyQueueIsNotExclusiveFreeze(t *testing.T) {
