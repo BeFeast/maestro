@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -21,6 +22,11 @@ type fleetSpawnReservation struct {
 	slot     string
 }
 
+type fleetProjectRegistration struct {
+	repo              string
+	queueSignalMaxAge time.Duration
+}
+
 // fleetSpawnLimiter serializes capacity checks across every project flow. A
 // successful spawn remains reserved until its running slot is visible in the
 // authoritative state file, closing both the concurrent-flow race and the
@@ -29,6 +35,7 @@ type fleetSpawnLimiter struct {
 	mu           sync.Mutex
 	settings     fleetConcurrencySettingsLoader
 	stateDirs    map[string]struct{}
+	projects     map[string]fleetProjectRegistration
 	reservations map[uint64]fleetSpawnReservation
 	nextID       uint64
 	loadState    func(string) (*state.State, error)
@@ -39,17 +46,30 @@ func newFleetSpawnLimiter(store ConfigLoader) *fleetSpawnLimiter {
 	return &fleetSpawnLimiter{
 		settings:     loader,
 		stateDirs:    make(map[string]struct{}),
+		projects:     make(map[string]fleetProjectRegistration),
 		reservations: make(map[uint64]fleetSpawnReservation),
 		loadState:    state.Load,
 	}
 }
 
 func (l *fleetSpawnLimiter) RegisterStateDir(stateDir string) {
+	l.RegisterProject(stateDir, "", DefaultSuperviseInterval)
+}
+
+func (l *fleetSpawnLimiter) RegisterProject(stateDir, repo string, superviseInterval time.Duration) {
 	if l == nil || strings.TrimSpace(stateDir) == "" {
 		return
 	}
+	stateDir = strings.TrimSpace(stateDir)
+	if superviseInterval <= 0 {
+		superviseInterval = DefaultSuperviseInterval
+	}
 	l.mu.Lock()
 	l.stateDirs[stateDir] = struct{}{}
+	l.projects[stateDir] = fleetProjectRegistration{
+		repo:              strings.TrimSpace(repo),
+		queueSignalMaxAge: 2*superviseInterval + time.Minute,
+	}
 	l.mu.Unlock()
 }
 
@@ -59,6 +79,7 @@ func (l *fleetSpawnLimiter) UnregisterStateDir(stateDir string) {
 	}
 	l.mu.Lock()
 	delete(l.stateDirs, stateDir)
+	delete(l.projects, stateDir)
 	for id, reservation := range l.reservations {
 		if reservation.stateDir == stateDir {
 			delete(l.reservations, id)
@@ -205,6 +226,17 @@ func (l *fleetSpawnLimiter) Reserve(stateDir string) (commit func(string), relea
 		l.mu.Unlock()
 		return nil, nil, false
 	}
+	deferReason, err := l.dogfoodDeferralReasonLocked(stateDir, settings, live)
+	if err != nil {
+		l.mu.Unlock()
+		log.Printf("[daemon] fleet spawn reservation fail-closed: product queue state unavailable: %v", err)
+		return nil, nil, false
+	}
+	if deferReason != "" {
+		l.mu.Unlock()
+		log.Printf("[daemon] fleet spawn reservation deferred for %s: %s", factoryDogfoodRepo, deferReason)
+		return nil, nil, false
+	}
 	l.nextID++
 	id := l.nextID
 	l.reservations[id] = fleetSpawnReservation{stateDir: stateDir}
@@ -225,6 +257,100 @@ func (l *fleetSpawnLimiter) Reserve(stateDir string) (commit func(string), relea
 		l.mu.Unlock()
 	}
 	return commit, release, true
+}
+
+const factoryDogfoodRepo = "BeFeast/maestro"
+
+// dogfoodDeferralReasonLocked keeps the Maestro dogfood project in the
+// background when product work can use the same fleet slot. It is deliberately
+// narrow: no new priority scheduler or operator knob, and no preemption. The
+// existing persisted supervisor decision supplies the runnable-backlog signal.
+func (l *fleetSpawnLimiter) dogfoodDeferralReasonLocked(stateDir string, settings config.FleetConcurrencySettings, live int) (string, error) {
+	registration, ok := l.projects[stateDir]
+	if !ok || !strings.EqualFold(registration.repo, factoryDogfoodRepo) {
+		return "", nil
+	}
+
+	dirs := make([]string, 0, len(l.projects))
+	for dir, project := range l.projects {
+		if dir == stateDir || strings.TrimSpace(project.repo) == "" || strings.EqualFold(project.repo, factoryDogfoodRepo) {
+			continue
+		}
+		dirs = append(dirs, dir)
+	}
+	sort.Strings(dirs)
+
+	for _, dir := range dirs {
+		project := l.projects[dir]
+		st, err := l.loadState(dir)
+		if err != nil {
+			return "", fmt.Errorf("load product state %s: %w", dir, err)
+		}
+		decision := st.LatestSupervisorDecision()
+		if !freshSupervisorQueueSignal(decision, project.queueSignalMaxAge, time.Now().UTC()) ||
+			!productQueueCanDispatch(st, decision) || !hasUnclaimedRunnableCandidate(st, decision) {
+			continue
+		}
+		productLive := st.RunningSessionCount()
+		if settings.MinLiveWorkers > 0 && live < settings.MinLiveWorkers {
+			return fmt.Sprintf("fleet is below floor (live=%d min=%d) and product %s has runnable backlog", live, settings.MinLiveWorkers, project.repo), nil
+		}
+		if productLive == 0 {
+			return fmt.Sprintf("product %s has runnable backlog and no live worker", project.repo), nil
+		}
+	}
+	return "", nil
+}
+
+func freshSupervisorQueueSignal(decision *state.SupervisorDecision, maxAge time.Duration, now time.Time) bool {
+	if decision == nil || decision.RecommendationDropped() || maxAge <= 0 {
+		return false
+	}
+	observedAt := decision.CreatedAt
+	if decision.LastSeenAt.After(observedAt) {
+		observedAt = decision.LastSeenAt
+	}
+	if observedAt.IsZero() {
+		return false
+	}
+	return !now.After(observedAt.UTC().Add(maxAge))
+}
+
+func productQueueCanDispatch(st *state.State, decision *state.SupervisorDecision) bool {
+	if st == nil || decision == nil {
+		return false
+	}
+	if st.PauseActive() || st.DrainActive() || decision.RequiresApproval {
+		return false
+	}
+	if st.DispatchHold.Active && st.DispatchHold.ReasonClass != state.DispatchHoldAwaitingDispatch {
+		return false
+	}
+	if decision.ProjectState.AvailableSlots > 0 {
+		return true
+	}
+	// A decision recorded at local capacity becomes dispatchable after one of
+	// those workers exits, even before the next supervisor cycle refreshes it.
+	return st.RunningSessionCount() < decision.ProjectState.Running
+}
+
+func hasUnclaimedRunnableCandidate(st *state.State, decision *state.SupervisorDecision) bool {
+	if st == nil || decision == nil || decision.QueueAnalysis == nil || decision.QueueAnalysis.EligibleCandidates <= 0 {
+		return false
+	}
+	analysis := decision.QueueAnalysis
+	candidates := analysis.EligibleRanked
+	if len(candidates) == 0 && analysis.SelectedCandidate != nil {
+		candidates = []state.SupervisorIssueCandidate{*analysis.SelectedCandidate}
+	}
+	for _, candidate := range candidates {
+		if candidate.Number > 0 && !st.IssueInProgress(candidate.Number) && !st.IssueDone(candidate.Number) {
+			return true
+		}
+	}
+	// EligibleRanked is bounded. A larger aggregate means unlisted runnable
+	// candidates remain even when every persisted identity is already claimed.
+	return analysis.EligibleCandidates > len(candidates)
 }
 
 func (d *Daemon) fleetSpawnCeilingReached() bool {

@@ -637,7 +637,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	for i := range projects {
 		if cfg := projects[i].Cfg(); cfg != nil {
 			if d.spawnLimiter != nil {
-				d.spawnLimiter.RegisterStateDir(cfg.StateDir)
+				d.spawnLimiter.RegisterProject(cfg.StateDir, cfg.Repo, d.opts.SuperviseInterval)
 			}
 		}
 	}
