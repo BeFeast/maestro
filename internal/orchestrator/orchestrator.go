@@ -6184,8 +6184,13 @@ func greptileReviewStreamPending(verdict github.ReviewGateVerdict) bool {
 // clearReviewPendingTracking resets the #691 pending clock once the review
 // gate resolves (passed or blocked by findings) so a later pending phase on
 // the same head starts a fresh window.
+// clearReviewPendingTracking stops the pending clock once the gate settles.
+// The head anchor is deliberately KEPT: a check that settles and then goes
+// pending again on the same commit (a re-run, or a check that disappears) must
+// not look like a new head, or the per-head re-trigger cap would reset on every
+// such flap and the PR could collect unlimited "@greptile review" comments.
+// Only trackReviewGateHead clears the anchor, and only for a real head change.
 func clearReviewPendingTracking(sess *state.Session) {
-	sess.ReviewPendingHeadSHA = ""
 	sess.ReviewPendingSince = nil
 }
 

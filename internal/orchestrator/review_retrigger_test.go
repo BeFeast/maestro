@@ -238,8 +238,14 @@ func TestReviewRetrigger_GateResolutionClearsTracking(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if sess.ReviewPendingHeadSHA != "" || sess.ReviewPendingSince != nil {
-		t.Fatalf("pending tracking = (%q, %v), want cleared once the gate resolves",
-			sess.ReviewPendingHeadSHA, sess.ReviewPendingSince)
+	// The clock stops when the gate resolves, but the head anchor stays: a
+	// check that settles and goes pending again on the same commit must not
+	// look like a new head, or the per-head re-trigger cap would reset on
+	// every such flap.
+	if sess.ReviewPendingSince != nil {
+		t.Fatalf("pending clock = %v, want stopped once the gate resolves", sess.ReviewPendingSince)
+	}
+	if sess.ReviewPendingHeadSHA != "abc123def456789" {
+		t.Fatalf("head anchor = %q, want it retained until the head actually changes", sess.ReviewPendingHeadSHA)
 	}
 }

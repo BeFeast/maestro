@@ -235,3 +235,30 @@ func TestMissingReviewGateElapsed_LookupFailureIsNotSilence(t *testing.T) {
 		t.Fatal("an API failure was treated as proof the reviewer is silent")
 	}
 }
+
+// Codex review catch (P2): a check that settles and goes pending again on the
+// SAME head must not reset the re-trigger cap, or flapping lets a PR collect
+// unlimited review-nag comments.
+func TestTrackReviewGateHead_SettledThenPendingKeepsRetryCount(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := &state.Session{}
+
+	o.trackReviewGateHead(sess, "deadbeef", github.ReviewGateVerdict{Pending: true, Observed: true}, now)
+	sess.ReviewRetriggerCount = 3
+
+	// The gate settles: the clock stops, the head anchor stays.
+	clearReviewPendingTracking(sess)
+	if sess.ReviewPendingHeadSHA != "deadbeef" {
+		t.Fatal("the head anchor was dropped when the gate settled")
+	}
+
+	// The same head goes pending again (check re-run).
+	o.trackReviewGateHead(sess, "deadbeef", github.ReviewGateVerdict{Pending: true, Observed: false}, now.Add(time.Minute))
+	if sess.ReviewRetriggerCount != 3 {
+		t.Fatalf("retrigger count = %d, want 3 — a settled/pending flap is not a new head", sess.ReviewRetriggerCount)
+	}
+	if !sess.ReviewGateObserved {
+		t.Fatal("observation memory was lost on a settled/pending flap")
+	}
+}
