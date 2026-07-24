@@ -2427,6 +2427,10 @@ var (
 )
 
 func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
+	// checkLookupFailed marks a degraded read: absence of a signal below then
+	// means "unknown", not "the reviewer is silent".
+	var checkLookupFailed bool
+
 	// --- 1. Get head SHA of the PR ---
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
@@ -2437,6 +2441,7 @@ func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdic
 	checkRuns, err := c.checkRunsForSHA(sha)
 	if err != nil {
 		// Non-fatal: fall through to comment fallback
+		checkLookupFailed = true
 		goto commentFallback
 	}
 
@@ -2471,10 +2476,12 @@ commentFallback:
 		// No check run AND no comment: the reviewer never showed up for this
 		// head. Observed stays false so callers can distinguish this from a
 		// review in progress and apply a missing-review policy instead of
-		// waiting forever.
-		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending}, nil
+		// waiting forever — unless the check-runs read itself failed, in which
+		// case the silence is unproven and LookupFailed says so.
+		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending, LookupFailed: checkLookupFailed}, nil
 	}
 	verdict := reviewStreamVerdictFromGreptileSignal(signal)
+	verdict.LookupFailed = checkLookupFailed
 	// Issue comments carry no head SHA, so a comment written for an EARLIER
 	// head would otherwise count as proof the reviewer spoke about this one —
 	// and a silent reviewer on the current head would look alive forever. Only
@@ -3671,8 +3678,13 @@ type ReviewStreamVerdict struct {
 	// reviews after its free credits ran out and posted nothing at all), and
 	// an unobserved pending gate would otherwise hold every PR forever with
 	// no timeout and no alert.
-	Observed bool            `json:"observed"`
-	Score    int             `json:"score,omitempty"`
+	Observed bool `json:"observed"`
+	// LookupFailed reports that a read the verdict depends on errored (e.g.
+	// the check-runs API), so "no signal" here means "unknown", not "the
+	// reviewer is silent". Callers must not conclude absence from it: a GitHub
+	// outage would otherwise look exactly like a reviewer that never showed up.
+	LookupFailed bool            `json:"lookup_failed,omitempty"`
+	Score        int             `json:"score,omitempty"`
 	ScoreMax int             `json:"score_max,omitempty"`
 	Verdict  string          `json:"verdict,omitempty"`
 	Findings []ReviewComment `json:"findings,omitempty"`
@@ -3683,8 +3695,11 @@ type ReviewGateVerdict struct {
 	Pending bool `json:"pending"`
 	// Observed is false when NO configured stream produced any signal, i.e.
 	// the whole review gate is silent rather than working.
-	Observed bool                  `json:"observed"`
-	Streams  []ReviewStreamVerdict `json:"streams"`
+	Observed bool `json:"observed"`
+	// LookupFailed is true when any stream's read was degraded, so an absent
+	// signal cannot be read as proof the reviewer is silent.
+	LookupFailed bool                  `json:"lookup_failed,omitempty"`
+	Streams      []ReviewStreamVerdict `json:"streams"`
 }
 
 func (v ReviewGateVerdict) BlockingFindings() []ReviewComment {
@@ -3785,6 +3800,10 @@ func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGate
 			// is silent.
 			verdict.Observed = true
 		}
+		if sv.LookupFailed {
+			// One degraded read makes the whole gate's silence unproven.
+			verdict.LookupFailed = true
+		}
 		if sv.Pending {
 			verdict.Pending = true
 			verdict.Passed = false
@@ -3848,8 +3867,10 @@ func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (
 	}
 	sv := ReviewStreamVerdict{Name: spec.Name, Passed: false, Pending: false, Findings: findings}
 	// A check run in any state, or an inline finding, means the reviewer spoke
-	// for this head. The default branch below is the silent case.
+	// for this head. The default branch below is the silent case — but only a
+	// successful read can prove silence.
 	sv.Observed = checkFound || checkPending || len(findings) > 0
+	sv.LookupFailed = checkErr != nil || commentsErr != nil
 	switch {
 	case checkPending:
 		sv.Pending = true

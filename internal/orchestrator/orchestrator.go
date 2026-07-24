@@ -6147,6 +6147,13 @@ func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict git
 	if grace <= 0 || verdict.Observed || !verdict.Pending {
 		return 0, false
 	}
+	// A degraded read cannot prove silence. Without this, a GitHub check-runs
+	// outage lasting longer than the grace would look exactly like a reviewer
+	// that never showed up, and PRs would merge unreviewed because of an API
+	// failure.
+	if verdict.LookupFailed {
+		return 0, false
+	}
 	// Sticky memory: a reviewer seen on this head keeps blocking even if this
 	// read came back unobserved (e.g. a failed check-runs lookup fell through
 	// to the comment path).

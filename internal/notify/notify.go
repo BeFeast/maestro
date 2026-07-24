@@ -32,6 +32,10 @@ type Notifier struct {
 	// An alert whose body equals the last-sent body is a no-op (no state
 	// change), so a supervisor cycle re-emitting the same condition sends once.
 	alertState map[string]string
+	// alertInFlight reserves an alert that is being sent right now, so
+	// concurrent callers with the same (class,key,body) collapse to one send
+	// without recording delivery before it succeeds.
+	alertInFlight map[string]string
 }
 
 // WithNtfy configures the ntfy push transport and returns the notifier for
@@ -193,11 +197,28 @@ func (n *Notifier) Sendf(format string, args ...any) {
 func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	stateKey := string(class) + "\x00" + key
 
+	// Reserve the (class,key,body) under the lock so concurrent callers with an
+	// identical alert still collapse to one send, then release it if the send
+	// fails so the condition stays eligible for retry. Recording delivery
+	// before sending would lose alerts on a transport error; not reserving at
+	// all would duplicate them under concurrency.
 	n.mu.Lock()
 	if last, ok := n.alertState[stateKey]; ok && last == body {
 		n.mu.Unlock()
 		return nil // no state change since last send — dedup
 	}
+	if inflight, ok := n.alertInFlight[stateKey]; ok && inflight == body {
+		n.mu.Unlock()
+		return nil // another caller is sending this exact alert right now
+	}
+	if n.alertInFlight == nil {
+		n.alertInFlight = make(map[string]string)
+	}
+	n.alertInFlight[stateKey] = body
+	// In digest mode the base transport only buffers, so "sent" is not
+	// "delivered" until Flush succeeds; skip the delivered-state write and let
+	// the next occurrence re-buffer rather than being silenced by dedup.
+	digestBuffered := !n.NtfyConfigured() && n.digestMode
 	n.mu.Unlock()
 
 	var err error
@@ -206,21 +227,17 @@ func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	} else {
 		err = n.Send(alertFallbackText(class, title, body))
 	}
-	if err != nil {
-		// Do NOT record the dedup state: a transient transport error would
-		// otherwise mark the alert as delivered and silence every later cycle
-		// reporting the same condition, permanently losing pages like a floor
-		// breach. An unsent alert must stay eligible for retry.
-		return err
-	}
 
 	n.mu.Lock()
-	if n.alertState == nil {
-		n.alertState = make(map[string]string)
+	delete(n.alertInFlight, stateKey)
+	if err == nil && !digestBuffered {
+		if n.alertState == nil {
+			n.alertState = make(map[string]string)
+		}
+		n.alertState[stateKey] = body
 	}
-	n.alertState[stateKey] = body
 	n.mu.Unlock()
-	return nil
+	return err
 }
 
 // alertFallbackText renders a classified alert for the plain-text transports,

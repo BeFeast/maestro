@@ -119,3 +119,46 @@ func TestAlert_TransportFailureStaysRetryable(t *testing.T) {
 		t.Fatalf("attempts = %d, want 2 — a failed alert must stay eligible for retry", attempts)
 	}
 }
+
+// Codex review catch (P2): concurrent identical alerts must still collapse to
+// one send — the retry fix must not lose the atomic dedup reservation.
+func TestAlert_ConcurrentIdenticalAlertsSendOnce(t *testing.T) {
+	var mu sync.Mutex
+	sends := 0
+	release := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		sends++
+		mu.Unlock()
+		<-release // hold the first send open so the second call races it
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := New(srv.URL, "operator")
+	var wg sync.WaitGroup
+	for i := 0; i < 2; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0")
+		}()
+	}
+	// Give both goroutines time to pass the dedup check before releasing.
+	for i := 0; i < 100; i++ {
+		mu.Lock()
+		started := sends
+		mu.Unlock()
+		if started > 0 {
+			break
+		}
+	}
+	close(release)
+	wg.Wait()
+
+	mu.Lock()
+	defer mu.Unlock()
+	if sends != 1 {
+		t.Fatalf("sends = %d, want 1 — concurrent identical alerts must collapse", sends)
+	}
+}

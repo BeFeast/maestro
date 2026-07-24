@@ -223,3 +223,15 @@ func TestNotifyMissingReviewGate_OncePerPR(t *testing.T) {
 		t.Fatalf("notified map = %v, want a single entry", o.missingReviewNotified)
 	}
 }
+
+// Codex review catch (P1): a degraded read must never be read as silence — a
+// check-runs API outage would otherwise merge PRs unreviewed.
+func TestMissingReviewGateElapsed_LookupFailureIsNotSilence(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	verdict := github.ReviewGateVerdict{Pending: true, Observed: false, LookupFailed: true}
+
+	if _, missing := o.missingReviewGateElapsed(pendingSince(48*time.Hour, now), verdict, now); missing {
+		t.Fatal("an API failure was treated as proof the reviewer is silent")
+	}
+}
