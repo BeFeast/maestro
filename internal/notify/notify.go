@@ -194,21 +194,33 @@ func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	stateKey := string(class) + "\x00" + key
 
 	n.mu.Lock()
-	if n.alertState == nil {
-		n.alertState = make(map[string]string)
-	}
 	if last, ok := n.alertState[stateKey]; ok && last == body {
 		n.mu.Unlock()
 		return nil // no state change since last send — dedup
 	}
-	n.alertState[stateKey] = body
 	n.mu.Unlock()
 
-	if !n.NtfyConfigured() {
-		return n.Send(alertFallbackText(class, title, body))
+	var err error
+	if n.NtfyConfigured() {
+		err = n.sendNtfy(title, body, RouteFor(class))
+	} else {
+		err = n.Send(alertFallbackText(class, title, body))
 	}
-	route := RouteFor(class)
-	return n.sendNtfy(title, body, route)
+	if err != nil {
+		// Do NOT record the dedup state: a transient transport error would
+		// otherwise mark the alert as delivered and silence every later cycle
+		// reporting the same condition, permanently losing pages like a floor
+		// breach. An unsent alert must stay eligible for retry.
+		return err
+	}
+
+	n.mu.Lock()
+	if n.alertState == nil {
+		n.alertState = make(map[string]string)
+	}
+	n.alertState[stateKey] = body
+	n.mu.Unlock()
+	return nil
 }
 
 // alertFallbackText renders a classified alert for the plain-text transports,

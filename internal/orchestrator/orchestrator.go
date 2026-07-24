@@ -5601,9 +5601,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
 			persistGate()
+			// Record what the gate said for this head BEFORE branching: a
+			// settled rejection is evidence the reviewer is alive just as much
+			// as a pending one, and only a head change may erase it.
+			now := time.Now().UTC()
+			o.trackReviewGateHead(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 			if reviewVerdict.Pending {
-				now := time.Now().UTC()
-				o.trackReviewPendingClock(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
 				// A gate that never produced any signal is not "reviewing" —
 				// it is absent. Past the configured grace the PR proceeds on
@@ -5618,7 +5621,7 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 					// next cycle. Repeated deferrals would then reset the
 					// window forever and the PR would never merge. The state
 					// is irrelevant once the merge succeeds, and a new head
-					// resets it through trackReviewPendingClock.
+					// resets it through trackReviewGateHead.
 					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA, missingReviewFor: silentFor})
 					continue
 				}
@@ -6026,7 +6029,7 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	head := sess.ReviewPendingHeadSHA
 	now := time.Now().UTC()
 	if sess.ReviewPendingSince == nil {
-		return // clock not started yet; trackReviewPendingClock owns that
+		return // clock not started yet; trackReviewGateHead owns that
 	}
 	pendingFor := now.Sub(*sess.ReviewPendingSince)
 	if pendingFor < o.cfg.ReviewRetrigger.EffectivePendingFor() {
@@ -6068,32 +6071,33 @@ func (o *Orchestrator) reviewClockHead(pr github.PR, gateHead string) string {
 	return head
 }
 
-// trackReviewPendingClock maintains the per-head review-gate clock for ANY
-// pending verdict, independent of the Greptile-specific comment re-trigger:
-// a project gating on another stream, or one with re-triggers disabled, still
-// needs the clock for the missing-review policy.
+// trackReviewGateHead maintains the per-head review-gate memory. It runs for
+// EVERY verdict, not just pending ones: a settled rejection is also proof the
+// reviewer is alive, and skipping it would let a later run of failed
+// check-runs reads look like "the reviewer never showed up" and merge a PR the
+// reviewer had already rejected.
 //
-// ReviewGateObserved is sticky within a head. A reviewer that has spoken once
-// keeps blocking even if a later read comes back unobserved — a transient
-// check-runs API error must not be able to demote a working reviewer to
-// "absent" and let the PR through.
-func (o *Orchestrator) trackReviewPendingClock(sess *state.Session, head string, verdict github.ReviewGateVerdict, now time.Time) {
+// ReviewGateObserved is sticky within a head and reset ONLY when the head
+// actually changes — a push or server-side update-branch genuinely restarts
+// the review, everything else must not erase what we already saw. The pending
+// clock starts at the first pending observation on the head; the
+// Greptile-specific comment re-trigger does not own any of this.
+func (o *Orchestrator) trackReviewGateHead(sess *state.Session, head string, verdict github.ReviewGateVerdict, now time.Time) {
 	if sess == nil || head == "" {
 		return
 	}
-	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
-		// First pending observation on this head — start the clock. A new head
-		// (push or server-side update-branch) restarts it, including the
-		// attempt counter and the observation memory.
-		started := now
+	if sess.ReviewPendingHeadSHA != head {
 		sess.ReviewPendingHeadSHA = head
-		sess.ReviewPendingSince = &started
+		sess.ReviewPendingSince = nil
 		sess.ReviewRetriggerCount = 0
-		sess.ReviewGateObserved = verdict.Observed
-		return
+		sess.ReviewGateObserved = false
 	}
 	if verdict.Observed {
 		sess.ReviewGateObserved = true
+	}
+	if verdict.Pending && sess.ReviewPendingSince == nil {
+		started := now
+		sess.ReviewPendingSince = &started
 	}
 }
 

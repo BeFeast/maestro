@@ -108,7 +108,7 @@ func TestMissingReviewGateElapsed_StickyObservationBlocksExpiry(t *testing.T) {
 	sess := pendingSince(90*time.Minute, now)
 
 	// The reviewer was seen earlier on this head.
-	o.trackReviewPendingClock(sess, "deadbeef", github.ReviewGateVerdict{Pending: true, Observed: true}, now)
+	o.trackReviewGateHead(sess, "deadbeef", github.ReviewGateVerdict{Pending: true, Observed: true}, now)
 	if !sess.ReviewGateObserved {
 		t.Fatal("observation was not recorded")
 	}
@@ -121,14 +121,14 @@ func TestMissingReviewGateElapsed_StickyObservationBlocksExpiry(t *testing.T) {
 }
 
 // A new head resets both the clock and the observation memory.
-func TestTrackReviewPendingClock_NewHeadResets(t *testing.T) {
+func TestTrackReviewGateHead_NewHeadResets(t *testing.T) {
 	now := time.Now().UTC()
 	o := missingReviewOrchestrator(60)
 	sess := pendingSince(90*time.Minute, now)
 	sess.ReviewGateObserved = true
 	sess.ReviewRetriggerCount = 3
 
-	o.trackReviewPendingClock(sess, "cafebabe", github.ReviewGateVerdict{Pending: true, Observed: false}, now)
+	o.trackReviewGateHead(sess, "cafebabe", github.ReviewGateVerdict{Pending: true, Observed: false}, now)
 
 	if sess.ReviewPendingHeadSHA != "cafebabe" {
 		t.Fatalf("head = %q, want cafebabe", sess.ReviewPendingHeadSHA)
@@ -147,12 +147,12 @@ func TestTrackReviewPendingClock_NewHeadResets(t *testing.T) {
 // Codex review catch (P2): the clock must start for a pending gate regardless
 // of which stream is pending — the Greptile-specific retrigger is not the
 // owner of the clock.
-func TestTrackReviewPendingClock_StartsForNonGreptileStream(t *testing.T) {
+func TestTrackReviewGateHead_StartsForNonGreptileStream(t *testing.T) {
 	now := time.Now().UTC()
 	o := missingReviewOrchestrator(60)
 	sess := &state.Session{}
 
-	o.trackReviewPendingClock(sess, "deadbeef", github.ReviewGateVerdict{
+	o.trackReviewGateHead(sess, "deadbeef", github.ReviewGateVerdict{
 		Pending:  true,
 		Observed: false,
 		Streams:  []github.ReviewStreamVerdict{{Name: "simplicity", Pending: true}},
@@ -178,9 +178,36 @@ func TestMissingReviewGateElapsed_SurvivesDeferredMerge(t *testing.T) {
 	}
 
 	// The merge was deferred this cycle; the clock must NOT have been reset.
-	o.trackReviewPendingClock(sess, "deadbeef", verdict, now.Add(time.Minute))
+	o.trackReviewGateHead(sess, "deadbeef", verdict, now.Add(time.Minute))
 	if _, missing := o.missingReviewGateElapsed(sess, verdict, now.Add(time.Minute)); !missing {
 		t.Fatal("a deferred candidate lost its elapsed grace — repeated deferrals would reset the window forever")
+	}
+}
+
+// Codex review catch (P1): a SETTLED verdict is proof the reviewer is alive
+// too. Recording observations only for pending verdicts meant a rejection
+// followed by failing check-runs reads could look like "never showed up" and
+// merge a PR the reviewer had rejected.
+func TestTrackReviewGateHead_RecordsSettledRejection(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := &state.Session{}
+
+	// The reviewer rejected this head: settled, not pending, but observed.
+	o.trackReviewGateHead(sess, "deadbeef", github.ReviewGateVerdict{Pending: false, Passed: false, Observed: true}, now)
+	if !sess.ReviewGateObserved {
+		t.Fatal("a settled rejection was not recorded as an observation")
+	}
+	if sess.ReviewPendingSince != nil {
+		t.Fatal("a settled verdict must not start the pending clock")
+	}
+
+	// Later reads fail over and look unobserved for longer than the grace.
+	since := now.Add(-90 * time.Minute)
+	sess.ReviewPendingSince = &since
+	blip := github.ReviewGateVerdict{Pending: true, Observed: false}
+	if _, missing := o.missingReviewGateElapsed(sess, blip, now); missing {
+		t.Fatal("a PR whose reviewer already rejected it was treated as unreviewed")
 	}
 }
 

@@ -79,3 +79,43 @@ func TestAlertFallbackText(t *testing.T) {
 		t.Fatalf("both = %q", got)
 	}
 }
+
+// Codex review catch (P1): a failed send must NOT record the dedup state, or
+// every later cycle reporting the same condition is silenced and the alert is
+// lost for good.
+func TestAlert_TransportFailureStaysRetryable(t *testing.T) {
+	var mu sync.Mutex
+	attempts := 0
+	fail := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		attempts++
+		shouldFail := fail
+		mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := New(srv.URL, "operator")
+	if err := n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0"); err == nil {
+		t.Fatal("expected the transport error to surface")
+	}
+
+	mu.Lock()
+	fail = false
+	mu.Unlock()
+
+	// Same condition next cycle: it must be retried, not deduped away.
+	if err := n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0"); err != nil {
+		t.Fatalf("retry failed: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2 — a failed alert must stay eligible for retry", attempts)
+	}
+}
