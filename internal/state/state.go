@@ -373,6 +373,12 @@ type Session struct {
 	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
 	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
 	ReviewRetriggerCount int        `json:"review_retrigger_count,omitempty"`  // re-triggers posted for ReviewPendingHeadSHA; capped by review_retrigger.max_attempts
+	// ReviewGateObserved is sticky for ReviewPendingHeadSHA: once ANY reviewer
+	// signal is seen on that head it stays true until the head changes. A
+	// transient check-runs API error degrades one read to "unobserved", and
+	// without this memory that single blip would look like "the reviewer never
+	// showed up" and expire a gate that is genuinely working.
+	ReviewGateObserved bool `json:"review_gate_observed,omitempty"`
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits

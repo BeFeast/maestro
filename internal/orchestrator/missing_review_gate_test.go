@@ -99,6 +99,70 @@ func TestMissingReviewGateElapsed_SettledGateIgnored(t *testing.T) {
 	}
 }
 
+// Codex review catch (P1): a reviewer seen on this head keeps blocking even if
+// a later read comes back unobserved — a transient check-runs error must not
+// demote a working reviewer to "absent".
+func TestMissingReviewGateElapsed_StickyObservationBlocksExpiry(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := pendingSince(90*time.Minute, now)
+
+	// The reviewer was seen earlier on this head.
+	o.trackReviewPendingClock(sess, "deadbeef", github.ReviewGateVerdict{Pending: true, Observed: true}, now)
+	if !sess.ReviewGateObserved {
+		t.Fatal("observation was not recorded")
+	}
+
+	// This cycle's read failed over to the comment path and looks unobserved.
+	blip := github.ReviewGateVerdict{Pending: true, Observed: false}
+	if _, missing := o.missingReviewGateElapsed(sess, blip, now); missing {
+		t.Fatal("a single unobserved read expired a gate that was observed earlier on the same head")
+	}
+}
+
+// A new head resets both the clock and the observation memory.
+func TestTrackReviewPendingClock_NewHeadResets(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := pendingSince(90*time.Minute, now)
+	sess.ReviewGateObserved = true
+	sess.ReviewRetriggerCount = 3
+
+	o.trackReviewPendingClock(sess, "cafebabe", github.ReviewGateVerdict{Pending: true, Observed: false}, now)
+
+	if sess.ReviewPendingHeadSHA != "cafebabe" {
+		t.Fatalf("head = %q, want cafebabe", sess.ReviewPendingHeadSHA)
+	}
+	if sess.ReviewGateObserved {
+		t.Fatal("observation memory survived a head change")
+	}
+	if sess.ReviewRetriggerCount != 0 {
+		t.Fatalf("retrigger count = %d, want 0 after a head change", sess.ReviewRetriggerCount)
+	}
+	if sess.ReviewPendingSince == nil || !sess.ReviewPendingSince.Equal(now) {
+		t.Fatal("clock was not restarted on the new head")
+	}
+}
+
+// Codex review catch (P2): the clock must start for a pending gate regardless
+// of which stream is pending — the Greptile-specific retrigger is not the
+// owner of the clock.
+func TestTrackReviewPendingClock_StartsForNonGreptileStream(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := &state.Session{}
+
+	o.trackReviewPendingClock(sess, "deadbeef", github.ReviewGateVerdict{
+		Pending:  true,
+		Observed: false,
+		Streams:  []github.ReviewStreamVerdict{{Name: "simplicity", Pending: true}},
+	}, now)
+
+	if sess.ReviewPendingSince == nil {
+		t.Fatal("clock did not start for a non-greptile pending stream")
+	}
+}
+
 // The merge-past-absent-gate alert fires once per PR.
 func TestNotifyMissingReviewGate_OncePerPR(t *testing.T) {
 	o := missingReviewOrchestrator(60)

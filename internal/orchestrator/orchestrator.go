@@ -5389,6 +5389,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		sess     *state.Session
 		pr       github.PR
 		headSHA  string
+		// missingReviewFor is non-zero when this candidate bypassed a silent
+		// review gate. The operator alert fires only after the merge actually
+		// succeeds — a candidate can still be deferred by the merge interval,
+		// dropped by conflict filtering, or fail to merge.
+		missingReviewFor time.Duration
 	}
 
 	ready := make([]mergeCandidate, 0)
@@ -5597,17 +5602,18 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
 			persistGate()
 			if reviewVerdict.Pending {
+				now := time.Now().UTC()
+				o.trackReviewPendingClock(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
 				// A gate that never produced any signal is not "reviewing" —
 				// it is absent. Past the configured grace the PR proceeds on
 				// its own merits (CI is already green here) instead of waiting
 				// forever on a reviewer that is not coming.
-				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, time.Now().UTC()); missing {
+				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, now); missing {
 					log.Printf("[orch] PR #%d: review gate produced no signal for %s — treating the missing review as non-blocking (review_retrigger.missing_after_minutes)",
 						pr.Number, silentFor.Round(time.Minute))
-					o.notifyMissingReviewGate(pr.Number, silentFor)
 					clearReviewPendingTracking(sess)
-					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA})
+					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA, missingReviewFor: silentFor})
 					continue
 				}
 				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
@@ -5684,7 +5690,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	strategy := o.mergeStrategy()
 	if strategy == "parallel" {
 		for _, candidate := range ready {
-			o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+			if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+				o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+			}
 		}
 		return
 	}
@@ -5720,7 +5728,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 
 	candidate := ready[0]
-	o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+	if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+		o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+	}
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
@@ -6007,20 +6017,10 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if !greptileReviewStreamPending(verdict) {
 		return // a non-greptile stream is pending; "@greptile review" won't help
 	}
-	head, err := o.prHeadSHA(pr.Number)
-	if err != nil {
-		log.Printf("[orch] review re-trigger: head SHA for PR #%d: %v", pr.Number, err)
-		return
-	}
+	head := sess.ReviewPendingHeadSHA
 	now := time.Now().UTC()
-	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
-		// First pending observation on this head — start the clock. A new
-		// head (push or server-side update-branch) restarts it, including the
-		// attempt counter.
-		sess.ReviewPendingHeadSHA = head
-		sess.ReviewPendingSince = &now
-		sess.ReviewRetriggerCount = 0
-		return
+	if sess.ReviewPendingSince == nil {
+		return // clock not started yet; trackReviewPendingClock owns that
 	}
 	pendingFor := now.Sub(*sess.ReviewPendingSince)
 	if pendingFor < o.cfg.ReviewRetrigger.EffectivePendingFor() {
@@ -6044,6 +6044,51 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%d, #691)",
 		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment,
 		sess.ReviewRetriggerCount, o.cfg.ReviewRetrigger.EffectiveMaxAttempts())
+}
+
+// reviewClockHead picks the head SHA the review clock applies to: the one the
+// gate transition already read, falling back to a direct lookup when the gate
+// is not observable. An empty result skips the clock rather than anchoring it
+// to the wrong head.
+func (o *Orchestrator) reviewClockHead(pr github.PR, gateHead string) string {
+	if strings.TrimSpace(gateHead) != "" {
+		return gateHead
+	}
+	head, err := o.prHeadSHA(pr.Number)
+	if err != nil {
+		log.Printf("[orch] review clock: head SHA for PR #%d: %v", pr.Number, err)
+		return ""
+	}
+	return head
+}
+
+// trackReviewPendingClock maintains the per-head review-gate clock for ANY
+// pending verdict, independent of the Greptile-specific comment re-trigger:
+// a project gating on another stream, or one with re-triggers disabled, still
+// needs the clock for the missing-review policy.
+//
+// ReviewGateObserved is sticky within a head. A reviewer that has spoken once
+// keeps blocking even if a later read comes back unobserved — a transient
+// check-runs API error must not be able to demote a working reviewer to
+// "absent" and let the PR through.
+func (o *Orchestrator) trackReviewPendingClock(sess *state.Session, head string, verdict github.ReviewGateVerdict, now time.Time) {
+	if sess == nil || head == "" {
+		return
+	}
+	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
+		// First pending observation on this head — start the clock. A new head
+		// (push or server-side update-branch) restarts it, including the
+		// attempt counter and the observation memory.
+		started := now
+		sess.ReviewPendingHeadSHA = head
+		sess.ReviewPendingSince = &started
+		sess.ReviewRetriggerCount = 0
+		sess.ReviewGateObserved = verdict.Observed
+		return
+	}
+	if verdict.Observed {
+		sess.ReviewGateObserved = true
+	}
 }
 
 // notifyMissingReviewGate tells the operator that a merge proceeded without a
@@ -6090,6 +6135,12 @@ func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict git
 	}
 	grace := o.cfg.ReviewRetrigger.MissingReviewGraceOrZero()
 	if grace <= 0 || verdict.Observed || !verdict.Pending {
+		return 0, false
+	}
+	// Sticky memory: a reviewer seen on this head keeps blocking even if this
+	// read came back unobserved (e.g. a failed check-runs lookup fell through
+	// to the comment path).
+	if sess.ReviewGateObserved {
 		return 0, false
 	}
 	if sess.ReviewPendingSince == nil {
