@@ -77,9 +77,12 @@ type Orchestrator struct {
 	// direct GitHub client — it serves fresh mirror rows locally and falls back
 	// to the API on a miss/stale. Writes and un-mirrored reads always stay on
 	// gh, so GitHub remains authoritative. nil = today's API-direct behavior.
-	readSource            githubReadSource
-	router                *router.Router
-	repo                  string
+	readSource githubReadSource
+	// tokenBudgetMillNotified remembers the streak length already alerted per
+	// issue so a held budget-wall issue alerts on escalation, not every cycle.
+	tokenBudgetMillNotified map[int]int
+	router                  *router.Router
+	repo                    string
 	binaryVersion         string
 	promptBase            string
 	bugPromptBase         string
@@ -1468,6 +1471,61 @@ func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetM
 		delta := marker.TokensObserved - sess.TokensUsedAttempt
 		sess.TokensUsedAttempt = marker.TokensObserved
 		sess.TokensUsedTotal += delta
+	}
+}
+
+// tokenBudgetKillStreakLimit is how many consecutive PR-less token-budget
+// stops on one issue are treated as a misconfigured budget rather than three
+// unlucky workers. Two is deliberate: one stop is a plausible runaway worker,
+// two in a row on the same issue means the budget itself is the wall.
+const tokenBudgetKillStreakLimit = 2
+
+// tokenBudgetMillHold reports whether fresh dispatch must hold for this issue's
+// budget-kill streak, and owns the alert bookkeeping. A streak below the limit
+// clears the alert memory: once a worker ends any other way the wall is gone,
+// and a later wall on the same issue must alert again rather than hold it
+// silently — a guard that parks work without telling anyone is the failure mode
+// this whole change exists to remove.
+func (o *Orchestrator) tokenBudgetMillHold(issueNumber, kills int) bool {
+	if o == nil {
+		return false
+	}
+	if kills < tokenBudgetKillStreakLimit {
+		delete(o.tokenBudgetMillNotified, issueNumber)
+		return false
+	}
+	o.notifyTokenBudgetMill(issueNumber, kills)
+	return true
+}
+
+// notifyTokenBudgetMill surfaces a budget-kill streak once per streak length so
+// a held issue cannot become a silent stall. The alert class is futile_recovery:
+// automated re-dispatch that cannot succeed until an operator changes config.
+func (o *Orchestrator) notifyTokenBudgetMill(issueNumber, kills int) {
+	if o == nil || o.notifier == nil {
+		return
+	}
+	if o.tokenBudgetMillNotified == nil {
+		o.tokenBudgetMillNotified = make(map[int]int)
+	}
+	if o.tokenBudgetMillNotified[issueNumber] >= kills {
+		return
+	}
+	o.tokenBudgetMillNotified[issueNumber] = kills
+	project := strings.TrimSpace(o.repo)
+	if project == "" && o.cfg != nil {
+		project = strings.TrimSpace(o.cfg.Repo)
+	}
+	title := "maestro token budget wall"
+	if project != "" {
+		title += ": " + project
+	}
+	body := fmt.Sprintf(
+		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch is held until the budget is raised.",
+		issueNumber, kills, o.cfg.WorkerMaxTokens,
+	)
+	if err := o.notifier.Alert(notify.AlertFutileRecovery, fmt.Sprintf("%s:token_budget_wall:%d", project, issueNumber), title, body); err != nil {
+		log.Printf("[orch] token-budget-wall notification failed for issue #%d: %v", issueNumber, err)
 	}
 }
 
@@ -10027,6 +10085,23 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if label, ok := matchingIssueLabel(issue, o.operatorGateLabels()); ok {
 			log.Printf("[orch] skipping issue #%d: held by operator gate label %q", issue.Number, label)
 			continue
+		}
+
+		// Break the budget-kill mill: a token budget below the floor a worker
+		// needs to load its initial context kills every dispatch identically,
+		// and budget stops are excluded from the retry budget by design, so
+		// nothing else stops the loop (#628 live: 9 spawns in 4.5h, each ~2
+		// min at observed≈157k vs max=120k). After a streak of PR-less budget
+		// kills the issue is held and the misconfiguration is surfaced once —
+		// the operator raises worker_max_tokens (or fixes the measure) instead
+		// of watching the fleet re-spawn into the same wall.
+		if !repairSpawn {
+			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number)
+			if o.tokenBudgetMillHold(issue.Number, kills) {
+				log.Printf("[orch] skipping issue #%d: %d consecutive token-budget stops — worker_max_tokens=%d is likely below the viable floor for this issue",
+					issue.Number, kills, o.cfg.WorkerMaxTokens)
+				continue
+			}
 		}
 
 		// Check retry limit: skip issues that have exhausted their retry budget
