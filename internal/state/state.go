@@ -5072,6 +5072,55 @@ func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	return count
 }
 
+// ConsecutiveTokenBudgetKillsForIssue counts how many of the issue's most
+// recent PR-less sessions ended at the token budget, stopping at the first
+// session that ended any other way.
+//
+// A budget stop is deliberately excluded from FailedAttemptsForIssue — it is a
+// governor, not a work failure, so it must not burn the per-issue retry budget.
+// The gap that leaves: when the configured budget sits BELOW the floor a worker
+// needs just to load its initial context, every dispatch dies the same way and
+// nothing ever stops re-dispatching. Live 2026-07-24: ok-player #628 spawned 9
+// times in 4.5h, each killed after ~2 minutes at observed≈157k vs max=120k.
+// Callers use this streak to break the mill and surface the misconfiguration.
+func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
+	if s == nil {
+		return 0
+	}
+	type ended struct {
+		at      time.Time
+		budget  bool
+		counted bool
+	}
+	var history []ended
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNum || sess.PRNumber != 0 {
+			continue
+		}
+		if sess.Status != StatusDead && sess.Status != StatusFailed && sess.Status != StatusRetryExhausted {
+			continue
+		}
+		at := sess.StartedAt
+		if sess.FinishedAt != nil {
+			at = *sess.FinishedAt
+		}
+		history = append(history, ended{
+			at:      at,
+			budget:  sess.WorkerOutcome == string(DisplayTokenBudgetExceeded),
+			counted: true,
+		})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].at.After(history[j].at) })
+	streak := 0
+	for _, entry := range history {
+		if !entry.budget {
+			break
+		}
+		streak++
+	}
+	return streak
+}
+
 // IssueRetryExhausted returns true if any session for the given issue
 // has been marked as retry_exhausted.
 func (s *State) IssueRetryExhausted(issueNum int) bool {
