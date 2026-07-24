@@ -190,6 +190,9 @@ type BackendSelection struct {
 	CandidateScores      []BackendCandidate `json:"candidate_scores,omitempty"`
 	HardPin              bool               `json:"hard_pin,omitempty"`
 	PreviousBackend      string             `json:"previous_backend,omitempty"`
+	// HoldUntil (RFC3339) is set when hold_on_cooldown suppressed a fallback
+	// cascade: no backend was selected and the work waits for this instant.
+	HoldUntil string `json:"hold_until,omitempty"`
 
 	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
 	// strength tier the policy resolved to; Effort/Model are the per-tier

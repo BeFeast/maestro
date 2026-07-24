@@ -27,7 +27,44 @@ const (
 	// or disabled), so the first healthy fallback was substituted instead of
 	// re-burning the retry budget on a dead backend (#805).
 	selectionReasonRetryBlockedFallback = "retry_fallback_blocked_backend"
+	// selectionReasonHoldOnCooldown marks a dispatch/fallover that was HELD
+	// for the routed backend's quota-cooldown reset instead of cascading to
+	// the next fallback rung (model.hold_on_cooldown). The work waits for the
+	// stated RetryAfter; nothing was substituted.
+	selectionReasonHoldOnCooldown = "hold_on_cooldown"
 )
+
+// holdableCooldownReason reports whether a BackendHealth block reason is a
+// quota/capacity cooldown worth waiting out under model.hold_on_cooldown.
+// Auth failures and missing models are excluded: waiting cannot fix them, so
+// they keep cascading to the next rung.
+func holdableCooldownReason(reason string) bool {
+	switch reason {
+	case state.BackendBlockProviderLimit,
+		state.BackendBlockUsageLimit,
+		state.BackendBlockModelCooldown,
+		state.BackendBlockModelOverloaded,
+		state.BackendBlockQuotaPressure:
+		return true
+	}
+	return false
+}
+
+// holdOnCooldownUntil decides whether a blocked backend should be waited for
+// instead of cascaded past. It returns the hold expiry when hold_on_cooldown
+// is enabled, the block is a holdable quota cooldown, and the stated reset
+// lands inside the configured window. A nil RetryAfter (unknown reset) or a
+// reset beyond max_wait (weekly cap) keeps today's cascade behavior.
+func (o *Orchestrator) holdOnCooldownUntil(blockedBy string, retryAfter *time.Time, now time.Time) (*time.Time, bool) {
+	hold := o.cfg.Model.HoldOnCooldown
+	if !hold.Enabled || !holdableCooldownReason(blockedBy) || retryAfter == nil {
+		return nil, false
+	}
+	if !retryAfter.After(now) || retryAfter.After(now.Add(hold.MaxWait())) {
+		return nil, false
+	}
+	return retryAfter, true
+}
 
 // backendFailureCopy holds the reason-dependent strings the dead-worker
 // handlers use to gate a backend and respawn on a fallback (#693/#713). Auth
@@ -261,6 +298,30 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 		RouteSelectionReason: o.cfg.Model.ResolvedRoute().SelectionReason,
 		PreviousBackend:      backendName(sess),
 	}
+	// model.hold_on_cooldown: when the session's own backend is gated by a
+	// quota cooldown that resets inside the hold window, refuse to cascade —
+	// return no selection so every caller takes its existing no-fallback path
+	// (park the retry / mark the budget-preserving dead session) and the work
+	// waits for the reset instead of dumping onto the next rung. The held
+	// backend is recorded as the sole blocked candidate so the audit trail and
+	// earliestCandidateRetry carry the hold expiry.
+	if holdUntil, held := o.sessionBackendHold(st, sess, now); held {
+		provider, model := o.providerModelRouteForSession(sess, "", "")
+		selection.SelectionReason = selectionReasonHoldOnCooldown
+		selection.HoldUntil = holdUntil.UTC().Format(time.RFC3339)
+		selection.CandidateScores = append(selection.CandidateScores, state.BackendCandidate{
+			Backend:    backendName(sess),
+			Provider:   provider,
+			Model:      model,
+			Available:  false,
+			BlockedBy:  o.sessionBackendBlockReason(st, sess),
+			RetryAfter: holdUntil.UTC().Format(time.RFC3339),
+			Fit:        0.5, Policy: 0.5, Final: 0.5,
+		})
+		log.Printf("[orch] hold_on_cooldown: backend %s cooling down until %s — holding instead of falling back (%s)",
+			backendName(sess), holdUntil.UTC().Format(time.RFC3339), selectionReason)
+		return selection
+	}
 	for _, candidate := range o.backendFallbackCandidates(st, sess, selectionReason) {
 		provider, model := o.providerModelRouteForBackend(candidate, "")
 		entry := state.BackendCandidate{Backend: candidate, Provider: provider, Model: model, Fit: 0.5, Policy: 0.5, Final: 0.5}
@@ -327,6 +388,44 @@ func (o *Orchestrator) selectBackendFallback(st *state.State, sess *state.Sessio
 	return selection
 }
 
+// sessionBackendHold reports whether the session's current backend is in a
+// holdable quota cooldown whose reset lands inside the hold_on_cooldown
+// window, checking both the backend-level gate and the provider/model-scoped
+// route gate.
+func (o *Orchestrator) sessionBackendHold(st *state.State, sess *state.Session, now time.Time) (*time.Time, bool) {
+	if st == nil || sess == nil || sess.Backend == "" || !o.cfg.Model.HoldOnCooldown.Enabled {
+		return nil, false
+	}
+	if health, ok := st.BackendHealth[sess.Backend]; ok && health.State == state.BackendHealthCooldown {
+		if holdUntil, held := o.holdOnCooldownUntil(health.Reason, health.RetryAfter, now); held {
+			return holdUntil, true
+		}
+	}
+	provider, model := o.providerModelRouteForSession(sess, "", "")
+	if health, ok := providerModelHealth(st, provider, model); ok && health.State == state.BackendHealthCooldown {
+		if holdUntil, held := o.holdOnCooldownUntil(health.Reason, health.RetryAfter, now); held {
+			return holdUntil, true
+		}
+	}
+	return nil, false
+}
+
+// sessionBackendBlockReason returns the block reason recorded for the
+// session's backend (backend-level first, then the provider/model route).
+func (o *Orchestrator) sessionBackendBlockReason(st *state.State, sess *state.Session) string {
+	if st == nil || sess == nil {
+		return ""
+	}
+	if health, ok := st.BackendHealth[sess.Backend]; ok && health.State == state.BackendHealthCooldown {
+		return health.Reason
+	}
+	provider, model := o.providerModelRouteForSession(sess, "", "")
+	if health, ok := providerModelHealth(st, provider, model); ok && health.State == state.BackendHealthCooldown {
+		return health.Reason
+	}
+	return ""
+}
+
 // resolveDispatchBackend resolves the backend for a fresh dispatch and gates
 // the routed choice on BackendHealth (#695). Without this gate the router's
 // decision never saw cooldowns, so during a credential outage every new
@@ -343,6 +442,15 @@ func (o *Orchestrator) resolveDispatchBackend(st *state.State, issue github.Issu
 	blockedBy, blockedRetry := o.dispatchBackendBlock(st, decision.Backend, decision.Model, now)
 	if blockedBy == "" {
 		return decision, true, nil
+	}
+	// model.hold_on_cooldown: a routed backend gated by a quota cooldown with
+	// a reset inside the hold window is a wait, not a cascade. Report the
+	// dispatch as not-dispatchable with the hold expiry so the caller pauses
+	// this issue until the window reopens instead of substituting the next
+	// rung. Reason marks the hold so the pause log names it.
+	if holdUntil, held := o.holdOnCooldownUntil(blockedBy, blockedRetry, now); held {
+		decision.Reason = selectionReasonHoldOnCooldown
+		return decision, false, holdUntil
 	}
 	earliest := blockedRetry
 	candidates := o.dispatchBackendCandidates(decision.Backend)

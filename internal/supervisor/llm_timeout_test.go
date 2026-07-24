@@ -33,7 +33,7 @@ func TestSupervisorBackendCandidatesUsesOrderedFallbacks(t *testing.T) {
 			"gpt55":  {Enabled: &disabled, Cmd: "codex"},
 		},
 	}}
-	candidates, err := supervisorBackendCandidates(cfg)
+	candidates, err := supervisorBackendCandidates(cfg, nil, time.Now().UTC())
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -10180,7 +10180,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 					if retryAt != nil {
 						expiry = "earliest cooldown expires " + retryAt.UTC().Format(time.RFC3339)
 					}
-					log.Printf("[orch] dispatch paused: all backends blocked or cooling down (%s) — not spawning fresh workers this cycle", expiry)
+					if decision.Reason == selectionReasonHoldOnCooldown {
+						log.Printf("[orch] dispatch hold: routed backend %s cooling down (%s) — hold_on_cooldown waits for the reset instead of cascading to fallback rungs", decision.Backend, expiry)
+					} else {
+						log.Printf("[orch] dispatch paused: all backends blocked or cooling down (%s) — not spawning fresh workers this cycle", expiry)
+					}
 					dispatchPauseLogged = true
 				}
 				continue
