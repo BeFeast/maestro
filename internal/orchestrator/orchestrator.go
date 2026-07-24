@@ -81,6 +81,9 @@ type Orchestrator struct {
 	// tokenBudgetMillNotified remembers the streak length already alerted per
 	// issue so a held budget-wall issue alerts on escalation, not every cycle.
 	tokenBudgetMillNotified map[int]int
+	// missingReviewNotified remembers PRs already reported as merged past an
+	// absent review gate, so the alert fires once per PR.
+	missingReviewNotified map[int]bool
 	router                  *router.Router
 	repo                    string
 	binaryVersion         string
@@ -5594,8 +5597,20 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
 			persistGate()
 			if reviewVerdict.Pending {
-				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
+				// A gate that never produced any signal is not "reviewing" —
+				// it is absent. Past the configured grace the PR proceeds on
+				// its own merits (CI is already green here) instead of waiting
+				// forever on a reviewer that is not coming.
+				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, time.Now().UTC()); missing {
+					log.Printf("[orch] PR #%d: review gate produced no signal for %s — treating the missing review as non-blocking (review_retrigger.missing_after_minutes)",
+						pr.Number, silentFor.Round(time.Minute))
+					o.notifyMissingReviewGate(pr.Number, silentFor)
+					clearReviewPendingTracking(sess)
+					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA})
+					continue
+				}
+				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				continue // not ready yet
 			}
 			clearReviewPendingTracking(sess)
@@ -6000,9 +6015,11 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	now := time.Now().UTC()
 	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
 		// First pending observation on this head — start the clock. A new
-		// head (push or server-side update-branch) restarts it.
+		// head (push or server-side update-branch) restarts it, including the
+		// attempt counter.
 		sess.ReviewPendingHeadSHA = head
 		sess.ReviewPendingSince = &now
+		sess.ReviewRetriggerCount = 0
 		return
 	}
 	pendingFor := now.Sub(*sess.ReviewPendingSince)
@@ -6012,13 +6029,77 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if sess.ReviewRetriggerAt != nil && now.Sub(*sess.ReviewRetriggerAt) < o.cfg.ReviewRetrigger.EffectiveCooldown() {
 		return
 	}
+	// Stop nagging a reviewer that is not answering. Past the cap the PR still
+	// waits (or clears through the missing-review policy), but it stops
+	// collecting a comment every cooldown window forever.
+	if maxAttempts := o.cfg.ReviewRetrigger.EffectiveMaxAttempts(); sess.ReviewRetriggerCount >= maxAttempts {
+		return
+	}
 	if err := o.commentPR(pr.Number, greptileRetriggerComment); err != nil {
 		log.Printf("[orch] review re-trigger: comment on PR #%d: %v", pr.Number, err)
 		return
 	}
 	sess.ReviewRetriggerAt = &now
-	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (#691)",
-		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment)
+	sess.ReviewRetriggerCount++
+	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%d, #691)",
+		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment,
+		sess.ReviewRetriggerCount, o.cfg.ReviewRetrigger.EffectiveMaxAttempts())
+}
+
+// notifyMissingReviewGate tells the operator that a merge proceeded without a
+// review, once per PR. Merging past an absent gate is a deliberate, bounded
+// weakening of the safety net — it must never be silent.
+func (o *Orchestrator) notifyMissingReviewGate(prNumber int, silentFor time.Duration) {
+	if o == nil || o.notifier == nil {
+		return
+	}
+	if o.missingReviewNotified == nil {
+		o.missingReviewNotified = make(map[int]bool)
+	}
+	if o.missingReviewNotified[prNumber] {
+		return
+	}
+	o.missingReviewNotified[prNumber] = true
+	project := strings.TrimSpace(o.repo)
+	if project == "" && o.cfg != nil {
+		project = strings.TrimSpace(o.cfg.Repo)
+	}
+	title := "maestro review gate absent"
+	if project != "" {
+		title += ": " + project
+	}
+	if err := o.notifier.Alert(
+		notify.AlertGateFailStreak,
+		fmt.Sprintf("%s:missing_review:%d", project, prNumber),
+		title,
+		fmt.Sprintf("PR #%d merged with NO review signal at all (gate silent for %s). CI was green. Check whether the review service is down or out of credits.",
+			prNumber, silentFor.Round(time.Minute)),
+	); err != nil {
+		log.Printf("[orch] missing-review notification failed for PR #%d: %v", prNumber, err)
+	}
+}
+
+// missingReviewGateElapsed reports whether the review gate has been completely
+// silent — no check run, no comment, nothing — on this head for longer than
+// review_retrigger.missing_after_minutes. A gate that produced ANY signal is
+// never "missing": a reviewer working, or one that reported findings, keeps
+// blocking exactly as before. Opt-in: 0 keeps today's block-forever behavior.
+func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict github.ReviewGateVerdict, now time.Time) (time.Duration, bool) {
+	if o == nil || o.cfg == nil || sess == nil {
+		return 0, false
+	}
+	grace := o.cfg.ReviewRetrigger.MissingReviewGraceOrZero()
+	if grace <= 0 || verdict.Observed || !verdict.Pending {
+		return 0, false
+	}
+	if sess.ReviewPendingSince == nil {
+		return 0, false
+	}
+	silentFor := now.Sub(*sess.ReviewPendingSince)
+	if silentFor < grace {
+		return 0, false
+	}
+	return silentFor, true
 }
 
 // greptileReviewStreamPending reports whether the greptile stream is the one

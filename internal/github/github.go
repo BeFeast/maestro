@@ -2464,6 +2464,10 @@ commentFallback:
 
 	foundGreptile, signal, comment := greptileCommentReviewSignal(comments)
 	if !foundGreptile {
+		// No check run AND no comment: the reviewer never showed up for this
+		// head. Observed stays false so callers can distinguish this from a
+		// review in progress and apply a missing-review policy instead of
+		// waiting forever.
 		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending}, nil
 	}
 	verdict := reviewStreamVerdictFromGreptileSignal(signal)
@@ -2595,11 +2599,16 @@ func rangeContainedByAny(candidate []int, containers [][]int) bool {
 	return false
 }
 
+// reviewStreamVerdictFromGreptileSignal builds a verdict from a signal the
+// reviewer actually produced, so Observed is always true here. The only
+// unobserved verdict is the explicit no-signal return in
+// prGreptileReviewStreamVerdict.
 func reviewStreamVerdictFromGreptileSignal(signal greptileReviewSignal) ReviewStreamVerdict {
 	return ReviewStreamVerdict{
 		Name:     "greptile",
 		Passed:   signal.Passed,
 		Pending:  signal.Pending,
+		Observed: true,
 		Score:    signal.Score,
 		ScoreMax: signal.ScoreMax,
 		Verdict:  signal.Verdict,
@@ -3601,9 +3610,18 @@ type ReviewComment struct {
 }
 
 type ReviewStreamVerdict struct {
-	Name     string          `json:"name"`
-	Passed   bool            `json:"passed"`
-	Pending  bool            `json:"pending"`
+	Name    string `json:"name"`
+	Passed  bool   `json:"passed"`
+	Pending bool   `json:"pending"`
+	// Observed reports whether the reviewer produced ANY signal for this head
+	// — a check run or a comment, in any state including "queued". Without it
+	// Pending conflates two very different situations: "the reviewer is
+	// working on it" and "the reviewer never showed up". The second happens
+	// whenever the review service is silent (live 2026-07: Greptile paused
+	// reviews after its free credits ran out and posted nothing at all), and
+	// an unobserved pending gate would otherwise hold every PR forever with
+	// no timeout and no alert.
+	Observed bool            `json:"observed"`
 	Score    int             `json:"score,omitempty"`
 	ScoreMax int             `json:"score_max,omitempty"`
 	Verdict  string          `json:"verdict,omitempty"`
@@ -3611,9 +3629,12 @@ type ReviewStreamVerdict struct {
 }
 
 type ReviewGateVerdict struct {
-	Passed  bool                  `json:"passed"`
-	Pending bool                  `json:"pending"`
-	Streams []ReviewStreamVerdict `json:"streams"`
+	Passed  bool `json:"passed"`
+	Pending bool `json:"pending"`
+	// Observed is false when NO configured stream produced any signal, i.e.
+	// the whole review gate is silent rather than working.
+	Observed bool                  `json:"observed"`
+	Streams  []ReviewStreamVerdict `json:"streams"`
 }
 
 func (v ReviewGateVerdict) BlockingFindings() []ReviewComment {
@@ -3708,6 +3729,12 @@ func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGate
 			return ReviewGateVerdict{}, err
 		}
 		verdict.Streams = append(verdict.Streams, sv)
+		if sv.Observed {
+			// One reviewer speaking is enough for the gate to count as live:
+			// the missing-review policy only applies when the gate as a whole
+			// is silent.
+			verdict.Observed = true
+		}
 		if sv.Pending {
 			verdict.Pending = true
 			verdict.Passed = false
@@ -3770,6 +3797,9 @@ func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (
 		return ReviewStreamVerdict{}, commentsErr
 	}
 	sv := ReviewStreamVerdict{Name: spec.Name, Passed: false, Pending: false, Findings: findings}
+	// A check run in any state, or an inline finding, means the reviewer spoke
+	// for this head. The default branch below is the silent case.
+	sv.Observed = checkFound || checkPending || len(findings) > 0
 	switch {
 	case checkPending:
 		sv.Pending = true

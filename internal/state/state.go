@@ -372,6 +372,7 @@ type Session struct {
 	ReviewPendingHeadSHA string     `json:"review_pending_head_sha,omitempty"` // head SHA the pending clock applies to
 	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
 	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
+	ReviewRetriggerCount int        `json:"review_retrigger_count,omitempty"`  // re-triggers posted for ReviewPendingHeadSHA; capped by review_retrigger.max_attempts
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits
