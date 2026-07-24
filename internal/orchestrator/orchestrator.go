@@ -1480,6 +1480,24 @@ func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetM
 // two in a row on the same issue means the budget itself is the wall.
 const tokenBudgetKillStreakLimit = 2
 
+// tokenBudgetMillHold reports whether fresh dispatch must hold for this issue's
+// budget-kill streak, and owns the alert bookkeeping. A streak below the limit
+// clears the alert memory: once a worker ends any other way the wall is gone,
+// and a later wall on the same issue must alert again rather than hold it
+// silently — a guard that parks work without telling anyone is the failure mode
+// this whole change exists to remove.
+func (o *Orchestrator) tokenBudgetMillHold(issueNumber, kills int) bool {
+	if o == nil {
+		return false
+	}
+	if kills < tokenBudgetKillStreakLimit {
+		delete(o.tokenBudgetMillNotified, issueNumber)
+		return false
+	}
+	o.notifyTokenBudgetMill(issueNumber, kills)
+	return true
+}
+
 // notifyTokenBudgetMill surfaces a budget-kill streak once per streak length so
 // a held issue cannot become a silent stall. The alert class is futile_recovery:
 // automated re-dispatch that cannot succeed until an operator changes config.
@@ -10078,8 +10096,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// the operator raises worker_max_tokens (or fixes the measure) instead
 		// of watching the fleet re-spawn into the same wall.
 		if !repairSpawn {
-			if kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number); kills >= tokenBudgetKillStreakLimit {
-				o.notifyTokenBudgetMill(issue.Number, kills)
+			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number)
+			if o.tokenBudgetMillHold(issue.Number, kills) {
 				log.Printf("[orch] skipping issue #%d: %d consecutive token-budget stops — worker_max_tokens=%d is likely below the viable floor for this issue",
 					issue.Number, kills, o.cfg.WorkerMaxTokens)
 				continue
