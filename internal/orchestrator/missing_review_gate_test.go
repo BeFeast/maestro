@@ -163,6 +163,27 @@ func TestTrackReviewPendingClock_StartsForNonGreptileStream(t *testing.T) {
 	}
 }
 
+// Codex review catch: the elapsed grace must survive a deferred merge. A
+// candidate that is queued but not merged this cycle keeps its per-head clock,
+// otherwise repeated deferrals restart the window forever and the PR never
+// merges.
+func TestMissingReviewGateElapsed_SurvivesDeferredMerge(t *testing.T) {
+	now := time.Now().UTC()
+	o := missingReviewOrchestrator(60)
+	sess := pendingSince(90*time.Minute, now)
+	verdict := github.ReviewGateVerdict{Pending: true, Observed: false}
+
+	if _, missing := o.missingReviewGateElapsed(sess, verdict, now); !missing {
+		t.Fatal("precondition: the gate should be expired")
+	}
+
+	// The merge was deferred this cycle; the clock must NOT have been reset.
+	o.trackReviewPendingClock(sess, "deadbeef", verdict, now.Add(time.Minute))
+	if _, missing := o.missingReviewGateElapsed(sess, verdict, now.Add(time.Minute)); !missing {
+		t.Fatal("a deferred candidate lost its elapsed grace — repeated deferrals would reset the window forever")
+	}
+}
+
 // The merge-past-absent-gate alert fires once per PR.
 func TestNotifyMissingReviewGate_OncePerPR(t *testing.T) {
 	o := missingReviewOrchestrator(60)

@@ -5612,7 +5612,13 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, now); missing {
 					log.Printf("[orch] PR #%d: review gate produced no signal for %s — treating the missing review as non-blocking (review_retrigger.missing_after_minutes)",
 						pr.Number, silentFor.Round(time.Minute))
-					clearReviewPendingTracking(sess)
+					// Deliberately keep the per-head tracking: sequential mode
+					// may defer this candidate, or the merge may fail, and
+					// clearing here would restart the grace from zero on the
+					// next cycle. Repeated deferrals would then reset the
+					// window forever and the PR would never merge. The state
+					// is irrelevant once the merge succeeds, and a new head
+					// resets it through trackReviewPendingClock.
 					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA, missingReviewFor: silentFor})
 					continue
 				}
