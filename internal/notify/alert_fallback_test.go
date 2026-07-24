@@ -162,3 +162,39 @@ func TestAlert_ConcurrentIdenticalAlertsSendOnce(t *testing.T) {
 		t.Fatalf("sends = %d, want 1 — concurrent identical alerts must collapse", sends)
 	}
 }
+
+// Codex review catch (P2): a digest-buffered alert must dedup like a delivered
+// one, but a FAILED flush must release it so the condition can be re-reported.
+func TestAlert_DigestBufferedDedupsAndReleasesOnFailedFlush(t *testing.T) {
+	var mu sync.Mutex
+	fail := true
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		shouldFail := fail
+		mu.Unlock()
+		if shouldFail {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	n := New(srv.URL, "operator")
+	n.SetDigestMode(true)
+
+	_ = n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0")
+	_ = n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0")
+	if got := n.Buffered(); got != 1 {
+		t.Fatalf("buffered = %d, want 1 — identical alerts must not duplicate digest entries", got)
+	}
+
+	if err := n.Flush(); err == nil {
+		t.Fatal("expected the flush to fail")
+	}
+	// The digest was lost, so the same condition must be reportable again.
+	_ = n.Alert(AlertFloorBreach, "proj:floor", "breach", "live=0")
+	if got := n.Buffered(); got != 1 {
+		t.Fatalf("buffered after failed flush = %d, want 1 — a lost alert must be re-reportable", got)
+	}
+}

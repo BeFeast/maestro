@@ -36,6 +36,10 @@ type Notifier struct {
 	// concurrent callers with the same (class,key,body) collapse to one send
 	// without recording delivery before it succeeds.
 	alertInFlight map[string]string
+	// alertPendingFlush holds alerts that are only buffered in digest mode.
+	// They dedup like delivered alerts, but a failed Flush releases them so the
+	// condition can be reported again.
+	alertPendingFlush map[string]string
 }
 
 // WithNtfy configures the ntfy push transport and returns the notifier for
@@ -78,6 +82,8 @@ func (n *Notifier) Flush() error {
 	n.mu.Lock()
 	msgs := n.buffer
 	n.buffer = nil
+	pending := n.alertPendingFlush
+	n.alertPendingFlush = nil
 	n.mu.Unlock()
 
 	if len(msgs) == 0 {
@@ -87,6 +93,15 @@ func (n *Notifier) Flush() error {
 	combined := "📋 *maestro digest:*\n\n" + strings.Join(msgs, "\n\n")
 	if err := n.send(combined); err != nil {
 		log.Printf("[notify] digest flush failed: %v", err)
+		// The buffer is gone, so these alerts were never delivered: drop their
+		// dedup records instead of silencing the next occurrence.
+		n.mu.Lock()
+		for key, body := range pending {
+			if n.alertState[key] == body {
+				delete(n.alertState, key)
+			}
+		}
+		n.mu.Unlock()
 		return err
 	}
 	return nil
@@ -216,8 +231,9 @@ func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	}
 	n.alertInFlight[stateKey] = body
 	// In digest mode the base transport only buffers, so "sent" is not
-	// "delivered" until Flush succeeds; skip the delivered-state write and let
-	// the next occurrence re-buffer rather than being silenced by dedup.
+	// "delivered" until Flush succeeds. Such an alert is recorded as PENDING:
+	// it dedups later identical calls (no duplicate digest entries) but is
+	// dropped again if the flush fails, so the condition can be re-reported.
 	digestBuffered := !n.NtfyConfigured() && n.digestMode
 	n.mu.Unlock()
 
@@ -230,11 +246,17 @@ func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 
 	n.mu.Lock()
 	delete(n.alertInFlight, stateKey)
-	if err == nil && !digestBuffered {
+	if err == nil {
 		if n.alertState == nil {
 			n.alertState = make(map[string]string)
 		}
 		n.alertState[stateKey] = body
+		if digestBuffered {
+			if n.alertPendingFlush == nil {
+				n.alertPendingFlush = make(map[string]string)
+			}
+			n.alertPendingFlush[stateKey] = body
+		}
 	}
 	n.mu.Unlock()
 	return err
