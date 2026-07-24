@@ -74,6 +74,10 @@ type issueComment struct {
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
+	// CreatedAt scopes a comment to a head. Issue comments carry no SHA, so a
+	// bot comment from an earlier head is otherwise indistinguishable from one
+	// about the current head.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // IssueComment is the public view of a single issue comment. Unlike the
@@ -2471,6 +2475,15 @@ commentFallback:
 		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending}, nil
 	}
 	verdict := reviewStreamVerdictFromGreptileSignal(signal)
+	// Issue comments carry no head SHA, so a comment written for an EARLIER
+	// head would otherwise count as proof the reviewer spoke about this one —
+	// and a silent reviewer on the current head would look alive forever. Only
+	// a comment newer than the head commit is head-scoped evidence. The
+	// legacy pass/fail semantics of the comment fallback are deliberately left
+	// as they are; this narrows only the Observed signal.
+	if !c.commentScopedToHead(comment, sha) {
+		verdict.Observed = false
+	}
 	if !verdict.Passed && !verdict.Pending && isActionableReviewSummary(comment.Body) {
 		verdict.Findings = append(verdict.Findings, ReviewComment{Body: comment.Body, User: comment.User.Login})
 	}
@@ -2501,6 +2514,43 @@ func greptileCommentReviewSignal(comments []issueComment) (found bool, signal gr
 		return true, greptileSignalFromText(comment.Body), comment
 	}
 	return false, greptileReviewSignal{}, issueComment{}
+}
+
+// commentScopedToHead reports whether an issue comment can be attributed to
+// the given head commit, i.e. it was written after that commit existed. An
+// unknown comment time or an unreadable commit is treated as NOT scoped: the
+// conservative answer keeps a silent reviewer from looking alive on the
+// strength of an older comment.
+func (c *Client) commentScopedToHead(comment issueComment, sha string) bool {
+	if comment.CreatedAt.IsZero() || strings.TrimSpace(sha) == "" {
+		return false
+	}
+	headAt, err := c.commitCommittedAt(sha)
+	if err != nil || headAt.IsZero() {
+		return false
+	}
+	return !comment.CreatedAt.Before(headAt)
+}
+
+// commitCommittedAt returns the committer timestamp of a commit. Only the
+// review comment-fallback path calls it, which runs when no review check run
+// exists at all.
+func (c *Client) commitCommittedAt(sha string) (time.Time, error) {
+	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, sha))
+	if err != nil {
+		return time.Time{}, err
+	}
+	var payload struct {
+		Commit struct {
+			Committer struct {
+				Date time.Time `json:"date"`
+			} `json:"committer"`
+		} `json:"commit"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return time.Time{}, err
+	}
+	return payload.Commit.Committer.Date, nil
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {

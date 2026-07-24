@@ -33,8 +33,9 @@ func (f *fakeEmergencySwitch) Get(_ context.Context) (emergencystore.State, erro
 }
 
 type fakeEmergencyNotifier struct {
-	msgs   []string
-	alerts []notify.AlertClass
+	msgs        []string
+	alerts      []notify.AlertClass
+	alertBodies []string
 }
 
 func (f *fakeEmergencyNotifier) Sendf(format string, args ...any) {
@@ -46,8 +47,9 @@ func (f *fakeEmergencyNotifier) Sendf(format string, args ...any) {
 	}
 }
 
-func (f *fakeEmergencyNotifier) Alert(class notify.AlertClass, _, _, _ string) error {
+func (f *fakeEmergencyNotifier) Alert(class notify.AlertClass, _, _, body string) error {
 	f.alerts = append(f.alerts, class)
+	f.alertBodies = append(f.alertBodies, body)
 	return nil
 }
 
@@ -115,8 +117,13 @@ func TestHandleFleetEmergency_StopAndResume(t *testing.T) {
 	if w.Code != http.StatusOK {
 		t.Fatalf("stop status = %d, want 200 (body: %s)", w.Code, w.Body.String())
 	}
-	if len(notifier.msgs) != 1 || !strings.Contains(notifier.msgs[0], "EMERGENCY STOP activated") {
-		t.Fatalf("notifier messages = %v, want one activation alert", notifier.msgs)
+	// One delivery, through Alert: it covers ntfy when configured and the base
+	// transport otherwise, so a separate Sendf would double-notify.
+	if len(notifier.alertBodies) != 1 || !strings.Contains(notifier.alertBodies[0], "EMERGENCY STOP activated") {
+		t.Fatalf("alert bodies = %v, want one activation alert", notifier.alertBodies)
+	}
+	if len(notifier.msgs) != 0 {
+		t.Fatalf("plain sends = %v, want none — Alert already reaches the base transport", notifier.msgs)
 	}
 	var got fleetEmergency
 	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
