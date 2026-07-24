@@ -151,6 +151,13 @@ type BackendDef struct {
 	// false backend gating. Validated to compile at config parse.
 	UsageLimitPatterns []string `yaml:"usage_limit_patterns,omitempty"`
 
+	// SupervisorAttemptTimeoutSeconds overrides supervisor.attempt_timeout_seconds
+	// for this backend when it serves a supervisor consult. Set it on slow
+	// print-mode carriers (claude CLI at high effort ≈ 180) so the walk gives
+	// them a real chance instead of billing a generation and killing it at the
+	// 45s default. Workers are unaffected — this is a supervisor-only knob.
+	SupervisorAttemptTimeoutSeconds int `yaml:"supervisor_attempt_timeout_seconds,omitempty"`
+
 	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
 	// delegate grunt subtasks to cheaper sub-agent models instead of
 	// reusing the expensive orchestrator model for everything (#706). When
@@ -934,6 +941,18 @@ type SupervisorConfig struct {
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
+	// AttemptTimeoutSeconds bounds ONE supervisor LLM backend attempt. Default
+	// 45s — calibrated for fast print-mode backends (codex/sol). A slow carrier
+	// (claude CLI at high effort through a proxy) needs more; give it a
+	// per-backend override (model.backends.<name>.supervisor_attempt_timeout_seconds)
+	// instead of raising this global. Burn RCA 2026-07-24: a chain of three
+	// claude-binary candidates under the 45s default produced ~365
+	// paid-and-discarded generations in 4.5h — every attempt billed
+	// server-side, then killed client-side before the answer arrived.
+	AttemptTimeoutSeconds int `yaml:"attempt_timeout_seconds" json:"attempt_timeout_seconds,omitempty"`
+	// TotalTimeoutSeconds bounds the whole candidate walk for one consult so a
+	// slow chain can never overrun the supervise interval. Default 180s.
+	TotalTimeoutSeconds int `yaml:"total_timeout_seconds" json:"total_timeout_seconds,omitempty"`
 	// AlwaysConsultLLM restores the pre-#837 behavior of calling the supervisor
 	// LLM on every enabled cycle, even when the deterministic guardrail already
 	// decided a safe, mutation-free action (action=none / wait_* / monitor_open_pr).
@@ -2694,6 +2713,17 @@ func parse(data []byte) (*Config, error) {
 	}
 	if cfg.Model.HoldOnCooldown.MaxWaitMinutes < 0 {
 		return nil, fmt.Errorf("config: model.hold_on_cooldown.max_wait_minutes = %d; want >= 0 (0 uses the default window)", cfg.Model.HoldOnCooldown.MaxWaitMinutes)
+	}
+	if cfg.Supervisor.AttemptTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.attempt_timeout_seconds = %d; want >= 0 (0 uses the 45s default)", cfg.Supervisor.AttemptTimeoutSeconds)
+	}
+	if cfg.Supervisor.TotalTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.total_timeout_seconds = %d; want >= 0 (0 uses the 180s default)", cfg.Supervisor.TotalTimeoutSeconds)
+	}
+	for name, def := range cfg.Model.Backends {
+		if def.SupervisorAttemptTimeoutSeconds < 0 {
+			return nil, fmt.Errorf("config: model.backends.%s.supervisor_attempt_timeout_seconds = %d; want >= 0", name, def.SupervisorAttemptTimeoutSeconds)
+		}
 	}
 	// #704: quota calibration sanity. Capacities must be non-negative and
 	// the dispatch threshold a fraction in (0, 1]; a percent-style value

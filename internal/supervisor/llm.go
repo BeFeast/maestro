@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -59,22 +60,112 @@ type backendLLMClient struct {
 	// re-burned the whole chain down to the last rung (live 2026-07: opencode
 	// every cycle while the primaries cooled).
 	backendHealth map[string]state.BackendHealth
+	// memory tracks consecutive per-backend failures across consults (shared
+	// by all withBackendHealth copies). A backend that keeps failing — e.g. a
+	// carrier that cannot answer within its attempt timeout — gets skipped for
+	// a window instead of billing another doomed generation every cycle. Burn
+	// RCA 2026-07-24: without this, a 100%-failing chain was re-walked on every
+	// consult for 4.5h.
+	memory *supervisorBackendMemory
 }
 
 const (
 	supervisorBackendAttemptTimeout = 45 * time.Second
 	supervisorBackendTotalTimeout   = 3 * time.Minute
+	// supervisorBackendFailureThreshold consecutive failures put a candidate
+	// into a skip window; a success resets the count.
+	supervisorBackendFailureThreshold = 3
+	// supervisorBackendFailureSkipWindow is how long a repeatedly-failing
+	// candidate is skipped before it may be probed again.
+	supervisorBackendFailureSkipWindow = 10 * time.Minute
 )
 
+// supervisorBackendMemory is the supervisor-local failure memory. It is
+// deliberately NOT written to state.BackendHealth: a print-mode consult
+// timing out says nothing about the backend's fitness for long-form worker
+// runs, so it must not gate dispatch.
+type supervisorBackendMemory struct {
+	mu        sync.Mutex
+	failures  map[string]int
+	skipUntil map[string]time.Time
+}
+
+func newSupervisorBackendMemory() *supervisorBackendMemory {
+	return &supervisorBackendMemory{failures: map[string]int{}, skipUntil: map[string]time.Time{}}
+}
+
+// shouldSkip reports whether the candidate is inside an active skip window.
+func (m *supervisorBackendMemory) shouldSkip(name string, now time.Time) (time.Time, bool) {
+	if m == nil {
+		return time.Time{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	until, ok := m.skipUntil[name]
+	if !ok || now.After(until) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// recordFailure bumps the candidate's consecutive-failure count and opens a
+// skip window at the threshold. Returns the window expiry when one opened.
+func (m *supervisorBackendMemory) recordFailure(name string, now time.Time) (time.Time, bool) {
+	if m == nil {
+		return time.Time{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failures[name]++
+	if m.failures[name] < supervisorBackendFailureThreshold {
+		return time.Time{}, false
+	}
+	m.failures[name] = 0
+	until := now.Add(supervisorBackendFailureSkipWindow)
+	m.skipUntil[name] = until
+	return until, true
+}
+
+func (m *supervisorBackendMemory) recordSuccess(name string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.failures, name)
+	delete(m.skipUntil, name)
+}
+
+// supervisorAttemptTimeoutFor resolves the attempt budget for one candidate:
+// per-backend override, then supervisor.attempt_timeout_seconds, then the 45s
+// default.
+func supervisorAttemptTimeoutFor(cfg *config.Config, def config.BackendDef) time.Duration {
+	if def.SupervisorAttemptTimeoutSeconds > 0 {
+		return time.Duration(def.SupervisorAttemptTimeoutSeconds) * time.Second
+	}
+	if cfg != nil && cfg.Supervisor.AttemptTimeoutSeconds > 0 {
+		return time.Duration(cfg.Supervisor.AttemptTimeoutSeconds) * time.Second
+	}
+	return supervisorBackendAttemptTimeout
+}
+
+func supervisorTotalTimeoutFor(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.Supervisor.TotalTimeoutSeconds > 0 {
+		return time.Duration(cfg.Supervisor.TotalTimeoutSeconds) * time.Second
+	}
+	return supervisorBackendTotalTimeout
+}
+
 func NewBackendLLMClient(cfg *config.Config) LLMClient {
-	return &backendLLMClient{cfg: cfg}
+	return &backendLLMClient{cfg: cfg, memory: newSupervisorBackendMemory()}
 }
 
 // withBackendHealth returns a copy of the client carrying the cycle's
 // BackendHealth snapshot, so a concurrent Complete on the shared engine client
-// never observes a mutated map.
+// never observes a mutated map. The failure memory pointer is shared — it must
+// survive across cycles.
 func (c *backendLLMClient) withBackendHealth(health map[string]state.BackendHealth) *backendLLMClient {
-	return &backendLLMClient{cfg: c.cfg, backendHealth: health}
+	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory}
 }
 
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
@@ -104,26 +195,43 @@ func (c *backendLLMClient) Complete(prompt string) (string, error) {
 	if strings.TrimSpace(worktree) == "" {
 		worktree = "."
 	}
-	deadline := time.Now().Add(supervisorBackendTotalTimeout)
+	deadline := time.Now().Add(supervisorTotalTimeoutFor(c.cfg))
 	var failed []string
+	var skipped []string
 	for _, candidate := range candidates {
+		now := time.Now()
+		if until, skip := c.memory.shouldSkip(candidate.name, now); skip {
+			skipped = append(skipped, candidate.name)
+			log.Printf("[supervisor] skipping backend %s: %d consecutive failures, retry allowed after %s",
+				candidate.name, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
+			continue
+		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
 			break
 		}
-		attemptTimeout := supervisorBackendAttemptTimeout
+		attemptTimeout := supervisorAttemptTimeoutFor(c.cfg, candidate.def)
 		if remaining < attemptTimeout {
 			attemptTimeout = remaining
 		}
 		out, runErr := completeSupervisorBackend(candidate.name, candidate.def, c.cfg, promptPath, worktree, attemptTimeout)
 		if runErr == nil {
+			c.memory.recordSuccess(candidate.name)
 			if len(failed) > 0 {
 				log.Printf("[supervisor] backend fallback selected %s after %s failed", candidate.name, strings.Join(failed, ", "))
 			}
 			return strings.TrimSpace(string(out)), nil
 		}
 		failed = append(failed, candidate.name)
-		log.Printf("[supervisor] backend %s unavailable for this cycle; trying configured fallback", candidate.name)
+		if until, opened := c.memory.recordFailure(candidate.name, time.Now()); opened {
+			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); %d consecutive failures — skipping it until %s",
+				candidate.name, runErr, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
+		} else {
+			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); trying configured fallback", candidate.name, runErr)
+		}
+	}
+	if len(failed) == 0 && len(skipped) > 0 {
+		return "", fmt.Errorf("run supervisor backends: all candidates inside failure-memory skip windows (%s); deterministic guardrail proceeds", strings.Join(skipped, ", "))
 	}
 	return "", fmt.Errorf("run supervisor backends: all bounded candidates failed (%s)", strings.Join(failed, ", "))
 }
