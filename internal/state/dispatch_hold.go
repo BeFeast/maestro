@@ -13,10 +13,14 @@ const (
 const (
 	DispatchHoldBlockingOutcomeCheck = "blocking_outcome_check"
 	DispatchHoldBackendsCoolingDown  = "all_backends_cooling_down"
-	DispatchHoldPRGateCapacity       = "capacity_blocked_by_pr_gates"
-	DispatchHoldPaused               = "paused"
-	DispatchHoldAwaitingDispatch     = "awaiting_dispatch"
-	DispatchHoldQueueEmpty           = "queue_empty"
+	// DispatchHoldOnCooldown: model.hold_on_cooldown is deliberately waiting
+	// out the routed backend's quota-cooldown reset instead of cascading work
+	// onto the remaining fallback rungs (which may be healthy).
+	DispatchHoldOnCooldown       = "hold_on_cooldown"
+	DispatchHoldPRGateCapacity   = "capacity_blocked_by_pr_gates"
+	DispatchHoldPaused           = "paused"
+	DispatchHoldAwaitingDispatch = "awaiting_dispatch"
+	DispatchHoldQueueEmpty       = "queue_empty"
 )
 
 // DispatchHold is the bounded, command/output-free explanation for why fresh

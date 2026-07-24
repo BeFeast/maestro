@@ -385,6 +385,41 @@ type ModelConfig struct {
 	// project override. Otherwise lanes compose in declaration order, with each
 	// provider's default followed by its local fallbacks before the next provider.
 	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
+	// HoldOnCooldown makes quota-class backend cooldowns a wait, not a cascade:
+	// when the routed backend is cooling down with a known reset inside the
+	// configured window, dispatch/retry hold for that reset instead of walking
+	// the fallback chain. See HoldOnCooldownConfig.
+	HoldOnCooldown HoldOnCooldownConfig `yaml:"hold_on_cooldown,omitempty"`
+}
+
+// HoldOnCooldownConfig controls hold-vs-cascade semantics for quota-class
+// backend cooldowns (provider_limit, usage_limit, model_cooldown,
+// model_overloaded, quota_pressure). Off, a cooling backend cascades work onto
+// the next fallback rung immediately — under a fleet-wide primary cooldown
+// that dumps every project onto one fallback seat (2026-07 live: an Anthropic
+// cooldown pushed ~80% of the week's tokens through the single ChatGPT seat).
+// On, a cooldown whose RetryAfter lands within max_wait_minutes holds the work
+// for the reset; only unknown or beyond-window resets (weekly caps), and
+// non-quota failures (auth_failure, model_unavailable, disabled), still
+// cascade.
+type HoldOnCooldownConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxWaitMinutes bounds how long a hold may wait for a stated reset.
+	// 0 means the default (360 = 6h, covering a 5-hour subscription window);
+	// resets further out than this cascade to the next rung as before.
+	MaxWaitMinutes int `yaml:"max_wait_minutes,omitempty"`
+}
+
+// defaultHoldOnCooldownMaxWait covers a full 5-hour subscription window with
+// slack; a stated reset beyond it (e.g. a weekly cap) is not worth idling for.
+const defaultHoldOnCooldownMaxWait = 360 * time.Minute
+
+// MaxWait returns the bounded hold window as a duration.
+func (h HoldOnCooldownConfig) MaxWait() time.Duration {
+	if h.MaxWaitMinutes > 0 {
+		return time.Duration(h.MaxWaitMinutes) * time.Minute
+	}
+	return defaultHoldOnCooldownMaxWait
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -2656,6 +2691,9 @@ func parse(data []byte) (*Config, error) {
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
 		}
+	}
+	if cfg.Model.HoldOnCooldown.MaxWaitMinutes < 0 {
+		return nil, fmt.Errorf("config: model.hold_on_cooldown.max_wait_minutes = %d; want >= 0 (0 uses the default window)", cfg.Model.HoldOnCooldown.MaxWaitMinutes)
 	}
 	// #704: quota calibration sanity. Capacities must be non-negative and
 	// the dispatch threshold a fraction in (0, 1]; a percent-style value

@@ -49,17 +49,25 @@ func (o *Orchestrator) reconcileDispatchVisibility(s *state.State, now time.Time
 	if project == "" {
 		project = strings.TrimSpace(o.cfg.Repo)
 	}
+	// A stall whose cause is backend cooldown routes to the dedicated
+	// backend_cooldown_exhausted class ("battery"), so the operator can tell a
+	// quota wait (self-clears at the stated reset) from a generic idle stall.
+	alertClass := notify.AlertIdleStall
 	title := "maestro idle stall"
+	if reasonClass == state.DispatchHoldBackendsCoolingDown || reasonClass == state.DispatchHoldOnCooldown {
+		alertClass = notify.AlertBackendCooldownExhausted
+		title = "maestro backend cooldown"
+	}
 	if project != "" {
 		title += ": " + project
 	}
 	if err := o.notifier.Alert(
-		notify.AlertIdleStall,
+		alertClass,
 		project+":"+reasonClass,
 		title,
 		body,
 	); err != nil {
-		log.Printf("[orch] idle_stall notification failed for %s: %v", project, err)
+		log.Printf("[orch] %s notification failed for %s: %v", alertClass, project, err)
 		return
 	}
 	s.MarkIdleStallNotified(reasonClass)
@@ -108,6 +116,17 @@ func (o *Orchestrator) dispatchHoldForCycle(s *state.State, capacity state.Capac
 				Active:      true,
 				ReasonClass: state.DispatchHoldBackendsCoolingDown,
 				Detail:      detail,
+			}
+		}
+		if holdUntil, backend, held := o.dispatchHoldOnCooldown(s, now); held {
+			return state.DispatchHold{
+				Active:      true,
+				ReasonClass: state.DispatchHoldOnCooldown,
+				Detail: fmt.Sprintf(
+					"hold_on_cooldown: routed backend %s cooling down; holding for reset at %s instead of cascading",
+					backend,
+					holdUntil.UTC().Format(time.RFC3339),
+				),
 			}
 		}
 		if capacity.GateBound() {
@@ -193,6 +212,31 @@ func containsFold(values []string, want string) bool {
 		}
 	}
 	return false
+}
+
+// dispatchHoldOnCooldown mirrors resolveDispatchBackend's hold gate for the
+// route default so the dashboard names the deliberate wait: the routed backend
+// is in a holdable quota cooldown whose reset lands inside the
+// model.hold_on_cooldown window, so fresh dispatch waits instead of cascading.
+// Per-issue label pins can route elsewhere; the route default is the fleet's
+// dispatch surface and is what the hold visibly parks.
+func (o *Orchestrator) dispatchHoldOnCooldown(s *state.State, now time.Time) (*time.Time, string, bool) {
+	if o == nil || o.cfg == nil || !o.cfg.Model.HoldOnCooldown.Enabled {
+		return nil, "", false
+	}
+	backend := o.cfg.Model.EffectiveDefault()
+	if backend == "" {
+		return nil, "", false
+	}
+	blockedBy, blockedRetry := o.dispatchBackendBlock(s, backend, "", now)
+	if blockedBy == "" {
+		return nil, "", false
+	}
+	holdUntil, held := o.holdOnCooldownUntil(blockedBy, blockedRetry, now)
+	if !held {
+		return nil, "", false
+	}
+	return holdUntil, backend, true
 }
 
 // allDispatchBackendsCoolingDown mirrors the selector's real candidate set and

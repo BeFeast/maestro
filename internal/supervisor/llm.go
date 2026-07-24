@@ -53,6 +53,12 @@ type LLMClient interface {
 
 type backendLLMClient struct {
 	cfg *config.Config
+	// backendHealth is an optional per-cycle snapshot of the project's
+	// BackendHealth gates. When present, candidates in an active cooldown are
+	// skipped instead of re-tried every supervise tick — without it the walk
+	// re-burned the whole chain down to the last rung (live 2026-07: opencode
+	// every cycle while the primaries cooled).
+	backendHealth map[string]state.BackendHealth
 }
 
 const (
@@ -64,8 +70,15 @@ func NewBackendLLMClient(cfg *config.Config) LLMClient {
 	return &backendLLMClient{cfg: cfg}
 }
 
+// withBackendHealth returns a copy of the client carrying the cycle's
+// BackendHealth snapshot, so a concurrent Complete on the shared engine client
+// never observes a mutated map.
+func (c *backendLLMClient) withBackendHealth(health map[string]state.BackendHealth) *backendLLMClient {
+	return &backendLLMClient{cfg: c.cfg, backendHealth: health}
+}
+
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
-	candidates, err := supervisorBackendCandidates(c.cfg)
+	candidates, err := supervisorBackendCandidates(c.cfg, c.backendHealth, time.Now().UTC())
 	if err != nil {
 		return "", err
 	}
@@ -120,7 +133,7 @@ type supervisorBackendCandidate struct {
 	def  config.BackendDef
 }
 
-func supervisorBackendCandidates(cfg *config.Config) ([]supervisorBackendCandidate, error) {
+func supervisorBackendCandidates(cfg *config.Config, health map[string]state.BackendHealth, now time.Time) ([]supervisorBackendCandidate, error) {
 	primary, def, err := supervisorBackend(cfg)
 	if err != nil {
 		return nil, err
@@ -128,6 +141,7 @@ func supervisorBackendCandidates(cfg *config.Config) ([]supervisorBackendCandida
 	names := append([]string{primary}, cfg.Model.FallbackBackends...)
 	seen := make(map[string]struct{}, len(names))
 	out := make([]supervisorBackendCandidate, 0, len(names))
+	var cooling []string
 	for _, name := range names {
 		name = strings.TrimSpace(name)
 		if name == "" {
@@ -141,13 +155,29 @@ func supervisorBackendCandidates(cfg *config.Config) ([]supervisorBackendCandida
 		if !ok || !candidate.IsEnabled() {
 			continue
 		}
+		// Skip candidates in an active BackendHealth cooldown instead of
+		// re-proving the outage with a live call every tick. The gate clears
+		// itself: ReconcileBackendHealth drops elapsed entries, and an entry
+		// whose RetryAfter has passed is eligible again here.
+		if gate, gated := health[name]; gated && gate.State == state.BackendHealthCooldown {
+			if gate.RetryAfter == nil || now.Before(*gate.RetryAfter) {
+				cooling = append(cooling, name)
+				continue
+			}
+		}
 		if name == primary {
 			candidate = def
 		}
 		out = append(out, supervisorBackendCandidate{name: name, def: candidate})
 	}
 	if len(out) == 0 {
+		if len(cooling) > 0 {
+			return nil, fmt.Errorf("supervisor backend candidates all cooling down (%s); skipping LLM this cycle", strings.Join(cooling, ", "))
+		}
 		return nil, fmt.Errorf("supervisor has no enabled backend candidates")
+	}
+	if len(cooling) > 0 {
+		log.Printf("[supervisor] skipping cooling-down backend candidate(s) %s for this cycle", strings.Join(cooling, ", "))
 	}
 	return out, nil
 }
@@ -241,6 +271,12 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	client := e.llm
 	if client == nil {
 		client = NewBackendLLMClient(e.cfg)
+	}
+	// Thread the cycle's BackendHealth gates into the backend walk so a
+	// cooling-down candidate is skipped, not re-tried per tick. Custom LLM
+	// clients (tests, remote implementations) pass through unchanged.
+	if backendClient, ok := client.(*backendLLMClient); ok {
+		client = backendClient.withBackendHealth(st.BackendHealth)
 	}
 	output, err := client.Complete(prompt)
 	if err != nil {
