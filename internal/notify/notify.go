@@ -185,8 +185,11 @@ func (n *Notifier) Sendf(format string, args ...any) {
 // digest/notify contract so a supervisor loop re-detecting the same condition
 // every cycle produces one notification, not one per cycle.
 //
-// The alert fans out to the ntfy transport when configured; a nil-config ntfy
-// is a no-op. Returns the ntfy send error (nil when ntfy is not configured).
+// The alert fans out to the ntfy transport when configured. When it is NOT
+// configured the alert falls back to the base transport (Telegram/OpenClaw)
+// rather than disappearing: an install that never set up ntfy would otherwise
+// silently lose every classified alert, including the CRITICAL floor-breach
+// page. The fallback loses only the priority/tag routing, which ntfy owns.
 func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	stateKey := string(class) + "\x00" + key
 
@@ -202,10 +205,26 @@ func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	n.mu.Unlock()
 
 	if !n.NtfyConfigured() {
-		return nil
+		return n.Send(alertFallbackText(class, title, body))
 	}
 	route := RouteFor(class)
 	return n.sendNtfy(title, body, route)
+}
+
+// alertFallbackText renders a classified alert for the plain-text transports,
+// keeping the class visible since they carry no priority/tag metadata.
+func alertFallbackText(class AlertClass, title, body string) string {
+	title = strings.TrimSpace(title)
+	body = strings.TrimSpace(body)
+	switch {
+	case title == "" && body == "":
+		return fmt.Sprintf("[%s]", class)
+	case title == "":
+		return fmt.Sprintf("[%s] %s", class, body)
+	case body == "":
+		return fmt.Sprintf("[%s] %s", class, title)
+	}
+	return fmt.Sprintf("[%s] %s — %s", class, title, body)
 }
 
 // ResetAlertState clears the dedup memory (test/rotation helper).
