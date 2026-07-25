@@ -78,11 +78,27 @@ func TestSupersedingSessionRequiresProvenLaterDurableOwner(t *testing.T) {
 	candidate := &Session{IssueNumber: 976, Status: StatusFailed, StartedAt: started}
 	st.Sessions["candidate"] = candidate
 	st.Sessions["same-time"] = &Session{IssueNumber: 976, Status: StatusDone, PRNumber: 1033, StartedAt: started}
-	st.Sessions["queued"] = &Session{IssueNumber: 976, Status: StatusQueued, StartedAt: started.Add(time.Second)}
 	st.Sessions["released"] = &Session{IssueNumber: 976, Status: StatusDone, PRNumber: 1034, StartedAt: started.Add(2 * time.Second), ReleasedForRedispatch: true}
 
 	if _, _, ok := st.SupersedingSession(candidate); ok {
-		t.Fatal("same-time, queued, or released peers must not prove supersession")
+		t.Fatal("same-time or released peers must not prove supersession")
+	}
+}
+
+// A replacement that is already queued is the current lifecycle for the issue.
+// Leaving StatusQueued out of the authoritative set kept an exhausted attempt
+// actionable — recommending its repair — while its successor was waiting to run.
+func TestSupersedingSessionAcceptsQueuedReplacement(t *testing.T) {
+	started := time.Date(2026, 7, 21, 13, 30, 0, 0, time.UTC)
+	st := NewState()
+	candidate := &Session{IssueNumber: 976, Status: StatusRetryExhausted, StartedAt: started}
+	st.Sessions["candidate"] = candidate
+	queued := &Session{IssueNumber: 976, Status: StatusQueued, StartedAt: started.Add(time.Second)}
+	st.Sessions["queued"] = queued
+
+	slot, got, ok := st.SupersedingSession(candidate)
+	if !ok || slot != "queued" || got != queued {
+		t.Fatalf("queued replacement = %q, %p, %v; want queued %p", slot, got, ok, queued)
 	}
 }
 

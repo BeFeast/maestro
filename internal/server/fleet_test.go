@@ -4283,7 +4283,7 @@ func TestFleetAPISuppressesPredecessorAttentionBehindCurrentLifecycle(t *testing
 		wantFailed       int
 	}{
 		{name: "later done clears predecessor attention", currentStatus: state.StatusDone, wantAttention: 0, wantFailed: 2},
-		{name: "code landed QA owns attention", currentStatus: state.StatusCodeLanded, wantAttention: 1, wantOperatorSlot: "current", wantFailed: 2},
+		{name: "code landed needs no operator action", currentStatus: state.StatusCodeLanded, wantAttention: 0, wantOperatorSlot: "current", wantFailed: 2},
 		{name: "current regression owns attention", currentStatus: state.StatusFailed, wantAttention: 1, wantOperatorSlot: "current", wantFailed: 3},
 	}
 

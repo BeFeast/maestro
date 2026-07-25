@@ -7,15 +7,16 @@ package state
 // attribution record.
 //
 // A terminal failure can be superseded through either durable lifecycle link:
-//   - a later session for the same issue, when the candidate owns no PR of its
-//     own; or
+//   - a later session for the same issue; or
 //   - a later session for the same PR, including a continuation issue.
 //
-// A terminal attempt that owns its own PR is never hidden behind a session for
-// a DIFFERENT PR: that PR is a separate artifact and may still need operator
-// action or reconciliation, so only the same PR's later owner may supersede it.
-// This mirrors the rule the Fleet projection already enforced before this
-// predicate was centralized.
+// One issue has one current lifecycle: an earlier terminal attempt is history
+// even when it owns a PR of its own. Review asked for the opposite — that an
+// attempt with its own distinct PR always stay actionable — and that was
+// declined deliberately (operator decision 2026-07-25): with an issue that has
+// already shipped through a later PR, every abandoned attempt would keep
+// emitting "reconcile the closed PR" findings forever. Suppression here is
+// display truth only; the PR itself is untouched and every session row remains.
 //
 // Ordering compares SessionChangedAt — the newest durable lifecycle timestamp
 // (started / finished / issue-closed / last output) — not StartedAt. Start
@@ -41,8 +42,7 @@ func (s *State) SupersedingSession(candidate *Session) (string, *Session, bool) 
 		if peer == nil || peer == candidate || peer.StartedAt.IsZero() || peer.ReleasedForRedispatch {
 			continue
 		}
-		// A candidate that owns a PR is only superseded through that same PR.
-		sameIssue := peer.IssueNumber == candidate.IssueNumber && candidate.PRNumber <= 0
+		sameIssue := peer.IssueNumber == candidate.IssueNumber
 		sharedPR := candidate.PRNumber > 0 && peer.PRNumber == candidate.PRNumber
 		if !sameIssue && !sharedPR {
 			continue
