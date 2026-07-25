@@ -5121,7 +5121,7 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 			// started-after-completion / released-for-redispatch guards, so a
 			// genuinely regressed later session surfaces instead of a predecessor.
 			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
-				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" ||
+				(candidate.WorkerOutcome == state.WorkerOutcomeDuplicateDispatchReconciled ||
 					fleetSessionStartedAfterCanonicalCompletion(candidate, peer) ||
 					fleetSessionPrecededLaterAuthoritative(candidate, peer)) {
 				return peer, true

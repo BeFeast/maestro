@@ -5972,7 +5972,7 @@ func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int,
 		// its branch/worktree intact for forensics and recovery. Without this,
 		// the preserved worktree itself blocks the canonical repair forever.
 		sibling.ReleasedForRedispatch = true
-		sibling.WorkerOutcome = "duplicate_dispatch_reconciled"
+		sibling.WorkerOutcome = state.WorkerOutcomeDuplicateDispatchReconciled
 		released = append(released, siblingSlot)
 	}
 	if len(handoffs) > 0 {

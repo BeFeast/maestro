@@ -96,6 +96,13 @@ const (
 	// worker that disappeared again after Maestro already gave the same
 	// canonical session one automatic unexpected-exit recovery.
 	WorkerOutcomeRepeatedUnexpectedExit = "repeated_unexpected_exit"
+	// WorkerOutcomeDuplicateDispatchReconciled marks a SIBLING session that
+	// Maestro itself retired while reconciling duplicate dispatches for one
+	// issue: its durable work was proven patch-equivalent or handed off to the
+	// canonical session, and only its dispatcher claim was released. It is
+	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
+	// must not consume the per-issue retry budget.
+	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
 )
 
 const (
@@ -5067,12 +5074,21 @@ func (s *State) IssueDone(issueNum int) bool {
 // as failed attempts: neither condition proves the implementation itself failed,
 // and both must remain runnable after their independent hold/release policy.
 // See #432 / #458 / #466 / #693.
+//
+// Sessions Maestro itself retired while reconciling duplicate dispatches are
+// excluded for the same reason: that outcome records the control plane tidying
+// up after spawning two workers for one issue, not an attempt that failed.
+// Live 2026-07-23 (ok-player #627): a respawn-thrash incident produced two such
+// siblings, and with only one genuine failure the issue still reported 3/3
+// attempts and stopped being dispatched at all.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit && sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) {
+			!sess.RateLimitHit &&
+			sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) &&
+			sess.WorkerOutcome != WorkerOutcomeDuplicateDispatchReconciled {
 			count++
 		}
 	}
