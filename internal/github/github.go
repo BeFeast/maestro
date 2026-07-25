@@ -2488,8 +2488,13 @@ commentFallback:
 	// a comment newer than the head commit is head-scoped evidence. The
 	// legacy pass/fail semantics of the comment fallback are deliberately left
 	// as they are; this narrows only the Observed signal.
-	if !c.commentScopedToHead(comment, sha) {
+	if scoped, lookupFailed := c.commentScopedToHead(comment, sha); !scoped {
 		verdict.Observed = false
+		if lookupFailed {
+			// Could not prove the comment's age: absence of head-scoped
+			// evidence here is unknown, not silence.
+			verdict.LookupFailed = true
+		}
 	}
 	if !verdict.Passed && !verdict.Pending && isActionableReviewSummary(comment.Body) {
 		verdict.Findings = append(verdict.Findings, ReviewComment{Body: comment.Body, User: comment.User.Login})
@@ -2524,19 +2529,28 @@ func greptileCommentReviewSignal(comments []issueComment) (found bool, signal gr
 }
 
 // commentScopedToHead reports whether an issue comment can be attributed to
-// the given head commit, i.e. it was written after that commit existed. An
-// unknown comment time or an unreadable commit is treated as NOT scoped: the
-// conservative answer keeps a silent reviewer from looking alive on the
-// strength of an older comment.
-func (c *Client) commentScopedToHead(comment issueComment, sha string) bool {
-	if comment.CreatedAt.IsZero() || strings.TrimSpace(sha) == "" {
-		return false
+// the given head commit, i.e. it was written after that commit existed.
+//
+// lookupFailed distinguishes the two reasons a comment is not scoped: it is
+// genuinely older than the head (proof it says nothing about this head), or
+// the commit timestamp could not be read (nothing is proven at all). Collapsing
+// both into "not scoped" would let a rate-limited timestamp read look exactly
+// like a silent reviewer — and a PR the reviewer REJECTED could then merge
+// through the missing-review path.
+func (c *Client) commentScopedToHead(comment issueComment, sha string) (scoped bool, lookupFailed bool) {
+	if strings.TrimSpace(sha) == "" {
+		return false, true
+	}
+	if comment.CreatedAt.IsZero() {
+		// The comment carries no timestamp: unattributable, but the read itself
+		// worked, so this is genuine "not scoped", not a degraded read.
+		return false, false
 	}
 	headAt, err := c.commitCommittedAt(sha)
 	if err != nil || headAt.IsZero() {
-		return false
+		return false, true
 	}
-	return !comment.CreatedAt.Before(headAt)
+	return !comment.CreatedAt.Before(headAt), false
 }
 
 // commitCommittedAt returns the committer timestamp of a commit. Only the

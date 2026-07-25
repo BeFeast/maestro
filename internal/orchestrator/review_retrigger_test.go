@@ -249,3 +249,46 @@ func TestReviewRetrigger_GateResolutionClearsTracking(t *testing.T) {
 		t.Fatalf("head anchor = %q, want it retained until the head actually changes", sess.ReviewPendingHeadSHA)
 	}
 }
+
+// Workflow review catch: the per-head cap must actually suppress comments.
+func TestReviewRetrigger_MaxAttemptsCapSuppressesComment(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := retriggerTestConfig()
+	cfg.ReviewRetrigger.MaxAttempts = 2
+	o, comments := newRetriggerTestOrchestrator(cfg, prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(11 * time.Minute)
+	sess.ReviewRetriggerCount = 2 // cap already reached
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 0 {
+		t.Fatalf("comments = %v, want none once the per-head cap is reached", *comments)
+	}
+	if sess.ReviewRetriggerCount != 2 {
+		t.Fatalf("count = %d, want it to stay at the cap", sess.ReviewRetriggerCount)
+	}
+}
+
+// Below the cap the comment is posted and the counter advances.
+func TestReviewRetrigger_CountsAttemptsPerHead(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := retriggerTestConfig()
+	cfg.ReviewRetrigger.MaxAttempts = 2
+	o, comments := newRetriggerTestOrchestrator(cfg, prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(11 * time.Minute)
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 1 {
+		t.Fatalf("comments = %v, want one below the cap", *comments)
+	}
+	if sess.ReviewRetriggerCount != 1 {
+		t.Fatalf("count = %d, want 1 after the first re-trigger", sess.ReviewRetriggerCount)
+	}
+}

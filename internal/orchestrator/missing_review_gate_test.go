@@ -262,3 +262,67 @@ func TestTrackReviewGateHead_SettledThenPendingKeepsRetryCount(t *testing.T) {
 		t.Fatal("observation memory was lost on a settled/pending flap")
 	}
 }
+
+// Workflow review catch: end-to-end wiring of the missing-review policy through
+// autoMergePRs — a silent gate past the grace must actually merge the PR, and a
+// silent gate inside the grace must not.
+func TestAutoMergePRs_MissingReviewMergesPastGrace(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{Repo: "owner/repo", ReviewGate: "greptile"}
+	cfg.ReviewRetrigger.MissingAfterMinutes = 60
+	cfg.ReviewRetrigger.Enabled = new(bool) // re-triggers off: the clock must still run
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRGreptileApprovedFn = func(int) (bool, bool, error) { return false, true, nil } // pending, unobserved
+	o.ghPRHeadSHAFn = func(int) (string, error) { return "abc123def456789", nil }
+
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(90 * time.Minute)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 1 || (*merged)[0] != 10 {
+		t.Fatalf("merged = %v, want PR #10 merged past the silent gate", *merged)
+	}
+}
+
+func TestAutoMergePRs_MissingReviewWaitsInsideGrace(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{Repo: "owner/repo", ReviewGate: "greptile"}
+	cfg.ReviewRetrigger.MissingAfterMinutes = 60
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRGreptileApprovedFn = func(int) (bool, bool, error) { return false, true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return "abc123def456789", nil }
+
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(10 * time.Minute)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 0 {
+		t.Fatalf("merged = %v, want none inside the grace window", *merged)
+	}
+}
+
+// The policy stays off unless the operator opts in, end to end.
+func TestAutoMergePRs_MissingReviewDisabledByDefault(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{Repo: "owner/repo", ReviewGate: "greptile"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRGreptileApprovedFn = func(int) (bool, bool, error) { return false, true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return "abc123def456789", nil }
+
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(48 * time.Hour)
+
+	o.autoMergePRs(s)
+
+	if len(*merged) != 0 {
+		t.Fatalf("merged = %v, want none — missing_after_minutes defaults to off", *merged)
+	}
+}

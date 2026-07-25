@@ -32,10 +32,10 @@ type Notifier struct {
 	// An alert whose body equals the last-sent body is a no-op (no state
 	// change), so a supervisor cycle re-emitting the same condition sends once.
 	alertState map[string]string
-	// alertInFlight reserves an alert that is being sent right now, so
-	// concurrent callers with the same (class,key,body) collapse to one send
-	// without recording delivery before it succeeds.
-	alertInFlight map[string]string
+	// alertKeyLocks serializes the check-send-record sequence per (class,key)
+	// so concurrent callers cannot both pass the dedup check, and a slow send
+	// cannot overwrite the state recorded by a newer one.
+	alertKeyLocks map[string]*sync.Mutex
 	// alertPendingFlush holds alerts that are only buffered in digest mode.
 	// They dedup like delivered alerts, but a failed Flush releases them so the
 	// condition can be reported again.
@@ -204,62 +204,94 @@ func (n *Notifier) Sendf(format string, args ...any) {
 // digest/notify contract so a supervisor loop re-detecting the same condition
 // every cycle produces one notification, not one per cycle.
 //
-// The alert fans out to the ntfy transport when configured. When it is NOT
-// configured the alert falls back to the base transport (Telegram/OpenClaw)
-// rather than disappearing: an install that never set up ntfy would otherwise
-// silently lose every classified alert, including the CRITICAL floor-breach
-// page. The fallback loses only the priority/tag routing, which ntfy owns.
+// The alert reaches the operator on EVERY configured channel: ntfy when it is
+// configured (carrying the class priority/tags), and the base transport
+// (Telegram/OpenClaw) whenever a target is set. Fanning out to one channel only
+// loses the alert whenever that channel is the broken one — and an install that
+// never set up ntfy would silently lose every classified alert, including the
+// CRITICAL floor-breach page. The error is returned only when every configured
+// channel failed; a partial success still counts as delivered.
+//
+// The whole check-send-record sequence is serialized per (class,key) so
+// concurrent callers cannot interleave: without that, two callers can both pass
+// the dedup check, and a slower send can overwrite the recorded state of a
+// newer one, silencing a later genuine alert.
 func (n *Notifier) Alert(class AlertClass, key, title, body string) error {
 	stateKey := string(class) + "\x00" + key
 
-	// Reserve the (class,key,body) under the lock so concurrent callers with an
-	// identical alert still collapse to one send, then release it if the send
-	// fails so the condition stays eligible for retry. Recording delivery
-	// before sending would lose alerts on a transport error; not reserving at
-	// all would duplicate them under concurrency.
+	unlock := n.lockAlertKey(stateKey)
+	defer unlock()
+
 	n.mu.Lock()
-	if last, ok := n.alertState[stateKey]; ok && last == body {
-		n.mu.Unlock()
-		return nil // no state change since last send — dedup
-	}
-	if inflight, ok := n.alertInFlight[stateKey]; ok && inflight == body {
-		n.mu.Unlock()
-		return nil // another caller is sending this exact alert right now
-	}
-	if n.alertInFlight == nil {
-		n.alertInFlight = make(map[string]string)
-	}
-	n.alertInFlight[stateKey] = body
+	last, seen := n.alertState[stateKey]
 	// In digest mode the base transport only buffers, so "sent" is not
 	// "delivered" until Flush succeeds. Such an alert is recorded as PENDING:
 	// it dedups later identical calls (no duplicate digest entries) but is
 	// dropped again if the flush fails, so the condition can be re-reported.
-	digestBuffered := !n.NtfyConfigured() && n.digestMode
+	digestBuffered := n.digestMode && strings.TrimSpace(n.Target) != ""
 	n.mu.Unlock()
+	if seen && last == body {
+		return nil // no state change since last send — dedup
+	}
 
-	var err error
+	var errs []string
+	delivered := false
 	if n.NtfyConfigured() {
-		err = n.sendNtfy(title, body, RouteFor(class))
-	} else {
-		err = n.Send(alertFallbackText(class, title, body))
+		if err := n.sendNtfy(title, body, RouteFor(class)); err != nil {
+			errs = append(errs, "ntfy: "+err.Error())
+		} else {
+			delivered = true
+		}
+	}
+	if strings.TrimSpace(n.Target) != "" {
+		if err := n.Send(alertFallbackText(class, title, body)); err != nil {
+			errs = append(errs, "base: "+err.Error())
+		} else {
+			delivered = true
+		}
+	}
+	if !delivered {
+		if len(errs) == 0 {
+			return nil // no transport configured at all — nothing to do
+		}
+		// Nothing was delivered: do NOT record the state, or every later cycle
+		// reporting the same condition would be deduped away and the alert lost.
+		return fmt.Errorf("alert %s: %s", class, strings.Join(errs, "; "))
 	}
 
 	n.mu.Lock()
-	delete(n.alertInFlight, stateKey)
-	if err == nil {
-		if n.alertState == nil {
-			n.alertState = make(map[string]string)
+	if n.alertState == nil {
+		n.alertState = make(map[string]string)
+	}
+	n.alertState[stateKey] = body
+	if digestBuffered {
+		if n.alertPendingFlush == nil {
+			n.alertPendingFlush = make(map[string]string)
 		}
-		n.alertState[stateKey] = body
-		if digestBuffered {
-			if n.alertPendingFlush == nil {
-				n.alertPendingFlush = make(map[string]string)
-			}
-			n.alertPendingFlush[stateKey] = body
-		}
+		n.alertPendingFlush[stateKey] = body
 	}
 	n.mu.Unlock()
-	return err
+	if len(errs) > 0 {
+		log.Printf("[notify] alert %s delivered with partial failure: %s", class, strings.Join(errs, "; "))
+	}
+	return nil
+}
+
+// lockAlertKey serializes Alert calls that share a (class,key) identity and
+// returns the release func. Distinct keys stay concurrent.
+func (n *Notifier) lockAlertKey(stateKey string) func() {
+	n.mu.Lock()
+	if n.alertKeyLocks == nil {
+		n.alertKeyLocks = make(map[string]*sync.Mutex)
+	}
+	mu, ok := n.alertKeyLocks[stateKey]
+	if !ok {
+		mu = &sync.Mutex{}
+		n.alertKeyLocks[stateKey] = mu
+	}
+	n.mu.Unlock()
+	mu.Lock()
+	return mu.Unlock
 }
 
 // alertFallbackText renders a classified alert for the plain-text transports,
