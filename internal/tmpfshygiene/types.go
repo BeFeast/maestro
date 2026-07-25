@@ -57,7 +57,12 @@ type Summary struct {
 	Categories       map[string]CategoryStats `json:"categories"`
 	ProtectHits      map[string]int           `json:"protect_hits"`
 	ProcScanErrors   int                      `json:"proc_scan_errors,omitempty"`
-	Error            string                   `json:"error,omitempty"`
+	// ProcPermissionSkips counts /proc entries the sweeper could not inspect
+	// because they belong to other users (EACCES). These are expected on any
+	// multi-user host and never blanket-protect candidates; they are surfaced
+	// for observability only.
+	ProcPermissionSkips int    `json:"proc_permission_skips,omitempty"`
+	Error               string `json:"error,omitempty"`
 }
 
 type removalResult struct {
