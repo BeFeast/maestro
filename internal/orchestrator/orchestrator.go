@@ -1031,6 +1031,13 @@ func (o *Orchestrator) saveCheckpoint(sess *state.Session) (string, error) {
 }
 
 func (o *Orchestrator) checkOutcome(ctx context.Context) outcome.HealthCheckResult {
+	if o.emergencyHaltFn != nil && o.emergencyHaltFn() {
+		return outcome.HealthCheckResult{
+			CheckedAt: time.Now().UTC(),
+			State:     outcome.HealthUnknown,
+			Summary:   "skipped: emergency stop active",
+		}
+	}
 	if o.outcomeCheckFn != nil {
 		return o.outcomeCheckFn(ctx, o.cfg.Outcome)
 	}
@@ -2953,6 +2960,14 @@ func (o *Orchestrator) RunOnce() error {
 	// across cycles.
 	o.beginCycle()
 	defer o.endCycle()
+
+	// EMERGENCY STOP: skip the whole orchestrator cycle. Spawn halt alone left
+	// outcome verifiers (java/gradle/android), gh api children, and go builds
+	// running under the daemon cgroup; engaging the switch must not re-create them.
+	if o.emergencyHaltFn != nil && o.emergencyHaltFn() {
+		log.Printf("[orch] EMERGENCY STOP active: skipping cycle (no GitHub/outcome/spawn)")
+		return nil
+	}
 
 	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
@@ -9907,8 +9922,8 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	// EMERGENCY STOP (#840): the fleet-wide big red button closes the spawn gate
 	// ahead of every other check. It halts ALL new worker spawns (and, since the
 	// router is only consulted inside this issue loop, every router LLM call for a
-	// spawn) within one poll interval. In-flight workers keep running; the daemon
-	// stays up so the operator can watch while nothing spends.
+	// spawn) within one poll interval. In-flight workers and attached verify/build
+	// children are killed on engage; the daemon stays up so the operator can watch.
 	if o.emergencyHaltFn != nil && o.emergencyHaltFn() {
 		log.Printf("[orch] EMERGENCY STOP active: not spawning new workers (running=%d)", s.RunningSessionCount())
 		return

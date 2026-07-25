@@ -645,6 +645,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		flow := d.startFlow(ctx, storeNames[i], projects[i])
 		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, flow.cfg.Repo, flow.cfg.StateDir)
 	}
+	// configureEmergencyStop may have run before flows existed (0 configs). Once
+	// flows are live, re-sweep workers + attached children if the switch is on.
+	if d.EmergencyState().Active() {
+		d.killInFlightWorkersForEmergency("post-start")
+	}
 
 	// Expose the fleet only after the flows are started so callers that observe
 	// d.Fleet() can rely on the flows being live.

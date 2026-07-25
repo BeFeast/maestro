@@ -78,14 +78,15 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 	// archaeology (#764). Logs key on the unique fleet name (not the possibly
 	// shared session prefix) so two same-basename repos stay distinguishable.
 	runOnce := func() error {
-		// Fleet-wide EMERGENCY STOP (#840): when the switch halts LLM calls, run
-		// the cycle deterministic-only so the supervisor stops spending on its
-		// backend within one cycle. The rest of the cycle (state, GitHub reads,
-		// journal) is unchanged, so the operator keeps seeing what is happening.
-		opts := []supervisor.RunOption{supervisor.WithApprovalsDBPath(approvalsDBPath)}
+		// Fleet-wide EMERGENCY STOP (#840): skip the whole supervise cycle while
+		// the switch is active. Deterministic-only still spawned gh api children
+		// and outcome/verify scripts (java/gradle/go/android); engaging the
+		// stop must not keep re-creating them under the daemon cgroup.
 		if emergencyLLMHalt != nil && emergencyLLMHalt() {
-			opts = append(opts, supervisor.WithEmergencyLLMHalt(true))
+			log.Printf("[%s] supervise: EMERGENCY STOP — skipping cycle (no GitHub/outcome/LLM)", name)
+			return nil
 		}
+		opts := []supervisor.RunOption{supervisor.WithApprovalsDBPath(approvalsDBPath)}
 		decision, err := supervisor.RunOnce(getCfg(), reader, opts...)
 		if err != nil {
 			return err

@@ -130,7 +130,7 @@ Emergency stop (#840) — fleet-wide BIG RED BUTTON:
                                   worker spawns, router calls stopped. The daemon
                                   keeps running (dashboards/state/reads stay up);
                                   in-flight workers are left running unless you
-                                  pass --kill-workers. Flag lives in the unified
+                                  in-flight workers are killed. Flag lives in the unified
                                   DB and survives a daemon restart.
   maestro emergency stop-all      Whole-fleet stop, recorded as an emergency
                                   state that survives restart until resumed.
@@ -140,7 +140,7 @@ Emergency stop (#840) — fleet-wide BIG RED BUTTON:
     --db string       Unified SQLite db the switch lives in (default ~/.maestro/maestro.db)
     --reason string   Why the stop was engaged (recorded + notified)
     --actor string    Who engaged it (default: current user)
-    --kill-workers    Also kill in-flight tmux workers (stop-llm/stop-all)
+    --kill-workers    Deprecated (always on): kill in-flight workers on stop
 
 Stop flags:
   --session string      Session name to stop (e.g. pan-1)

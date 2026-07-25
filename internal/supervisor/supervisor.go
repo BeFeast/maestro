@@ -339,7 +339,12 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	// state.Save that records the executed/failed transition lives
 	// inside the !DryRun guard below, so dry-run would also re-execute
 	// the same approvals on every cycle. We move the call there.
-	recordOutcomeHealth(cfg, st)
+	// EMERGENCY STOP: skip outcome/verify healthchecks (gradle/java/go/android
+	// scripts). Engaging the switch also SIGKILLs any already-running children;
+	// skipping here stops the supervise loop from immediately re-spawning them.
+	if !ro.emergencyLLMHalt {
+		recordOutcomeHealth(cfg, st)
+	}
 
 	engine := NewEngine(cfg, reader)
 	engine.SetEmergencyLLMHalt(ro.emergencyLLMHalt)

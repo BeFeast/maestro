@@ -83,7 +83,7 @@ export function EmergencyControls() {
         <button
           className="tb-btn danger"
           onClick={() => setDialog("stop")}
-          title="Emergency stop — halt all LLM spend fleet-wide"
+          title="Emergency stop — kill workers + verify/build children and halt all LLM spend"
         >
           ⏹ Emergency stop
         </button>
@@ -91,19 +91,21 @@ export function EmergencyControls() {
 
       <ConfirmDialog
         open={dialog === "stop"}
-        title="Emergency stop — halt all LLM spend"
-        confirmLabel="Stop LLM calls"
+        title="Emergency stop — kill workers, verify/build & halt LLM spend"
+        confirmLabel="Kill all & stop LLM"
         danger
         busy={busy}
         onConfirm={() => run("llm_stopped")}
         onClose={close}
       >
         <p style={{ margin: "0 0 10px" }}>
-          Halts <strong>all LLM calls fleet-wide</strong>: the supervisor drops to
-          deterministic-only, no new workers spawn, and router calls stop. The
-          daemon keeps running so you can watch while nothing spends. In-flight
-          workers are left running. The flag persists across a restart until you
-          resume.
+          Halts <strong>all LLM work fleet-wide immediately</strong>: in-flight
+          workers are killed, and maestro-attached verify/build children
+          (java/gradle, gh, go test/build, android tools) under the daemon
+          cgroup are stopped too. The supervisor drops to deterministic-only, no
+          new workers spawn, and router/LLM calls stop. The daemon itself keeps
+          running (dashboards/state) so you can watch while nothing spends. The
+          flag persists across a restart until you resume.
         </p>
         <label className="emergency-reason-label">
           Reason (optional)

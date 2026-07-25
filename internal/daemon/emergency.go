@@ -9,6 +9,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // configureEmergencyStop opens the fleet-wide EMERGENCY STOP switch store (#840)
@@ -42,6 +43,10 @@ func (d *Daemon) configureEmergencyStop(ctx context.Context, cfgs []*config.Conf
 		if st.Active() {
 			log.Printf("[daemon] EMERGENCY STOP active on startup — level=%s since=%s by=%s reason=%q: no LLM calls, no new spawns until `maestro emergency resume`",
 				st.Level, formatEmergencySince(st.Since), st.Actor, st.Reason)
+			// A switch set while we were down (or a restart under an active stop)
+			// must also tear down any workers that survived the previous process —
+			// spawn-halt alone leaves in-flight LLM spend running.
+			d.killInFlightWorkersForEmergency("startup")
 		}
 	}
 
@@ -103,6 +108,17 @@ func (d *Daemon) watchEmergencyLoop(ctx context.Context, interval time.Duration)
 			}
 			prev := d.EmergencyState()
 			if st.Level == prev.Level {
+				// While the stop stays engaged, keep reaping daemon-cgroup /
+				// worker-scope children so supervise outcome/gh/java work cannot
+				// rebuild under an active emergency. Do not re-sweep worker
+				// session state every tick — that already happened on engage.
+				if st.Active() {
+					attached := worker.KillDaemonCgroupChildren(0)
+					attached += worker.KillMaestroWorkerScopeChildren()
+					if attached > 0 {
+						log.Printf("[daemon] EMERGENCY STOP kill-workers (watch): stopped %d attached child process(es)", attached)
+					}
+				}
 				continue
 			}
 			d.setEmergencyState(st)
@@ -122,7 +138,15 @@ func (d *Daemon) announceEmergencyTransition(prev, cur emergencystore.State) {
 		log.Printf("[daemon] EMERGENCY STOP engaged — level=%s since=%s by=%s reason=%q",
 			cur.Level, formatEmergencySince(cur.Since), cur.Actor, cur.Reason)
 		for _, name := range flows {
-			log.Printf("[%s] EMERGENCY STOP (%s) — no LLM calls, no new spawns this flow", name, cur.Level)
+			log.Printf("[%s] EMERGENCY STOP (%s) — no LLM calls, no new spawns this flow; killing in-flight workers and attached verify/build children", name, cur.Level)
+		}
+		// CRITICAL: engaging the switch must halt live LLM spend immediately.
+		// Historically the gate only refused new spawns and left in-flight
+		// workers (and their codex/claude/opencode children) running until the
+		// operator passed --kill-workers. Kill on every inactive→active edge
+		// (and on startup seed) so dashboard/CLI/API all get the same behavior.
+		if !prev.Active() {
+			d.killInFlightWorkersForEmergency("engage")
 		}
 		return
 	}
@@ -163,6 +187,42 @@ func emergencyNotifierFor(cfgs []*config.Config) *notify.Notifier {
 		return n
 	}
 	return nil
+}
+
+// killInFlightWorkersForEmergency stops every StatusRunning worker across the
+// live flows AND tears down maestro-attached non-LLM children in the daemon
+// cgroup / worker scopes (gh, java/gradle, go test/build, verify-outcome,
+// aapt2, …). Worktrees are preserved. reason is a short journal tag
+// ("engage" / "startup" / "watch").
+func (d *Daemon) killInFlightWorkersForEmergency(reason string) {
+	cfgs := d.liveFlowConfigs()
+	res := worker.EmergencyKillAll(cfgs)
+	log.Printf("[daemon] EMERGENCY STOP kill-workers (%s): stopped %d in-flight worker(s) and %d attached child process(es) across %d flow(s)",
+		reason, res.Workers, res.Attached, len(cfgs))
+}
+
+// liveFlowConfigs returns the current config for every running flow (holder
+// load when available, else the startup cfg).
+func (d *Daemon) liveFlowConfigs() []*config.Config {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	out := make([]*config.Config, 0, len(d.flows))
+	for _, flow := range d.flows {
+		if flow == nil {
+			continue
+		}
+		var cfg *config.Config
+		if flow.holder != nil {
+			cfg = flow.holder.Load()
+		}
+		if cfg == nil {
+			cfg = flow.cfg
+		}
+		if cfg != nil {
+			out = append(out, cfg)
+		}
+	}
+	return out
 }
 
 func formatEmergencySince(t time.Time) string {

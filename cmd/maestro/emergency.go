@@ -14,7 +14,6 @@ import (
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/notify"
-	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
 )
 
@@ -67,7 +66,7 @@ func emergencyFlagSet(name string) (*flag.FlagSet, *emergencyFlags) {
 	fs.Var(&ef.configs, "config", "Path to config file (can be repeated; alternative to --store)")
 	fs.StringVar(&ef.reason, "reason", "", "Why the emergency stop was engaged (recorded + notified)")
 	fs.StringVar(&ef.actor, "actor", "", "Who engaged it (default: current OS user)")
-	fs.BoolVar(&ef.killWorkers, "kill-workers", false, "Also kill in-flight tmux workers")
+	fs.BoolVar(&ef.killWorkers, "kill-workers", true, "Deprecated no-op (always true): in-flight workers are always killed on emergency stop")
 	return fs, ef
 }
 
@@ -89,18 +88,13 @@ func emergencyStop(level emergencystore.Level, args []string) {
 
 	st, _ := store.Get(context.Background())
 	fmt.Printf("EMERGENCY STOP engaged — level=%s by=%s\n", st.Level, actor)
-	fmt.Printf("All LLM calls and new worker spawns are halted fleet-wide. A running daemon applies this within one poll interval; the flag survives a restart.\n")
+	fmt.Printf("All LLM calls and new worker spawns are halted fleet-wide; in-flight workers and attached verify/build children (java/gh/go/android) are killed. A running daemon applies this within one poll interval; the flag survives a restart.\n")
 	if strings.TrimSpace(ef.reason) != "" {
 		fmt.Printf("Reason: %s\n", strings.TrimSpace(ef.reason))
 	}
 
-	killed := 0
-	if ef.killWorkers {
-		killed = killInFlightWorkers(ef)
-		fmt.Printf("Killed %d in-flight worker(s).\n", killed)
-	} else {
-		fmt.Printf("In-flight tmux workers left running (pass --kill-workers to also kill them).\n")
-	}
+	killed := killInFlightWorkers(ef)
+	fmt.Printf("Killed %d in-flight worker(s).\n", killed)
 
 	notifyEmergency(ef, st.ActivationMessage())
 	fmt.Printf("Run `maestro emergency resume` to restore normal operation.\n")
@@ -234,36 +228,6 @@ func notifyEmergency(ef *emergencyFlags, msg string) {
 // (the --kill-workers escalation). Best-effort per session so one failure does
 // not abort the sweep.
 func killInFlightWorkers(ef *emergencyFlags) int {
-	killed := 0
-	for _, cfg := range emergencyConfigs(ef) {
-		if cfg == nil {
-			continue
-		}
-		s, err := state.Load(cfg.StateDir)
-		if err != nil {
-			log.Printf("warn: load state for %s: %v", cfg.Repo, err)
-			continue
-		}
-		changed := false
-		for slot, sess := range s.Sessions {
-			if sess == nil || sess.Status != state.StatusRunning {
-				continue
-			}
-			if err := worker.Stop(cfg, slot, sess); err != nil {
-				log.Printf("warn: kill worker %s (%s): %v", slot, cfg.Repo, err)
-				continue
-			}
-			now := time.Now().UTC()
-			sess.Status = state.StatusDead
-			sess.FinishedAt = &now
-			changed = true
-			killed++
-		}
-		if changed {
-			if err := state.Save(cfg.StateDir, s); err != nil {
-				log.Printf("warn: save state after kill for %s: %v", cfg.Repo, err)
-			}
-		}
-	}
-	return killed
+	res := worker.EmergencyKillAll(emergencyConfigs(ef))
+	return res.Workers + res.Attached
 }
