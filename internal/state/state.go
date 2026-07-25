@@ -5086,9 +5086,7 @@ func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit &&
-			sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) &&
-			sess.WorkerOutcome != WorkerOutcomeDuplicateDispatchReconciled {
+			sessionProvesFailedAttempt(sess) {
 			count++
 		}
 	}
@@ -5148,11 +5146,33 @@ func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
 // has been marked as retry_exhausted.
 func (s *State) IssueRetryExhausted(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted {
+		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted &&
+			sessionProvesFailedAttempt(sess) {
 			return true
 		}
 	}
 	return false
+}
+
+// sessionProvesFailedAttempt reports whether a terminal session is evidence the
+// implementation itself failed, as opposed to a transient backend block, a
+// deterministic governor stop, or Maestro's own bookkeeping.
+//
+// Both retry gates must agree on this, and both are consulted: the queue paths
+// check IssueRetryExhausted BEFORE FailedAttemptsForIssue, so excluding an
+// outcome from the count alone leaves the issue blocked anyway the moment one
+// such session carries the retry_exhausted status. Live ok-player #627: two
+// duplicate-dispatch siblings were retired with that status, and the issue
+// stayed permanently undispatchable even after the count was corrected.
+func sessionProvesFailedAttempt(sess *Session) bool {
+	if sess == nil || sess.RateLimitHit {
+		return false
+	}
+	switch sess.WorkerOutcome {
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+		return false
+	}
+	return true
 }
 
 // MarkIssueRetryExhausted transitions the most recent dead/failed session

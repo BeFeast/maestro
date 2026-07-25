@@ -1367,7 +1367,7 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 		// ok-folio's LAN healthcheck flapped under host load and the fleet
 		// ground through 31 failed sessions on the minted issues). The operator
 		// decides; an explicitly labelled streak issue still runs normally.
-		if isGateFailStreakIssue(issue) && !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+		if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
 			baseReasons = appendReasons(baseReasons,
 				fmt.Sprintf("Issue #%d is an auto-minted gate-fail-streak report — it needs an operator to judge whether the gate failure is repo-fixable before it enters the queue", issue.Number),
 			)

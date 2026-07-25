@@ -17,3 +17,21 @@ const gateFailStreakBodyMarker = "<!-- maestro:gate-fail-streak"
 func isGateFailStreakIssue(issue github.Issue) bool {
 	return strings.Contains(issue.Body, gateFailStreakBodyMarker)
 }
+
+// operatorTriagedGateStreak reports whether an operator has explicitly admitted
+// a minted streak report into the queue by labelling it.
+//
+// This deliberately does NOT reuse matchesRequiredLabels: with no issue_labels
+// and no supervisor.ready_label configured — a supported setup where every open
+// issue is eligible — that predicate is vacuously true, so a freshly minted
+// report would count as triaged the moment it appeared and the wave would spawn
+// against it. In that configuration there is no label for an operator to apply,
+// so a streak report is never auto-eligible; the operator closes it, or converts
+// it into a real issue.
+func (e *Engine) operatorTriagedGateStreak(issue github.Issue) bool {
+	required := e.requiredIssueLabels()
+	if len(required) == 0 {
+		return false
+	}
+	return matchesRequiredLabels(issue, required)
+}
