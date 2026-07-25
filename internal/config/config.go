@@ -151,6 +151,13 @@ type BackendDef struct {
 	// false backend gating. Validated to compile at config parse.
 	UsageLimitPatterns []string `yaml:"usage_limit_patterns,omitempty"`
 
+	// SupervisorAttemptTimeoutSeconds overrides supervisor.attempt_timeout_seconds
+	// for this backend when it serves a supervisor consult. Set it on slow
+	// print-mode carriers (claude CLI at high effort ≈ 180) so the walk gives
+	// them a real chance instead of billing a generation and killing it at the
+	// 45s default. Workers are unaffected — this is a supervisor-only knob.
+	SupervisorAttemptTimeoutSeconds int `yaml:"supervisor_attempt_timeout_seconds,omitempty"`
+
 	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
 	// delegate grunt subtasks to cheaper sub-agent models instead of
 	// reusing the expensive orchestrator model for everything (#706). When
@@ -385,6 +392,41 @@ type ModelConfig struct {
 	// project override. Otherwise lanes compose in declaration order, with each
 	// provider's default followed by its local fallbacks before the next provider.
 	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
+	// HoldOnCooldown makes quota-class backend cooldowns a wait, not a cascade:
+	// when the routed backend is cooling down with a known reset inside the
+	// configured window, dispatch/retry hold for that reset instead of walking
+	// the fallback chain. See HoldOnCooldownConfig.
+	HoldOnCooldown HoldOnCooldownConfig `yaml:"hold_on_cooldown,omitempty"`
+}
+
+// HoldOnCooldownConfig controls hold-vs-cascade semantics for quota-class
+// backend cooldowns (provider_limit, usage_limit, model_cooldown,
+// model_overloaded, quota_pressure). Off, a cooling backend cascades work onto
+// the next fallback rung immediately — under a fleet-wide primary cooldown
+// that dumps every project onto one fallback seat (2026-07 live: an Anthropic
+// cooldown pushed ~80% of the week's tokens through the single ChatGPT seat).
+// On, a cooldown whose RetryAfter lands within max_wait_minutes holds the work
+// for the reset; only unknown or beyond-window resets (weekly caps), and
+// non-quota failures (auth_failure, model_unavailable, disabled), still
+// cascade.
+type HoldOnCooldownConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxWaitMinutes bounds how long a hold may wait for a stated reset.
+	// 0 means the default (360 = 6h, covering a 5-hour subscription window);
+	// resets further out than this cascade to the next rung as before.
+	MaxWaitMinutes int `yaml:"max_wait_minutes,omitempty"`
+}
+
+// defaultHoldOnCooldownMaxWait covers a full 5-hour subscription window with
+// slack; a stated reset beyond it (e.g. a weekly cap) is not worth idling for.
+const defaultHoldOnCooldownMaxWait = 360 * time.Minute
+
+// MaxWait returns the bounded hold window as a duration.
+func (h HoldOnCooldownConfig) MaxWait() time.Duration {
+	if h.MaxWaitMinutes > 0 {
+		return time.Duration(h.MaxWaitMinutes) * time.Minute
+	}
+	return defaultHoldOnCooldownMaxWait
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -899,6 +941,18 @@ type SupervisorConfig struct {
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
+	// AttemptTimeoutSeconds bounds ONE supervisor LLM backend attempt. Default
+	// 45s — calibrated for fast print-mode backends (codex/sol). A slow carrier
+	// (claude CLI at high effort through a proxy) needs more; give it a
+	// per-backend override (model.backends.<name>.supervisor_attempt_timeout_seconds)
+	// instead of raising this global. Burn RCA 2026-07-24: a chain of three
+	// claude-binary candidates under the 45s default produced ~365
+	// paid-and-discarded generations in 4.5h — every attempt billed
+	// server-side, then killed client-side before the answer arrived.
+	AttemptTimeoutSeconds int `yaml:"attempt_timeout_seconds" json:"attempt_timeout_seconds,omitempty"`
+	// TotalTimeoutSeconds bounds the whole candidate walk for one consult so a
+	// slow chain can never overrun the supervise interval. Default 180s.
+	TotalTimeoutSeconds int `yaml:"total_timeout_seconds" json:"total_timeout_seconds,omitempty"`
 	// AlwaysConsultLLM restores the pre-#837 behavior of calling the supervisor
 	// LLM on every enabled cycle, even when the deterministic guardrail already
 	// decided a safe, mutation-free action (action=none / wait_* / monitor_open_pr).
@@ -1721,6 +1775,20 @@ type ReviewRetriggerConfig struct {
 	Enabled         *bool `yaml:"enabled"`          // default: true
 	PendingMinutes  int   `yaml:"pending_minutes"`  // re-trigger after this many minutes of greptile=pending on one head (default: 10)
 	CooldownMinutes int   `yaml:"cooldown_minutes"` // minimum minutes between re-trigger comments per session (default: 30)
+	// MaxAttempts caps how many re-trigger comments one session may post for
+	// a single head. Without a cap a permanently silent reviewer collects a
+	// "@greptile review" comment every cooldown window forever (live 2026-07:
+	// Greptile paused after exhausting its free credits and every wedged PR
+	// kept accruing comments). Default 3; <= 0 means the default, and a
+	// deliberate "never stop" is spelled as a large number.
+	MaxAttempts int `yaml:"max_attempts,omitempty"`
+	// MissingAfterMinutes makes an UNOBSERVED review gate non-blocking once the
+	// gate has been silent this long on one head — no check run, no comment,
+	// nothing. 0 (default) preserves today's behavior: a silent gate holds the
+	// PR forever. A reviewer that DOES answer still hard-blocks regardless of
+	// this value, so enabling it never weakens a working gate; it only bounds
+	// the wait on a reviewer that never shows up.
+	MissingAfterMinutes int `yaml:"missing_after_minutes,omitempty"`
 }
 
 // Active reports whether the stale-review re-trigger runs. Default true —
@@ -1749,6 +1817,35 @@ func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
 		return 30 * time.Minute
 	}
 	return time.Duration(c.CooldownMinutes) * time.Minute
+}
+
+// EffectiveMaxAttempts caps re-trigger comments per head; 0 means unlimited,
+// which is the default.
+//
+// The cap is deliberately opt-in. Capping by default would REMOVE the only
+// automatic recovery an untouched install has: before this knob existed, a
+// wedged gate kept being nudged every cooldown window, so a review service that
+// came back hours later was woken by the next nudge and the PR merged
+// hands-off. A default cap silences those nudges after N tries while the
+// escape hatch that would release the PR (missing_after_minutes) is itself
+// off by default — turning "eventually self-heals" into "wedged forever" for an
+// operator who changed nothing. An operator who sets a cap is accepting that
+// trade, and should set missing_after_minutes with it.
+func (c ReviewRetriggerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts <= 0 {
+		return 0
+	}
+	return c.MaxAttempts
+}
+
+// MissingReviewGraceOrZero returns how long a fully silent review gate may hold
+// a PR before it is treated as non-blocking, or 0 when the operator has not
+// opted in (today's block-forever behavior).
+func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
+	if c.MissingAfterMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.MissingAfterMinutes) * time.Minute
 }
 
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting
@@ -2655,6 +2752,20 @@ func parse(data []byte) (*Config, error) {
 		}
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
+		}
+	}
+	if cfg.Model.HoldOnCooldown.MaxWaitMinutes < 0 {
+		return nil, fmt.Errorf("config: model.hold_on_cooldown.max_wait_minutes = %d; want >= 0 (0 uses the default window)", cfg.Model.HoldOnCooldown.MaxWaitMinutes)
+	}
+	if cfg.Supervisor.AttemptTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.attempt_timeout_seconds = %d; want >= 0 (0 uses the 45s default)", cfg.Supervisor.AttemptTimeoutSeconds)
+	}
+	if cfg.Supervisor.TotalTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.total_timeout_seconds = %d; want >= 0 (0 uses the 180s default)", cfg.Supervisor.TotalTimeoutSeconds)
+	}
+	for name, def := range cfg.Model.Backends {
+		if def.SupervisorAttemptTimeoutSeconds < 0 {
+			return nil, fmt.Errorf("config: model.backends.%s.supervisor_attempt_timeout_seconds = %d; want >= 0", name, def.SupervisorAttemptTimeoutSeconds)
 		}
 	}
 	// #704: quota calibration sanity. Capacities must be non-negative and

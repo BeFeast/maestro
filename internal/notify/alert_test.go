@@ -179,10 +179,13 @@ func TestAlert_DifferentKeysAreIndependent(t *testing.T) {
 	}
 }
 
-func TestAlert_NoNtfyConfig_IsNoOp(t *testing.T) {
-	n := &Notifier{} // no ntfy configured
+// With NO transport at all — neither ntfy nor Telegram/OpenClaw — Alert stays a
+// silent no-op. When only ntfy is missing it now falls back to the base
+// transport instead (see TestAlert_FallsBackToBaseTransportWithoutNtfy).
+func TestAlert_NoTransportConfigured_IsNoOp(t *testing.T) {
+	n := &Notifier{} // neither ntfy nor a base transport
 	if err := n.Alert(AlertEmergency, "k", "t", "b"); err != nil {
-		t.Errorf("Alert without ntfy config should return nil, got %v", err)
+		t.Errorf("Alert without any transport should return nil, got %v", err)
 	}
 }
 

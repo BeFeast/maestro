@@ -1355,6 +1355,26 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			continue
 		}
 
+		// A gate-fail-streak issue is Maestro reporting that a scheduled gate
+		// failed N times — it is a notification, not a triaged task. Whether a
+		// worker can fix it depends entirely on what the gate checks: repo code,
+		// or an external service Maestro has no reach into. Auto-promoting it
+		// spawns workers against outages they cannot fix (live 2026-07-23:
+		// ok-folio's LAN healthcheck flapped under host load and the fleet
+		// ground through 31 failed sessions on the minted issues). The operator
+		// decides; an explicitly labelled streak issue still runs normally.
+		//
+		// This must stay ahead of the SelectedCandidate assignment below: with
+		// owns_ready_label enabled, a skipped-but-selected candidate is handed
+		// to applySupervisorOwnedReadyFilter, which admits it to the dispatch
+		// list even though the decision itself was `none`.
+		if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is an auto-minted gate-fail-streak report — it needs an operator to judge whether the gate failure is repo-fixable before it enters the queue", issue.Number),
+			)
+			continue
+		}
+
 		if analysis != nil {
 			analysis.SelectedCandidate = supervisorIssueCandidate(issue)
 		}
@@ -1910,7 +1930,8 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolved(st, sess, cache) {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 &&
+			state.SessionProvesFailedAttempt(sess) && !e.retryExhaustedSessionResolved(st, sess, cache) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -2845,6 +2866,9 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
 	}
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
+	}
 	policyExcludedLabels := e.policyExcludedLabels()
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(e.excludeLabels(), label) || hasLabelName(policyExcludedLabels, label)) {
 		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
@@ -2892,6 +2916,12 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 	}
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
+	}
+	// Gate-streak intake is enabled independently of dynamic-wave policy, so the
+	// hold cannot live only in decideDynamicWave: the default eligibility path
+	// and the repair path both reach dispatch through here.
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
 	}
 	policyExcludedLabels := excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(excludeLabels, label) || hasLabelName(policyExcludedLabels, label)) {
@@ -3520,7 +3550,8 @@ func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int)
 func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted {
+		if sess == nil || sess.Status != state.StatusRetryExhausted ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {
@@ -3541,7 +3572,8 @@ func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.
 	}
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 {
+		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {

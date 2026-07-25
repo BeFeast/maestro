@@ -96,6 +96,13 @@ const (
 	// worker that disappeared again after Maestro already gave the same
 	// canonical session one automatic unexpected-exit recovery.
 	WorkerOutcomeRepeatedUnexpectedExit = "repeated_unexpected_exit"
+	// WorkerOutcomeDuplicateDispatchReconciled marks a SIBLING session that
+	// Maestro itself retired while reconciling duplicate dispatches for one
+	// issue: its durable work was proven patch-equivalent or handed off to the
+	// canonical session, and only its dispatcher claim was released. It is
+	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
+	// must not consume the per-issue retry budget.
+	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
 )
 
 const (
@@ -190,6 +197,9 @@ type BackendSelection struct {
 	CandidateScores      []BackendCandidate `json:"candidate_scores,omitempty"`
 	HardPin              bool               `json:"hard_pin,omitempty"`
 	PreviousBackend      string             `json:"previous_backend,omitempty"`
+	// HoldUntil (RFC3339) is set when hold_on_cooldown suppressed a fallback
+	// cascade: no backend was selected and the work waits for this instant.
+	HoldUntil string `json:"hold_until,omitempty"`
 
 	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
 	// strength tier the policy resolved to; Effort/Model are the per-tier
@@ -369,6 +379,13 @@ type Session struct {
 	ReviewPendingHeadSHA string     `json:"review_pending_head_sha,omitempty"` // head SHA the pending clock applies to
 	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
 	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
+	ReviewRetriggerCount int        `json:"review_retrigger_count,omitempty"`  // re-triggers posted for ReviewPendingHeadSHA; capped by review_retrigger.max_attempts
+	// ReviewGateObserved is sticky for ReviewPendingHeadSHA: once ANY reviewer
+	// signal is seen on that head it stays true until the head changes. A
+	// transient check-runs API error degrades one read to "unobserved", and
+	// without this memory that single blip would look like "the reviewer never
+	// showed up" and expire a gate that is genuinely working.
+	ReviewGateObserved bool `json:"review_gate_observed,omitempty"`
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits
@@ -5057,27 +5074,115 @@ func (s *State) IssueDone(issueNum int) bool {
 // as failed attempts: neither condition proves the implementation itself failed,
 // and both must remain runnable after their independent hold/release policy.
 // See #432 / #458 / #466 / #693.
+//
+// Sessions Maestro itself retired while reconciling duplicate dispatches are
+// excluded for the same reason: that outcome records the control plane tidying
+// up after spawning two workers for one issue, not an attempt that failed.
+// Live 2026-07-23 (ok-player #627): a respawn-thrash incident produced two such
+// siblings, and with only one genuine failure the issue still reported 3/3
+// attempts and stopped being dispatched at all.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit && sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) {
+			sessionProvesFailedAttempt(sess) {
 			count++
 		}
 	}
 	return count
 }
 
+// ConsecutiveTokenBudgetKillsForIssue counts how many of the issue's most
+// recent PR-less sessions ended at the token budget, stopping at the first
+// session that ended any other way.
+//
+// A budget stop is deliberately excluded from FailedAttemptsForIssue — it is a
+// governor, not a work failure, so it must not burn the per-issue retry budget.
+// The gap that leaves: when the configured budget sits BELOW the floor a worker
+// needs just to load its initial context, every dispatch dies the same way and
+// nothing ever stops re-dispatching. Live 2026-07-24: ok-player #628 spawned 9
+// times in 4.5h, each killed after ~2 minutes at observed≈157k vs max=120k.
+// Callers use this streak to break the mill and surface the misconfiguration.
+func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
+	if s == nil {
+		return 0
+	}
+	type ended struct {
+		at      time.Time
+		budget  bool
+		counted bool
+	}
+	var history []ended
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNum || sess.PRNumber != 0 {
+			continue
+		}
+		if sess.Status != StatusDead && sess.Status != StatusFailed && sess.Status != StatusRetryExhausted {
+			continue
+		}
+		at := sess.StartedAt
+		if sess.FinishedAt != nil {
+			at = *sess.FinishedAt
+		}
+		history = append(history, ended{
+			at:      at,
+			budget:  sess.WorkerOutcome == string(DisplayTokenBudgetExceeded),
+			counted: true,
+		})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].at.After(history[j].at) })
+	streak := 0
+	for _, entry := range history {
+		if !entry.budget {
+			break
+		}
+		streak++
+	}
+	return streak
+}
+
 // IssueRetryExhausted returns true if any session for the given issue
 // has been marked as retry_exhausted.
 func (s *State) IssueRetryExhausted(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted {
+		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted &&
+			sessionProvesFailedAttempt(sess) {
 			return true
 		}
 	}
 	return false
+}
+
+// sessionProvesFailedAttempt reports whether a terminal session is evidence the
+// implementation itself failed, as opposed to a transient backend block, a
+// deterministic governor stop, or Maestro's own bookkeeping.
+//
+// Both retry gates must agree on this, and both are consulted: the queue paths
+// check IssueRetryExhausted BEFORE FailedAttemptsForIssue, so excluding an
+// outcome from the count alone leaves the issue blocked anyway the moment one
+// such session carries the retry_exhausted status. Live ok-player #627: two
+// duplicate-dispatch siblings were retired with that status, and the issue
+// stayed permanently undispatchable even after the count was corrected.
+// SessionProvesFailedAttempt is the exported form for callers outside this
+// package that act on retry exhaustion — spawning a repair worker, or raising a
+// Blocked stuck-state. They must agree with the two retry gates: a session
+// retired by Maestro's own duplicate-dispatch cleanup, stopped deterministically
+// at the token budget, or blocked by a rate limit carries the retry_exhausted
+// status without being evidence that the implementation failed.
+func SessionProvesFailedAttempt(sess *Session) bool {
+	return sessionProvesFailedAttempt(sess)
+}
+
+func sessionProvesFailedAttempt(sess *Session) bool {
+	if sess == nil || sess.RateLimitHit {
+		return false
+	}
+	switch sess.WorkerOutcome {
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+		return false
+	}
+	return true
 }
 
 // MarkIssueRetryExhausted transitions the most recent dead/failed session

@@ -2434,11 +2434,11 @@ func (s *FleetServer) handleFleetEmergency(w http.ResponseWriter, r *http.Reques
 		} else {
 			msg = emergencystore.ResumeMessage(emergencystore.State{Level: level}, st)
 		}
-		n.Sendf("%s", msg)
-		// Fan the notify_red-grade alert to ntfy (#1018); dedup keeps a repeated
-		// identical emergency state from re-notifying.
+		// Alert covers both transports: ntfy when configured, otherwise the
+		// base Telegram/OpenClaw send; dedup keeps a repeated identical
+		// emergency state from re-notifying (#1018).
 		if err := n.Alert(notify.AlertEmergency, "emergency", "maestro emergency", msg); err != nil {
-			log.Printf("[fleet] ntfy emergency alert failed: %v", err)
+			log.Printf("[fleet] emergency alert failed: %v", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, emergencyStateToWire(st))
@@ -5121,7 +5121,7 @@ func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (ses
 			// started-after-completion / released-for-redispatch guards, so a
 			// genuinely regressed later session surfaces instead of a predecessor.
 			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
-				(candidate.WorkerOutcome == "duplicate_dispatch_reconciled" ||
+				(candidate.WorkerOutcome == state.WorkerOutcomeDuplicateDispatchReconciled ||
 					fleetSessionStartedAfterCanonicalCompletion(candidate, peer) ||
 					fleetSessionPrecededLaterAuthoritative(candidate, peer)) {
 				return peer, true

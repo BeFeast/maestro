@@ -220,11 +220,11 @@ func notifyEmergency(ef *emergencyFlags, msg string) {
 		}
 		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 		n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
-		n.Sendf("%s", msg)
-		// Fan the notify_red-grade alert to ntfy (#1018). Keyed by message so a
-		// repeated identical emergency state does not re-notify.
+		// Alert covers both transports: ntfy when configured, otherwise the
+		// base Telegram/OpenClaw send. Keyed by message so a repeated identical
+		// emergency state does not re-notify (#1018).
 		if err := n.Alert(notify.AlertEmergency, "emergency", "maestro emergency", msg); err != nil {
-			log.Printf("[emergency] ntfy alert failed: %v", err)
+			log.Printf("[emergency] alert failed: %v", err)
 		}
 		return
 	}

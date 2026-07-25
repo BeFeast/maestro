@@ -238,8 +238,77 @@ func TestReviewRetrigger_GateResolutionClearsTracking(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if sess.ReviewPendingHeadSHA != "" || sess.ReviewPendingSince != nil {
-		t.Fatalf("pending tracking = (%q, %v), want cleared once the gate resolves",
-			sess.ReviewPendingHeadSHA, sess.ReviewPendingSince)
+	// The clock stops when the gate resolves, but the head anchor stays: a
+	// check that settles and goes pending again on the same commit must not
+	// look like a new head, or the per-head re-trigger cap would reset on
+	// every such flap.
+	if sess.ReviewPendingSince != nil {
+		t.Fatalf("pending clock = %v, want stopped once the gate resolves", sess.ReviewPendingSince)
+	}
+	if sess.ReviewPendingHeadSHA != "abc123def456789" {
+		t.Fatalf("head anchor = %q, want it retained until the head actually changes", sess.ReviewPendingHeadSHA)
+	}
+}
+
+// Workflow review catch: the per-head cap must actually suppress comments.
+func TestReviewRetrigger_MaxAttemptsCapSuppressesComment(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := retriggerTestConfig()
+	cfg.ReviewRetrigger.MaxAttempts = 2
+	o, comments := newRetriggerTestOrchestrator(cfg, prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(11 * time.Minute)
+	sess.ReviewRetriggerCount = 2 // cap already reached
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 0 {
+		t.Fatalf("comments = %v, want none once the per-head cap is reached", *comments)
+	}
+	if sess.ReviewRetriggerCount != 2 {
+		t.Fatalf("count = %d, want it to stay at the cap", sess.ReviewRetriggerCount)
+	}
+}
+
+// Below the cap the comment is posted and the counter advances.
+func TestReviewRetrigger_CountsAttemptsPerHead(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := retriggerTestConfig()
+	cfg.ReviewRetrigger.MaxAttempts = 2
+	o, comments := newRetriggerTestOrchestrator(cfg, prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(11 * time.Minute)
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 1 {
+		t.Fatalf("comments = %v, want one below the cap", *comments)
+	}
+	if sess.ReviewRetriggerCount != 1 {
+		t.Fatalf("count = %d, want 1 after the first re-trigger", sess.ReviewRetriggerCount)
+	}
+}
+
+// Workflow review catch: the cap must be OPT-IN. Capping by default removes the
+// only automatic recovery an untouched install has — the nudges that wake a
+// review service which comes back later — while the escape hatch that would
+// release the PR (missing_after_minutes) is itself off by default.
+func TestReviewRetrigger_UncappedByDefault(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	o, comments := newRetriggerTestOrchestrator(retriggerTestConfig(), prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(6 * time.Hour)
+	sess.ReviewRetriggerCount = 12 // far beyond any cap an operator might pick
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 1 {
+		t.Fatalf("comments = %v, want the nudge to still fire — the cap must be opt-in", *comments)
 	}
 }
