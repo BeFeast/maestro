@@ -84,8 +84,8 @@ type Orchestrator struct {
 	// missingReviewNotified remembers PRs already reported as merged past an
 	// absent review gate, so the alert fires once per PR.
 	missingReviewNotified map[int]bool
-	router                  *router.Router
-	repo                    string
+	router                *router.Router
+	repo                  string
 	binaryVersion         string
 	promptBase            string
 	bugPromptBase         string
@@ -10245,6 +10245,17 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		}
 		if label, ok := matchingIssueLabel(issue, o.operatorGateLabels()); ok {
 			log.Printf("[orch] skipping issue #%d: held by operator gate label %q", issue.Number, label)
+			continue
+		}
+
+		// A gate-fail-streak issue is Maestro's own report that a scheduled gate
+		// failed N times, not a triaged task — see the supervisor's hold. This
+		// loop lists issues itself, so with no issue_labels configured (every
+		// open issue eligible) the supervisor's hold is not in the path and the
+		// report would be dispatched here. There is no label for an operator to
+		// apply in that configuration, so the report is never auto-eligible.
+		if len(o.cfg.IssueLabels) == 0 && supervisor.IsGateFailStreakIssue(issue) && !repairSpawn {
+			log.Printf("[orch] skipping issue #%d: auto-minted gate-fail-streak report awaits operator triage", issue.Number)
 			continue
 		}
 
