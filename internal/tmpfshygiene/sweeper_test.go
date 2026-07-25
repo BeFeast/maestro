@@ -321,6 +321,12 @@ func TestSweepIgnoresForeignProcessPermissionDenials(t *testing.T) {
 	}
 	root, proc, now := fakeRoots(t)
 	stale := oldDir(t, root, "tmp.stale", now, 3*time.Hour, "stale")
+	// The fixture cannot chown itself to another UID without root, and
+	// ownership is what separates a foreign process from a same-UID one that
+	// cleared PR_SET_DUMPABLE, so state the foreign ownership explicitly.
+	restoreOwner := procOwnerIsSelf
+	procOwnerIsSelf = func(string) bool { return false }
+	t.Cleanup(func() { procOwnerIsSelf = restoreOwner })
 	// A foreign process whose /proc internals are unreadable (EACCES), like
 	// every other user's process on a shared host. It must not freeze the
 	// sweep: before the 2026-07-23 fix this blanket-protected every candidate.
@@ -620,4 +626,81 @@ func assertMissing(t *testing.T, path string) {
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected %s to be absent, err=%v", path, err)
 	}
+}
+
+// Codex review catch (P1): the `.*-00000000.so` glob enforces neither the
+// documented hex stem nor a regular-file type, so an unrelated plugin file —
+// or a directory that merely ends the same way — was recursively deleted by
+// every apply sweep.
+func TestSweepLeavesNonGeneratedNativeLibLookalikes(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	old := now.Add(-3 * time.Hour)
+
+	// Not a hex stem: a real plugin that happens to share the suffix.
+	foreignFile := filepath.Join(root, ".my-plugin-00000000.so")
+	if err := os.WriteFile(foreignFile, []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A directory the glob also matched.
+	foreignDir := filepath.Join(root, ".bcddfd9eb5fdb63f-00000000.so.d")
+	if err := os.MkdirAll(foreignDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignDir, "keep"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A genuine leak, to prove the policy still fires.
+	leaked := filepath.Join(root, ".18c737bd3e5dfeff-00000000.so")
+	if err := os.WriteFile(leaked, []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{foreignFile, foreignDir, leaked} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true)); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, foreignFile)
+	assertExists(t, filepath.Join(foreignDir, "keep"))
+	assertMissing(t, leaked)
+}
+
+// Codex review catch (P1): EACCES does not prove the process belongs to
+// another user — Linux denies the same read for a same-UID process that
+// cleared PR_SET_DUMPABLE. Downgrading that to a routine skip let the sweep
+// delete a tree such a process was sitting in.
+func TestSweepFailsClosedOnSameUIDPermissionDenial(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission denials cannot be simulated as root")
+	}
+	root, proc, now := fakeRoots(t)
+	stale := oldDir(t, root, "tmp.stale", now, 3*time.Hour, "stale")
+
+	processDir := filepath.Join(proc, "655")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fdDir := filepath.Join(processDir, "fd")
+	if err := os.MkdirAll(fdDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("dumpable-off\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProcScanErrors == 0 {
+		t.Fatalf("summary = %+v, want a scan error for a same-UID denial", summary)
+	}
+	if summary.DeletedEntries != 0 {
+		t.Fatalf("summary = %+v, want no deletion while the scan is incomplete", summary)
+	}
+	assertExists(t, stale)
 }

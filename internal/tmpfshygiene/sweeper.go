@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,7 +31,19 @@ type policy struct {
 	Category string
 	Pattern  string
 	MinAge   time.Duration
+	// GeneratedName, when set, must also match the entry basename. The glob
+	// alone is far too loose for the leak categories: `.*-00000000.so` happily
+	// matches an unrelated `.my-plugin-00000000.so`. RegularOnly additionally
+	// refuses directories, which the same glob matched. Without both, every
+	// apply sweep recursively deleted foreign entries that merely shared the
+	// suffix.
+	GeneratedName *regexp.Regexp
+	RegularOnly   bool
 }
+
+// nativeLibLeakName pins the documented generated basename: a hex stem, the
+// fixed -00000000 discriminator, and the extension the extractor writes.
+var nativeLibLeakName = regexp.MustCompile(`^\.[0-9a-f]+-00000000\.(so|hm)$`)
 
 // defaultPolicies is the compiled policy table used by both the CLI and
 // daemon. It is intentionally not configurable at runtime: broadening the
@@ -42,8 +55,8 @@ var defaultPolicies = []policy{
 	// these around the clock; on the RAM-backed /tmp this leaked ~10.5GB
 	// across 1978 copies before the 2026-07-23 overload. Deleting a mapped
 	// .so is safe on Linux: the inode survives until the mapping is gone.
-	{Category: "native_lib_leak", Pattern: ".*-00000000.so", MinAge: time.Hour},
-	{Category: "native_lib_leak", Pattern: ".*-00000000.hm", MinAge: time.Hour},
+	{Category: "native_lib_leak", Pattern: ".*-00000000.so", MinAge: time.Hour, GeneratedName: nativeLibLeakName, RegularOnly: true},
+	{Category: "native_lib_leak", Pattern: ".*-00000000.hm", MinAge: time.Hour, GeneratedName: nativeLibLeakName, RegularOnly: true},
 	{Category: "outcome_snapshot", Pattern: "tmp.*", MinAge: time.Hour},
 	{Category: "browser_profile", Pattern: "playwright-*", MinAge: 2 * time.Hour},
 	{Category: "browser_profile", Pattern: "playwright_chromiumdev_profile-*", MinAge: 2 * time.Hour},
@@ -126,7 +139,7 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	candidates := make([]candidate, 0)
 	nameSet := make(map[string]struct{})
 	for _, entry := range entries {
-		policy, matched := matchPolicy(entry.Name())
+		policy, matched := matchPolicy(entry.Name(), entry)
 		if !matched {
 			continue
 		}
@@ -460,14 +473,45 @@ func InspectLinuxMount(root string) (MountUsage, error) {
 	}, nil
 }
 
-func matchPolicy(name string) (policy, bool) {
+func matchPolicy(name string, entry fs.DirEntry) (policy, bool) {
 	for _, policy := range defaultPolicies {
 		matched, err := filepath.Match(policy.Pattern, name)
-		if err == nil && matched {
-			return policy, true
+		if err != nil || !matched {
+			continue
 		}
+		if policy.GeneratedName != nil && !policy.GeneratedName.MatchString(name) {
+			continue
+		}
+		if policy.RegularOnly && entry != nil && !entry.Type().IsRegular() {
+			continue
+		}
+		return policy, true
 	}
 	return policy{}, false
+}
+
+// procOwnerIsSelf reports whether /proc/<pid> belongs to the sweeper's own UID.
+//
+// EACCES on /proc/<pid>/cwd does not prove the process belongs to another
+// user: Linux denies the same read for a same-UID process that cleared
+// PR_SET_DUMPABLE. Counting that as a routine foreign-process skip would let
+// the sweep quarantine and delete a tree such a process is actively sitting
+// in, so same-UID denials stay fail-closed.
+// procOwnerIsSelf is a variable so tests can simulate a foreign-owned
+// /proc entry: without root they cannot chown the fixture, and ownership is
+// the only thing separating the two EACCES cases.
+var procOwnerIsSelf = defaultProcOwnerIsSelf
+
+func defaultProcOwnerIsSelf(processDir string) bool {
+	info, err := os.Stat(processDir)
+	if err != nil {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(stat.Uid) == os.Getuid()
 }
 
 func alwaysKeepTopLevel(name string) bool {
@@ -618,7 +662,11 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 			// separately so it never blanket-protects the sweep. cmdline
 			// below is still world-readable, so foreign processes that name
 			// a candidate path on their command line stay protected.
-			scan.permissionSkips++
+			if procOwnerIsSelf(processDir) {
+				scan.errors++
+			} else {
+				scan.permissionSkips++
+			}
 		} else if !errors.Is(err, fs.ErrNotExist) {
 			scan.errors++
 		}
@@ -626,7 +674,11 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 		fdEntries, err := os.ReadDir(filepath.Join(processDir, "fd"))
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) {
-				scan.permissionSkips++
+				if procOwnerIsSelf(processDir) {
+					scan.errors++
+				} else {
+					scan.permissionSkips++
+				}
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				scan.errors++
 			}
@@ -636,7 +688,11 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 				if err == nil {
 					add(trimDeletedSuffix(target), "process_fd")
 				} else if errors.Is(err, fs.ErrPermission) {
-					scan.permissionSkips++
+					if procOwnerIsSelf(processDir) {
+						scan.errors++
+					} else {
+						scan.permissionSkips++
+					}
 				} else if !errors.Is(err, fs.ErrNotExist) {
 					scan.errors++
 				}
@@ -646,7 +702,11 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 		cmdline, err := os.ReadFile(filepath.Join(processDir, "cmdline"))
 		if err != nil {
 			if errors.Is(err, fs.ErrPermission) {
-				scan.permissionSkips++
+				if procOwnerIsSelf(processDir) {
+					scan.errors++
+				} else {
+					scan.permissionSkips++
+				}
 			} else if !errors.Is(err, fs.ErrNotExist) {
 				scan.errors++
 			}
