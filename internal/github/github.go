@@ -3699,9 +3699,9 @@ type ReviewStreamVerdict struct {
 	// outage would otherwise look exactly like a reviewer that never showed up.
 	LookupFailed bool            `json:"lookup_failed,omitempty"`
 	Score        int             `json:"score,omitempty"`
-	ScoreMax int             `json:"score_max,omitempty"`
-	Verdict  string          `json:"verdict,omitempty"`
-	Findings []ReviewComment `json:"findings,omitempty"`
+	ScoreMax     int             `json:"score_max,omitempty"`
+	Verdict      string          `json:"verdict,omitempty"`
+	Findings     []ReviewComment `json:"findings,omitempty"`
 }
 
 type ReviewGateVerdict struct {

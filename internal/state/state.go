@@ -5164,6 +5164,16 @@ func (s *State) IssueRetryExhausted(issueNum int) bool {
 // such session carries the retry_exhausted status. Live ok-player #627: two
 // duplicate-dispatch siblings were retired with that status, and the issue
 // stayed permanently undispatchable even after the count was corrected.
+// SessionProvesFailedAttempt is the exported form for callers outside this
+// package that act on retry exhaustion — spawning a repair worker, or raising a
+// Blocked stuck-state. They must agree with the two retry gates: a session
+// retired by Maestro's own duplicate-dispatch cleanup, stopped deterministically
+// at the token budget, or blocked by a rate limit carries the retry_exhausted
+// status without being evidence that the implementation failed.
+func SessionProvesFailedAttempt(sess *Session) bool {
+	return sessionProvesFailedAttempt(sess)
+}
+
 func sessionProvesFailedAttempt(sess *Session) bool {
 	if sess == nil || sess.RateLimitHit {
 		return false

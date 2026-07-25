@@ -18,6 +18,14 @@ func isGateFailStreakIssue(issue github.Issue) bool {
 	return strings.Contains(issue.Body, gateFailStreakBodyMarker)
 }
 
+// IsGateFailStreakIssue is the exported form for the orchestrator, whose spawn
+// loop lists issues itself and never passes through the supervisor's
+// eligibility gate. With no issue_labels configured every open issue reaches
+// that loop, minted reports included.
+func IsGateFailStreakIssue(issue github.Issue) bool {
+	return isGateFailStreakIssue(issue)
+}
+
 // operatorTriagedGateStreak reports whether an operator has explicitly admitted
 // a minted streak report into the queue by labelling it.
 //
