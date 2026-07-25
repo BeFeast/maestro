@@ -74,6 +74,10 @@ type issueComment struct {
 	User struct {
 		Login string `json:"login"`
 	} `json:"user"`
+	// CreatedAt scopes a comment to a head. Issue comments carry no SHA, so a
+	// bot comment from an earlier head is otherwise indistinguishable from one
+	// about the current head.
+	CreatedAt time.Time `json:"created_at"`
 }
 
 // IssueComment is the public view of a single issue comment. Unlike the
@@ -2423,6 +2427,10 @@ var (
 )
 
 func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
+	// checkLookupFailed marks a degraded read: absence of a signal below then
+	// means "unknown", not "the reviewer is silent".
+	var checkLookupFailed bool
+
 	// --- 1. Get head SHA of the PR ---
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
@@ -2433,6 +2441,7 @@ func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdic
 	checkRuns, err := c.checkRunsForSHA(sha)
 	if err != nil {
 		// Non-fatal: fall through to comment fallback
+		checkLookupFailed = true
 		goto commentFallback
 	}
 
@@ -2464,9 +2473,29 @@ commentFallback:
 
 	foundGreptile, signal, comment := greptileCommentReviewSignal(comments)
 	if !foundGreptile {
-		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending}, nil
+		// No check run AND no comment: the reviewer never showed up for this
+		// head. Observed stays false so callers can distinguish this from a
+		// review in progress and apply a missing-review policy instead of
+		// waiting forever — unless the check-runs read itself failed, in which
+		// case the silence is unproven and LookupFailed says so.
+		return ReviewStreamVerdict{Name: "greptile", Pending: true, Verdict: reviewVerdictPending, LookupFailed: checkLookupFailed}, nil
 	}
 	verdict := reviewStreamVerdictFromGreptileSignal(signal)
+	verdict.LookupFailed = checkLookupFailed
+	// Issue comments carry no head SHA, so a comment written for an EARLIER
+	// head would otherwise count as proof the reviewer spoke about this one —
+	// and a silent reviewer on the current head would look alive forever. Only
+	// a comment newer than the head commit is head-scoped evidence. The
+	// legacy pass/fail semantics of the comment fallback are deliberately left
+	// as they are; this narrows only the Observed signal.
+	if scoped, lookupFailed := c.commentScopedToHead(comment, sha); !scoped {
+		verdict.Observed = false
+		if lookupFailed {
+			// Could not prove the comment's age: absence of head-scoped
+			// evidence here is unknown, not silence.
+			verdict.LookupFailed = true
+		}
+	}
 	if !verdict.Passed && !verdict.Pending && isActionableReviewSummary(comment.Body) {
 		verdict.Findings = append(verdict.Findings, ReviewComment{Body: comment.Body, User: comment.User.Login})
 	}
@@ -2497,6 +2526,52 @@ func greptileCommentReviewSignal(comments []issueComment) (found bool, signal gr
 		return true, greptileSignalFromText(comment.Body), comment
 	}
 	return false, greptileReviewSignal{}, issueComment{}
+}
+
+// commentScopedToHead reports whether an issue comment can be attributed to
+// the given head commit, i.e. it was written after that commit existed.
+//
+// lookupFailed distinguishes the two reasons a comment is not scoped: it is
+// genuinely older than the head (proof it says nothing about this head), or
+// the commit timestamp could not be read (nothing is proven at all). Collapsing
+// both into "not scoped" would let a rate-limited timestamp read look exactly
+// like a silent reviewer — and a PR the reviewer REJECTED could then merge
+// through the missing-review path.
+func (c *Client) commentScopedToHead(comment issueComment, sha string) (scoped bool, lookupFailed bool) {
+	if strings.TrimSpace(sha) == "" {
+		return false, true
+	}
+	if comment.CreatedAt.IsZero() {
+		// The comment carries no timestamp: unattributable, but the read itself
+		// worked, so this is genuine "not scoped", not a degraded read.
+		return false, false
+	}
+	headAt, err := c.commitCommittedAt(sha)
+	if err != nil || headAt.IsZero() {
+		return false, true
+	}
+	return !comment.CreatedAt.Before(headAt), false
+}
+
+// commitCommittedAt returns the committer timestamp of a commit. Only the
+// review comment-fallback path calls it, which runs when no review check run
+// exists at all.
+func (c *Client) commitCommittedAt(sha string) (time.Time, error) {
+	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, sha))
+	if err != nil {
+		return time.Time{}, err
+	}
+	var payload struct {
+		Commit struct {
+			Committer struct {
+				Date time.Time `json:"date"`
+			} `json:"committer"`
+		} `json:"commit"`
+	}
+	if err := json.Unmarshal(out, &payload); err != nil {
+		return time.Time{}, err
+	}
+	return payload.Commit.Committer.Date, nil
 }
 
 func greptileCheckDecision(checkRuns []greptileCheckRun) (found bool, approved bool, pending bool) {
@@ -2595,11 +2670,16 @@ func rangeContainedByAny(candidate []int, containers [][]int) bool {
 	return false
 }
 
+// reviewStreamVerdictFromGreptileSignal builds a verdict from a signal the
+// reviewer actually produced, so Observed is always true here. The only
+// unobserved verdict is the explicit no-signal return in
+// prGreptileReviewStreamVerdict.
 func reviewStreamVerdictFromGreptileSignal(signal greptileReviewSignal) ReviewStreamVerdict {
 	return ReviewStreamVerdict{
 		Name:     "greptile",
 		Passed:   signal.Passed,
 		Pending:  signal.Pending,
+		Observed: true,
 		Score:    signal.Score,
 		ScoreMax: signal.ScoreMax,
 		Verdict:  signal.Verdict,
@@ -3601,19 +3681,39 @@ type ReviewComment struct {
 }
 
 type ReviewStreamVerdict struct {
-	Name     string          `json:"name"`
-	Passed   bool            `json:"passed"`
-	Pending  bool            `json:"pending"`
-	Score    int             `json:"score,omitempty"`
+	Name    string `json:"name"`
+	Passed  bool   `json:"passed"`
+	Pending bool   `json:"pending"`
+	// Observed reports whether the reviewer produced ANY signal for this head
+	// — a check run or a comment, in any state including "queued". Without it
+	// Pending conflates two very different situations: "the reviewer is
+	// working on it" and "the reviewer never showed up". The second happens
+	// whenever the review service is silent (live 2026-07: Greptile paused
+	// reviews after its free credits ran out and posted nothing at all), and
+	// an unobserved pending gate would otherwise hold every PR forever with
+	// no timeout and no alert.
+	Observed bool `json:"observed"`
+	// LookupFailed reports that a read the verdict depends on errored (e.g.
+	// the check-runs API), so "no signal" here means "unknown", not "the
+	// reviewer is silent". Callers must not conclude absence from it: a GitHub
+	// outage would otherwise look exactly like a reviewer that never showed up.
+	LookupFailed bool            `json:"lookup_failed,omitempty"`
+	Score        int             `json:"score,omitempty"`
 	ScoreMax int             `json:"score_max,omitempty"`
 	Verdict  string          `json:"verdict,omitempty"`
 	Findings []ReviewComment `json:"findings,omitempty"`
 }
 
 type ReviewGateVerdict struct {
-	Passed  bool                  `json:"passed"`
-	Pending bool                  `json:"pending"`
-	Streams []ReviewStreamVerdict `json:"streams"`
+	Passed  bool `json:"passed"`
+	Pending bool `json:"pending"`
+	// Observed is false when NO configured stream produced any signal, i.e.
+	// the whole review gate is silent rather than working.
+	Observed bool `json:"observed"`
+	// LookupFailed is true when any stream's read was degraded, so an absent
+	// signal cannot be read as proof the reviewer is silent.
+	LookupFailed bool                  `json:"lookup_failed,omitempty"`
+	Streams      []ReviewStreamVerdict `json:"streams"`
 }
 
 func (v ReviewGateVerdict) BlockingFindings() []ReviewComment {
@@ -3708,6 +3808,16 @@ func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGate
 			return ReviewGateVerdict{}, err
 		}
 		verdict.Streams = append(verdict.Streams, sv)
+		if sv.Observed {
+			// One reviewer speaking is enough for the gate to count as live:
+			// the missing-review policy only applies when the gate as a whole
+			// is silent.
+			verdict.Observed = true
+		}
+		if sv.LookupFailed {
+			// One degraded read makes the whole gate's silence unproven.
+			verdict.LookupFailed = true
+		}
 		if sv.Pending {
 			verdict.Pending = true
 			verdict.Passed = false
@@ -3770,6 +3880,11 @@ func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (
 		return ReviewStreamVerdict{}, commentsErr
 	}
 	sv := ReviewStreamVerdict{Name: spec.Name, Passed: false, Pending: false, Findings: findings}
+	// A check run in any state, or an inline finding, means the reviewer spoke
+	// for this head. The default branch below is the silent case — but only a
+	// successful read can prove silence.
+	sv.Observed = checkFound || checkPending || len(findings) > 0
+	sv.LookupFailed = checkErr != nil || commentsErr != nil
 	switch {
 	case checkPending:
 		sv.Pending = true

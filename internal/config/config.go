@@ -1775,6 +1775,20 @@ type ReviewRetriggerConfig struct {
 	Enabled         *bool `yaml:"enabled"`          // default: true
 	PendingMinutes  int   `yaml:"pending_minutes"`  // re-trigger after this many minutes of greptile=pending on one head (default: 10)
 	CooldownMinutes int   `yaml:"cooldown_minutes"` // minimum minutes between re-trigger comments per session (default: 30)
+	// MaxAttempts caps how many re-trigger comments one session may post for
+	// a single head. Without a cap a permanently silent reviewer collects a
+	// "@greptile review" comment every cooldown window forever (live 2026-07:
+	// Greptile paused after exhausting its free credits and every wedged PR
+	// kept accruing comments). Default 3; <= 0 means the default, and a
+	// deliberate "never stop" is spelled as a large number.
+	MaxAttempts int `yaml:"max_attempts,omitempty"`
+	// MissingAfterMinutes makes an UNOBSERVED review gate non-blocking once the
+	// gate has been silent this long on one head — no check run, no comment,
+	// nothing. 0 (default) preserves today's behavior: a silent gate holds the
+	// PR forever. A reviewer that DOES answer still hard-blocks regardless of
+	// this value, so enabling it never weakens a working gate; it only bounds
+	// the wait on a reviewer that never shows up.
+	MissingAfterMinutes int `yaml:"missing_after_minutes,omitempty"`
 }
 
 // Active reports whether the stale-review re-trigger runs. Default true —
@@ -1803,6 +1817,35 @@ func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
 		return 30 * time.Minute
 	}
 	return time.Duration(c.CooldownMinutes) * time.Minute
+}
+
+// EffectiveMaxAttempts caps re-trigger comments per head; 0 means unlimited,
+// which is the default.
+//
+// The cap is deliberately opt-in. Capping by default would REMOVE the only
+// automatic recovery an untouched install has: before this knob existed, a
+// wedged gate kept being nudged every cooldown window, so a review service that
+// came back hours later was woken by the next nudge and the PR merged
+// hands-off. A default cap silences those nudges after N tries while the
+// escape hatch that would release the PR (missing_after_minutes) is itself
+// off by default — turning "eventually self-heals" into "wedged forever" for an
+// operator who changed nothing. An operator who sets a cap is accepting that
+// trade, and should set missing_after_minutes with it.
+func (c ReviewRetriggerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts <= 0 {
+		return 0
+	}
+	return c.MaxAttempts
+}
+
+// MissingReviewGraceOrZero returns how long a fully silent review gate may hold
+// a PR before it is treated as non-blocking, or 0 when the operator has not
+// opted in (today's block-forever behavior).
+func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
+	if c.MissingAfterMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.MissingAfterMinutes) * time.Minute
 }
 
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting

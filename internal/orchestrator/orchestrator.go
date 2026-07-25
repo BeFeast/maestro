@@ -81,6 +81,9 @@ type Orchestrator struct {
 	// tokenBudgetMillNotified remembers the streak length already alerted per
 	// issue so a held budget-wall issue alerts on escalation, not every cycle.
 	tokenBudgetMillNotified map[int]int
+	// missingReviewNotified remembers PRs already reported as merged past an
+	// absent review gate, so the alert fires once per PR.
+	missingReviewNotified map[int]bool
 	router                  *router.Router
 	repo                    string
 	binaryVersion         string
@@ -5386,6 +5389,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		sess     *state.Session
 		pr       github.PR
 		headSHA  string
+		// missingReviewFor is non-zero when this candidate bypassed a silent
+		// review gate. The operator alert fires only after the merge actually
+		// succeeds — a candidate can still be deferred by the merge interval,
+		// dropped by conflict filtering, or fail to merge.
+		missingReviewFor time.Duration
 	}
 
 	ready := make([]mergeCandidate, 0)
@@ -5593,9 +5601,31 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
 			persistGate()
+			// Record what the gate said for this head BEFORE branching: a
+			// settled rejection is evidence the reviewer is alive just as much
+			// as a pending one, and only a head change may erase it.
+			now := time.Now().UTC()
+			o.trackReviewGateHead(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 			if reviewVerdict.Pending {
-				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
+				// A gate that never produced any signal is not "reviewing" —
+				// it is absent. Past the configured grace the PR proceeds on
+				// its own merits (CI is already green here) instead of waiting
+				// forever on a reviewer that is not coming.
+				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, now); missing {
+					log.Printf("[orch] PR #%d: review gate produced no signal for %s — treating the missing review as non-blocking (review_retrigger.missing_after_minutes)",
+						pr.Number, silentFor.Round(time.Minute))
+					// Deliberately keep the per-head tracking: sequential mode
+					// may defer this candidate, or the merge may fail, and
+					// clearing here would restart the grace from zero on the
+					// next cycle. Repeated deferrals would then reset the
+					// window forever and the PR would never merge. The state
+					// is irrelevant once the merge succeeds, and a new head
+					// resets it through trackReviewGateHead.
+					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA, missingReviewFor: silentFor})
+					continue
+				}
+				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				continue // not ready yet
 			}
 			clearReviewPendingTracking(sess)
@@ -5669,7 +5699,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	strategy := o.mergeStrategy()
 	if strategy == "parallel" {
 		for _, candidate := range ready {
-			o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+			if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+				o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+			}
 		}
 		return
 	}
@@ -5705,7 +5737,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 
 	candidate := ready[0]
-	o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+	if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+		o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+	}
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
@@ -5992,18 +6026,10 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if !greptileReviewStreamPending(verdict) {
 		return // a non-greptile stream is pending; "@greptile review" won't help
 	}
-	head, err := o.prHeadSHA(pr.Number)
-	if err != nil {
-		log.Printf("[orch] review re-trigger: head SHA for PR #%d: %v", pr.Number, err)
-		return
-	}
+	head := sess.ReviewPendingHeadSHA
 	now := time.Now().UTC()
-	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
-		// First pending observation on this head — start the clock. A new
-		// head (push or server-side update-branch) restarts it.
-		sess.ReviewPendingHeadSHA = head
-		sess.ReviewPendingSince = &now
-		return
+	if sess.ReviewPendingSince == nil {
+		return // clock not started yet; trackReviewGateHead owns that
 	}
 	pendingFor := now.Sub(*sess.ReviewPendingSince)
 	if pendingFor < o.cfg.ReviewRetrigger.EffectivePendingFor() {
@@ -6012,13 +6038,143 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if sess.ReviewRetriggerAt != nil && now.Sub(*sess.ReviewRetriggerAt) < o.cfg.ReviewRetrigger.EffectiveCooldown() {
 		return
 	}
+	// Stop nagging a reviewer that is not answering, when the operator opted
+	// into a cap. Past it the PR still waits (or clears through the
+	// missing-review policy). Unlimited by default: the nudges are the only
+	// automatic recovery for a reviewer that comes back later, so silencing
+	// them without the missing-review escape hatch would wedge the PR for good.
+	maxAttempts := o.cfg.ReviewRetrigger.EffectiveMaxAttempts()
+	if maxAttempts > 0 && sess.ReviewRetriggerCount >= maxAttempts {
+		return
+	}
 	if err := o.commentPR(pr.Number, greptileRetriggerComment); err != nil {
 		log.Printf("[orch] review re-trigger: comment on PR #%d: %v", pr.Number, err)
 		return
 	}
 	sess.ReviewRetriggerAt = &now
-	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (#691)",
-		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment)
+	sess.ReviewRetriggerCount++
+	cap := "unlimited"
+	if maxAttempts > 0 {
+		cap = strconv.Itoa(maxAttempts)
+	}
+	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%s, #691)",
+		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment,
+		sess.ReviewRetriggerCount, cap)
+}
+
+// reviewClockHead picks the head SHA the review clock applies to: the one the
+// gate transition already read, falling back to a direct lookup when the gate
+// is not observable. An empty result skips the clock rather than anchoring it
+// to the wrong head.
+func (o *Orchestrator) reviewClockHead(pr github.PR, gateHead string) string {
+	if strings.TrimSpace(gateHead) != "" {
+		return gateHead
+	}
+	head, err := o.prHeadSHA(pr.Number)
+	if err != nil {
+		log.Printf("[orch] review clock: head SHA for PR #%d: %v", pr.Number, err)
+		return ""
+	}
+	return head
+}
+
+// trackReviewGateHead maintains the per-head review-gate memory. It runs for
+// EVERY verdict, not just pending ones: a settled rejection is also proof the
+// reviewer is alive, and skipping it would let a later run of failed
+// check-runs reads look like "the reviewer never showed up" and merge a PR the
+// reviewer had already rejected.
+//
+// ReviewGateObserved is sticky within a head and reset ONLY when the head
+// actually changes — a push or server-side update-branch genuinely restarts
+// the review, everything else must not erase what we already saw. The pending
+// clock starts at the first pending observation on the head; the
+// Greptile-specific comment re-trigger does not own any of this.
+func (o *Orchestrator) trackReviewGateHead(sess *state.Session, head string, verdict github.ReviewGateVerdict, now time.Time) {
+	if sess == nil || head == "" {
+		return
+	}
+	if sess.ReviewPendingHeadSHA != head {
+		sess.ReviewPendingHeadSHA = head
+		sess.ReviewPendingSince = nil
+		sess.ReviewRetriggerCount = 0
+		sess.ReviewGateObserved = false
+	}
+	if verdict.Observed {
+		sess.ReviewGateObserved = true
+	}
+	if verdict.Pending && sess.ReviewPendingSince == nil {
+		started := now
+		sess.ReviewPendingSince = &started
+	}
+}
+
+// notifyMissingReviewGate tells the operator that a merge proceeded without a
+// review, once per PR. Merging past an absent gate is a deliberate, bounded
+// weakening of the safety net — it must never be silent.
+func (o *Orchestrator) notifyMissingReviewGate(prNumber int, silentFor time.Duration) {
+	if o == nil || o.notifier == nil {
+		return
+	}
+	if o.missingReviewNotified == nil {
+		o.missingReviewNotified = make(map[int]bool)
+	}
+	if o.missingReviewNotified[prNumber] {
+		return
+	}
+	o.missingReviewNotified[prNumber] = true
+	project := strings.TrimSpace(o.repo)
+	if project == "" && o.cfg != nil {
+		project = strings.TrimSpace(o.cfg.Repo)
+	}
+	title := "maestro review gate absent"
+	if project != "" {
+		title += ": " + project
+	}
+	if err := o.notifier.Alert(
+		notify.AlertGateFailStreak,
+		fmt.Sprintf("%s:missing_review:%d", project, prNumber),
+		title,
+		fmt.Sprintf("PR #%d merged with NO review signal at all (gate silent for %s). CI was green. Check whether the review service is down or out of credits.",
+			prNumber, silentFor.Round(time.Minute)),
+	); err != nil {
+		log.Printf("[orch] missing-review notification failed for PR #%d: %v", prNumber, err)
+	}
+}
+
+// missingReviewGateElapsed reports whether the review gate has been completely
+// silent — no check run, no comment, nothing — on this head for longer than
+// review_retrigger.missing_after_minutes. A gate that produced ANY signal is
+// never "missing": a reviewer working, or one that reported findings, keeps
+// blocking exactly as before. Opt-in: 0 keeps today's block-forever behavior.
+func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict github.ReviewGateVerdict, now time.Time) (time.Duration, bool) {
+	if o == nil || o.cfg == nil || sess == nil {
+		return 0, false
+	}
+	grace := o.cfg.ReviewRetrigger.MissingReviewGraceOrZero()
+	if grace <= 0 || verdict.Observed || !verdict.Pending {
+		return 0, false
+	}
+	// A degraded read cannot prove silence. Without this, a GitHub check-runs
+	// outage lasting longer than the grace would look exactly like a reviewer
+	// that never showed up, and PRs would merge unreviewed because of an API
+	// failure.
+	if verdict.LookupFailed {
+		return 0, false
+	}
+	// Sticky memory: a reviewer seen on this head keeps blocking even if this
+	// read came back unobserved (e.g. a failed check-runs lookup fell through
+	// to the comment path).
+	if sess.ReviewGateObserved {
+		return 0, false
+	}
+	if sess.ReviewPendingSince == nil {
+		return 0, false
+	}
+	silentFor := now.Sub(*sess.ReviewPendingSince)
+	if silentFor < grace {
+		return 0, false
+	}
+	return silentFor, true
 }
 
 // greptileReviewStreamPending reports whether the greptile stream is the one
@@ -6035,8 +6191,13 @@ func greptileReviewStreamPending(verdict github.ReviewGateVerdict) bool {
 // clearReviewPendingTracking resets the #691 pending clock once the review
 // gate resolves (passed or blocked by findings) so a later pending phase on
 // the same head starts a fresh window.
+// clearReviewPendingTracking stops the pending clock once the gate settles.
+// The head anchor is deliberately KEPT: a check that settles and then goes
+// pending again on the same commit (a re-run, or a check that disappears) must
+// not look like a new head, or the per-head re-trigger cap would reset on every
+// such flap and the PR could collect unlimited "@greptile review" comments.
+// Only trackReviewGateHead clears the anchor, and only for a real head change.
 func clearReviewPendingTracking(sess *state.Session) {
-	sess.ReviewPendingHeadSHA = ""
 	sess.ReviewPendingSince = nil
 }
 
