@@ -28,6 +28,10 @@ type projectFlow struct {
 	holder *configHolder
 	cancel context.CancelFunc
 	done   chan struct{} // closed once every flow goroutine has exited
+	// refreshCh coalesces webhook gate updates into immediate orchestrator
+	// reconciliations for this repository. One buffered wake-up is sufficient:
+	// a RunOnce reads the complete current PR head/check rollup.
+	refreshCh chan struct{}
 }
 
 // startFlow launches the orchestrator + supervisor loops (and the liveness
@@ -44,6 +48,9 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	cfg := proj.Cfg()
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+		if d.spawnLimiter != nil {
+			d.spawnLimiter.RegisterProject(cfg.StateDir, cfg.Repo, d.opts.SuperviseInterval)
+		}
 	}
 	fctx, cancel := context.WithCancel(parent)
 	flow := &projectFlow{
@@ -54,6 +61,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		holder:    newConfigHolder(cfg),
 		cancel:    cancel,
 		done:      make(chan struct{}),
+		refreshCh: make(chan struct{}, 1),
 	}
 
 	// Per-flow hot-reload (#757, #768): when store-watch is enabled and this
@@ -93,7 +101,9 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		defer recoverFlow(flow, "orchestrator")
 		// orchReloadCh (fed by the pump) is typed as <-chan; a nil channel
 		// leaves the orchestrator's reload arm inert (store-watch disabled).
-		d.runLoop(fctx, cfg, d.opts, orchReloadCh)
+		flowOpts := d.opts
+		flowOpts.refreshCh = flow.refreshCh
+		d.runLoop(fctx, cfg, flowOpts, orchReloadCh)
 	}()
 	go func() {
 		defer wg.Done()
@@ -164,11 +174,16 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		// its own — e.g. a panic that recoverFlow cancelled — does not linger in
 		// the registry reporting as live. Guarded against a restart that reused
 		// the same key (stopFlow may have already removed and replaced it).
+		removed := false
 		d.mu.Lock()
 		if d.flows[flow.key] == flow {
 			delete(d.flows, flow.key)
+			removed = true
 		}
 		d.mu.Unlock()
+		if removed && d.spawnLimiter != nil && flow.cfg != nil {
+			d.spawnLimiter.UnregisterStateDir(flow.cfg.StateDir)
+		}
 	}()
 
 	return flow
@@ -189,6 +204,9 @@ func (d *Daemon) stopFlow(key string) {
 	}
 	flow.cancel()
 	<-flow.done
+	if d.spawnLimiter != nil && flow.cfg != nil {
+		d.spawnLimiter.UnregisterStateDir(flow.cfg.StateDir)
+	}
 	log.Printf("[daemon] stopped flow %q", flow.name)
 }
 
@@ -199,6 +217,14 @@ func (d *Daemon) stopFlow(key string) {
 // RunOnce is not ctx-cancellable mid-cycle, so the sum could be many minutes
 // (#764).
 func (d *Daemon) stopAll() {
+	d.stopAllUntil(time.Now().Add(shutdownFlowTimeout))
+}
+
+// stopAllUntil cancels every flow and waits for them concurrently until the
+// earlier of shutdownFlowTimeout or the global shutdown deadline. A non-returning
+// flow is logged and detached from daemon shutdown; it cannot serialize another
+// per-flow timeout or hold the systemd restart job (#966).
+func (d *Daemon) stopAllUntil(deadline time.Time) {
 	// Covers the teardown paths where Drain never ran (e.g. a serve error):
 	// gh reads fail fast on rate limits instead of blocking flow stop (#797).
 	github.BeginShutdown()
@@ -214,18 +240,43 @@ func (d *Daemon) stopAll() {
 	for _, flow := range flows {
 		flow.cancel()
 	}
-	// Give each flow its own independent deadline so a stuck cycle in one
-	// flow never consumes the timeout for a later one (review #660). Each
-	// flow gets shutdownFlowTimeout to exit after context cancellation;
-	// after that we log a warning and move on (#817).
+	if len(flows) == 0 {
+		return
+	}
+
+	cutoff := time.Now().Add(shutdownFlowTimeout)
+	if !deadline.IsZero() && deadline.Before(cutoff) {
+		cutoff = deadline
+	}
+	type stoppedFlow struct{ flow *projectFlow }
+	stopped := make(chan stoppedFlow, len(flows))
+	pending := make(map[*projectFlow]struct{}, len(flows))
 	for _, flow := range flows {
-		t := time.NewTimer(shutdownFlowTimeout)
+		pending[flow] = struct{}{}
+		go func(f *projectFlow) {
+			<-f.done
+			stopped <- stoppedFlow{flow: f}
+		}(flow)
+	}
+
+	remaining := time.Until(cutoff)
+	if remaining < 0 {
+		remaining = 0
+	}
+	timer := time.NewTimer(remaining)
+	defer timer.Stop()
+	for len(pending) > 0 {
 		select {
-		case <-flow.done:
-			t.Stop()
-			log.Printf("[daemon] stopped flow %q", flow.name)
-		case <-t.C:
-			log.Printf("[daemon] stopAll: timed out waiting for flow %q — proceeding with shutdown", flow.name)
+		case result := <-stopped:
+			if _, ok := pending[result.flow]; ok {
+				delete(pending, result.flow)
+				log.Printf("[daemon] stopped flow %q", result.flow.name)
+			}
+		case <-timer.C:
+			for flow := range pending {
+				log.Printf("[daemon] stopAll: deadline reached waiting for flow %q — detaching it from daemon shutdown; restart checkpoint pass will preserve any running worker", flow.name)
+			}
+			return
 		}
 	}
 }
@@ -387,6 +438,10 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// within one poll interval. nil emergency store (open failed / test loader)
 	// leaves the closure reading a permanently-normal cache, i.e. inert.
 	orch.SetEmergencyHalt(d.emergencySpawnHalt)
+	orch.SetFleetSpawnCeiling(d.fleetSpawnCeilingReached)
+	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
+		return d.reserveFleetSpawn(orchCfg.StateDir)
+	})
 	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
 	// from the shared mirror when github_mirror.source is mirror-first, falling
 	// back to the API on a miss/stale. The closure reads &orchCfg — the live,
@@ -418,14 +473,8 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 		runInterval = time.Duration(cfg.PollIntervalSeconds) * time.Second
 	}
 
-	// The daemon has no API-triggered refresh channel: the per-project HTTP
-	// server that drove one in `maestro run` is replaced by the shared
-	// FleetServer, which does not signal individual flows. Pass nil rather than
-	// a buffered channel nothing ever sends on, so orch.Run's `case <-refreshCh`
-	// arm is plainly inert instead of looking like a wired-but-dead feature
-	// (#764).
 	log.Printf("[%s] starting orchestrator — repo=%s interval=%s", cfg.SessionPrefix, cfg.Repo, runInterval)
-	if err := orch.Run(ctx, runInterval, false, nil); err != nil {
+	if err := orch.Run(ctx, runInterval, false, opts.refreshCh); err != nil {
 		log.Printf("[%s] orchestrator exited: %v", cfg.SessionPrefix, err)
 	}
 }

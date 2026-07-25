@@ -68,6 +68,11 @@ issue. The dogfood config should keep `pipeline.enabled` unset or `false` so
 routine `maestro-ready` issues continue to use the cheaper single implementer
 session by default.
 
+Use `pipeline:advised` when the issue also needs the bounded independent plan
+review described in [`pipeline-advisor.md`](./pipeline-advisor.md). The Advisor
+adds latency and token cost, fails closed by default, and should be piloted on a
+small cohort before broader rollout.
+
 If a spec needs to wait, add `blocked` and explain in a comment. Do not delete the issue — supervisor needs the
 audit trail.
 

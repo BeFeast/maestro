@@ -257,6 +257,11 @@ func TestDefaultAllowedActions_IncludesOpenChildIssue(t *testing.T) {
 	if !seenApproval[ActionOpenChildIssue] {
 		t.Errorf("defaultApprovalRequiredActions missing %q", ActionOpenChildIssue)
 	}
+	for _, action := range []string{ActionSpawnWorker, ActionSpawnRepairWorker, ActionSpawnReviewRepair} {
+		if seenApproval[action] {
+			t.Errorf("defaultApprovalRequiredActions unexpectedly gates mechanical action %q", action)
+		}
+	}
 }
 
 // Test: canonicalAction maps "create_issue" / "create_child_issue" → open_child_issue.

@@ -122,6 +122,7 @@ export function FleetScreen({ navigate }) {
       <BackendHealthRow entries={fleet.backendHealth || []} now={now} />
       <BackendQuotaRow entries={fleet.backendQuota || []} now={now} />
       <ProviderModelHealthRow entries={fleet.providerModelHealth || []} now={now} />
+      <TmpfsHygienePanel hygiene={fleet.tmpfsHygiene} now={now} />
 
       <div className="stats">
         <Stat
@@ -261,6 +262,59 @@ export function CostObservabilityPanel({ cost }) {
       </Panel>
     </div>
   );
+}
+
+export function TmpfsHygienePanel({ hygiene, now = Date.now() }) {
+  if (!hygiene) return null;
+  const pressure = hygiene.pressure === true;
+  const timestampMs = parseTimestamp(hygiene.timestamp);
+  const when = timestampMs == null ? "time unavailable" : relTimePrecise(timestampMs, now);
+  const tone = pressure || hygiene.error ? "stuck" : "ok";
+  const title = pressure ? "Host tmpfs pressure" : "Host tmpfs hygiene";
+  const summary = pressure
+    ? `/tmp remains at ${hygiene.usePct}% used after the latest sweep.`
+    : `/tmp is at ${hygiene.usePct}% used after the latest sweep.`;
+
+  return (
+    <div id="tmpfs-pressure" className="mt-6">
+      <Panel title={title} sub={`${hygiene.usePct}% used · ${when}`}>
+        <div style={{ padding: "var(--s-5)", display: "grid", gap: "var(--s-4)" }}>
+          <div>
+            <Pill tone={tone}>{pressure ? "operator attention" : "within threshold"}</Pill>
+            <div style={{ marginTop: "var(--s-3)", fontSize: 13 }}>{summary}</div>
+          </div>
+          <div className="hb-meta">
+            <div><span>Freed</span><strong>{formatBytes(hygiene.freedBytes)}</strong></div>
+            <div><span>Deleted</span><strong>{hygiene.deletedEntries}</strong></div>
+            <div><span>Protected</span><strong>{hygiene.protectedEntries}</strong></div>
+            <div><span>Partial</span><strong>{hygiene.partialEntries}</strong></div>
+            <div><span>Mode</span><strong>{hygiene.mode || "—"}</strong></div>
+          </div>
+          {hygiene.error && <div className="error">Latest sweep error: {hygiene.error}</div>}
+          {pressure && (
+            <div className="dim" style={{ fontSize: 12.5 }}>
+              Inspect the allowlisted candidates with <code>maestro tmpfs-hygiene --dry-run</code>, then follow the{" "}
+              <a href="https://github.com/BeFeast/maestro/blob/main/docs/tmpfs-hygiene-runbook.md" target="_blank" rel="noreferrer">
+                tmpfs hygiene runbook
+              </a>.
+            </div>
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function formatBytes(value) {
+  let amount = Math.max(0, Number(value || 0));
+  const units = ["B", "KiB", "MiB", "GiB", "TiB"];
+  let unit = 0;
+  while (amount >= 1024 && unit < units.length - 1) {
+    amount /= 1024;
+    unit++;
+  }
+  const digits = unit === 0 || amount >= 10 ? 0 : 1;
+  return `${amount.toFixed(digits)} ${units[unit]}`;
 }
 
 function CostWindowCard({ label, window: w }) {
@@ -692,6 +746,10 @@ function navigateDashboardTarget(target, navigate) {
     window.location.assign(value);
     return;
   }
+  if (value.startsWith("#")) {
+    document.getElementById(value.slice(1))?.scrollIntoView({ behavior: "smooth", block: "center" });
+    return;
+  }
   navigate(value);
 }
 
@@ -724,7 +782,7 @@ function ctaHandlerForNextAction(action, navigate) {
   };
 }
 
-function attentionTargetURL(fleet) {
+export function attentionTargetURL(fleet) {
   const next = fleet?.nextAction;
   if (next?.target_url && next.kind !== "approval_pending") {
     return next.target_url;
@@ -735,6 +793,9 @@ function attentionTargetURL(fleet) {
     return kind === "stale_worker" || kind === "dispatch_failure" || kind === "attention" ||
       p.state?.state === "stuck";
   });
+  if (!project && fleet?.tmpfsHygiene?.pressure) {
+    return "#tmpfs-pressure";
+  }
   if (!project) return "workers";
   const op = project.operatorState || {};
   if (op.session && (op.kind === "stale_worker" || op.kind === "attention")) {

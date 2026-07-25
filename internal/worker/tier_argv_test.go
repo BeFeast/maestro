@@ -5,6 +5,8 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 // #783: a routing tier's effort/model override must be threaded into the worker
@@ -22,6 +24,11 @@ func buildArgs(t *testing.T, backend string, cfg BackendConfig) string {
 		t.Fatalf("BuildWorkerCmd(%s): %v", backend, err)
 	}
 	return strings.Join(cmd.Args, " ")
+}
+
+func buildArgsFromDef(t *testing.T, backend string, def config.BackendDef) string {
+	t.Helper()
+	return buildArgs(t, backend, workerBackendConfig(def))
 }
 
 func TestTierArgv_ClaudeModelEffort(t *testing.T) {
@@ -60,6 +67,16 @@ func TestTierArgv_GeminiModelEffort(t *testing.T) {
 	}
 }
 
+func TestTierArgv_KimiModelAndDropsEffort(t *testing.T) {
+	args := buildArgs(t, "kimi", BackendConfig{Cmd: "kimi", TierModel: "kimi-k2.5", TierEffort: "high"})
+	if !strings.Contains(args, "--model kimi-k2.5") {
+		t.Errorf("kimi args missing tier model: %s", args)
+	}
+	if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
+		t.Errorf("kimi must not emit an unsupported effort flag: %s", args)
+	}
+}
+
 func TestTierArgv_NoOverrideWhenEmpty(t *testing.T) {
 	// Without a tier override the argv is unchanged — no spurious --model/--effort.
 	args := buildArgs(t, "claude", BackendConfig{Cmd: "claude"})
@@ -76,7 +93,7 @@ func TestTierArgv_NoOverrideWhenEmpty(t *testing.T) {
 // TierModel/TierEffort carriers (set solely by a real policy tier override) may
 // thread, so a non-policy #513-metadata config dispatches byte-for-byte as before.
 func TestTierArgv_AttributionMetadataDoesNotLeak(t *testing.T) {
-	for _, backend := range []string{"claude", "codex", "gemini"} {
+	for _, backend := range []string{"claude", "codex", "gemini", "kimi"} {
 		cfg := BackendConfig{Cmd: backend, Provider: "anthropic", Model: "opus-4.8", Effort: "xhigh"}
 		args := buildArgs(t, backend, cfg)
 		if strings.Contains(args, "--model") || strings.Contains(args, "opus-4.8") {
@@ -85,6 +102,58 @@ func TestTierArgv_AttributionMetadataDoesNotLeak(t *testing.T) {
 		if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
 			t.Errorf("%s: #513 attribution effort leaked into argv: %s", backend, args)
 		}
+	}
+}
+
+func TestBackendEffortDefault_ClaudeEmitsEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "claude", config.BackendDef{Cmd: "claude", Effort: "high"})
+	if !strings.Contains(args, "--effort high") {
+		t.Errorf("claude backend effort default not emitted: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_ClaudeReplacesStalePinnedEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "claude", config.BackendDef{
+		Cmd:       "claude --model opus --effort xhigh",
+		ExtraArgs: []string{"--effort", "medium"},
+		Effort:    "high",
+	})
+	if strings.Contains(args, "--effort xhigh") || strings.Contains(args, "--effort medium") {
+		t.Errorf("stale claude effort pin survived backend effort update: %s", args)
+	}
+	if strings.Count(args, "--effort") != 1 || !strings.Contains(args, "--effort high") {
+		t.Errorf("claude args should contain exactly backend effort high: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_CodexEmitsReasoningEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "codex", config.BackendDef{Cmd: "codex", Effort: "high"})
+	if !strings.Contains(args, "model_reasoning_effort=high") {
+		t.Errorf("codex backend effort default not emitted: %s", args)
+	}
+	if strings.Contains(args, "--effort") {
+		t.Errorf("codex must not use --effort for backend effort: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_CodexReplacesStalePinnedEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "codex", config.BackendDef{
+		Cmd:       "codex -c model_reasoning_effort=xhigh",
+		ExtraArgs: []string{"-c", "model_reasoning_effort=medium"},
+		Effort:    "high",
+	})
+	if strings.Contains(args, "model_reasoning_effort=xhigh") || strings.Contains(args, "model_reasoning_effort=medium") {
+		t.Errorf("stale codex effort pin survived backend effort update: %s", args)
+	}
+	if strings.Count(args, "model_reasoning_effort=") != 1 || !strings.Contains(args, "model_reasoning_effort=high") {
+		t.Errorf("codex args should contain exactly backend reasoning effort high: %s", args)
+	}
+}
+
+func TestBackendEffortDefault_UnsupportedBackendDropsEffort(t *testing.T) {
+	args := buildArgsFromDef(t, "gemini", config.BackendDef{Cmd: "gemini", Effort: "high"})
+	if strings.Contains(args, "--effort") || strings.Contains(args, "model_reasoning_effort") {
+		t.Errorf("gemini must not emit unsupported effort flag: %s", args)
 	}
 }
 
@@ -99,17 +168,17 @@ func TestTierArgv_OperatorPinnedModelWins(t *testing.T) {
 	}
 }
 
-func TestTierArgv_OperatorPinnedCodexEffortWins(t *testing.T) {
+func TestTierArgv_CodexEffortOverrideReplacesPinnedEffort(t *testing.T) {
 	args := buildArgs(t, "codex", BackendConfig{
 		Cmd:        "codex",
 		ExtraArgs:  []string{"-c", "model_reasoning_effort=xhigh"},
 		TierEffort: "low",
 	})
-	if strings.Contains(args, "model_reasoning_effort=low") {
-		t.Errorf("tier effort must not override operator-pinned codex effort: %s", args)
+	if strings.Contains(args, "model_reasoning_effort=xhigh") {
+		t.Errorf("stale operator-pinned codex effort must not override configured effort: %s", args)
 	}
-	if !strings.Contains(args, "model_reasoning_effort=xhigh") {
-		t.Errorf("operator-pinned codex effort missing: %s", args)
+	if strings.Count(args, "model_reasoning_effort=") != 1 || !strings.Contains(args, "model_reasoning_effort=low") {
+		t.Errorf("configured codex effort missing or duplicated: %s", args)
 	}
 }
 

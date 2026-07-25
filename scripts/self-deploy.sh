@@ -15,6 +15,12 @@
 #      failing the whole build (merges silently never shipped). The version is
 #      stamped via -ldflags, so VCS stamping is redundant here anyway,
 #   2. install atomically, keeping the previous binary as <bin>.prev,
+#   2c. apply any required systemd unit change (#877): for each configured unit
+#      whose repo copy differs from the live installed file (FragmentPath), back
+#      the installed file up as <path>.prev, install the repo copy, and
+#      daemon-reload so the restart adopts it. A fix such as KillMode=mixed lives
+#      in the unit file, not the binary, so a binary-only deploy would restart
+#      under the OLD unit and never ship it. Rollback restores every unit touched,
 #   3. restart the maestro units — the units' normal stop path runs, so
 #      existing drain semantics are honored,
 #   4. verify post-restart health: installed CLI reports the stamped version,
@@ -54,6 +60,7 @@
 # Usage:
 #   self-deploy.sh --repo-dir DIR --bin PATH --units a.service[,b.service] \
 #     --result-file PATH --timeout-seconds N --pr N \
+#     [--restart-timeout-seconds N] \
 #     [--health-url URL] [--health-token-env ENVVAR] [--install-via-sudo] \
 #     [--scope user|system]
 
@@ -64,6 +71,7 @@ BIN=""
 UNITS=""
 RESULT_FILE=""
 TIMEOUT_SECONDS=1800
+RESTART_TIMEOUT_SECONDS=270
 PR=0
 HEALTH_URL=""
 HEALTH_TOKEN_ENV=""
@@ -77,6 +85,7 @@ while [[ $# -gt 0 ]]; do
     --units) UNITS="$2"; shift 2 ;;
     --result-file) RESULT_FILE="$2"; shift 2 ;;
     --timeout-seconds) TIMEOUT_SECONDS="$2"; shift 2 ;;
+    --restart-timeout-seconds) RESTART_TIMEOUT_SECONDS="$2"; shift 2 ;;
     --pr) PR="$2"; shift 2 ;;
     --health-url) HEALTH_URL="$2"; shift 2 ;;
     --health-token-env) HEALTH_TOKEN_ENV="$2"; shift 2 ;;
@@ -111,6 +120,14 @@ SHA=""
 STAMP=""
 PREV_VERSION=""
 GATE_FAIL_DETAIL=""
+RESTART_FAIL_DETAIL=""
+RESTART_TIMED_OUT=0
+# #877: installed unit paths this deploy changed. Each carries either a
+# <path>.prev backup (unit existed before — rollback restores it) or a
+# <path>.prev.absent marker (unit newly installed this deploy — rollback removes
+# it), so rollback can never leave a new unit paired with the rolled-back binary.
+# Empty unless a required unit change (e.g. KillMode) actually shipped.
+APPLIED_UNITS=()
 
 IFS=',' read -r -a UNIT_LIST <<<"$UNITS"
 
@@ -169,22 +186,31 @@ cleanup_build() {
 # targets the system manager via `sudo -n systemctl restart` (non-interactive,
 # mirroring --install-via-sudo), since restarting a system unit needs privilege.
 # Either way the unit's normal stop path runs, so drain semantics are honored.
-# The user-scope command is byte-for-byte unchanged from before scope support.
+# All configured units are passed to one systemctl invocation so they share the
+# same absolute restart budget instead of multiplying it per unit (#966).
 restart_units() {
-  local budget=$1 unit
+  local budget=$1 rc units
   local -a restart_cmd
   if [[ "$SCOPE" == "system" ]]; then
     restart_cmd=(sudo -n systemctl restart)
   else
     restart_cmd=(systemctl --user restart)
   fi
-  for unit in "${UNIT_LIST[@]}"; do
-    log "restarting $unit (scope=$SCOPE; honors the unit's stop/drain path; budget ${budget}s)"
-    if ! timeout "$budget" "${restart_cmd[@]}" "$unit"; then
-      log "restart of $unit failed or timed out"
-      return 1
-    fi
-  done
+  units=${UNIT_LIST[*]}
+  log "restarting $units (scope=$SCOPE; honors each unit's stop/drain path; shared budget ${budget}s)"
+  if timeout "$budget" "${restart_cmd[@]}" "${UNIT_LIST[@]}"; then
+    return 0
+  else
+    rc=$?
+  fi
+  if (( rc == 124 || rc == 137 )); then
+    RESTART_TIMED_OUT=1
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] exceeded the shared bounded drain/restart budget (${budget}s) while Fleet may be unavailable"
+  else
+    RESTART_FAIL_DETAIL="restart of configured unit(s) [$units] failed (rc=$rc)"
+  fi
+  log "$RESTART_FAIL_DETAIL"
+  return 1
 }
 
 # units_active is scope-aware too (#716). The read-only liveness query needs no
@@ -200,6 +226,107 @@ units_active() {
   for unit in "${UNIT_LIST[@]}"; do
     "${active_cmd[@]}" "$unit" || return 1
   done
+}
+
+# daemon_reload reloads the systemd manager so a freshly installed unit file
+# takes effect, scoped per --scope (system manager needs sudo -n).
+daemon_reload() {
+  if [[ "$SCOPE" == "system" ]]; then
+    sudo -n systemctl daemon-reload
+  else
+    systemctl --user daemon-reload
+  fi
+}
+
+# installed_unit_path prints the live FragmentPath systemd loaded a unit from
+# (the authoritative install destination), or empty when the unit is unknown.
+# Read-only, so it needs no privilege even for system units.
+installed_unit_path() {
+  local unit=$1
+  if [[ "$SCOPE" == "system" ]]; then
+    systemctl show -p FragmentPath --value "$unit" 2>/dev/null || true
+  else
+    systemctl --user show -p FragmentPath --value "$unit" 2>/dev/null || true
+  fi
+}
+
+# apply_units ships any required systemd unit change alongside the binary (#877).
+# A fix such as KillMode=mixed lives in the repo's unit file, not the binary, so a
+# binary-only deploy would restart under the OLD unit and the fix would never go
+# live (P1 #877 review). For each configured unit whose repo copy (built from the
+# deployed SHA) differs from the live installed file, back the installed file up
+# as <path>.prev, install the repo copy, and remember it in APPLIED_UNITS. A
+# single daemon-reload afterward makes the subsequent restart pick up every
+# change. rollback() restores exactly these files. Units with no repo copy (an
+# operator-managed sibling unit) are left untouched.
+apply_units() {
+  local unit src dest reloaded=0
+  for unit in "${UNIT_LIST[@]}"; do
+    src="$BUILD_DIR/$unit"
+    [[ -f "$src" ]] || continue
+    dest=$(installed_unit_path "$unit")
+    if [[ -z "$dest" ]]; then
+      log "no installed FragmentPath for $unit — skipping unit apply (restart uses the live unit)"
+      continue
+    fi
+    if [[ -f "$dest" ]] && cmp -s "$src" "$dest"; then
+      continue
+    fi
+    log "unit change detected for $unit — installing repo copy over $dest"
+    if [[ -f "$dest" ]]; then
+      priv cp -p "$dest" "$dest.prev" || fail "backing up unit $dest failed"
+      # Clear any stale absent-marker so rollback restores this .prev, not "remove".
+      priv rm -f "$dest.prev.absent" 2>/dev/null || true
+    else
+      # The unit did not exist before this deploy: there is no .prev to restore,
+      # so record an absent-marker instead. Without it, rollback_units would skip
+      # this path (no .prev) and leave the new unit in place while the binary
+      # rolled back — shipping a unit and binary from different revisions (#877
+      # review). The marker tells rollback to REMOVE the newly-installed unit.
+      priv rm -f "$dest.prev" 2>/dev/null || true
+      priv touch "$dest.prev.absent" || fail "recording new-unit marker for $dest failed"
+    fi
+    priv install -m 0644 "$src" "$dest" || fail "installing unit $unit to $dest failed"
+    APPLIED_UNITS+=("$dest")
+  done
+  if (( ${#APPLIED_UNITS[@]} )); then
+    daemon_reload || fail "systemd daemon-reload failed after unit change"
+    log "applied ${#APPLIED_UNITS[@]} unit change(s) and reloaded the systemd manager"
+  fi
+}
+
+# rollback_units reverts every unit file apply_units changed, then daemon-reloads
+# so the reverted units are live before the rollback restart runs. A unit that
+# EXISTED before this deploy is restored from its <path>.prev backup; a unit that
+# was newly INSTALLED this deploy (no prior file, marked with <path>.prev.absent)
+# is REMOVED, so rollback can never leave a new unit paired with the rolled-back
+# (previous-revision) binary (#877 review). Best-effort: a failed revert is
+# logged, not fatal, so binary rollback still proceeds.
+rollback_units() {
+  (( ${#APPLIED_UNITS[@]} )) || return 0
+  local dest restored=0
+  for dest in "${APPLIED_UNITS[@]}"; do
+    if [[ -f "$dest.prev" ]]; then
+      log "rolling back unit $dest to $dest.prev"
+      if priv cp -p "$dest.prev" "$dest.rollback.$$" && priv mv -f "$dest.rollback.$$" "$dest"; then
+        restored=1
+      else
+        priv rm -f "$dest.rollback.$$" 2>/dev/null || true
+        log "unit rollback of $dest failed"
+      fi
+    elif [[ -f "$dest.prev.absent" ]]; then
+      log "rolling back unit $dest — removing newly-installed unit (no prior file)"
+      if priv rm -f "$dest"; then
+        priv rm -f "$dest.prev.absent" 2>/dev/null || true
+        restored=1
+      else
+        log "unit rollback of $dest failed (could not remove new unit)"
+      fi
+    fi
+  done
+  if (( restored )); then
+    daemon_reload || log "daemon-reload after unit rollback failed"
+  fi
 }
 
 health_ok() {
@@ -276,6 +403,10 @@ smoke_gate() {
 
 rollback() {
   local reason=$1
+  # Restore any unit files this deploy shipped BEFORE restarting, so the
+  # rollback restart brings the units back on their previous definition too
+  # (#877). No-op unless apply_units actually changed a unit.
+  rollback_units
   if [[ ! -f "$BIN.prev" ]]; then
     write_result failed "$reason; no $BIN.prev to roll back to"
     return
@@ -304,6 +435,19 @@ fail() {
   else
     write_result failed "$reason"
   fi
+  cleanup_build
+  exit 1
+}
+
+# A timed-out systemctl client may leave its manager-side restart job pending.
+# Starting a second rollback restart would merely stack another blocking job and
+# postpone the failure report under the much larger rollback timeout. Leave the
+# newly installed binary/unit pair intact for the pending job, record the outage
+# immediately, and require operator verification (#966).
+fail_restart_timeout() {
+  local reason=$1
+  log "FAILED: $reason"
+  write_result failed "$reason; no rollback restart attempted because the original restart job may still be pending"
   cleanup_build
   exit 1
 }
@@ -410,10 +554,25 @@ else
   log "installed $BIN (first deploy — no previous binary to keep)"
 fi
 
+# --- 2c. apply any required systemd unit change + daemon-reload (#877) -------
+# Must run BEFORE the restart so the restart adopts the new unit definition (a
+# fix like KillMode=mixed lives in the unit file, not the binary). fail() ->
+# rollback() restores every unit this step overwrote, exactly like the binary.
+apply_units
+
 # --- 3. restart units (drain semantics via the units' own stop path) --------
-RESTART_BUDGET=$((DEADLINE - $(date +%s)))
-(( RESTART_BUDGET > 30 )) || RESTART_BUDGET=30
-restart_units "$RESTART_BUDGET" || fail "unit restart failed or exceeded ${RESTART_BUDGET}s"
+RESTART_BUDGET=$RESTART_TIMEOUT_SECONDS
+DEPLOY_REMAINING=$((DEADLINE - $(date +%s)))
+if (( DEPLOY_REMAINING < RESTART_BUDGET )); then
+  RESTART_BUDGET=$DEPLOY_REMAINING
+fi
+(( RESTART_BUDGET > 0 )) || fail "deploy deadline expired before unit restart"
+if ! restart_units "$RESTART_BUDGET"; then
+  if (( RESTART_TIMED_OUT )); then
+    fail_restart_timeout "$RESTART_FAIL_DETAIL"
+  fi
+  fail "${RESTART_FAIL_DETAIL:-unit restart failed}"
+fi
 
 # --- 4. verify post-restart health ------------------------------------------
 verify || fail "post-restart verification failed (expected v$STAMP from sha $SHA)"

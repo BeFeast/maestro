@@ -9,15 +9,18 @@ import {
   approvalSlotLabel,
   attributionSegmentDuration,
   fetchWorkerDetail,
+  formatAbsoluteTimestamp,
   formatAttributionSegment,
   formatAttributionTimeline,
-	formatCountdown,
+  formatCountdown,
   formatTokens,
   formatUSD,
   isApprovalActionCloseIssue,
   isApprovalActionMergePR,
   isExecutionSkippedApproval,
   manualFollowupForApproval,
+  mapAdvisor,
+  mapPRGate,
   postFleetAction,
   postFleetApproval,
   postProjectApproval,
@@ -55,8 +58,62 @@ function projectFocusMatches(p, focus) {
     !!focus.approval;
 }
 
+export function OutcomeCheckReceipt({ check }) {
+  const deadline = check?.deadline_at ? (formatAbsoluteTimestamp(check.deadline_at) || check.deadline_at) : "";
+  return (
+    <span className="mono" style={{ color: check?.status === "pass" ? "var(--ok)" : "var(--watch)" }}>
+      {check?.status || "unknown"}{deadline ? ` · deadline ${deadline}` : ""}
+    </span>
+  );
+}
+
+export function OutcomeRecoveryReceipt({ recovery, now }) {
+  if (!recovery) return null;
+  return (
+    <>
+      <div className="kv"><span>Recovery</span><strong className="mono">{recovery.status || "unknown"}</strong></div>
+      {recovery.summary && <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>{recovery.summary}</div>}
+      {recovery.started_at && <div className="kv"><span>Last attempt</span><span className="mono">{relTime(parseTimestamp(recovery.started_at), now)}</span></div>}
+      {recovery.next_eligible_at && <div className="kv"><span>Retry eligible</span><span className="mono">{relTime(parseTimestamp(recovery.next_eligible_at), now)}</span></div>}
+      {recovery.exit_code != null && <div className="kv"><span>Exit code</span><strong className="mono">{recovery.exit_code}</strong></div>}
+    </>
+  );
+}
+
+export function PRGateFacts({ gates }) {
+  const rows = (Array.isArray(gates) ? gates : [gates]).filter(Boolean);
+  if (!rows.length) return null;
+  return (
+    <Panel title="PR gates" sub={`${rows.length} current`}>
+      <div style={{ padding: "var(--s-3) var(--s-5)" }}>
+        {rows.map(gate => (
+          <div key={gate.prNumber || gate.pr_number} style={{ padding: "var(--s-3) 0", borderTop: "1px solid var(--grid-line)" }}>
+            <div className="row gap-2" style={{ alignItems: "center", flexWrap: "wrap" }}>
+              <strong className="mono">PR #{gate.prNumber || gate.pr_number}</strong>
+              {gate.ci && <Pill tone={gate.ci === "success" ? "ok" : gate.ci === "failure" ? "stuck" : "watch"} noDot>CI {gate.ci}</Pill>}
+              {(gate.reviewStreams || []).map(stream => (
+                <Pill key={stream.name} tone={stream.passed ? "ok" : stream.pending ? "watch" : "stuck"} noDot>
+                  {stream.summary || `${stream.name} ${stream.scoreMax ? `${stream.score}/${stream.scoreMax}` : ""}`.trim()}
+                </Pill>
+              ))}
+              {gate.mergeAction && <Pill tone={gate.mergeAction.actionRequired ? "watch" : "info"} noDot>{gate.mergeAction.label}</Pill>}
+              {gate.merged && <Pill tone="ok" noDot>PR merged</Pill>}
+            </div>
+            {gate.summary && <div className="mono dim mt-2" style={{ fontSize: 11 }}>{gate.summary}</div>}
+            {gate.mergeAction?.approvalId && (
+              <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>
+                approval <a href={`/approvals?id=${encodeURIComponent(gate.mergeAction.approvalId)}`}>{gate.mergeAction.approvalId}</a> · {gate.mergeAction.status}
+              </div>
+            )}
+          </div>
+        ))}
+      </div>
+    </Panel>
+  );
+}
+
 export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
-  const { fleet, now } = useFleet();
+  const { fleet, now, refresh } = useFleet();
   const p = projectBySlug(fleet, slug);
   const focusMatch = projectFocusMatches(p, focus);
   useScrollToFocus(focusMatch ? "[data-project-focus='true']" : "", [slug, focus?.approval, focus?.issue, focus?.pr, focusMatch]);
@@ -127,6 +184,12 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
         </div>
         <ProjectMiniHeartbeat tone={vtone} events={p.tapeEvents || []} />
       </div>
+
+      <ProjectActionsPanel project={p} refresh={refresh} />
+
+      <PRGateFacts gates={p.prStates} />
+
+      <DispatchBlockersPanel project={p} now={now} />
 
       {p.operatorState?.kind === "attention" && (p.operatorState.summary || p.operatorState.next_action) && (
         <Panel title="Needs attention" sub={p.operatorState.session || undefined}>
@@ -276,6 +339,13 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                   <div className="kv"><span>Dashboard</span><UrlValue url={p.dashboardUrl} /></div>
                 )}
                 <div className="kv"><span>Last check</span><span className="mono">{p.outcome?.health_checked_at ? relTime(parseTimestamp(p.outcome.health_checked_at), now) : "—"}</span></div>
+                {(p.outcome?.checks || []).filter((check) => check.blocking || check.status !== "pass").map((check, index) => (
+                  <div className="kv" key={`${check.name || "check"}-${index}`}>
+                    <span>{check.name}</span>
+                    <OutcomeCheckReceipt check={check} />
+                  </div>
+                ))}
+                <OutcomeRecoveryReceipt recovery={p.outcome?.recovery} now={now} />
                 <div className="kv"><span>Sessions</span><strong className="mono">{p.sessions}</strong></div>
               </>
             ) : (
@@ -313,6 +383,20 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
                       {d.warn && <span style={{ color: "var(--watch)", marginLeft: 6 }}>· past SLA</span>}
                     </div>
                     <div className="dec-note">{d.note}</div>
+                    <div
+                      className="mono dim mt-2"
+                      style={{ fontSize: 10.5 }}
+                      title={[
+                        d.firstSeen ? `first seen ${new Date(d.firstSeen).toISOString()}` : "",
+                        d.lastSeen ? `last seen ${new Date(d.lastSeen).toISOString()}` : "",
+                        d.recommendationId ? `recommendation ${d.recommendationId}` : "",
+                      ].filter(Boolean).join(" · ")}
+                    >
+                      {d.firstSeen ? `first seen ${relTime(d.firstSeen, now)}` : "first seen unknown"}
+                      {` · last seen ${relTime(d.lastSeen, now)}`}
+                      {` · seen ${d.seenCount} time${d.seenCount === 1 ? "" : "s"}`}
+                      {d.disposition?.reason ? ` · ${String(d.disposition.reason).replaceAll("_", " ")}` : ""}
+                    </div>
                   </div>
                   <div className="dec-conf">conf {(d.conf * 100).toFixed(0)}%</div>
                 </div>
@@ -321,6 +405,203 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           </Panel>
         </div>
       </div>
+    </div>
+  );
+}
+
+function actionWorkerTargets(action, field) {
+  return Array.isArray(action?.[field]) ? action[field] : [];
+}
+
+function actionWorkerTargetLabel(target) {
+  const parts = [
+    target?.slot && `slot ${target.slot}`,
+    Number(target?.issue_number || 0) > 0 && `issue #${target.issue_number}`,
+    Number(target?.pr_number || 0) > 0 && `PR #${target.pr_number}`,
+  ].filter(Boolean);
+  return parts.join(" · ") || "worker";
+}
+
+function projectActionSummary(action) {
+  const workers = actionWorkerTargets(action, "workers");
+  const skipped = actionWorkerTargets(action, "skipped_workers");
+  if (workers.length || skipped.length) {
+    return `${workers.length} restartable · ${skipped.length} skipped`;
+  }
+  return action.description || "";
+}
+
+// ProjectActionsPanel renders project-scoped controls from the same fleet
+// snapshot action contract as worker controls. The stale-backend batch restart
+// action lives here because it targets all restartable PR-less workers in a
+// project, while skipped open-PR workers are previewed but not restarted.
+export function ProjectActionsPanel({ project, refresh }) {
+  const actions = Array.isArray(project?.actions) ? project.actions : [];
+  const [busyId, setBusyId] = React.useState("");
+  const [message, setMessage] = React.useState(null);
+  const [pending, setPending] = React.useState(null);
+  const [pendingReason, setPendingReason] = React.useState("");
+
+  if (!actions.length) return null;
+
+  const closeDialog = () => {
+    if (busyId) return;
+    setPending(null);
+    setPendingReason("");
+  };
+
+  const send = async () => {
+    if (!pending || !project) return;
+    const action = pending;
+    setBusyId(action.id);
+    setMessage(null);
+    try {
+      const resp = await postFleetAction({
+        actionId: action.id,
+        project: project.name,
+        reason: pendingReason.trim(),
+      });
+      const enqueued = Array.isArray(resp?.enqueued) ? resp.enqueued.length : 0;
+      const skipped = Array.isArray(resp?.skipped) ? resp.skipped.length : 0;
+      const suffix = enqueued || skipped
+        ? `${enqueued} approvals queued · ${skipped} skipped`
+        : (resp?.status || resp?.approval_id || "ok").replace(/_/g, " ");
+      setMessage({ tone: "ok", text: `${action.label || action.id}: ${suffix}` });
+      setPending(null);
+      setPendingReason("");
+      if (typeof refresh === "function") {
+        try { await refresh(); } catch (_) { /* status already surfaced */ }
+      }
+    } catch (err) {
+      setMessage({ tone: "stuck", text: `${action.label || action.id}: ${err?.message || String(err)}` });
+    } finally {
+      setBusyId("");
+    }
+  };
+
+  const openConfirm = action => {
+    if (action.disabled || busyId) return;
+    setMessage(null);
+    setPendingReason("");
+    setPending(action);
+  };
+
+  return (
+    <Panel title="Project controls" sub={project.readOnly ? "read-only" : "approval gated"}>
+      <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+        <div className="row gap-2" style={{ flexWrap: "wrap" }}>
+          {actions.map(action => {
+            const disabled = action.disabled || !!busyId;
+            const summary = projectActionSummary(action);
+            return (
+              <button
+                key={action.id}
+                className={"tb-btn" + (action.disabled ? " ghost" : "")}
+                disabled={disabled}
+                title={action.disabled ? (action.disabled_reason || "Unavailable") : (action.description || action.label || action.id)}
+                onClick={() => openConfirm(action)}
+              >
+                {busyId === action.id ? "…" : (action.label || action.id)}
+                {summary && <span className="mono dim" style={{ fontSize: 10, marginLeft: 6 }}>{summary}</span>}
+              </button>
+            );
+          })}
+        </div>
+        {message && (
+          <div className="mono mt-2" style={{ fontSize: 11, color: message.tone === "stuck" ? "var(--stuck)" : "var(--ok)" }}>
+            {message.text}
+          </div>
+        )}
+        {project.readOnly && (
+          <div className="mono dim mt-2" style={{ fontSize: 10.5 }}>Controls are disabled while the project runs in read-only mode.</div>
+        )}
+        <ConfirmDialog
+          open={pending !== null}
+          title={pending ? `${pending.label || pending.id}?` : ""}
+          confirmLabel={pending ? (pending.label || pending.id) : "Confirm"}
+          busy={!!busyId}
+          onClose={closeDialog}
+          onConfirm={send}
+        >
+          {pending && (
+            <>
+              <div className="mono dim" style={{ fontSize: 11, marginBottom: 8 }}>
+                action: {pending.label || pending.id} · project {project.name}
+              </div>
+              <div style={{ marginBottom: 12, fontSize: 12, color: "var(--fg-2)" }}>
+                This <strong>enqueues pending Approvals</strong> for restartable targets. Workers with open PRs are skipped and remain for in-place repair or handoff.
+              </div>
+              <ActionTargetPreview action={pending} />
+              {pending.description && (
+                <div className="dim" style={{ fontSize: 11.5, marginBottom: 12 }}>{pending.description}</div>
+              )}
+              <label htmlFor={`reason-project-action-${pending.id}`} style={{ display: "block", fontSize: 11, color: "var(--fg-2)", marginBottom: 4 }}>
+                Reason <span className="dim">(optional, recorded in the audit log)</span>
+              </label>
+              <textarea
+                id={`reason-project-action-${pending.id}`}
+                value={pendingReason}
+                onChange={e => setPendingReason(e.target.value)}
+                placeholder="why this batch approval is being enqueued"
+                autoFocus
+                rows={3}
+                disabled={!!busyId}
+                style={{
+                  width: "100%",
+                  fontFamily: "inherit",
+                  fontSize: 13,
+                  padding: 8,
+                  border: "1px solid var(--border-1)",
+                  borderRadius: "var(--r-2)",
+                  background: "var(--bg-0)",
+                  color: "var(--fg-0)",
+                  resize: "vertical",
+                  boxSizing: "border-box",
+                }}
+                onKeyDown={e => {
+                  if ((e.metaKey || e.ctrlKey) && e.key === "Enter") {
+                    e.preventDefault();
+                    if (!busyId) send();
+                  }
+                }}
+              />
+              <div className="mono dim" style={{ fontSize: 10, marginTop: 4 }}>⌘/Ctrl+Enter to confirm, Esc to cancel.</div>
+            </>
+          )}
+        </ConfirmDialog>
+      </div>
+    </Panel>
+  );
+}
+
+function ActionTargetPreview({ action }) {
+  const workers = actionWorkerTargets(action, "workers");
+  const skipped = actionWorkerTargets(action, "skipped_workers");
+  if (!workers.length && !skipped.length) return null;
+  return (
+    <div style={{ marginBottom: 12 }}>
+      {workers.length > 0 && (
+        <div style={{ marginBottom: 8 }}>
+          <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Restart approval targets</div>
+          {workers.map(target => (
+            <div key={`target-${target.slot}`} className="kv" style={{ fontSize: 12 }}>
+              <span>{actionWorkerTargetLabel(target)}</span>
+              <strong className="mono">{target.reason || "stale backend settings"}</strong>
+            </div>
+          ))}
+        </div>
+      )}
+      {skipped.length > 0 && (
+        <div>
+          <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Skipped</div>
+          {skipped.map(target => (
+            <div key={`skipped-${target.slot}`} className="kv" style={{ fontSize: 12 }}>
+              <span>{actionWorkerTargetLabel(target)}</span>
+              <strong className="mono">{target.reason || "not restartable"}</strong>
+            </div>
+          ))}
+        </div>
+      )}
     </div>
   );
 }
@@ -363,7 +644,7 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             <div className="kv">
               <span>Contract</span>
               <strong style={{ color: watchdog.contractPending ? "var(--watch)" : "var(--fg-1)" }}>
-                {watchdog.contract || (watchdog.contractPending ? "pending actuator/live-canary proof" : "not published")}
+                {watchdog.contract || (watchdog.contractPending ? "pending live-canary proof" : "not published")}
               </strong>
             </div>
             <div className="kv"><span>Silence budget</span><strong className="mono">{watchdog.enabled ? formatCadence(watchdog.silenceBudgetSeconds) : "0s"}</strong></div>
@@ -385,8 +666,10 @@ export function WatchdogPanel({ watchdog, cadences, now = Date.now() }) {
             </div>
             <div className="kv">
               <span>Actual recovery</span>
-              <strong className="mono">
-                {recovery?.action ? `${recovery.action.replace(/_/g, " ")} · ${recovery.outcome || "attempted"}` : "none recorded"}
+              <strong className="mono" title={recovery?.reason || undefined}>
+                {recovery?.action
+                  ? `${recovery.action.replace(/_/g, " ")} · ${(recovery.stage || recovery.outcome || "attempted").replace(/_/g, " ")}`
+                  : "none recorded"}
               </strong>
             </div>
           </>
@@ -663,6 +946,114 @@ function QueueNextPanel({ p }) {
       </div>
     </Panel>
   );
+}
+
+// DispatchBlockersPanel turns the queue decision plane into the direct answer
+// to “why are there 0 workers?” Eligible candidates are explicitly marked
+// dispatchable unless a project-wide hold applies; skipped candidates retain
+// the exact per-issue guard supplied by SupervisorQueueAnalysis.
+export function DispatchBlockersPanel({ project: p, now = Date.now() }) {
+  const hold = p?.dispatchHold || {};
+  const q = p?.queueSnapshot || {};
+  const rows = dispatchGuardRows(q);
+  const issueURL = num => (p?.repo && num ? `https://github.com/${p.repo}/issues/${num}` : "");
+  const sinceMs = hold.since ? parseTimestamp(hold.since) : null;
+  const heldLabel = displayReasonClass(hold.reasonClass) || "dispatch hold";
+
+  return (
+    <div className="mt-4">
+      <Panel
+        title="Dispatch blockers"
+        sub={`${rows.length} issue guard${rows.length === 1 ? "" : "s"}`}
+      >
+        <div style={{ padding: "var(--s-4) var(--s-5)" }}>
+          {hold.active && (
+            <div className="dispatch-hold-banner" role="status">
+              <div className="row gap-2" style={{ flexWrap: "wrap", alignItems: "center" }}>
+                <Pill tone="stuck" noDot>dispatch held</Pill>
+                <strong>{heldLabel}</strong>
+                {sinceMs != null && <span className="mono dim">since {relTime(sinceMs, now)}</span>}
+              </div>
+              <div className="dispatch-hold-detail">
+                {hold.detail || "Fresh issue dispatch is suspended by the current project guard."}
+              </div>
+            </div>
+          )}
+
+          {rows.length > 0 ? (
+            <div className={hold.active ? "mt-3" : ""}>
+              {rows.map((row, i) => {
+                const globallyHeld = row.dispatchable && hold.active;
+                const dispatchable = row.dispatchable && !hold.active;
+                const guard = globallyHeld
+                  ? (hold.detail || heldLabel)
+                  : row.guard;
+                return (
+                  <div key={`${row.number || "x"}-${i}`} className="dispatch-guard-row">
+                    <div className="row gap-2" style={{ minWidth: 0, flexWrap: "wrap" }}>
+                      <PriorityPill label={row.priorityLabel} fallbackTone="idle" />
+                      {row.number ? <IssueLink num={row.number} url={issueURL(row.number)} /> : null}
+                      <span className="dispatch-guard-title">{row.title || "Ready issue"}</span>
+                    </div>
+                    <div className="dispatch-guard-verdict">
+                      <Pill tone={dispatchable ? "ok" : globallyHeld ? "watch" : "stuck"} noDot>
+                        {dispatchable ? "dispatchable" : globallyHeld ? "held" : "blocked"}
+                      </Pill>
+                      <span>{guard || "dispatchable now"}</span>
+                    </div>
+                  </div>
+                );
+              })}
+            </div>
+          ) : (
+            <div className="dim" style={{ padding: "var(--s-3) 0" }}>
+              {hold.active
+                ? "No per-issue candidates were reported in the latest supervisor snapshot."
+                : "No ready issue guards are active."}
+            </div>
+          )}
+        </div>
+      </Panel>
+    </div>
+  );
+}
+
+function dispatchGuardRows(queue) {
+  const byNumber = new Map();
+  const eligible = Array.isArray(queue?.eligible_ranked) ? queue.eligible_ranked : [];
+  const selected = queue?.selected_candidate || null;
+  const skipped = Array.isArray(queue?.skipped_candidates) ? queue.skipped_candidates : [];
+  const addEligible = candidate => {
+    if (!candidate) return;
+    const number = Number(candidate.number || 0);
+    const key = number > 0 ? `issue-${number}` : `eligible-${byNumber.size}`;
+    if (byNumber.has(key)) return;
+    byNumber.set(key, {
+      number,
+      title: candidate.title || "",
+      priorityLabel: candidate.priority_label || "",
+      dispatchable: true,
+      guard: "dispatchable now",
+    });
+  };
+  addEligible(selected);
+  eligible.forEach(addEligible);
+  skipped.forEach((candidate, index) => {
+    const number = Number(candidate?.number || 0);
+    const key = number > 0 ? `issue-${number}` : `skipped-${index}`;
+    byNumber.set(key, {
+      number,
+      title: candidate?.title || "",
+      priorityLabel: candidate?.priority_label || "",
+      dispatchable: false,
+      guard: candidate?.reason || "skipped by the current issue guard",
+    });
+  });
+  return Array.from(byNumber.values());
+}
+
+function displayReasonClass(reasonClass) {
+  return String(reasonClass || "").trim().replaceAll("_", " ");
 }
 
 function QueueCount({ tone, label, value }) {
@@ -961,17 +1352,26 @@ export function WorkersScreen({ navigate, openDrawer, selectedSlot, filterProjec
 // timeline (older sessions before #518 / backends without metadata).
 export function AttributionInline({ worker, now }) {
   const attribution = worker?.attribution || [];
-  if (!attribution.length) return null;
-  const text = formatAttributionTimeline(attribution, now);
-  if (!text) return null;
+  const text = attribution.length ? formatAttributionTimeline(attribution, now) : "";
+  const drift = worker?.backendDrift;
+  if (!text && !drift) return null;
   return (
-    <div
-      className="mono dim mt-2"
-      style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
-      title={text}
-    >
-      {text}
-    </div>
+    <>
+      {text && (
+        <div
+          className="mono dim mt-2"
+          style={{ fontSize: 10.5, whiteSpace: "nowrap", overflow: "hidden", textOverflow: "ellipsis" }}
+          title={text}
+        >
+          {text}
+        </div>
+      )}
+      {drift && (
+        <div className="mono mt-2" style={{ fontSize: 10.5, color: "var(--watch)" }} title={drift.reason}>
+          stale backend settings · effective {formatBackendSettings(drift.effective)}
+        </div>
+      )}
+    </>
   );
 }
 
@@ -1017,6 +1417,73 @@ function AttributionTimeline({ attribution, now }) {
   );
 }
 
+export function AdvisorReviewSection({ advisor }) {
+  if (!advisor) return null;
+  const reviews = Array.isArray(advisor.reviews) ? advisor.reviews : [];
+  const tone = advisor.terminalReason && !advisor.bypassed ? "stuck" : advisor.bypassed ? "watch" : advisor.verdict === "PLAN_APPROVED" ? "ok" : "info";
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Advisor plan gate</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", borderLeft: `2px solid var(--${tone === "stuck" ? "stuck" : tone === "watch" ? "watch" : tone === "ok" ? "ok" : "accent"})` }}>
+        <div className="row gap-2" style={{ alignItems: "center", flexWrap: "wrap" }}>
+          <Pill tone={tone} noDot>{advisor.verdict || advisor.phase || "pending"}</Pill>
+          <span className="mono" style={{ fontSize: 11 }}>
+            plan v{advisor.planVersion || "—"} · round {advisor.reviewRound || "—"}/{advisor.maxReviewRounds || "—"}
+          </span>
+          <span className="mono dim" style={{ fontSize: 10.5 }}>
+            {[advisor.backend, advisor.model].filter(Boolean).join(" · ") || "backend/model pending"}
+          </span>
+        </div>
+        {advisor.terminalReason && (
+          <div className="mono mt-2" style={{ fontSize: 11, color: advisor.bypassed ? "var(--watch)" : "var(--stuck)" }}>
+            terminal: {advisor.terminalReason}{advisor.bypassed ? " · explicitly bypassed" : " · failed closed"}
+          </div>
+        )}
+        {advisor.unresolvedFindings && (
+          <pre className="mono mt-2" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 11, color: "var(--fg-1)", marginBottom: 0 }}>
+            {advisor.unresolvedFindings}
+          </pre>
+        )}
+        {reviews.length > 0 && (
+          <details className="mt-2">
+            <summary className="mono dim" style={{ fontSize: 10.5, cursor: "pointer" }}>{reviews.length} review record{reviews.length === 1 ? "" : "s"}</summary>
+            {reviews.map((review, index) => (
+              <div key={`${review.planVersion}-${review.reviewRound}-${index}`} style={{ borderTop: index === 0 ? "none" : "1px solid var(--border-1)", paddingTop: 6, marginTop: 6 }}>
+                <div className="mono dim" style={{ fontSize: 10.5 }}>
+                  v{review.planVersion} · round {review.reviewRound} · {review.verdict || "no verdict"}{review.terminalReason ? ` · ${review.terminalReason}` : ""}
+                </div>
+                {review.findings && <pre className="mono" style={{ whiteSpace: "pre-wrap", overflowWrap: "anywhere", fontSize: 10.5, marginBottom: 0 }}>{review.findings}</pre>}
+              </div>
+            ))}
+          </details>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function BackendDriftSection({ drift }) {
+  if (!drift) return null;
+  return (
+    <div className="drawer-sec">
+      <div className="drawer-sec-title">Backend settings drift</div>
+      <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", borderLeft: "2px solid var(--watch)" }}>
+        <div className="mono" style={{ fontSize: 12, color: "var(--fg-1)" }}>
+          running {formatBackendSettings(drift.running)} · effective {formatBackendSettings(drift.effective)}
+        </div>
+        <div className="dim mt-2" style={{ fontSize: 12 }}>
+          {drift.restartable ? "Restart can be approval-gated for this PR-less worker." : drift.refusalReason || drift.reason}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function formatBackendSettings(settings) {
+  const parts = [settings?.provider, settings?.model, settings?.variant, settings?.effort].filter(Boolean);
+  return parts.length ? parts.join(" ") : "metadata not set";
+}
+
 // WorkerSpendSection surfaces the per-session token / $ counters and
 // the issue-level rollup the server precomputes in cost_observability
 // (#619). When the project has pricing configured for the worker's
@@ -1027,7 +1494,11 @@ function WorkerSpendSection({ worker, fleet }) {
   if (!worker) return null;
   const tokens = Number(worker.tokens_used_total || 0);
   const attemptTokens = Number(worker.tokens_used_attempt || 0);
+  const budgetTokens = Number(
+    worker.token_budget_measure ? worker.token_budget_tokens_attempt || 0 : attemptTokens,
+  );
   const maxTokens = Number(worker.worker_max_tokens || 0);
+  const budgetMeasure = String(worker.token_budget_measure || "provider_total_tokens_legacy");
   const usd = Number(worker.cost_usd_estimate || 0);
   // Find the issue-level rollup so retries are visible on the drawer.
   const projectName = worker.project_name || worker.project || "";
@@ -1056,9 +1527,11 @@ function WorkerSpendSection({ worker, fleet }) {
       </div>
       {maxTokens > 0 && (
         <div className="kv">
-          <span>Configured budget</span>
+          <span>
+            Budget use ({budgetMeasure === "uncached_tokens" ? "uncached tokens" : budgetMeasure.replaceAll("_", " ")})
+          </span>
           <strong className="mono">
-            {formatTokens(attemptTokens)} / {formatTokens(maxTokens)} tok
+            {formatTokens(budgetTokens)} / {formatTokens(maxTokens)} tok
           </strong>
         </div>
       )}
@@ -1169,6 +1642,15 @@ export function WorkerDrawer({ worker, onClose, now }) {
 
           <WorkerSpendSection worker={worker} fleet={fleet} />
 
+          {worker.backend_selection && (
+            <div className="drawer-sec">
+              <div className="drawer-sec-title">Backend selection</div>
+              <div className="kv"><span>Backend</span><strong className="mono">{worker.backend_selection.selected_backend || worker.backend || "—"}</strong></div>
+              <div className="kv"><span>Decision</span><span className="mono">{worker.backend_selection.selection_reason || "—"}</span></div>
+              <div className="kv"><span>Route</span><span className="mono">{worker.backend_selection.route_selection_reason || "—"}</span></div>
+            </div>
+          )}
+
           <div className="drawer-sec">
             <div className="drawer-sec-title">Next action</div>
             <div style={{ background: "var(--bg-2)", borderRadius: "var(--r-2)", padding: "var(--s-3)", fontSize: 12.5, color: "var(--fg-1)", borderLeft: "2px solid var(--accent)" }}>
@@ -1193,6 +1675,11 @@ export function WorkerDrawer({ worker, onClose, now }) {
             attribution={detail?.worker?.attribution || worker.attribution}
             now={now}
           />
+          <AdvisorReviewSection advisor={mapAdvisor(detail?.worker) || worker.advisor} />
+          <div className="drawer-sec">
+            <PRGateFacts gates={mapPRGate(detail?.worker?.pr_gate) || worker.prGate} />
+          </div>
+          <BackendDriftSection drift={detail?.worker?.backendDrift || worker.backendDrift} />
 
           <div className="drawer-sec" ref={logRef}>
             <div className="drawer-sec-title row" style={{ justifyContent: "space-between" }}>
@@ -1254,7 +1741,7 @@ export function WorkerDrawer({ worker, onClose, now }) {
 // approval-gate semantics explicit in the body so the operator knows
 // the click enqueues a pending Approval rather than executing
 // immediately.
-function WorkerActionsPanel({ worker, readOnly, refresh }) {
+export function WorkerActionsPanel({ worker, readOnly, refresh }) {
   const actions = Array.isArray(worker?.actions) ? worker.actions : [];
   const [busyId, setBusyId] = React.useState("");
   const [message, setMessage] = React.useState(null);
@@ -1316,8 +1803,8 @@ function WorkerActionsPanel({ worker, readOnly, refresh }) {
     project && `project ${project}`,
   ].filter(Boolean).join(" · ");
 
-  const isDangerVerb = (id) => id === "stop_worker";
-  const isRecoveryVerb = (id) => id === "restart_worker";
+	const isDangerVerb = (id) => id === "stop_worker" || id === "hold_merge";
+	const isRecoveryVerb = (id) => id === "restart_worker" || id === "release_merge";
 
   return (
     <div className="drawer-sec">
@@ -2083,7 +2570,17 @@ function EffectiveConfigView({ project, onEdit }) {
         <div className="settings-section-title">Model policy</div>
         <div className="kv"><span>Default</span><strong className="mono">{cfg.modelPolicy?.default || "—"}</strong></div>
         <div className="kv"><span>Fallbacks</span><TagList values={cfg.modelPolicy?.fallbackBackends} /></div>
+        <div className="kv"><span>Resolved route</span><TagList values={cfg.modelPolicy?.resolvedRoute} /></div>
+        <div className="kv"><span>Selection reason</span><strong className="mono">{cfg.modelPolicy?.selectionReason || "—"}</strong></div>
         <div className="kv"><span>Routing</span><span className="mono">{routingLabel(cfg.modelPolicy?.routing)}</span></div>
+        <RoutingTierList tiers={cfg.modelPolicy?.routing?.tiers} />
+        <PipelineOverrideList pipeline={cfg.pipeline} />
+        {(cfg.modelPolicy?.providerLanes || []).map(lane => (
+          <div className="kv" key={`${lane.provider}:${lane.default}`}>
+            <span>{lane.provider}</span>
+            <TagList values={[lane.default, ...(lane.fallbackBackends || [])]} />
+          </div>
+        ))}
         <div className="settings-backends">
           {(cfg.modelPolicy?.backends || []).map(backend => (
             <div key={backend.name} className="settings-backend">
@@ -2162,6 +2659,56 @@ function TagList({ values, empty = "—" }) {
   const list = (values || []).filter(Boolean);
   if (!list.length) return <span className="dim">{empty}</span>;
   return <span className="settings-tags">{list.map(v => <span key={v} className="mono">{v}</span>)}</span>;
+}
+
+function RoutingTierList({ tiers }) {
+  const rows = Array.isArray(tiers) ? tiers.filter(t => t?.name) : [];
+  if (!rows.length) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Routing tiers</div>
+      {rows.map(tier => (
+        <div key={tier.name} className="kv">
+          <span className="mono">{tier.name}</span>
+          <strong className="mono">
+            {[tier.backend, tier.model, tier.effort].filter(Boolean).join(" · ") || "—"}
+          </strong>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function PipelineOverrideList({ pipeline }) {
+  const roles = [
+    ["planner", pipeline?.planner],
+    ["advisor", pipeline?.advisor],
+    ["implementer", pipeline?.implementer],
+    ["validator", pipeline?.validator],
+  ].filter(([, role]) => role?.backend || role?.effort || role?.enabled);
+  if (!roles.length) return null;
+  return (
+    <div style={{ marginTop: 8 }}>
+      <div className="mono dim" style={{ fontSize: 10.5, marginBottom: 4 }}>Pipeline phase overrides</div>
+      {roles.map(([name, role]) => (
+        <div key={name} className="kv">
+          <span className="mono">{name}</span>
+          <strong className="mono">
+            {[role.backend, role.effort].filter(Boolean).join(" · ") || (role.enabled ? "enabled" : "—")}
+          </strong>
+        </div>
+      ))}
+      {pipeline?.advisor?.enabled && pipeline?.advisorReviewRounds > 0 && (
+        <div className="kv">
+          <span className="mono">advisor budget</span>
+          <strong className="mono">
+            {pipeline.advisorReviewRounds} round{pipeline.advisorReviewRounds === 1 ? "" : "s"}
+            {pipeline.advisorBestEffort ? " · best effort" : " · fail closed"}
+          </strong>
+        </div>
+      )}
+    </div>
+  );
 }
 
 function routingLabel(routing) {

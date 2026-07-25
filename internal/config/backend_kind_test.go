@@ -19,11 +19,14 @@ func TestResolveBackendKind(t *testing.T) {
 		{"codex", "", "", BackendKindCodex},
 		{"gemini", "", "gemini-cli", BackendKindGemini},
 		{"cline", "", "", BackendKindCline},
+		{"kimi", "", "", BackendKindKimi},
 		// 2. Provider field resolves custom names (sup-175 `fable:` shape).
 		{"fable", "anthropic", "claude --model claude-fable-5 --effort xhigh", BackendKindClaude},
 		{"fast", "openai", "codex --profile fast", BackendKindCodex},
 		{"flash", "google", "gemini", BackendKindGemini},
 		{"wrapped", "cline", "cline", BackendKindCline},
+		{"moonshot", "moonshot", "kimi", BackendKindKimi},
+		{"kimi-custom", "kimi", "my-kimi-shim", BackendKindKimi},
 		// #730: provider pi / ollama resolves to the first-class pi backend.
 		{"pi-ollama", "ollama", "pi", BackendKindPi},
 		{"picustom", "pi", "my-pi-shim", BackendKindPi},
@@ -36,6 +39,7 @@ func TestResolveBackendKind(t *testing.T) {
 		{"mymodel", "", "codex --flag", BackendKindCodex},
 		{"mymodel", "groq", "gemini", BackendKindGemini},
 		{"picli", "", "/usr/local/bin/pi", BackendKindPi},
+		{"kimicli", "", "/usr/local/bin/kimi", BackendKindKimi},
 		// 4. Everything else is generic.
 		{"helper", "groq", "groq-cli", BackendKindGeneric},
 		{"custom", "", "my-cli --verbose", BackendKindGeneric},
@@ -81,8 +85,9 @@ func TestConfig_Warnings_CustomBackendProviderResolvedNoWarning(t *testing.T) {
 		Model: ModelConfig{
 			Default: "fable",
 			Backends: map[string]BackendDef{
-				"fable":   {Provider: "anthropic", Cmd: "claude --model claude-fable-5 --effort xhigh"},
-				"mymodel": {Cmd: "/usr/local/bin/codex --profile fast"},
+				"fable":            {Provider: "anthropic", Cmd: "claude --model claude-fable-5 --effort xhigh"},
+				"moonshot-primary": {Provider: "moonshot", Cmd: "kimi"},
+				"mymodel":          {Cmd: "/usr/local/bin/codex --profile fast"},
 			},
 		},
 	}

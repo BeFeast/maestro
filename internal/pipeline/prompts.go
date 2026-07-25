@@ -3,6 +3,7 @@ package pipeline
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/befeast/maestro/internal/config"
@@ -50,6 +51,18 @@ const defaultPlannerPrompt = `You are a **planner** for a coding agent pipeline.
 4. Commit both files with message: "plan: add implementation plan for #{{ISSUE_NUMBER}}"
 5. Do NOT implement the issue. Only plan and define validation criteria.
 6. Do NOT create a PR.
+`
+
+const defaultAdvisorPrompt = `You are an independent **Advisor** in a coding-agent pipeline. Review the issue, the canonical implementation plan, and the validation contract before any implementation begins.
+
+You are review-only. You must not edit source files, mutate MAESTRO_PLAN.md or VALIDATION.md, commit, push, create a PR, or otherwise change git HEAD. The only file you may create is MAESTRO_PLAN_REVIEW.md.
+
+Write MAESTRO_PLAN_REVIEW.md with an exact first line:
+
+- PLAN_APPROVED when the plan and validation contract are ready for implementation; or
+- PLAN_REVISE when the planner must address findings before implementation.
+
+For PLAN_REVISE, put specific unresolved findings after the first line. Do not place any preamble, Markdown fence, whitespace, or commentary before the verdict token. Missing or malformed output fails closed.
 `
 
 const defaultValidatorPrompt = `You are a **validator** for a coding agent pipeline. Your job is to verify that an implementation meets the validation contract.
@@ -110,6 +123,8 @@ func PromptForPhase(cfg *config.Config, phase state.Phase, issue github.Issue, w
 	switch phase {
 	case state.PhasePlan:
 		base = loadPromptOrDefault(cfg.Pipeline.Planner.Prompt, defaultPlannerPrompt)
+	case state.PhaseAdvisor:
+		base = loadPromptOrDefault(cfg.Pipeline.Advisor.Prompt, defaultAdvisorPrompt)
 	case state.PhaseValidate:
 		base = loadPromptOrDefault(cfg.Pipeline.Validator.Prompt, defaultValidatorPrompt)
 	default:
@@ -125,11 +140,97 @@ func PromptTemplateForPhase(cfg *config.Config, phase state.Phase) string {
 	switch phase {
 	case state.PhasePlan:
 		return loadPromptOrDefault(cfg.Pipeline.Planner.Prompt, defaultPlannerPrompt)
+	case state.PhaseAdvisor:
+		return loadPromptOrDefault(cfg.Pipeline.Advisor.Prompt, defaultAdvisorPrompt)
 	case state.PhaseValidate:
 		return loadPromptOrDefault(cfg.Pipeline.Validator.Prompt, defaultValidatorPrompt)
 	default:
 		return ""
 	}
+}
+
+// AdvisorPrompt builds the mandatory Advisor packet. The packet is appended
+// even for a custom prompt so the issue, artifacts, version/round, ledger, and
+// strict verdict contract can never be accidentally omitted by a template.
+func AdvisorPrompt(cfg *config.Config, issue github.Issue, worktreePath, branchName string, sess *state.Session) (string, error) {
+	plan, err := os.ReadFile(filepath.Join(worktreePath, PlanFile))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", PlanFile, err)
+	}
+	validation, err := os.ReadFile(filepath.Join(worktreePath, ValidationFile))
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", ValidationFile, err)
+	}
+	base := PromptForPhase(cfg, state.PhaseAdvisor, issue, worktreePath, branchName)
+	ledger := "None."
+	planVersion := 0
+	reviewRound := 0
+	if sess != nil {
+		planVersion = sess.PlanVersion
+		reviewRound = sess.AdvisorReviewRound
+		if strings.TrimSpace(sess.AdvisorFindingsLedger) != "" {
+			ledger = sess.AdvisorFindingsLedger
+		}
+	}
+	return fmt.Sprintf(`%s
+
+---
+
+## Mandatory Advisor Review Packet
+
+### Issue
+
+**#%d: %s**
+
+%s
+
+### Review identity
+
+- Plan version: %d
+- Review round: %d
+
+### Compact unresolved-findings ledger
+
+%s
+
+### Current MAESTRO_PLAN.md
+
+%s
+
+### Current VALIDATION.md
+
+%s
+
+Re-check the strict verdict and review-only rules above. Write only %s; do not mutate either canonical artifact.
+`, base, issue.Number, issue.Title, issue.Body, planVersion, reviewRound, ledger, string(plan), string(validation), AdvisorReviewFile), nil
+}
+
+// PlannerRevisionPrompt gives the planner sole ownership of canonical plan
+// changes while carrying every accumulated Advisor finding into the revision.
+func PlannerRevisionPrompt(cfg *config.Config, issue github.Issue, worktreePath, branchName string, sess *state.Session) string {
+	base := PromptForPhase(cfg, state.PhasePlan, issue, worktreePath, branchName)
+	ledger := "No Advisor findings were recorded."
+	version := 0
+	if sess != nil {
+		version = sess.PlanVersion
+		if strings.TrimSpace(sess.AdvisorFindingsLedger) != "" {
+			ledger = sess.AdvisorFindingsLedger
+		}
+	}
+	return fmt.Sprintf(`%s
+
+---
+
+## Advisor-requested plan revision
+
+You remain the sole owner of MAESTRO_PLAN.md and VALIDATION.md. Revise both canonical artifacts as needed to address every finding below. Do not implement the issue and do not create a PR.
+
+Current plan version: %d
+
+### Accumulated Advisor findings
+
+%s
+`, base, version, ledger)
 }
 
 // ImplementerPreamble returns extra context to prepend to the implementer prompt

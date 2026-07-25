@@ -18,10 +18,8 @@ const defaultBaseBranch = "main"
 // Maestro creates each worker worktree from the local checkout. When the local
 // base branch lags origin (e.g. PRs merged on GitHub but never pulled locally),
 // every worker branches from a stale base: it re-implements already-merged work,
-// its branch becomes a sibling rather than a descendant of origin/main, and the
-// attribution amend's `git push --force-with-lease` fails with stale
-// remote-tracking info. The fetch + fast-forward here prevents all of that
-// (#734).
+// and its branch becomes a sibling rather than a descendant of origin/main.
+// The fetch + fast-forward here prevents all of that (#734).
 //
 // If the local base branch has diverged from origin (cannot fast-forward), or
 // the base branch is checked out with a dirty working tree, SyncBaseBranch
@@ -36,8 +34,7 @@ func SyncBaseBranch(localPath, branch string) error {
 	}
 	remoteRef := "origin/" + branch
 
-	// Refresh remote-tracking refs. This also repairs the stale remote-tracking
-	// info that otherwise breaks a later `git push --force-with-lease`.
+	// Refresh remote-tracking refs before deriving or rebasing worker branches.
 	if _, err := runGit(localPath, "fetch", "origin"); err != nil {
 		return fmt.Errorf("sync base branch %q: %w", branch, err)
 	}
@@ -77,8 +74,11 @@ func SyncBaseBranch(localPath, branch string) error {
 
 	head, _ := runGit(localPath, "symbolic-ref", "--quiet", "--short", "HEAD")
 	if strings.TrimSpace(head) == branch {
-		// Base branch is checked out: refuse a dirty tree, then fast-forward merge.
-		if dirty, err := worktreeDirty(localPath); err != nil {
+		// Base branch is checked out: refuse a dirty *tracked* tree, then
+		// fast-forward merge. Untracked agent harness dirs (.claude/.codex/…)
+		// normally do not affect an ff-only merge and commonly live in the shared
+		// base checkout, so they must not freeze fleet spawn (#1100).
+		if dirty, err := baseCheckoutBlockingDirt(localPath); err != nil {
 			return fmt.Errorf("sync base branch %q: %w", branch, err)
 		} else if dirty != "" {
 			return fmt.Errorf("base branch %q checkout at %s is dirty; cannot fast-forward to %s:\n%s",
@@ -96,6 +96,57 @@ func SyncBaseBranch(localPath, branch string) error {
 		return fmt.Errorf("fast-forward base branch %q to %s: %w", branch, remoteRef, err)
 	}
 	return nil
+}
+
+// ignorableBaseUntrackedPrefixes are untracked top-level paths workers and
+// agent harnesses commonly leave in the shared local_path checkout. They do
+// not block git merge --ff-only and must not freeze fleet spawn (#1100).
+var ignorableBaseUntrackedPrefixes = []string{
+	".claude/",
+	".codex/",
+	".cursor/",
+	".entire/",
+	".agents/",
+	".windsurf/",
+	".clinerules",
+}
+
+// baseCheckoutBlockingDirt returns porcelain lines that should block SyncBaseBranch.
+// Tracked modifications always block. Untracked agent harness dirs are ignored.
+func baseCheckoutBlockingDirt(localPath string) (string, error) {
+	out, err := worktreeDirty(localPath)
+	if err != nil {
+		return "", err
+	}
+	if out == "" {
+		return "", nil
+	}
+	var blocking []string
+	for _, line := range strings.Split(out, "\n") {
+		line = strings.TrimRight(line, "\r")
+		if line == "" {
+			continue
+		}
+		if strings.HasPrefix(line, "?? ") {
+			path := strings.TrimPrefix(line, "?? ")
+			if isIgnorableBaseUntracked(path) {
+				continue
+			}
+		}
+		blocking = append(blocking, line)
+	}
+	return strings.Join(blocking, "\n"), nil
+}
+
+func isIgnorableBaseUntracked(path string) bool {
+	path = strings.TrimSpace(path)
+	path = strings.ReplaceAll(path, "\\", "/")
+	for _, prefix := range ignorableBaseUntrackedPrefixes {
+		if path == strings.TrimSuffix(prefix, "/") || strings.HasPrefix(path, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 // addWorktreeFromBase creates worktreePath as a fresh checkout on branchName,

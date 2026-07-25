@@ -101,6 +101,7 @@ func TestSupervisorMutatingActions_AreInExecutorRegistry(t *testing.T) {
 func TestDecide_SpawnRepairWorkerDecision_IsRegistrySupported(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{
+		issues: []github.Issue{testIssue(1, "spawn repair regression", "maestro-ready")},
 		prs: []github.PR{{
 			Number:      7,
 			HeadRefName: "feat/checks",

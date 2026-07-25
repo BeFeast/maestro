@@ -8,7 +8,10 @@ import (
 	"io"
 	"log"
 	"os"
+	"os/exec"
 	"strings"
+	"sync"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
@@ -51,14 +54,122 @@ type LLMClient interface {
 
 type backendLLMClient struct {
 	cfg *config.Config
+	// backendHealth is an optional per-cycle snapshot of the project's
+	// BackendHealth gates. When present, candidates in an active cooldown are
+	// skipped instead of re-tried every supervise tick — without it the walk
+	// re-burned the whole chain down to the last rung (live 2026-07: opencode
+	// every cycle while the primaries cooled).
+	backendHealth map[string]state.BackendHealth
+	// memory tracks consecutive per-backend failures across consults (shared
+	// by all withBackendHealth copies). A backend that keeps failing — e.g. a
+	// carrier that cannot answer within its attempt timeout — gets skipped for
+	// a window instead of billing another doomed generation every cycle. Burn
+	// RCA 2026-07-24: without this, a 100%-failing chain was re-walked on every
+	// consult for 4.5h.
+	memory *supervisorBackendMemory
+}
+
+const (
+	supervisorBackendAttemptTimeout = 45 * time.Second
+	supervisorBackendTotalTimeout   = 3 * time.Minute
+	// supervisorBackendFailureThreshold consecutive failures put a candidate
+	// into a skip window; a success resets the count.
+	supervisorBackendFailureThreshold = 3
+	// supervisorBackendFailureSkipWindow is how long a repeatedly-failing
+	// candidate is skipped before it may be probed again.
+	supervisorBackendFailureSkipWindow = 10 * time.Minute
+)
+
+// supervisorBackendMemory is the supervisor-local failure memory. It is
+// deliberately NOT written to state.BackendHealth: a print-mode consult
+// timing out says nothing about the backend's fitness for long-form worker
+// runs, so it must not gate dispatch.
+type supervisorBackendMemory struct {
+	mu        sync.Mutex
+	failures  map[string]int
+	skipUntil map[string]time.Time
+}
+
+func newSupervisorBackendMemory() *supervisorBackendMemory {
+	return &supervisorBackendMemory{failures: map[string]int{}, skipUntil: map[string]time.Time{}}
+}
+
+// shouldSkip reports whether the candidate is inside an active skip window.
+func (m *supervisorBackendMemory) shouldSkip(name string, now time.Time) (time.Time, bool) {
+	if m == nil {
+		return time.Time{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	until, ok := m.skipUntil[name]
+	if !ok || now.After(until) {
+		return time.Time{}, false
+	}
+	return until, true
+}
+
+// recordFailure bumps the candidate's consecutive-failure count and opens a
+// skip window at the threshold. Returns the window expiry when one opened.
+func (m *supervisorBackendMemory) recordFailure(name string, now time.Time) (time.Time, bool) {
+	if m == nil {
+		return time.Time{}, false
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.failures[name]++
+	if m.failures[name] < supervisorBackendFailureThreshold {
+		return time.Time{}, false
+	}
+	m.failures[name] = 0
+	until := now.Add(supervisorBackendFailureSkipWindow)
+	m.skipUntil[name] = until
+	return until, true
+}
+
+func (m *supervisorBackendMemory) recordSuccess(name string) {
+	if m == nil {
+		return
+	}
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	delete(m.failures, name)
+	delete(m.skipUntil, name)
+}
+
+// supervisorAttemptTimeoutFor resolves the attempt budget for one candidate:
+// per-backend override, then supervisor.attempt_timeout_seconds, then the 45s
+// default.
+func supervisorAttemptTimeoutFor(cfg *config.Config, def config.BackendDef) time.Duration {
+	if def.SupervisorAttemptTimeoutSeconds > 0 {
+		return time.Duration(def.SupervisorAttemptTimeoutSeconds) * time.Second
+	}
+	if cfg != nil && cfg.Supervisor.AttemptTimeoutSeconds > 0 {
+		return time.Duration(cfg.Supervisor.AttemptTimeoutSeconds) * time.Second
+	}
+	return supervisorBackendAttemptTimeout
+}
+
+func supervisorTotalTimeoutFor(cfg *config.Config) time.Duration {
+	if cfg != nil && cfg.Supervisor.TotalTimeoutSeconds > 0 {
+		return time.Duration(cfg.Supervisor.TotalTimeoutSeconds) * time.Second
+	}
+	return supervisorBackendTotalTimeout
 }
 
 func NewBackendLLMClient(cfg *config.Config) LLMClient {
-	return &backendLLMClient{cfg: cfg}
+	return &backendLLMClient{cfg: cfg, memory: newSupervisorBackendMemory()}
+}
+
+// withBackendHealth returns a copy of the client carrying the cycle's
+// BackendHealth snapshot, so a concurrent Complete on the shared engine client
+// never observes a mutated map. The failure memory pointer is shared — it must
+// survive across cycles.
+func (c *backendLLMClient) withBackendHealth(health map[string]state.BackendHealth) *backendLLMClient {
+	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory}
 }
 
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
-	backendName, backendDef, err := supervisorBackend(c.cfg)
+	candidates, err := supervisorBackendCandidates(c.cfg, c.backendHealth, time.Now().UTC())
 	if err != nil {
 		return "", err
 	}
@@ -80,35 +191,146 @@ func (c *backendLLMClient) Complete(prompt string) (string, error) {
 		return "", fmt.Errorf("close supervisor prompt file: %w", err)
 	}
 
-	backendCfg := worker.BackendConfig{
-		Cmd:        backendDef.Cmd,
-		ExtraArgs:  backendDef.ExtraArgs,
-		PromptMode: backendDef.PromptMode,
-		Provider:   backendDef.Provider,
-		Model:      c.cfg.Supervisor.Model,
-		Effort:     c.cfg.Supervisor.Effort,
-	}
 	worktree := c.cfg.LocalPath
 	if strings.TrimSpace(worktree) == "" {
 		worktree = "."
 	}
-	cmd, stdinFile, err := worker.BuildSupervisorCmd(backendName, backendCfg, promptPath, worktree)
+	deadline := time.Now().Add(supervisorTotalTimeoutFor(c.cfg))
+	var failed []string
+	var skipped []string
+	for _, candidate := range candidates {
+		now := time.Now()
+		if until, skip := c.memory.shouldSkip(candidate.name, now); skip {
+			skipped = append(skipped, candidate.name)
+			log.Printf("[supervisor] skipping backend %s: %d consecutive failures, retry allowed after %s",
+				candidate.name, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
+			continue
+		}
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		attemptTimeout := supervisorAttemptTimeoutFor(c.cfg, candidate.def)
+		if remaining < attemptTimeout {
+			attemptTimeout = remaining
+		}
+		out, runErr := completeSupervisorBackend(candidate.name, candidate.def, c.cfg, promptPath, worktree, attemptTimeout)
+		if runErr == nil {
+			c.memory.recordSuccess(candidate.name)
+			if len(failed) > 0 {
+				log.Printf("[supervisor] backend fallback selected %s after %s failed", candidate.name, strings.Join(failed, ", "))
+			}
+			return strings.TrimSpace(string(out)), nil
+		}
+		failed = append(failed, candidate.name)
+		if until, opened := c.memory.recordFailure(candidate.name, time.Now()); opened {
+			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); %d consecutive failures — skipping it until %s",
+				candidate.name, runErr, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
+		} else {
+			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); trying configured fallback", candidate.name, runErr)
+		}
+	}
+	if len(failed) == 0 && len(skipped) > 0 {
+		return "", fmt.Errorf("run supervisor backends: all candidates inside failure-memory skip windows (%s); deterministic guardrail proceeds", strings.Join(skipped, ", "))
+	}
+	return "", fmt.Errorf("run supervisor backends: all bounded candidates failed (%s)", strings.Join(failed, ", "))
+}
+
+type supervisorBackendCandidate struct {
+	name string
+	def  config.BackendDef
+}
+
+func supervisorBackendCandidates(cfg *config.Config, health map[string]state.BackendHealth, now time.Time) ([]supervisorBackendCandidate, error) {
+	primary, def, err := supervisorBackend(cfg)
 	if err != nil {
-		return "", fmt.Errorf("build supervisor backend cmd: %w", err)
+		return nil, err
+	}
+	names := append([]string{primary}, cfg.Model.FallbackBackends...)
+	seen := make(map[string]struct{}, len(names))
+	out := make([]supervisorBackendCandidate, 0, len(names))
+	var cooling []string
+	for _, name := range names {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		if _, duplicate := seen[name]; duplicate {
+			continue
+		}
+		seen[name] = struct{}{}
+		candidate, ok := cfg.Model.Backends[name]
+		if !ok || !candidate.IsEnabled() {
+			continue
+		}
+		// Skip candidates in an active BackendHealth cooldown instead of
+		// re-proving the outage with a live call every tick. The gate clears
+		// itself: ReconcileBackendHealth drops elapsed entries, and an entry
+		// whose RetryAfter has passed is eligible again here.
+		if gate, gated := health[name]; gated && gate.State == state.BackendHealthCooldown {
+			if gate.RetryAfter == nil || now.Before(*gate.RetryAfter) {
+				cooling = append(cooling, name)
+				continue
+			}
+		}
+		if name == primary {
+			candidate = def
+		}
+		out = append(out, supervisorBackendCandidate{name: name, def: candidate})
+	}
+	if len(out) == 0 {
+		if len(cooling) > 0 {
+			return nil, fmt.Errorf("supervisor backend candidates all cooling down (%s); skipping LLM this cycle", strings.Join(cooling, ", "))
+		}
+		return nil, fmt.Errorf("supervisor has no enabled backend candidates")
+	}
+	if len(cooling) > 0 {
+		log.Printf("[supervisor] skipping cooling-down backend candidate(s) %s for this cycle", strings.Join(cooling, ", "))
+	}
+	return out, nil
+}
+
+func completeSupervisorBackend(name string, def config.BackendDef, cfg *config.Config, promptPath, worktree string, timeout time.Duration) ([]byte, error) {
+	backendCfg := worker.BackendConfig{
+		Cmd: def.Cmd, ExtraArgs: def.ExtraArgs, PromptMode: def.PromptMode, Provider: def.Provider,
+		Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort,
+	}
+	cmd, stdinFile, err := worker.BuildSupervisorCmd(name, backendCfg, promptPath, worktree)
+	if err != nil {
+		return nil, fmt.Errorf("build supervisor backend cmd: %w", err)
 	}
 	if stdinFile != "" {
 		in, err := os.Open(stdinFile)
 		if err != nil {
-			return "", fmt.Errorf("open supervisor prompt stdin: %w", err)
+			return nil, fmt.Errorf("open supervisor prompt stdin: %w", err)
 		}
 		defer in.Close()
 		cmd.Stdin = in
 	}
-	out, err := cmd.Output()
-	if err != nil {
-		return "", fmt.Errorf("run supervisor backend %q: %w", backendName, err)
+	return outputWithTimeout(cmd, timeout)
+}
+
+func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
+	var out bytes.Buffer
+	cmd.Stdout = &out
+	if err := cmd.Start(); err != nil {
+		return nil, err
 	}
-	return strings.TrimSpace(string(out)), nil
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+	select {
+	case err := <-done:
+		return out.Bytes(), err
+	case <-timer.C:
+		// This is already a hard attempt deadline. Do not spend the worker
+		// reaper's two-second SIGTERM grace period here or the bounded fallback
+		// chain can overrun its advertised total deadline.
+		worker.ForceKillProcessTree(cmd.Process.Pid)
+		<-done
+		return nil, fmt.Errorf("timed out after %s", timeout.Round(time.Second))
+	}
 }
 
 func supervisorBackend(cfg *config.Config) (string, config.BackendDef, error) {
@@ -132,22 +354,15 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 
-	// #837: short-circuit the LLM call on a safe, mutation-free deterministic
-	// decision (idle-project token burn). validateLLMDecision forces the LLM to
-	// agree with the guardrail on action/target/risk, and resolveGuardrailConflict
-	// resolves any disagreement in favor of the deterministic side whenever the
-	// guardrail decision is risk=safe — so on an idle project the LLM can only
-	// reword the summary, never change the decision. Building the ~55K-token state
-	// packet and calling the backend there buys nothing, so skip both.
-	//
-	// The LLM stays in the loop exactly where it adds value: every mutating /
-	// approval-gated decision (spawn_worker, spawn_repair_worker, merge_pr,
-	// review_retry_exhausted, ...) has Risk != safe, and a safe decision that
-	// still plans a GitHub mutation (label_issue_ready with add_ready_label) has
-	// len(Mutations) > 0 — both fall through to the LLM path below. The escape
-	// hatch supervisor.always_consult_llm=true restores the old always-call path.
-	if !e.cfg.Supervisor.AlwaysConsultLLM && deterministic.Risk == RiskSafe && len(deterministic.Mutations) == 0 {
-		log.Printf("[supervisor] supervise: safe idle decision, LLM skipped (action=%s risk=%s)", deterministic.RecommendedAction, deterministic.Risk)
+	// #837 / hands-off 2026-07-22: short-circuit EVERY risk=safe deterministic
+	// decision, including label_issue_ready with planned mutations. validateLLMDecision
+	// + resolveGuardrailConflict already force agreement with the safe guardrail, so
+	// the LLM can only reword the summary. Waiting on a hung supervisor backend
+	// (live ok-player: safe label path never returned, live→0) freezes the control
+	// loop for nothing. Mutating / approval-gated decisions still consult the LLM.
+	// Escape hatch: supervisor.always_consult_llm=true.
+	if !e.cfg.Supervisor.AlwaysConsultLLM && deterministic.Risk == RiskSafe {
+		log.Printf("[supervisor] supervise: safe decision, LLM skipped (action=%s risk=%s mutations=%d)", deterministic.RecommendedAction, deterministic.Risk, len(deterministic.Mutations))
 		return deterministic, nil
 	}
 
@@ -165,9 +380,21 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	if client == nil {
 		client = NewBackendLLMClient(e.cfg)
 	}
+	// Thread the cycle's BackendHealth gates into the backend walk so a
+	// cooling-down candidate is skipped, not re-tried per tick. Custom LLM
+	// clients (tests, remote implementations) pass through unchanged.
+	if backendClient, ok := client.(*backendLLMClient); ok {
+		client = backendClient.withBackendHealth(st.BackendHealth)
+	}
 	output, err := client.Complete(prompt)
 	if err != nil {
-		return state.SupervisorDecision{}, err
+		// The deterministic guardrail already selected the only action the LLM
+		// is allowed to agree with. Provider failure must not freeze the project
+		// control loop: preserve that decision and make the degraded route visible.
+		log.Printf("[supervisor] all model backends unavailable; continuing with deterministic guardrail: %v", err)
+		deterministic.ErrorClass = ErrorClassSupervisorBackend
+		deterministic.Reasons = append(deterministic.Reasons, "Supervisor model backends were unavailable; deterministic guardrail executed without model synthesis.")
+		return deterministic, nil
 	}
 	llmDecision, err := ParseLLMDecision(output)
 	if err != nil {
@@ -459,8 +686,6 @@ func defaultAllowedActions() []string {
 func defaultApprovalRequiredActions() []string {
 	return []string{
 		ActionReviewRetryExhausted,
-		ActionSpawnWorker,
-		ActionSpawnRepairWorker,
 		ActionLabelIssueReady,
 		ActionOpenChildIssue,
 	}

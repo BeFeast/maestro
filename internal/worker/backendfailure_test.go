@@ -55,9 +55,19 @@ func TestDetectModelUnavailable_KnownSignatures(t *testing.T) {
 			wantLabel: "model_not_found",
 		},
 		{
-			name:      "http 404 with error context word",
-			output:    "stream error: received 404 from upstream",
-			wantLabel: "http_404",
+			name:      "CLIProxyAPI model overloaded",
+			output:    `API Error: 529 {"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			wantLabel: "model_overloaded",
+		},
+		{
+			name:      "HTTP 529 overloaded",
+			output:    "HTTP 529: Overloaded",
+			wantLabel: "model_overloaded",
+		},
+		{
+			name:      "wrapped CLIProxyAPI model overloaded",
+			output:    "API Error: 529\n" + `{"type":"error","error":{"type":"overloaded_error","message":"Overloaded"}}`,
+			wantLabel: "model_overloaded",
 		},
 	}
 	for _, tc := range cases {
@@ -88,12 +98,43 @@ func TestDetectModelUnavailable_NoFalsePositives(t *testing.T) {
 		"the existing model works fine in production",
 		"HTTP 200 OK — model loaded",
 		"all tests passed: 404 assertions",
+		"processed 529 overloaded fixtures successfully",
+		"issue #529 tracks upstream overload handling",
+		"HTTP 529 without an overload marker",
+		"overloaded queue recovered without an HTTP status",
+		"API Error: 529\nworker overloaded queue recovered after backpressure",
 		"the issue body says the model may not exist, but that is the prompt",
+		`assert_eq!(state.last_load_error.as_deref(), Some("libmpv error 404"));`,
+		"HTTP 404/retry",
+		"stream error: received 404 from upstream",
+		"tool response status: 404 while loading album art",
+		"API Error: 404 from the application's media endpoint",
 	}
 	for _, output := range cases {
 		if hit, label := DetectModelUnavailable(output); hit {
 			t.Errorf("DetectModelUnavailable(%q) = true (label=%q), want false", output, label)
 		}
+	}
+}
+
+// #918: domain-level 404 output in the terminal log tail is ordinary worker
+// output, not evidence that the configured AI model is unavailable.
+func TestIsModelUnavailable_DomainError404InLogTailIgnored(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+
+	var b strings.Builder
+	for i := 0; i < authFailureTailLines; i++ {
+		b.WriteString("normal worker output line\n")
+	}
+	b.WriteString(`assert_eq!(state.last_load_error.as_deref(), Some("libmpv error 404"));`)
+	b.WriteString("\nHTTP 404/retry\n")
+	if err := os.WriteFile(logFile, []byte(b.String()), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	if hit, label := IsModelUnavailable(logFile); hit {
+		t.Fatalf("IsModelUnavailable = (true, %q), want false for domain 404 output in the log tail", label)
 	}
 }
 

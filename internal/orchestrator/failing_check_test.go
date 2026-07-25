@@ -312,7 +312,7 @@ func TestHandleCIFailureRetry_CapturesFailingCheck(t *testing.T) {
 		s := state.NewState()
 		sess := &state.Session{IssueNumber: 42, IssueTitle: "t", Status: state.StatusPROpen, PRNumber: 10, Worktree: "/tmp/wt"}
 		s.Sessions["slot-1"] = sess
-		o.handleCIFailureRetry(s, "slot-1", sess, github.PR{Number: 10})
+		o.handleCIFailureRetry(s, "slot-1", sess, github.PR{Number: 10}, "")
 		return sess
 	}
 

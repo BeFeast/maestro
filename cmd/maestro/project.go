@@ -118,7 +118,7 @@ func projectPlanCmd(args []string) {
 		failGenesis("plan", *asJSON, "invalid_input", "project plan: --db must not be empty")
 	}
 
-	prepared := prepareGenesisFile(*file, "project plan", *asJSON)
+	prepared := prepareGenesisFile(*file, *dbPath, "project plan", *asJSON)
 	if err := validateGenesisRuntime(prepared); err != nil {
 		failGenesis("plan", *asJSON, "preflight_failed", fmt.Sprintf("project plan: preflight: %v", err))
 	}
@@ -159,7 +159,7 @@ func projectApplyCmd(args []string) {
 		failGenesis("apply", *asJSON, "invalid_input", "project apply: --db must not be empty")
 	}
 
-	prepared := prepareGenesisFile(*file, "project apply", *asJSON)
+	prepared := prepareGenesisFile(*file, *dbPath, "project apply", *asJSON)
 	if err := validateGenesisRuntime(prepared); err != nil {
 		failGenesis("apply", *asJSON, "preflight_failed", fmt.Sprintf("project apply: preflight: %v", err))
 	}
@@ -222,9 +222,10 @@ func validateApplyApproval(p *configstore.PreparedProject, confirm, fingerprint,
 
 // prepareGenesisFile reads and strict-validates the portable project file,
 // sharing the flag-plumbing between plan and apply. It fatals (with a clear
-// cmd-prefixed message) on any read/validation failure. Opening the store is the
-// caller's job so `plan` can avoid creating an absent store.
-func prepareGenesisFile(file, cmd string, asJSON bool) *configstore.PreparedProject {
+// cmd-prefixed message) on any read/validation failure. Existing stores are
+// opened through the zero-write snapshot reader so shared backend references can
+// be validated without changing DB/WAL/SHM; an absent store is never opened.
+func prepareGenesisFile(file, dbPath, cmd string, asJSON bool) *configstore.PreparedProject {
 	if strings.TrimSpace(file) == "" {
 		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "invalid_input", fmt.Sprintf("%s: --file is required (a portable project YAML)", cmd))
 	}
@@ -232,7 +233,21 @@ func prepareGenesisFile(file, cmd string, asJSON bool) *configstore.PreparedProj
 	if err != nil {
 		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "file_read_failed", fmt.Sprintf("%s: read %s: %v", cmd, file, err))
 	}
-	prepared, err := configstore.PrepareProject(file, data)
+	exists, err := inspectStoreFile(dbPath)
+	if err != nil {
+		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "store_preflight_failed", fmt.Sprintf("%s: inspect config store %s: %v", cmd, dbPath, err))
+	}
+	var prepared *configstore.PreparedProject
+	if exists {
+		store, openErr := configstore.OpenReadOnly(dbPath)
+		if openErr != nil {
+			failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "store_open_failed", fmt.Sprintf("%s: open config store %s: %v", cmd, dbPath, openErr))
+		}
+		defer store.Close()
+		prepared, err = store.PrepareProject(context.Background(), file, data)
+	} else {
+		prepared, err = configstore.PrepareProject(file, data)
+	}
 	if err != nil {
 		failGenesis(strings.TrimPrefix(cmd, "project "), asJSON, "validation_failed", fmt.Sprintf("%s: %v", cmd, err))
 	}

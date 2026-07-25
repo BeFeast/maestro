@@ -21,14 +21,16 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // GitHubClient is the surface the executor needs from a GitHub client.
 // *github.Client satisfies this; tests inject fakes.
 type GitHubClient interface {
-	MergePR(prNumber int) error
 	CloseIssue(number int, comment string) error
 
 	// AddIssueLabel applies a label to an issue. executeLabelIssueReady
@@ -59,6 +61,24 @@ type GitHubClient interface {
 	// UpdateBranch brings a BEHIND PR head up to date with its base
 	// branch (no --admin bypass). Used by executeMergePR (#547).
 	UpdateBranch(prNumber int) error
+}
+
+type prHeadSHAReader interface {
+	PRHeadSHA(prNumber int) (string, error)
+}
+
+type prHeadBoundMerger interface {
+	MergePRAtHead(prNumber int, expectedHeadSHA string) error
+}
+
+type prMergedReader interface {
+	IsPRMerged(prNumber int) (bool, error)
+}
+
+type finalMergeReader interface {
+	GetIssue(number int) (github.Issue, error)
+	PRLabels(prNumber int) ([]string, error)
+	PRUnresolvedReviewThreadsOnHead(prNumber int) (string, []github.ReviewThread, error)
 }
 
 // WorktreeRemover removes a git worktree. *worker.RemoveWorktree-shaped
@@ -160,6 +180,12 @@ type Executor struct {
 	// fetch the proposed rule and mark it applied after the gated append.
 	State *state.State
 
+	// Runtime probes are optional deterministic overrides for the exact worker
+	// lease checked by delete_worktree. Production defaults use worker/tmux
+	// liveness; tests can inject stable observations.
+	PIDAlive  func(int) bool
+	TmuxAlive func(string) bool
+
 	// locks serializes Execute(approval) per approval.ID within the same
 	// process. The second concurrent caller for the same ID returns
 	// ApprovalStatusExecutionSkipped without firing any side effect.
@@ -193,6 +219,12 @@ var ErrUnknownAction = errors.New("unknown approval action")
 // ErrMissingTarget is returned when the approval lacks the per-verb
 // target field the executor needs (PR number, issue number, session).
 var ErrMissingTarget = errors.New("approval target is missing required fields")
+
+// ErrWorkerAlreadyStopped lets a worker controller report that the immutable
+// process instance named by a stop approval was already gone. Safety stops
+// treat this as a terminal no-op, never as a reason to act on a later process
+// that happens to reuse the slot.
+var ErrWorkerAlreadyStopped = errors.New("worker process is already stopped")
 
 // Execute drives one approval to its real-world side effect. The caller
 // is responsible for the state transition (Mark*) using the returned
@@ -430,7 +462,39 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 	if e.GH == nil {
 		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no GitHub client wired into executor")}
 	}
+	if e.Cfg == nil {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("no project config wired into executor")}
+	}
 	pr := approval.Target.PR
+	if merged, ok := readPRMerged(e.GH, pr); ok && merged {
+		return Result{
+			Status:  state.ApprovalStatusExecuted,
+			Summary: fmt.Sprintf("PR #%d was already merged; merge request converged idempotently", pr),
+		}
+	}
+	expectedHead := strings.TrimSpace(approval.Target.HeadSHA)
+	if expectedHead != "" {
+		headReader, ok := e.GH.(prHeadSHAReader)
+		if !ok {
+			return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot verify PR head SHA before merge")}
+		}
+		currentHead, err := headReader.PRHeadSHA(pr)
+		if err != nil {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("verify head for PR #%d before merge: %v", pr, err),
+				Err:     fmt.Errorf("verify head for PR #%d: %w", pr, err),
+			}
+		}
+		if strings.TrimSpace(currentHead) != expectedHead {
+			return Result{
+				Status: state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf(
+					"PR #%d head changed after approval; expected %s, current %s — re-validate before merging",
+					pr, expectedHead, strings.TrimSpace(currentHead)),
+			}
+		}
+	}
 
 	// #547: a green PR that has fallen BEHIND main cannot merge under
 	// "branches must be up to date" protection — `gh pr merge` fails with
@@ -477,17 +541,81 @@ func (e *Executor) executeMergePR(approval *state.Approval) Result {
 		}
 	}
 
-	if err := e.GH.MergePR(pr); err != nil {
+	reader, ok := e.GH.(finalMergeReader)
+	if !ok {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot perform final issue-label and review-thread merge checks")}
+	}
+	headMerger, ok := e.GH.(prHeadBoundMerger)
+	if !ok {
+		return Result{Status: state.ApprovalStatusExecutionFailed, Err: errors.New("GitHub client cannot atomically bind merge to PR head SHA")}
+	}
+	mergeResult := mergegate.Execute(mergegate.Request{
+		StateDir:     e.Cfg.StateDir,
+		Repo:         e.Cfg.Repo,
+		IssueNumber:  approval.Target.Issue,
+		PRNumber:     pr,
+		ExpectedHead: expectedHead,
+		Owner:        "supervisor",
+		HoldLabels:   mergegate.ConfiguredHoldLabels(e.Cfg),
+	}, mergegate.ReadFuncs{
+		Issue:         reader.GetIssue,
+		PRLabels:      reader.PRLabels,
+		ReviewThreads: reader.PRUnresolvedReviewThreadsOnHead,
+	}, func(headSHA string) error {
+		return headMerger.MergePRAtHead(pr, headSHA)
+	})
+	if mergeResult.Refused {
+		e.recordMergeRefusal(approval.Target.Issue, pr, mergeResult.RefusalName)
+		return Result{
+			Status:  state.ApprovalStatusExecutionSkipped,
+			Summary: fmt.Sprintf("refused merge of PR #%d at final compare/claim boundary: %s", pr, mergeResult.RefusalReason),
+		}
+	}
+	if mergeResult.Err != nil {
+		if merged, ok := readPRMerged(e.GH, pr); ok && merged {
+			return Result{
+				Status:  state.ApprovalStatusExecuted,
+				Summary: fmt.Sprintf("PR #%d merged concurrently; merge request converged idempotently", pr),
+			}
+		}
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
-			Summary: fmt.Sprintf("merge PR #%d: %v", pr, err),
-			Err:     fmt.Errorf("merge PR #%d: %w", pr, err),
+			Summary: fmt.Sprintf("merge PR #%d: %v", pr, mergeResult.Err),
+			Err:     fmt.Errorf("merge PR #%d: %w", pr, mergeResult.Err),
 		}
 	}
 	return Result{
 		Status:  state.ApprovalStatusExecuted,
 		Summary: fmt.Sprintf("merged PR #%d", pr),
 	}
+}
+
+func (e *Executor) recordMergeRefusal(issueNumber, prNumber int, name string) {
+	if e == nil || e.State == nil || strings.TrimSpace(name) == "" {
+		return
+	}
+	for _, sess := range e.State.Sessions {
+		if sess == nil || sess.PRNumber != prNumber || (issueNumber > 0 && sess.IssueNumber != issueNumber) {
+			continue
+		}
+		sess.OperatorGateName = name
+		sess.OperatorGateRequiredAction = "Remove the merge hold or resolve every current-head review thread, then request merge again."
+		if sess.Status != state.StatusCodeLanded && sess.Status != state.StatusDone {
+			sess.Status = state.StatusPROpen
+		}
+	}
+}
+
+func readPRMerged(client GitHubClient, prNumber int) (bool, bool) {
+	reader, ok := client.(prMergedReader)
+	if !ok {
+		return false, false
+	}
+	merged, err := reader.IsPRMerged(prNumber)
+	if err != nil {
+		return false, false
+	}
+	return merged, true
 }
 
 func (e *Executor) executeCloseIssue(approval *state.Approval) Result {
@@ -822,26 +950,121 @@ func (e *Executor) executeDeleteWorktree(approval *state.Approval) Result {
 	// When the approval lacks a target issue (rare; older approvals), or
 	// the session lookup is not wired, fall through to the previous
 	// behaviour to preserve compatibility.
+	var live *state.Session
 	if e.Sessions != nil && approval.Target.Issue > 0 {
-		if live, ok := e.Sessions.LookupSession(slot); ok && live != nil {
-			if live.IssueNumber != approval.Target.Issue {
+		if current, ok := e.Sessions.LookupSession(slot); ok && current != nil {
+			live = current
+			if current.IssueNumber != approval.Target.Issue {
 				return Result{
 					Status: state.ApprovalStatusExecutionFailed,
 					Summary: fmt.Sprintf(
 						"slot %s now bound to issue #%d (approval expected #%d) — refusing to delete a recycled worktree",
-						slot, live.IssueNumber, approval.Target.Issue,
+						slot, current.IssueNumber, approval.Target.Issue,
 					),
-					Err: fmt.Errorf("slot %s reused: live=#%d approval=#%d", slot, live.IssueNumber, approval.Target.Issue),
+					Err: fmt.Errorf("slot %s reused: live=#%d approval=#%d", slot, current.IssueNumber, approval.Target.Issue),
+				}
+			}
+			if current.Status == state.StatusRunning {
+				return Result{
+					Status: state.ApprovalStatusExecutionFailed,
+					Summary: fmt.Sprintf(
+						"slot %s holds a live %s session for issue #%d — refusing to delete a canonical worktree owned by an in-place repair worker",
+						slot, current.Status, approval.Target.Issue,
+					),
+					Err: fmt.Errorf("slot %s live: status=%s issue=#%d", slot, current.Status, approval.Target.Issue),
 				}
 			}
 		}
 	}
+	if e.State != nil && approval.Target.Issue > 0 {
+		if repair, ok := e.State.ApprovedRepairOwnsSession(slot, approval.Target.Issue, approval.Target.PR); ok {
+			return Result{
+				Status:  state.ApprovalStatusExecutionFailed,
+				Summary: fmt.Sprintf("approved repair %s owns slot %s — refusing worktree deletion", repair.ID, slot),
+				Err:     fmt.Errorf("slot %s reserved by approved repair %s", slot, repair.ID),
+			}
+		}
+	}
 
-	if err := e.Worktrees.RemoveWorktree(e.Cfg.LocalPath, worktreePath); err != nil {
+	remove := func(localPath, path string) error {
+		return e.Worktrees.RemoveWorktree(localPath, path)
+	}
+	var removeErr error
+	if live != nil && strings.TrimSpace(live.Worktree) != "" && filepath.Clean(live.Worktree) == filepath.Clean(worktreePath) && e.State != nil {
+		lease := worker.CaptureCleanupLease(slot, live)
+		removeErr = worker.CleanupLeasedWorktree(
+			e.Cfg,
+			e.State,
+			lease,
+			worker.CleanupProbes{PIDAlive: e.PIDAlive, TmuxAlive: e.TmuxAlive},
+			worker.CleanupPolicy{},
+			worker.CleanupHooks{Remove: remove},
+		)
+	} else {
+		removeErr = state.WithSessionLease(e.Cfg.StateDir, slot, func() error {
+			// This fallback is selected from a cached lookup. Reload persisted
+			// canonical state after acquiring the slot lease so a replacement that
+			// landed between selection and deletion cannot remain invisible.
+			canonical := e.State
+			if strings.TrimSpace(e.Cfg.StateDir) != "" {
+				latest, err := state.Load(e.Cfg.StateDir)
+				if err != nil {
+					return fmt.Errorf("reload canonical session for slot %s: %w", slot, err)
+				}
+				canonical = latest
+			}
+
+			var current *state.Session
+			if canonical != nil {
+				current = canonical.Sessions[slot]
+			} else if e.Sessions != nil {
+				current, _ = e.Sessions.LookupSession(slot)
+			}
+			if current != nil {
+				if approval.Target.Issue > 0 && current.IssueNumber != approval.Target.Issue {
+					return fmt.Errorf("slot %s changed from issue #%d to #%d", slot, approval.Target.Issue, current.IssueNumber)
+				}
+				if approval.Target.PR > 0 && current.PRNumber > 0 && current.PRNumber != approval.Target.PR {
+					return fmt.Errorf("slot %s changed from PR #%d to #%d", slot, approval.Target.PR, current.PRNumber)
+				}
+				if current.Status == state.StatusRunning {
+					return fmt.Errorf("slot %s is running", slot)
+				}
+				lease := worker.CaptureCleanupLease(slot, current)
+				if err := worker.ValidateCleanupLease(
+					lease,
+					current,
+					worker.CleanupProbes{PIDAlive: e.PIDAlive, TmuxAlive: e.TmuxAlive},
+					worker.CleanupPolicy{},
+				); err != nil {
+					return err
+				}
+				if strings.TrimSpace(current.Worktree) != "" {
+					return fmt.Errorf("slot %s has canonical worktree claim %q; refusing fallback deletion", slot, current.Worktree)
+				}
+			}
+			if canonical != nil {
+				issueNumber, prNumber := approval.Target.Issue, approval.Target.PR
+				if current != nil {
+					if issueNumber <= 0 {
+						issueNumber = current.IssueNumber
+					}
+					if prNumber <= 0 {
+						prNumber = current.PRNumber
+					}
+				}
+				if repair, ok := canonical.ApprovedRepairOwnsSession(slot, issueNumber, prNumber); ok {
+					return fmt.Errorf("slot %s reserved by approved repair %s", slot, repair.ID)
+				}
+			}
+			return remove(e.Cfg.LocalPath, worktreePath)
+		})
+	}
+	if removeErr != nil {
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
-			Summary: fmt.Sprintf("delete worktree %s: %v", worktreePath, err),
-			Err:     fmt.Errorf("delete worktree %s: %w", worktreePath, err),
+			Summary: fmt.Sprintf("delete worktree %s: %v", worktreePath, removeErr),
+			Err:     fmt.Errorf("delete worktree %s: %w", worktreePath, removeErr),
 		}
 	}
 	return Result{
@@ -879,6 +1102,26 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 	}
 
 	slot := approval.Target.Session
+
+	// #964: an approved worker-control action is a capability for one exact
+	// session snapshot, not a standing instruction for the slot. A delayed
+	// restart can otherwise execute after an in-place repair or redispatch has
+	// changed the canonical session, killing the replacement worker and
+	// deleting its preserved worktree. Recompute the same target-state digest
+	// stamped when the approval was created and skip stale approvals before any
+	// controller side effect.
+	if e.State != nil && strings.TrimSpace(approval.TargetStateHash) != "" {
+		currentHash := e.State.ApprovalTargetStateHash(approval.Target)
+		if currentHash != approval.TargetStateHash {
+			return Result{
+				Status: state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf(
+					"%s skipped: session state for slot %s changed after approval; no worker or worktree was touched",
+					verb, slot,
+				),
+			}
+		}
+	}
 
 	// Slot-reuse fence — same shape as executeDeleteWorktree (#488 /
 	// premortem #7). By the time the operator approves a stop/restart,
@@ -927,6 +1170,21 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 		}
 	}
 
+	// #964: restart_worker is destructive in the current controller: it stops
+	// the worker and removes the worktree before the orchestrator recreates the
+	// slot. A retained worktree, even before a PR exists, may contain completed
+	// uncommitted work. Recovery must use the in-place repair path instead.
+	if !stop && sess != nil && strings.TrimSpace(sess.Worktree) != "" {
+		return Result{
+			Status: state.ApprovalStatusExecutionFailed,
+			Summary: fmt.Sprintf(
+				"restart_worker refused: slot %s retains worktree %s; destructive restart could discard completed work. Use spawn_repair_worker to recover the same slot and worktree in place, or stop_worker to terminate.",
+				slot, sess.Worktree,
+			),
+			Err: fmt.Errorf("restart_worker on slot %s refused: retained worktree %s", slot, sess.Worktree),
+		}
+	}
+
 	var err error
 	if stop {
 		err = e.Workers.StopWorker(slot, sess)
@@ -934,6 +1192,12 @@ func (e *Executor) executeWorkerControl(approval *state.Approval, verb string, s
 		err = e.Workers.RestartWorker(slot, sess)
 	}
 	if err != nil {
+		if stop && errors.Is(err, ErrWorkerAlreadyStopped) {
+			return Result{
+				Status:  state.ApprovalStatusExecutionSkipped,
+				Summary: fmt.Sprintf("%s skipped: worker process for slot %s was already stopped", verb, slot),
+			}
+		}
 		return Result{
 			Status:  state.ApprovalStatusExecutionFailed,
 			Summary: fmt.Sprintf("%s on slot %s: %v", verb, slot, err),

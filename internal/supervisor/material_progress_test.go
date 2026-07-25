@@ -63,21 +63,69 @@ func TestCollectMaterialProgressObservations_ExactWorkersCannotMaskEachOther(t *
 	}
 }
 
+func TestMaterialProgressWatchdog_UsageUnreliableDoesNotKillHealthyWorker(t *testing.T) {
+	st := state.NewState()
+	t0 := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	st.Sessions["slot-946"] = &state.Session{
+		IssueNumber:    946,
+		Status:         state.StatusRunning,
+		PID:            946,
+		StartedAt:      t0.Add(-time.Hour),
+		LastOutputHash: "healthy-output-1",
+		Attribution: []state.BackendAttribution{{
+			Backend:               "grok",
+			UsageUnreliable:       true,
+			UsageUnreliableReason: "live_assistant_zero_input_or_output",
+			UsageUnreliableScope:  state.UsageUnreliableScopeLiveBudget,
+		}},
+	}
+
+	budget := 20 * time.Minute
+	if _, err := st.RecordMaterialProgress(collectMaterialProgressObservations(st, t0), budget, time.Minute, t0); err != nil {
+		t.Fatal(err)
+	}
+	// Token telemetry remains unavailable, but independently-observed terminal
+	// output advances. The watchdog must treat the worker as healthy.
+	st.Sessions["slot-946"].LastOutputHash = "healthy-output-2"
+	decisions, err := st.RecordMaterialProgress(
+		collectMaterialProgressObservations(st, t0.Add(budget+time.Minute)),
+		budget,
+		time.Minute,
+		t0.Add(budget+time.Minute),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(decisions) != 1 || decisions[0].Action != progress.ActionNone || decisions[0].RecommendsRecovery() {
+		t.Fatalf("usage-unreliable healthy worker decision = %+v, want progress/no recovery", decisions)
+	}
+}
+
 func TestCollectMaterialProgressObservations_WorkerReplacementHasNewLease(t *testing.T) {
 	st := state.NewState()
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
-	sess := &state.Session{IssueNumber: 9, Status: state.StatusRunning, PID: 100, StartedAt: t0}
+	sess := &state.Session{
+		IssueNumber:      9,
+		Status:           state.StatusRunning,
+		PID:              100,
+		StartedAt:        t0,
+		ProcessLeaseUnit: "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+	}
 	st.Sessions["slot-9"] = sess
 	first := collectMaterialProgressObservations(st, t0)
 
 	sess.PID = 200
 	sess.StartedAt = t0.Add(10 * time.Minute)
+	sess.ProcessLeaseUnit = "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope"
 	second := collectMaterialProgressObservations(st, t0.Add(10*time.Minute))
 	if len(first) != 1 || len(second) != 1 {
 		t.Fatalf("observations first=%d second=%d, want one each", len(first), len(second))
 	}
 	if first[0].Target.Key() == second[0].Target.Key() || first[0].Target.LeaseID == second[0].Target.LeaseID {
 		t.Fatalf("respawn reused old exact lease: before=%+v after=%+v", first[0].Target, second[0].Target)
+	}
+	if first[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope" || second[0].Target.LeaseID != "maestro-worker-0123456789abcdef0123456789abcdef-g2.scope" {
+		t.Fatalf("material progress lost OS process lease identity: before=%+v after=%+v", first[0].Target, second[0].Target)
 	}
 }
 
@@ -142,6 +190,47 @@ func TestCollectMaterialProgressObservations_QueuedRemainsAnActivePRGate(t *test
 	}
 	if got.Target.ProcessID != 0 || got.Target.TmuxSession != "" {
 		t.Fatalf("queued PR gate leaked stale worker identity: %+v", got.Target)
+	}
+}
+
+func TestCollectMaterialProgressObservations_LiveWorkerOwnsExactPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 0, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, PID: 1234, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want only the live continuation", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetWorker || observations[0].Target.IssueNumber != 406 || observations[0].Target.ProcessID != 1234 {
+		t.Fatalf("active target = %+v, want live continuation worker", observations[0].Target)
+	}
+}
+
+func TestCollectMaterialProgressObservations_NewestSessionOwnsSharedPRGate(t *testing.T) {
+	st := state.NewState()
+	now := time.Date(2026, 7, 18, 3, 15, 0, 0, time.UTC)
+	st.Sessions["old-gate"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Hour),
+	}
+	st.Sessions["continuation"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, StartedAt: now.Add(-time.Minute),
+	}
+	recordTestPRGateSnapshot(t, st, 345, 388, strings.Repeat("a", 40), now.Add(-time.Hour))
+	recordTestPRGateSnapshot(t, st, 406, 388, strings.Repeat("a", 40), now.Add(-time.Minute))
+
+	observations := collectMaterialProgressObservationsForProject(st, "owner/repo", now)
+	if len(observations) != 1 {
+		t.Fatalf("observations = %+v, want one canonical PR gate", observations)
+	}
+	if observations[0].Target.Kind != progress.TargetPRGate || observations[0].Target.IssueNumber != 406 || observations[0].Target.Slot != "continuation" {
+		t.Fatalf("canonical PR target = %+v, want newest continuation", observations[0].Target)
 	}
 }
 
@@ -589,7 +678,7 @@ func TestCollectMaterialProgressObservations_LiveExactTmuxAdvancesWithFrozenGitA
 	outputPath := filepath.Join(bin, "output")
 	script := filepath.Join(bin, "tmux")
 	if err := os.WriteFile(script, []byte(`#!/bin/sh
-if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact" ]; then
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
   exit 91
 fi
 if [ "${TMUX_FAKE_FAIL:-}" = "1" ]; then
@@ -653,6 +742,37 @@ cat "$TMUX_FAKE_OUTPUT"
 	}
 	if len(decisions) != 1 || decisions[0].Action != progress.ActionEvidenceUnavailable || decisions[0].RecommendsRecovery() {
 		t.Fatalf("tmux failure authorized recovery: %+v", decisions)
+	}
+}
+
+func TestTerminalCheckpointProgress_LiveTmuxIsCompleteWhenConsumedCheckpointIsMissing(t *testing.T) {
+	bin := t.TempDir()
+	outputPath := filepath.Join(bin, "output")
+	script := filepath.Join(bin, "tmux")
+	if err := os.WriteFile(script, []byte(`#!/bin/sh
+if [ "$1" = "has-session" ]; then
+  exit 1
+fi
+if [ "$1" != "capture-pane" ] || [ "$2" != "-p" ] || [ "$3" != "-t" ] || [ "$4" != "=mae-exact:" ]; then
+  exit 91
+fi
+cat "$TMUX_FAKE_OUTPUT"
+`), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(outputPath, []byte("live terminal progress\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv("TMUX_FAKE_OUTPUT", outputPath)
+
+	sess := &state.Session{
+		TmuxSession:    "mae-exact",
+		CheckpointFile: filepath.Join(bin, "consumed-CHECKPOINT.md"),
+	}
+	got, complete := terminalCheckpointProgress(sess)
+	if got == "" || !complete {
+		t.Fatalf("live tmux with consumed checkpoint = (%q,%t), want non-empty complete evidence", got, complete)
 	}
 }
 

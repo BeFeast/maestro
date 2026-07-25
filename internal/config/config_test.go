@@ -123,6 +123,33 @@ issue_labels: []
 	}
 }
 
+func TestParse_SupervisorOperatorGate(t *testing.T) {
+	yaml := `
+repo: owner/repo
+supervisor:
+  operator_gate:
+    check_names:
+      - Android SDK license acceptance gate
+      - legal/*
+    labels:
+      - operator-decision
+    required_action: Record legal acceptance, then rerun CI.
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if got := strings.Join(cfg.Supervisor.OperatorGate.CheckNames, ","); got != "Android SDK license acceptance gate,legal/*" {
+		t.Fatalf("check_names = %q", got)
+	}
+	if got := strings.Join(cfg.Supervisor.OperatorGate.Labels, ","); got != "operator-decision" {
+		t.Fatalf("labels = %q", got)
+	}
+	if cfg.Supervisor.OperatorGate.RequiredAction != "Record legal acceptance, then rerun CI." {
+		t.Fatalf("required_action = %q", cfg.Supervisor.OperatorGate.RequiredAction)
+	}
+}
+
 func TestParse_SupervisorOrderedQueue(t *testing.T) {
 	yaml := `
 repo: owner/repo
@@ -377,6 +404,39 @@ outcome:
 	}
 	if cfg.Outcome.SourceRepoPath != filepath.Join(os.Getenv("HOME"), "src/repo") {
 		t.Fatalf("SourceRepoPath = %q, want local_path fallback", cfg.Outcome.SourceRepoPath)
+	}
+}
+
+func TestParse_OutcomeAutomaticRecoveryRequiresHealthAndCommand(t *testing.T) {
+	for _, yaml := range []string{
+		"repo: owner/repo\noutcome:\n  desired_outcome: healthy\n  recovery_mode: automatic\n  recovery_command: ./recover.sh\n",
+		"repo: owner/repo\noutcome:\n  desired_outcome: healthy\n  healthcheck_command: ./check.sh\n  recovery_mode: automatic\n",
+	} {
+		if _, err := parse([]byte(yaml)); err == nil {
+			t.Fatalf("parse accepted incomplete automatic recovery:\n%s", yaml)
+		}
+	}
+}
+
+func TestParse_OutcomeAutomaticRecoveryContract(t *testing.T) {
+	yaml := `
+repo: owner/repo
+local_path: /srv/repo
+outcome:
+  desired_outcome: Candidate follows main.
+  healthcheck_command: ./check.sh
+  recovery_mode: automatic
+  recovery_command: ./recover.sh
+  recovery_interval_seconds: 60
+  recovery_cooldown_minutes: 20
+  recovery_timeout_seconds: 120
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !cfg.Outcome.AutomaticRecoveryEnabled() || cfg.Outcome.EffectiveRecoveryInterval() != time.Minute || cfg.Outcome.EffectiveRecoveryCooldown() != 20*time.Minute {
+		t.Fatalf("recovery contract=%+v", cfg.Outcome)
 	}
 }
 
@@ -1398,6 +1458,8 @@ supervisor:
   queue_comments: true
   one_at_a_time: true
   dispatch_sla_seconds: 90
+  unchanged_decision_window_seconds: 600
+  recommendation_ttl_seconds: 7200
 `
 	cfg, err := parse([]byte(yaml))
 	if err != nil {
@@ -1418,6 +1480,36 @@ supervisor:
 	if cfg.Supervisor.DispatchSLASeconds != 90 {
 		t.Errorf("Supervisor.DispatchSLASeconds = %d, want 90", cfg.Supervisor.DispatchSLASeconds)
 	}
+	if got := cfg.Supervisor.EffectiveUnchangedDecisionWindow(); got != 10*time.Minute {
+		t.Errorf("EffectiveUnchangedDecisionWindow = %s, want 10m", got)
+	}
+	if got := cfg.Supervisor.EffectiveRecommendationTTL(); got != 2*time.Hour {
+		t.Errorf("EffectiveRecommendationTTL = %s, want 2h", got)
+	}
+}
+
+func TestSupervisorRecommendationPolicyDefaults(t *testing.T) {
+	cfg := SupervisorConfig{}
+	if got := cfg.EffectiveUnchangedDecisionWindow(); got != time.Hour {
+		t.Fatalf("EffectiveUnchangedDecisionWindow = %s, want 1h", got)
+	}
+	if got := cfg.EffectiveRecommendationTTL(); got != 24*time.Hour {
+		t.Fatalf("EffectiveRecommendationTTL = %s, want 24h", got)
+	}
+
+	root := &Config{}
+	for key, want := range map[string]string{
+		"supervisor.unchanged_decision_window_seconds": "3600",
+		"supervisor.recommendation_ttl_seconds":        "86400",
+	} {
+		spec, ok := FleetSettingSpecByKey(key)
+		if !ok {
+			t.Fatalf("FleetSettingSpecByKey(%q) missing", key)
+		}
+		if got := spec.Value(root); got != want {
+			t.Fatalf("%s active default = %q, want %q", key, got, want)
+		}
+	}
 }
 
 func TestParse_SupervisorDispatchSLAMustBeNonNegative(t *testing.T) {
@@ -1432,6 +1524,21 @@ supervisor:
 	}
 	if !strings.Contains(err.Error(), "supervisor.dispatch_sla_seconds") {
 		t.Fatalf("error = %v, want supervisor.dispatch_sla_seconds", err)
+	}
+}
+
+func TestParse_SupervisorRecommendationPolicyMustBeNonNegative(t *testing.T) {
+	for _, field := range []string{"unchanged_decision_window_seconds", "recommendation_ttl_seconds"} {
+		t.Run(field, func(t *testing.T) {
+			yaml := "repo: owner/repo\nsupervisor:\n  " + field + ": -1\n"
+			_, err := parse([]byte(yaml))
+			if err == nil {
+				t.Fatal("parse succeeded, want invalid recommendation policy error")
+			}
+			if !strings.Contains(err.Error(), "supervisor."+field) {
+				t.Fatalf("error = %v, want supervisor.%s", err, field)
+			}
+		})
 	}
 }
 

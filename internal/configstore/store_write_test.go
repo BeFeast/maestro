@@ -56,7 +56,8 @@ func TestUpsertProjectLoadAllRoundTrip(t *testing.T) {
 	}
 	want.SourcePath = ""
 	got.SourcePath = ""
-	got.SettingsSources = nil // provenance map is set by Load, absent from Parse
+	got.SettingsSources = nil   // provenance map is set by Load, absent from Parse
+	got.FleetOnlySettings = nil // daemon-only settings are set by Load, absent from Parse
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("round-trip config differs\n got=%#v\nwant=%#v", got.Model, want.Model)
 	}

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/specgroom"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -22,6 +23,7 @@ import (
 // #547 paths set mergeable/mergeState explicitly.
 type fakeGH struct {
 	mergeCalls    []int
+	mergeHeads    []string
 	closeCalls    []closeCall
 	updateCalls   []int
 	labelCalls    []labelCall
@@ -42,8 +44,20 @@ type fakeGH struct {
 	mergeState     string
 	mergeStatusErr error
 	// updateErr is returned by UpdateBranch.
-	updateErr error
+	updateErr                 error
+	headSHA                   string
+	headErr                   error
+	merged                    bool
+	mergedErr                 error
+	mergedAfterConcurrentCall bool
+	issue                     github.Issue
+	prLabels                  []string
+	reviewHead                string
+	reviewThreads             []github.ReviewThread
+	reviewThreadsErr          error
 }
+
+const testMergeHeadSHA = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 
 type closeCall struct {
 	issue   int
@@ -63,6 +77,25 @@ type editBodyCall struct {
 func (f *fakeGH) MergePR(pr int) error {
 	f.mergeCalls = append(f.mergeCalls, pr)
 	return f.mergeErr
+}
+func (f *fakeGH) MergePRAtHead(pr int, headSHA string) error {
+	f.mergeHeads = append(f.mergeHeads, headSHA)
+	return f.MergePR(pr)
+}
+func (f *fakeGH) PRHeadSHA(int) (string, error) {
+	if f.headErr != nil {
+		return "", f.headErr
+	}
+	if f.headSHA != "" {
+		return f.headSHA, nil
+	}
+	return testMergeHeadSHA, nil
+}
+func (f *fakeGH) IsPRMerged(int) (bool, error) {
+	if f.mergedErr != nil {
+		return false, f.mergedErr
+	}
+	return f.merged || (f.mergedAfterConcurrentCall && len(f.mergeCalls) > 0), nil
 }
 func (f *fakeGH) CloseIssue(issue int, comment string) error {
 	f.closeCalls = append(f.closeCalls, closeCall{issue: issue, comment: comment})
@@ -95,6 +128,28 @@ func (f *fakeGH) IssueBody(issue int) (string, error) {
 	}
 	return f.issueBody, nil
 }
+func (f *fakeGH) GetIssue(number int) (github.Issue, error) {
+	if f.issue.Number == 0 {
+		return github.Issue{Number: number}, nil
+	}
+	return f.issue, nil
+}
+func (f *fakeGH) PRLabels(int) ([]string, error) {
+	return append([]string(nil), f.prLabels...), nil
+}
+func (f *fakeGH) PRUnresolvedReviewThreadsOnHead(int) (string, []github.ReviewThread, error) {
+	if f.reviewThreadsErr != nil {
+		return "", nil, f.reviewThreadsErr
+	}
+	head := f.reviewHead
+	if head == "" {
+		head = f.headSHA
+	}
+	if head == "" {
+		head = testMergeHeadSHA
+	}
+	return head, append([]github.ReviewThread(nil), f.reviewThreads...), nil
+}
 
 type fakeWT struct {
 	calls []wtCall
@@ -118,6 +173,11 @@ func newCfg() *config.Config {
 }
 
 func mkApproval(action string, target *state.SupervisorTarget, summary, approveReason string) *state.Approval {
+	if action == config.SupervisorActionMergePR && target != nil && target.PR > 0 && target.Issue <= 0 {
+		copyTarget := *target
+		copyTarget.Issue = 42
+		target = &copyTarget
+	}
 	now := time.Now().UTC()
 	a := &state.Approval{
 		ID:        "approval-test",
@@ -231,7 +291,7 @@ func TestExecute_ApplyLessonProposal_AppendsWorkerPromptAndMarksApplied(t *testi
 func TestExecute_MergePR_HappyPath(t *testing.T) {
 	gh := &fakeGH{}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99}, "merge me", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -242,6 +302,94 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 	}
 	if len(gh.mergeCalls) != 1 || gh.mergeCalls[0] != 99 {
 		t.Fatalf("mergeCalls = %v", gh.mergeCalls)
+	}
+	if len(gh.mergeHeads) != 1 || gh.mergeHeads[0] != testMergeHeadSHA {
+		t.Fatalf("mergeHeads = %v, want atomic merge at %s", gh.mergeHeads, testMergeHeadSHA)
+	}
+}
+
+func TestExecute_MergePR_AlreadyMergedIsIdempotentSuccess(t *testing.T) {
+	gh := &fakeGH{merged: true}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted || res.Err != nil {
+		t.Fatalf("already-merged result = %+v, want executed idempotent success", res)
+	}
+	if len(gh.mergeCalls) != 0 || len(gh.mergeHeads) != 0 {
+		t.Fatalf("already-merged PR was merged again: calls=%v heads=%v", gh.mergeCalls, gh.mergeHeads)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "already merged") {
+		t.Fatalf("summary = %q, want already-merged truth", res.Summary)
+	}
+}
+
+func TestExecute_MergePR_ConcurrentMergeAfterClickConvergesToExecuted(t *testing.T) {
+	gh := &fakeGH{mergeErr: errors.New("pull request is already merged"), mergedAfterConcurrentCall: true}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecuted || res.Err != nil {
+		t.Fatalf("concurrent-merge result = %+v, want executed idempotent success", res)
+	}
+	if len(gh.mergeCalls) != 1 {
+		t.Fatalf("merge calls = %v, want one raced call", gh.mergeCalls)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "concurrently") {
+		t.Fatalf("summary = %q, want concurrent merge truth", res.Summary)
+	}
+}
+
+func TestExecute_MergePR_ChangedHeadSkipsWithoutMerge(t *testing.T) {
+	gh := &fakeGH{headSHA: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(gh.mergeCalls) != 0 || len(gh.mergeHeads) != 0 {
+		t.Fatalf("changed head must not merge: calls=%v heads=%v", gh.mergeCalls, gh.mergeHeads)
+	}
+	if !strings.Contains(strings.ToLower(res.Summary), "head changed") {
+		t.Fatalf("summary = %q, want head-changed explanation", res.Summary)
+	}
+}
+
+func TestExecute_MergePR_RefusesLateIssueHoldAtFinalBoundary(t *testing.T) {
+	issue := github.Issue{Number: 42}
+	issue.Labels = append(issue.Labels, struct {
+		Name string `json:"name"`
+	}{Name: "blocked"})
+	gh := &fakeGH{issue: issue}
+	cfg := newCfg()
+	cfg.ExcludeLabels = []string{"blocked"}
+	ex := &Executor{GH: gh, Cfg: cfg}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{Issue: 42, PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped || !strings.Contains(res.Summary, "blocked") {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("merge calls = %v, want none", gh.mergeCalls)
+	}
+}
+
+func TestExecute_MergePR_RefusesCurrentHeadUnresolvedThreadAtFinalBoundary(t *testing.T) {
+	gh := &fakeGH{reviewThreads: []github.ReviewThread{{ID: "codex-p1", Path: "merge.go", Line: 42, Author: "codex"}}}
+	ex := &Executor{GH: gh, Cfg: newCfg()}
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{Issue: 42, PR: 99, HeadSHA: testMergeHeadSHA}, "merge me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped || !strings.Contains(res.Summary, "unresolved") {
+		t.Fatalf("result = %+v", res)
+	}
+	if len(gh.mergeCalls) != 0 {
+		t.Fatalf("merge calls = %v, want none", gh.mergeCalls)
 	}
 }
 
@@ -255,7 +403,7 @@ func TestExecute_MergePR_HappyPath(t *testing.T) {
 func TestExecute_MergePR_Behind_UpdatesBranchAndSkips(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 542}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 542, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionSkipped {
@@ -283,7 +431,7 @@ func TestExecute_MergePR_Behind_UpdatesBranchAndSkips(t *testing.T) {
 func TestExecute_MergePR_Clean_Merges(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "clean"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 100}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 100, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -303,7 +451,7 @@ func TestExecute_MergePR_Clean_Merges(t *testing.T) {
 func TestExecute_MergePR_Conflicting_Fails(t *testing.T) {
 	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "dirty"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
@@ -326,7 +474,7 @@ func TestExecute_MergePR_Conflicting_Fails(t *testing.T) {
 func TestExecute_MergePR_BehindButConflicting_DoesNotUpdate(t *testing.T) {
 	gh := &fakeGH{mergeable: "CONFLICTING", mergeState: "behind"}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 8}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 8, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed {
@@ -343,7 +491,7 @@ func TestExecute_MergePR_BehindButConflicting_DoesNotUpdate(t *testing.T) {
 func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
 	gh := &fakeGH{mergeable: "MERGEABLE", mergeState: "behind", updateErr: errors.New("update boom")}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 9}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 9, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
@@ -358,13 +506,12 @@ func TestExecute_MergePR_Behind_UpdateBranchError_Fails(t *testing.T) {
 }
 
 // TestExecute_MergePR_StatusFetchError_StillMerges verifies that a failure
-// to fetch the merge status does NOT block the merge — we fall through to
-// the original MergePR path (gh pr merge does its own gating). This keeps
-// the change additive and avoids a status-endpoint flake stalling merges.
+// to fetch the merge status does NOT block the final head-bound merge. This
+// avoids a status-endpoint flake stalling an otherwise valid merge.
 func TestExecute_MergePR_StatusFetchError_StillMerges(t *testing.T) {
 	gh := &fakeGH{mergeStatusErr: errors.New("rate limited")}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 11}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 11, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	res := ex.Execute(a)
 	if res.Status != state.ApprovalStatusExecuted {
@@ -734,6 +881,119 @@ func TestExecute_RestartWorker_HappyPath(t *testing.T) {
 	}
 	if len(wc.stopCalls) != 0 {
 		t.Fatalf("stop must NOT be called for restart_worker; got %+v", wc.stopCalls)
+	}
+}
+
+// #964: an approval stamped for an earlier session snapshot must not execute
+// after the canonical session changes. This fences delayed watchdog approvals
+// before the worker controller can terminate a replacement worker.
+func TestExecute_RestartWorker_StaleTargetStateSkipped(t *testing.T) {
+	wc := &fakeWorkers{}
+	target := &state.SupervisorTarget{Session: "slot-1", Issue: 42}
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 42, Status: state.StatusDead, RetryCount: 1}
+	a := mkApproval(config.SupervisorActionRestartWorker, target, "restart me", "")
+	a.TargetStateHash = st.ApprovalTargetStateHash(target)
+
+	// A repair has already started since the approval was minted.
+	st.Sessions["slot-1"].Status = state.StatusRunning
+	st.Sessions["slot-1"].StartedAt = time.Now().UTC()
+	ex := &Executor{
+		Cfg:      newCfg(),
+		Workers:  wc,
+		Sessions: fakeSessions{"slot-1": st.Sessions["slot-1"]},
+		State:    st,
+	}
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("stale approval must not touch the worker; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "changed after approval") || !strings.Contains(res.Summary, "no worker or worktree was touched") {
+		t.Fatalf("summary = %q, want stale-state and no-side-effect explanation", res.Summary)
+	}
+}
+
+// #964: a replacement worker can return the session projection to the same
+// running status, branch, retry count, and next-retry state that existed when
+// restart_worker was approved. The durable attempt generation and start time
+// distinguish that replacement even if the OS reuses the same PID. A delayed
+// approval for the earlier attempt must be skipped before the retained-worktree
+// refusal or worker controller can run.
+func TestExecute_RestartWorker_StaleAfterRespawnDeathCycleSkipped(t *testing.T) {
+	wc := &fakeWorkers{}
+	target := &state.SupervisorTarget{Session: "slot-1", Issue: 42}
+	firstStarted := time.Date(2026, 7, 17, 23, 30, 0, 0, time.UTC)
+	sess := &state.Session{
+		IssueNumber:      42,
+		Status:           state.StatusRunning,
+		Worktree:         "/srv/wt/slot-1",
+		Branch:           "issue-42",
+		PID:              4242,
+		StartedAt:        firstStarted,
+		WorkerGeneration: 7,
+		RetryCount:       1,
+	}
+	st := state.NewState()
+	st.Sessions["slot-1"] = sess
+	a := mkApproval(config.SupervisorActionRestartWorker, target, "restart me", "")
+	a.TargetStateHash = st.ApprovalTargetStateHash(target)
+
+	// The approved attempt dies and is repaired in place. The replacement is
+	// running in the same slot/worktree/branch with the same retry projection;
+	// retain the PID too to prove process-ID reuse cannot defeat the fence.
+	finished := firstStarted.Add(10 * time.Minute)
+	sess.Status = state.StatusDead
+	sess.FinishedAt = &finished
+	sess.PID = 0
+	sess.Status = state.StatusRunning
+	sess.StartedAt = finished.Add(time.Minute)
+	sess.WorkerGeneration++
+	sess.FinishedAt = nil
+	sess.PID = 4242
+
+	if current := st.ApprovalTargetStateHash(target); current == a.TargetStateHash {
+		t.Fatal("target-state hash did not change across an intervening death and in-place respawn")
+	}
+	ex := &Executor{
+		Cfg:      newCfg(),
+		Workers:  wc,
+		Sessions: fakeSessions{"slot-1": sess},
+		State:    st,
+	}
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionSkipped {
+		t.Fatalf("status = %q, want execution_skipped; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("stale approval must not touch the replacement worker; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "changed after approval") || !strings.Contains(res.Summary, "no worker or worktree was touched") {
+		t.Fatalf("summary = %q, want stale-state and no-side-effect explanation", res.Summary)
+	}
+}
+
+// #964: a PR-less retained worktree is still canonical durable work. The
+// destructive restart controller must not run; repair resumes it in place.
+func TestExecute_RestartWorker_RefusedForRetainedWorktree(t *testing.T) {
+	wc := &fakeWorkers{}
+	sess := &state.Session{IssueNumber: 42, Status: state.StatusDead, Worktree: "/srv/wt/slot-1"}
+	ex := &Executor{Cfg: newCfg(), Workers: wc, Sessions: fakeSessions{"slot-1": sess}}
+	a := mkApproval(config.SupervisorActionRestartWorker, &state.SupervisorTarget{Session: "slot-1", Issue: 42}, "restart me", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed {
+		t.Fatalf("status = %q, want execution_failed; res=%+v", res.Status, res)
+	}
+	if len(wc.restartCalls) != 0 || len(wc.stopCalls) != 0 {
+		t.Fatalf("retained worktree must not be touched; restart=%+v stop=%+v", wc.restartCalls, wc.stopCalls)
+	}
+	if !strings.Contains(res.Summary, "/srv/wt/slot-1") || !strings.Contains(res.Summary, "spawn_repair_worker") {
+		t.Fatalf("summary = %q, want retained path and in-place repair guidance", res.Summary)
 	}
 }
 

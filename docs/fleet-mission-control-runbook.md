@@ -129,6 +129,14 @@ header starts with one global operator brief; project cards, supervisor details,
 queues, and worker logs are drilldown/debug data. One project load error is shown
 on that project card without hiding the rest of the fleet.
 
+The same single daemon also runs the protect-aware `/tmp` tmpfs hygiene sweep
+every 10 minutes. Its latest JSONL result is exposed as `tmpfs_hygiene`; a
+post-sweep utilization of at least 85% carries `attention_code:
+tmpfs_pressure`. Mission Control renders that host alert with utilization, sweep
+results, the safe dry-run command, and a direct runbook link. See the [`/tmp`
+tmpfs hygiene runbook](tmpfs-hygiene-runbook.md) for the allowlist, protection
+rules, dry-run command, and 24-hour dogfood check.
+
 The same daemon is the execution surface. Each flow starts workers, reconciles
 dead sessions, opens and monitors PRs, waits for review gates, merges eligible
 PRs, deploys when configured, and updates local state.
@@ -236,6 +244,22 @@ Dynamic wave policy:
 
 Fleet cards surface `open`, `eligible`, `excluded`, `held/meta`, `blocked-deps`, `non_runnable_project_status`, selected candidate, and top skipped reason so operators can tell whether the queue is empty, held by parent/meta policy, blocked by dependencies, or waiting on project status.
 
+Fleet capacity contention is product-first. The shared spawn limiter treats the
+`BeFeast/maestro` dogfood project as background work: it defers a dogfood spawn
+while the fleet is below `fleet.min_live_workers` and another registered
+project has runnable supervisor backlog, and also when such a product queue has
+no live worker. The signal comes from fresh persisted queue analysis and
+durable issue claims. Empty, stale, locally capacity-blocked, or fully claimed
+product queues do not suppress dogfood, and the policy never preempts a running
+worker.
+
+The Settings view also surfaces the effective model route as provider lanes, a
+flattened backend order, and its exact source (`provider_lanes`,
+`explicit_backend_chain`, or `model_default_only`). Worker drawers show the
+immediate backend decision reason separately from that route source. This makes
+an outage transition such as `claude -> sol -> gpt55` auditable without reading
+raw project YAML or inferring order from backend names.
+
 ### Queue / Next decision plane (#720)
 
 The per-project **Queue / Next** panel in Mission Control visualizes the supervisor's selection decision: the **next** issue (selected candidate, highlighted with its priority label), the **eligible** set in real selection order (priority `P0<P1<P2<P3`, then ascending issue number — the same order as the supervisor's `sortDynamicWaveCandidates`), and every **skipped** candidate with its reason (`retry limit exhausted`, `epic`/`meta`, `blocked`, `project status not runnable`, etc.) and queue counts. Rows link to their GitHub issue.
@@ -272,8 +296,12 @@ PR states to watch:
 | `backend_auth_failure` (#693) | A backend CLI failed to authenticate (invalid/expired credentials); the worker died early and fell over to a fallback backend without burning the per-issue retry budget. The default backend down is a blocker; a non-default backend warns | Re-authenticate the backend CLI or re-sync its credentials; fallback backends keep the queue moving meanwhile |
 | `backend_model_unavailable` (#713) | A backend's configured model is unavailable or not accessible (pulled, renamed, or no access — e.g. Fable pulled from subscriptions early); the worker died early and fell over to a fallback backend without burning the per-issue retry budget. The default backend's model down is a blocker; a non-default backend warns | Swap the model id (`model.default` or the backend's model) to an available one, or restore access; fallback backends keep the queue moving meanwhile |
 | `backend_model_cooldown` (#908) | CLIProxyAPI rotated the compatible credential pool and reported no credential usable for the requested provider/model route. Mission Control shows aggregate candidate/usable counts, reason, and retry time; no credential identifiers are persisted. The provider's other models remain eligible | Wait for the route retry time, or restore access/capacity for that model on a compatible credential. Do not interpret a low generic quota percentage as proof that this model is available |
+| `backend_model_overloaded` (#908) | The requested provider/model route returned a terminal HTTP 529 `overloaded_error`. This is transient model capacity, not proof of credential exhaustion and not an invalid model id. Maestro cools only that route briefly and tries the next configured model, including another model on the same provider before crossing providers | Wait for the short route cooldown or use the provider-local fallback model. Investigate proxy credential rotation separately if an apparently healthy compatible credential was not attempted |
+| `backend_drift` warning (#900) | A running worker's attribution snapshot (provider/model/variant/effort) differs from the current effective backend row. The worker is immutable; only newly spawned or explicitly restarted workers use the new settings | For PR-less workers, use the approval-gated "Restart stale backend workers" project action or the worker's Restart action. Workers with open PRs are skipped by the batch action; use review-repair, handoff, or another in-place path |
 
 Supervisor approvals are stale-sensitive. A pending approval becomes stale if the decision payload changes or the target session/PR state changes, and pending `spawn_worker` approvals become superseded when a matching worker has already started. Fleet Mission Control shows pending approvals first; superseded, stale, approved, and rejected approvals are audit history collapsed below the active inbox. Do not approve a stale or superseded approval. Re-run the supervisor, review the new decision, and approve or reject the new ID if appropriate.
+
+Backend row edits in the config store advance every affected project's effective config fingerprint, so the daemon reloads the project flow on the normal watch interval without a service restart. Active workers do not mutate in place: Mission Control compares their attribution snapshot to the effective backend row and marks drift. The batch restart action is previewable: it lists restartable PR-less workers, lists skipped open-PR workers, and only enqueues ordinary `restart_worker` approvals for the restartable set.
 
 ## Safe Commands
 
@@ -316,8 +344,11 @@ configuration, and semantics.
 ## Worker Token Budgets
 
 For projects with `worker_max_tokens > 0`, the worker drawer's **Spend** section
-shows current-attempt usage beside the configured ceiling. A worker stopped by
-the live ceiling is displayed as `token budget exceeded`, with status `failed`
+shows the budget measure and current-attempt budget usage beside the configured
+ceiling. For Claude and Pi this row is labeled **uncached tokens** and counts
+input + output + cache writes while excluding cache reads; the session and issue
+spend rows remain inclusive cache-aware telemetry for cost reporting. A worker
+stopped by the live ceiling is displayed as `token budget exceeded`, with status `failed`
 and an operator-facing reason; it is never placed in the actually-running
 group, even during the interval before the orchestrator persists its next
 reconciliation cycle. The Fleet API derives that immediate view from the

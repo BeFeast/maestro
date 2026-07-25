@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -14,7 +15,9 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/pipeline"
+	"github.com/befeast/maestro/internal/repopolicy"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 // SlotPrefix derives the slot prefix from the repo name ("BeFeast/panoptikon" → "pan")
@@ -45,13 +48,53 @@ func TmuxSessionName(slotName string) string {
 	return "maestro-" + slotName
 }
 
+// TmuxPanePID returns the pane pid of a live tmux session, so a caller can
+// recover the runtime pid of a worker whose recorded pid is stale (e.g. a
+// restart-resume adopting an already-running replacement, #877). It errors if
+// the session is gone or the pid is unparseable.
+func TmuxPanePID(session string) (int, error) {
+	out, err := exec.Command("tmux", "list-panes", "-t", session, "-F", "#{pane_pid}").Output()
+	if err != nil {
+		return 0, fmt.Errorf("tmux list-panes %s: %w", session, err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("parse pane pid for %s: %w", session, err)
+	}
+	return pid, nil
+}
+
 // Start spawns a new worker for the given issue inside a tmux session.
 // backendName selects the model backend ("claude", "codex", etc.); empty defaults to config.
 func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string) (string, error) {
 	slotName := s.NextSlotName(cfg.SessionPrefix)
+	return StartReserved(cfg, s, repo, issue, promptBase, backendName, slotName)
+}
+
+// BranchName returns the deterministic branch identity for a fresh dispatch.
+// The orchestrator persists this beside the reserved slot before worker setup
+// begins so an interrupted start can be resumed in place without allocating a
+// duplicate branch or worktree.
+func BranchName(slotName string, issue github.Issue) string {
+	return fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+}
+
+// StartReserved starts or adopts a fresh worker on an already-reserved exact
+// slot. If a prior owner crashed after launching tmux but before committing the
+// Session, the exact tmux/worktree/branch identity is adopted. If setup created
+// the canonical worktree but no process, it is reused in place. Mismatched or
+// invalid identities fail closed and are never deleted.
+func StartReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName string) (string, error) {
+	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
+		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
+	}
+	if cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return "", fmt.Errorf("remote runner v1 does not support phase-pipeline dispatches")
+	}
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
-	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+	branchName := BranchName(slotName, issue)
+	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
 
 	// Resolve and validate the backend before creating a worktree or running the
 	// pre-worker pipeline. A positive hard budget must fail closed before any
@@ -74,17 +117,76 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		return "", err
 	}
 
-	// #734: sync the local base branch to origin so the worker branches from an
-	// up-to-date base, then root the worktree directly at origin/main. A stale
-	// or diverged base fails loudly here rather than silently branching from it.
-	if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
-		return "", fmt.Errorf("sync base branch before spawning worker: %w", err)
+	// The process may already exist when a previous owner died between tmux
+	// launch and the atomic state commit. Adopt only the exact canonical pane;
+	// a session-name match without worktree+branch proof is not sufficient.
+	tmuxName := TmuxSessionName(slotName)
+	if tmuxSessionExists(tmuxName) {
+		pid, panePath, err := TmuxPaneIdentity(tmuxName)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved tmux session %s: %w", tmuxName, err)
+		}
+		if !sameCleanPath(panePath, worktreePath) {
+			return "", fmt.Errorf("reserved tmux session %s runs in %q, want canonical worktree %q", tmuxName, panePath, worktreePath)
+		}
+		if err := validateExactWorktreeIdentity(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", fmt.Errorf("validate reserved live worker identity: %w", err)
+		}
+		processLease, err := workerProcessLease(cfg, slotName, 1)
+		if err != nil {
+			return "", err
+		}
+		active, err := workerProcessLeaseActive(processLease)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved worker process lease: %w", err)
+		}
+		if !active {
+			return "", fmt.Errorf("reserved tmux session %s has no active durable process lease %s", tmuxName, processLease.Unit)
+		}
+		owned, err := workerProcessLeaseAnchored(processLease, pid)
+		if err != nil {
+			return "", fmt.Errorf("inspect reserved worker pane ownership: %w", err)
+		}
+		if !owned {
+			return "", fmt.Errorf("reserved tmux session %s pane pid %d is not owned by durable process lease %s", tmuxName, pid, processLease.Unit)
+		}
+		scratchLease, err := recoverWorkerScratchLease(cfg, slotName, processLease)
+		if err != nil {
+			return "", err
+		}
+		attachWorkerScratchReceipt(&processLease, scratchLease)
+		startedAt := time.Now().UTC()
+		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
+		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
+		recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn_adopted", "", startedAt)
+		log.Printf("[worker] adopted reserved worker %s in tmux session %s (pane_pid=%d)", slotName, tmuxName, pid)
+		return slotName, nil
 	}
 
-	// Create worktree
-	log.Printf("[worker] creating worktree %s on branch %s", worktreePath, branchName)
-	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
-		return "", err
+	if info, err := os.Stat(worktreePath); err == nil {
+		if !info.IsDir() {
+			return "", fmt.Errorf("reserved worktree path %s exists but is not a directory", worktreePath)
+		}
+		if err := validateExactWorktreeIdentity(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
+		log.Printf("[worker] reusing reserved worktree %s on branch %s", worktreePath, branchName)
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return "", fmt.Errorf("stat reserved worktree %s: %w", worktreePath, err)
+	} else if localBranchExists(cfg.LocalPath, branchName) {
+		if err := RestoreMissingWorktree(cfg.LocalPath, cfg.WorktreeBase, slotName, worktreePath, branchName); err != nil {
+			return "", err
+		}
+	} else {
+		// #734: sync the local base branch to origin so the worker branches from
+		// an up-to-date base, then root the worktree directly at origin/main.
+		if err := SyncBaseBranch(cfg.LocalPath, defaultBaseBranch); err != nil {
+			return "", fmt.Errorf("sync base branch before spawning worker: %w", err)
+		}
+		log.Printf("[worker] creating reserved worktree %s on branch %s", worktreePath, branchName)
+		if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
 	}
 
 	// Run after_create hook
@@ -110,10 +212,14 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		}
 	}
 
-	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
-	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
-	if section := pipelineResult.PromptSection(); section != "" {
-		promptBase = promptBase + section
+	// Run deterministic control-plane context preparation only for local
+	// workers. The remote spike deliberately avoids heavy local scans and the
+	// generated verify.sh would exist only in the shadow worktree.
+	if !cfg.RemoteRunner.Enabled {
+		pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+		if section := pipelineResult.PromptSection(); section != "" {
+			promptBase = promptBase + section
+		}
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -122,9 +228,13 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	}
 
 	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
+	if err := assertCanonicalPrompt(slotName, issue.Number, prompt); err != nil {
+		return "", err
+	}
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
@@ -140,15 +250,15 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 	logFile := filepath.Join(logDir, slotName+".log")
 
 	// Build the worker command to generate the runner script
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return "", fmt.Errorf("build worker cmd: %w", err)
 	}
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	split := streamSplitForBackend(backendName, backendCfg, logFile, 1)
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return "", err
 	}
 
@@ -157,49 +267,108 @@ func Start(cfg *config.Config, s *state.State, repo string, issue github.Issue, 
 		return "", fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
-	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
-		return "", fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID of the shell running inside the tmux pane
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	// Start tmux session inside its unique OS process lease.
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0, "initial_spawn")
 	if err != nil {
-		return "", fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return "", fmt.Errorf("parse pane pid: %w", err)
+		if processLease.Unit != "" {
+			startedAt := time.Now().UTC()
+			retryAt := startedAt
+			failedSession := &state.Session{
+				IssueNumber:      issue.Number,
+				IssueTitle:       issue.Title,
+				Worktree:         worktreePath,
+				Branch:           branchName,
+				LogFile:          logFile,
+				StartedAt:        startedAt,
+				WorkerGeneration: 1,
+				Status:           state.StatusDead,
+				Backend:          backendName,
+				RetryReason:      state.RetryReasonStalledProgress,
+				NextRetryAt:      &retryAt,
+			}
+			setSessionProcessLease(failedSession, processLease)
+			s.Sessions[slotName] = failedSession
+			if saveErr := state.Save(cfg.StateDir, s); saveErr != nil {
+				return "", fmt.Errorf("%w (persist failed-start process lease: %v)", err, saveErr)
+			}
+		}
+		return "", err
 	}
 
 	log.Printf("[worker] started %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
 
 	// Save session to state
 	startedAt := time.Now().UTC()
-	s.Sessions[slotName] = &state.Session{
-		IssueNumber: issue.Number,
-		IssueTitle:  issue.Title,
-		Worktree:    worktreePath,
-		Branch:      branchName,
-		PID:         pid,
-		TmuxSession: tmuxName,
-		LogFile:     logFile,
-		StartedAt:   startedAt,
-		Status:      state.StatusRunning,
-		Backend:     backendName,
-	}
+	s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
+	// Close the launch/state gap before returning to either the daemon cycle or
+	// the one-shot CLI. A replacement daemon must always have the exact scope
+	// receipt needed to adopt or clean this worker; caller-specific metadata
+	// (such as backend-selection audit detail) can be saved immediately after.
+	if err := state.Save(cfg.StateDir, s); err != nil {
+		stopErr := StopProcess(slotName, s.Sessions[slotName])
+		if stopErr != nil {
+			return "", fmt.Errorf("persist worker process lease: %w (rollback teardown: %v)", err, stopErr)
+		}
+		return "", fmt.Errorf("persist worker process lease: %w", err)
+	}
 
 	return slotName, nil
+}
+
+func localBranchExists(localPath, branch string) bool {
+	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(branch) == "" {
+		return false
+	}
+	return exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+}
+
+func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
+	if !isGitWorktreeForRepo(localPath, worktree) {
+		return fmt.Errorf("reserved path %s is not a worktree for the configured repository", worktree)
+	}
+	out, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("inspect reserved worktree branch: %w: %s", err, strings.TrimSpace(string(out)))
+	}
+	if current := strings.TrimSpace(string(out)); current != strings.TrimSpace(branch) {
+		return fmt.Errorf("reserved worktree is on branch %q, want %q", current, branch)
+	}
+	return nil
+}
+
+func freshRunningSession(issue github.Issue, worktree, branch string, pid int, tmuxName, logFile, backend string, processLease tmuxsession.ProcessLease, startedAt time.Time) *state.Session {
+	sess := &state.Session{
+		IssueNumber:      issue.Number,
+		IssueTitle:       issue.Title,
+		Worktree:         worktree,
+		Branch:           branch,
+		PID:              pid,
+		TmuxSession:      tmuxName,
+		LogFile:          logFile,
+		StartedAt:        startedAt.UTC(),
+		WorkerGeneration: 1,
+		Status:           state.StatusRunning,
+		Backend:          backend,
+	}
+	setSessionProcessLease(sess, processLease)
+	return sess
 }
 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
 func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
+	}
+	// #959: assert the rendered issue matches the session's canonical
+	// issue_number before tearing anything down, so a slot-suffix-derived number
+	// can never launch a mis-scoped worker.
+	if err := assertCanonicalIssue(slotName, sess, issue); err != nil {
+		return err
+	}
 	// Validate the replacement backend before killing the old session or
 	// removing its worktree.
 	if backendName == "" {
@@ -220,7 +389,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Clean up old worker (tmux session, process, worktree)
-	Stop(cfg, slotName, sess)
+	if err := Stop(cfg, slotName, sess); err != nil {
+		return fmt.Errorf("stop previous worker process lease: %w", err)
+	}
 
 	// Delete old local branch (ignore errors — branch may not exist locally)
 	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
@@ -228,6 +399,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// Create fresh worktree with new branch
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
+	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
 
 	// #734: sync the local base branch to origin and root the worktree directly
 	// at origin/main so the respawned worker branches from an up-to-date base.
@@ -263,10 +435,13 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		}
 	}
 
-	// Run GSD pre-worker pipeline (research, plan validation, test mapping)
-	pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
-	if section := pipelineResult.PromptSection(); section != "" {
-		promptBase = promptBase + section
+	// Keep deterministic pre-worker scans off the control-plane host for the
+	// remote spike; see the initial-spawn path above.
+	if !cfg.RemoteRunner.Enabled {
+		pipelineResult := pipeline.RunGSD(cfg, worktreePath, issue.Number, issue.Title, issue.Body)
+		if section := pipelineResult.PromptSection(); section != "" {
+			promptBase = promptBase + section
+		}
 	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, worktreePath, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
@@ -275,9 +450,13 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Assemble worker prompt
-	prompt := assemblePrompt(promptBase, issue, worktreePath, branchName, cfg)
+	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
+	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
+		return err
+	}
 
 	// Write prompt to file
 	promptFile := filepath.Join(cfg.StateDir, fmt.Sprintf("%s-prompt.md", slotName))
@@ -293,15 +472,16 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	logFile := filepath.Join(logDir, slotName+".log")
 
 	// Build the worker command
-	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, worktreePath)
+	workerCmd, stdinFile, err := BuildWorkerCmd(backendName, backendCfg, promptFile, executionWorktree)
 	if err != nil {
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	split := streamSplitForBackend(backendName, backendCfg, logFile)
-	if err := writeWorkerRunnerScript(cfg.StateDir, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
+	nextGeneration := sess.WorkerGeneration + 1
+	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
+	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return err
 	}
 
@@ -310,21 +490,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	// Start tmux session
+	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
-	tmuxCmd := exec.Command("tmux", "new-session", "-d", "-s", tmuxName, "-c", worktreePath, "bash", runnerPath)
-	if tmuxOut, err := tmuxCmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("tmux new-session: %w\n%s", err, tmuxOut)
-	}
-
-	// Get PID
-	pidOut, err := exec.Command("tmux", "list-panes", "-t", tmuxName, "-F", "#{pane_pid}").Output()
+	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID, "fallover")
 	if err != nil {
-		return fmt.Errorf("tmux list-panes: %w", err)
-	}
-	pid, err := strconv.Atoi(strings.TrimSpace(string(pidOut)))
-	if err != nil {
-		return fmt.Errorf("parse pane pid: %w", err)
+		if processLease.Unit != "" {
+			sess.WorkerGeneration = nextGeneration
+			setSessionProcessLease(sess, processLease)
+		}
+		return err
 	}
 
 	log.Printf("[worker] respawned %s in tmux session %s (pane_pid=%d, log=%s)", slotName, tmuxName, pid, logFile)
@@ -335,19 +509,16 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PID = pid
 	sess.TmuxSession = tmuxName
 	sess.LogFile = logFile
-	sess.StartedAt = time.Now().UTC()
-	sess.FinishedAt = nil
-	sess.Status = state.StatusRunning
+	now := time.Now()
 	sess.PRNumber = 0
-	sess.Backend = backendName
-	// #513: stamp the fallover attribution segment.
-	recordBackendAttribution(cfg, sess, backendName, "fallover", "fallover", time.Now())
+	// #513/#931: stamp the fallover segment and clear the previous attempt's
+	// terminal/model projection without losing cumulative history.
+	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
+	setSessionProcessLease(sess, processLease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
-	sess.TokensUsedAttempt = 0
-	sess.WorkerOutcome = ""
 	// CIFailureOutput and PreviousAttemptFeedback are normally cleared by
 	// respawnDueRetries before this call, but cleared here defensively in
 	// case Respawn is called from other paths.
@@ -355,24 +526,86 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	sess.PreviousAttemptFeedback = ""
 	sess.PreviousAttemptFeedbackKind = ""
 	sess.CheckpointFile = ""
+	// A fresh respawn is a brand-new attempt in a brand-new worktree, so any
+	// restart-resume marker from a prior in-flight interruption (#877) is stale.
+	sess.RestartCheckpointAt = nil
 
 	return nil
 }
 
-// Stop kills a worker and removes its worktree
-func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
-	// Try to kill the tmux session first (covers tmux-spawned workers)
-	tmuxName := TmuxSessionName(slotName)
-	if out, err := exec.Command("tmux", "kill-session", "-t", tmuxName).CombinedOutput(); err != nil {
-		log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
+// StopProcess terminates only the worker runtime for a slot. It deliberately
+// preserves the worktree, branch, and PR so a safety stop cannot destroy the
+// worker's durable output; cleanup remains a separate, explicit operation.
+func StopProcess(slotName string, sess *state.Session) error {
+	lease, hasLease, leaseErr := sessionProcessLease(sess)
+	if leaseErr != nil {
+		return leaseErr
+	}
+	if hasLease {
+		// The cgroup is the ownership boundary. Signal it directly so
+		// double-forked/reparented descendants receive the graceful window and
+		// stubborn survivors are force-killed without touching a neighbor.
+		if err := terminateWorkerProcessLease(lease); err != nil {
+			return err
+		}
+		if _, err := cleanupOwnedWorkerScratch(nil, sess); err != nil {
+			return err
+		}
+		tmuxName := ""
+		if sess != nil {
+			tmuxName = strings.TrimSpace(sess.TmuxSession)
+		}
+		// systemd-run --scope is synchronous, so the owned tmux pane exits when
+		// the scope empties. Wait briefly for that natural close instead of ever
+		// killing a same-name pane whose lease ownership is not proven.
+		if !waitWorkerTmuxSessionGone(tmuxName, processLeaseTmuxExitWait) {
+			return fmt.Errorf("worker process lease %s is empty but tmux session %q still exists; refusing unowned tmux kill", lease.Unit, tmuxName)
+		}
+		clearSessionProcessLease(sess)
+		if sess != nil {
+			sess.TmuxSession = ""
+		}
+		return nil
+	}
+	if sess != nil && strings.TrimSpace(sess.WorkerLeaseID) != "" {
+		sess.WorkerLeaseAttention = "worker scratch has no matching process lease"
+		return fmt.Errorf("worker scratch receipt exists without a durable process lease")
 	}
 
+	// Remove only this exact tmux session after the lease is empty. The pane may
+	// already be gone; that is expected and does not weaken cgroup teardown.
+	tmuxName := ""
+	if sess != nil && strings.TrimSpace(sess.TmuxSession) != "" {
+		tmuxName = strings.TrimSpace(sess.TmuxSession)
+	}
+	if tmuxName != "" {
+		if out, err := killWorkerTmuxSession(tmuxName); err != nil {
+			log.Printf("[worker] tmux kill-session %s: %v (%s)", tmuxName, err, strings.TrimSpace(string(out)))
+		}
+	}
+	if sess != nil {
+		sess.TmuxSession = ""
+	}
+
+	// Legacy sessions predate durable process leases. Retain the ancestry sweep
+	// only for their read/cleanup compatibility; every new launch uses a cgroup.
 	// Reap the worker's whole process subtree. tmux kill-session only reaps
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
 	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
-	if sess.PID > 0 && IsAlive(sess.PID) {
+	if sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
 		KillProcessTree(sess.PID)
+	}
+	return nil
+}
+
+// Stop kills a worker and removes its worktree.
+func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
+	if err := StopProcess(slotName, sess); err != nil {
+		return err
+	}
+	if sess == nil {
+		return nil
 	}
 
 	// Run before_remove hook
@@ -424,18 +657,25 @@ func CleanupWorktrees(cfg *config.Config, s *state.State) []CleanupResult {
 			sess.Worktree = ""
 			continue
 		}
-		err := RemoveWorktree(cfg.LocalPath, sess.Worktree)
+		lease := CaptureCleanupLease(slotName, sess)
+		err := CleanupLeasedWorktree(
+			cfg,
+			s,
+			lease,
+			CleanupProbes{},
+			CleanupPolicy{RequireTerminal: true},
+			CleanupHooks{},
+		)
 		r := CleanupResult{
 			SlotName:    slotName,
 			IssueNumber: sess.IssueNumber,
-			Worktree:    sess.Worktree,
+			Worktree:    lease.Worktree,
 		}
 		if err != nil {
 			r.Error = err
 			log.Printf("[worker] cleanup worktree %s for %s: %v", sess.Worktree, slotName, err)
 		} else {
 			r.Removed = true
-			sess.Worktree = ""
 			log.Printf("[worker] cleaned up worktree %s for %s", r.Worktree, slotName)
 		}
 		results = append(results, r)
@@ -495,11 +735,33 @@ func RebaseWorktree(worktreePath, branch string, autoResolveFiles, autoRestoreFi
 			return fmt.Errorf("rebase failed: %v; auto-resolve failed: %v", rebaseErr, resolveErr)
 		}
 	}
+	if err := validateAttributionPolicyBeforeForcePush(worktreePath); err != nil {
+		return err
+	}
 
 	if _, err := runGit(worktreePath, "push", "--force-with-lease", "origin", branch); err != nil {
 		return err
 	}
 
+	return nil
+}
+
+func validateAttributionPolicyBeforeForcePush(worktreePath string) error {
+	prohibited, err := repopolicy.ProhibitsPublicAIAttribution(worktreePath)
+	if err != nil {
+		return err
+	}
+	if !prohibited {
+		return nil
+	}
+
+	messages, err := runGit(worktreePath, "log", "--format=%B%x00", "origin/main..HEAD")
+	if err != nil {
+		return fmt.Errorf("inspect commits before force-push: %w", err)
+	}
+	if repopolicy.ContainsForbiddenPublicAttribution(messages) {
+		return fmt.Errorf("repository policy prohibits AI attribution; refusing force-push")
+	}
 	return nil
 }
 
@@ -922,7 +1184,7 @@ func managementHomePromptSection(cfg *config.Config) string {
 	if vp := strings.TrimSpace(mh.VaultPath); vp != "" {
 		fmt.Fprintf(&b, "- Management Home (vault-relative): `%s`\n", vp)
 	}
-	if p := strings.TrimSpace(mh.Path); p != "" {
+	if p := strings.TrimSpace(mh.Path); p != "" && !cfg.RemoteRunner.Enabled {
 		fmt.Fprintf(&b, "- Management Home (absolute, execution-host only — never post/copy this into GitHub or repo files): `%s`\n", p)
 	}
 	return b.String()
@@ -959,8 +1221,17 @@ func subagentHintPromptSection(hint string) string {
 //   - If VALIDATION.md exists but no placeholder is present, appends the contract
 //   - Loads and appends any prompt section files from cfg.PromptSections
 func assemblePrompt(base string, issue github.Issue, worktreePath, branchName string, cfg *config.Config) string {
-	// Load validation contract from worktree (if present)
-	validationContract := readValidationContract(worktreePath)
+	return assemblePromptWithSource(base, issue, worktreePath, worktreePath, branchName, cfg)
+}
+
+// assemblePromptWithSource separates the path presented to the agent from the
+// control-plane worktree used to read repository rules and generated context.
+// They are identical for local workers. The SSH spike presents the runner-side
+// path while still embedding the checked-out repository's CLAUDE/AGENTS rules
+// from the lightweight local shadow.
+func assemblePromptWithSource(base string, issue github.Issue, executionWorktree, sourceWorktree, branchName string, cfg *config.Config) string {
+	// Load validation contract from the source worktree (if present).
+	validationContract := readValidationContract(sourceWorktree)
 
 	if strings.Contains(base, "{{ISSUE_NUMBER}}") {
 		// Template-style substitution
@@ -969,7 +1240,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 			"{{ISSUE_TITLE}}", issue.Title,
 			"{{ISSUE_BODY}}", issue.Body,
 			"{{BRANCH}}", branchName,
-			"{{WORKTREE}}", worktreePath,
+			"{{WORKTREE}}", executionWorktree,
 			"{{REPO}}", cfg.Repo,
 		}
 
@@ -985,7 +1256,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 		}
 
 		r := strings.NewReplacer(replacements...)
-		result := r.Replace(base) + repoRulesPromptSection(worktreePath) + workerSearchSafetyPromptSection(worktreePath) + visualEvidencePromptSection(cfg) + managementHomePromptSection(cfg) + workDisciplinePromptSection()
+		result := r.Replace(base) + repoRulesPromptSection(sourceWorktree) + workerSearchSafetyPromptSection(executionWorktree) + visualEvidencePromptSection(cfg) + managementHomePromptSection(cfg) + workDisciplinePromptSection()
 		return appendSectionsAndValidation(result, cfg.PromptSections, validationContract, contractInlined)
 	}
 
@@ -1014,7 +1285,7 @@ func assemblePrompt(base string, issue github.Issue, worktreePath, branchName st
 4. Commit your changes with a clear message.
 5. Before committing or opening a PR, check for accidental secrets and generated artifacts. Do NOT commit or mention API keys, bearer tokens, oauth tokens, bot tokens, env values, raw config dumps, or diagnostic logs. Do NOT commit temp/debug artifacts such as tmp/, _tmp/, *.log, *.logs, *.test, or *.test.json unless the issue explicitly requires them.
 6. Keep the PR body minimal and safe. Use: gh pr create --repo %s --title "%s" --body "Refs #%d". Never use closing keywords such as Closes/Fixes/Resolves in PR bodies for Maestro-managed work. Do NOT paste logs, doctor output, env dumps, or secret-bearing snippets into the PR body or comments.
-7. Preserve any Maestro-Backend: attribution trailer that Maestro adds to commit messages. Do NOT add backend/model attribution, pids, tmux session names, or host paths to PR bodies.
+7. Do NOT add backend/model attribution, effort, retry history, pids, tmux session names, or host paths to commit messages or PR bodies. Maestro records this control-plane telemetry internally.
 8. After creating the PR, you are done. Do NOT merge it yourself.
 
 Important: Always run cargo fmt --all before committing if this is a Rust project.
@@ -1023,15 +1294,15 @@ Always rebase on origin/main immediately before creating the PR.
 		base,
 		issue.Number, issue.Title,
 		cfg.Repo,
-		worktreePath,
+		executionWorktree,
 		issue.Body,
-		worktreePath,
+		executionWorktree,
 		cfg.Repo,
 		issue.Title,
 		issue.Number,
 	)
-	result += repoRulesPromptSection(worktreePath)
-	result += workerSearchSafetyPromptSection(worktreePath)
+	result += repoRulesPromptSection(sourceWorktree)
+	result += workerSearchSafetyPromptSection(executionWorktree)
 	result += visualEvidencePromptSection(cfg)
 	result += managementHomePromptSection(cfg)
 	result += workDisciplinePromptSection()

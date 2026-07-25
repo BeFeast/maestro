@@ -34,6 +34,9 @@ func TestParseClaudeUsage_RealSmokeCapture(t *testing.T) {
 	if usage.TotalTokens != 20076 {
 		t.Errorf("TotalTokens = %d, want 20076", usage.TotalTokens)
 	}
+	if usage.BudgetTokens != 4415 {
+		t.Errorf("BudgetTokens = %d, want 4415 (cache reads excluded)", usage.BudgetTokens)
+	}
 	if usage.CostUSD != 0.0401785 {
 		t.Errorf("CostUSD = %v, want 0.0401785", usage.CostUSD)
 	}
@@ -55,6 +58,41 @@ not json at all
 	}
 }
 
+func TestParseClaudeUsage_MissingTerminalUsageIsExplicitlyUnreliable(t *testing.T) {
+	const stream = `{"type":"system","subtype":"init","model":"proxy-model"}
+{"type":"assistant","message":{"id":"msg-1","model":"proxy-model","usage":{"input_tokens":100,"output_tokens":5}}}
+{"type":"result","subtype":"success","result":"done","total_cost_usd":0.12}
+`
+	usage, ok := ParseClaudeUsage(stream)
+	if !ok {
+		t.Fatal("assistant-frame lower bound should remain observable")
+	}
+	if usage.TotalTokens != 105 {
+		t.Fatalf("TotalTokens = %d, want lower-bound 105", usage.TotalTokens)
+	}
+	if !usage.UsageUnreliable || usage.UsageUnreliableReason != claudeUsageMissingResult || usage.UsageUnreliableScope != claudeUsageScopeAccounting {
+		t.Fatalf("usage reliability = %+v, want missing-result degradation", usage)
+	}
+	if usage.CostUSD != 0.12 {
+		t.Fatalf("CostUSD = %v, want trustworthy backend-reported 0.12", usage.CostUSD)
+	}
+}
+
+func TestParseClaudeUsage_ZeroTerminalUsageIsNotProgress(t *testing.T) {
+	const stream = `{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":0,"output_tokens":0}}
+`
+	usage, ok := ParseClaudeUsage(stream)
+	if ok {
+		t.Fatalf("zero usage returned ok=true: %+v", usage)
+	}
+	if usage.TotalTokens != 0 {
+		t.Fatalf("TotalTokens = %d, want 0", usage.TotalTokens)
+	}
+	if !usage.UsageUnreliable || usage.UsageUnreliableReason != claudeUsageZeroResult || usage.UsageUnreliableScope != claudeUsageScopeAccounting {
+		t.Fatalf("usage reliability = %+v, want zero-result degradation", usage)
+	}
+}
+
 func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
 	const live = `{"type":"system","subtype":"init","model":"claude-opus"}
 {"type":"assistant","message":{"role":"assistant","model":"claude-opus","usage":{"input_tokens":30000,"output_tokens":1000,"cache_creation_input_tokens":2000,"cache_read_input_tokens":7000}}}
@@ -66,6 +104,22 @@ func TestParseClaudeUsage_LiveAssistantFramesBeforeResult(t *testing.T) {
 	}
 	if usage.TotalTokens != 80_000 {
 		t.Fatalf("TotalTokens = %d, want 80000", usage.TotalTokens)
+	}
+	if usage.BudgetTokens != 59_000 {
+		t.Fatalf("BudgetTokens = %d, want 59000", usage.BudgetTokens)
+	}
+}
+
+func TestParseClaudeUsage_DeduplicatesRepeatedAssistantMessageFrames(t *testing.T) {
+	const live = `{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"thinking"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+{"type":"assistant","message":{"id":"msg-same","role":"assistant","model":"claude-fable-5","content":[{"type":"text","text":"done"}],"usage":{"input_tokens":2,"output_tokens":5,"cache_creation_input_tokens":12258,"cache_read_input_tokens":30869}}}
+`
+	usage, ok := ParseClaudeUsage(live)
+	if !ok {
+		t.Fatal("live assistant usage must be available")
+	}
+	if usage.TotalTokens != 43_134 {
+		t.Fatalf("TotalTokens = %d, want one message's 43134 rather than duplicate 86268", usage.TotalTokens)
 	}
 }
 

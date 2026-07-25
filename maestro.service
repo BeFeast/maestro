@@ -8,9 +8,11 @@ Description=Maestro agent orchestrator (single-service daemon, all projects)
 After=network.target
 
 [Service]
+User=god
+WorkingDirectory=/home/god
 Type=simple
-Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
-# One unified SQLite database (%h/.maestro/maestro.db) holds config + approvals +
+Environment=PATH=/home/god/.local/bin:/home/god/.bun/bin:/home/god/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# One unified SQLite database (/home/god/.maestro/maestro.db) holds config + approvals +
 # state; --approvals-db / --state-db default to that same file. --watch-store lets
 # the daemon hot add/remove/reload projects from the store (and powers dashboard
 # project CRUD: POST/DELETE /api/v1/fleet/projects) without a restart.
@@ -22,19 +24,46 @@ Environment=PATH=%h/.local/bin:%h/.bun/bin:%h/.npm-global/bin:/usr/local/bin:/us
 # is the write-path safety boundary.
 ExecStart=/usr/local/bin/maestro daemon \
     --host 0.0.0.0 \
-    --store %h/.maestro/maestro.db \
+    --store /home/god/.maestro/maestro.db \
     --port 8786 \
     --watch-store \
     --approvals-store sqlite \
     --state-store sqlite
 # Graceful in-process drain on SIGTERM: the daemon sets SpawnDrain on every flow
 # (no new workers) and waits for in-flight workers to finish — there is no
-# per-unit ExecStop=maestro drain anymore. Give it room before SIGKILL; the
-# daemon's own --drain-timeout (default 5m) finishes well inside this window
-# (#817).
+# per-unit ExecStop=maestro drain anymore. The daemon's --drain-timeout (default
+# 4m) now bounds the ENTIRE shutdown, including flow joins and restart markers;
+# it reserves a small handoff tail inside that budget and force-exits itself at
+# the deadline if a callback never returns (#966). TimeoutStopSec stays longer as
+# a defense-in-depth systemd backstop, not part of normal restart latency.
 TimeoutStopSec=6min
+# Kill ownership is explicit (#877/#920). The private worker tmux server runs in
+# a sibling transient scope (#891), and every runner it launches is moved again
+# into its own generation-specific unit below maestro-workers.slice. Legacy temp
+# behavior uses a scope; config-gated isolated scratch uses the service form of
+# that same lease so BindPaths and ExecStopPost share its lifecycle. A worker's
+# model CLI, tools, and reparented descendants therefore survive daemon restart
+# but remain exactly attributable and independently terminable. KillMode=mixed
+# also protects any legacy worker still inside this unit's cgroup: the systemd
+# default KillMode=control-group would SIGTERM daemon and legacy workers together
+# before the in-process drain could observe them finishing.
+#
+#   KillMode=mixed: the stop SIGTERM goes to the daemon's MAIN process ONLY, so
+#   unit-owned descendants keep running while the daemon drains. A subsequent
+#   SIGKILL still reaps this unit's control group; per-worker scopes remain
+#   independently owned by systemd and are adopted or terminated by exact
+#   persisted scope identity in the replacement daemon.
+#   This is deliberately NOT KillMode=process, which would leak descendants out
+#   of systemd lifecycle management (rejected in #877 review).
+#
+# The daemon is the belt to this suspenders: any worker still in-flight near the
+# deadline is checkpointed to a resumable marker before flow joins. The next
+# daemon adopts the same surviving leased PID/worktree, or resumes a pre-#920
+# worker in place if it did exit — same logical session, exactly once
+# (internal/worker/checkpoint.go, orchestrator reconcile).
+KillMode=mixed
 Restart=on-failure
 RestartSec=30
 
 [Install]
-WantedBy=default.target
+WantedBy=multi-user.target

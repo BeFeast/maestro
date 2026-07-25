@@ -139,6 +139,39 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 	}
 }
 
+func TestCheckWebhookRefreshesOnlyMatchingProjectFlow(t *testing.T) {
+	d := New(fakeLoader{}, Options{Port: 0})
+	alpha := &projectFlow{
+		cfg:       &config.Config{Repo: "BeFeast/ok-player"},
+		refreshCh: make(chan struct{}, 1),
+	}
+	beta := &projectFlow{
+		cfg:       &config.Config{Repo: "BeFeast/maestro"},
+		refreshCh: make(chan struct{}, 1),
+	}
+	d.flows = map[string]*projectFlow{"alpha": alpha, "beta": beta}
+
+	// A burst coalesces to one pending reconciliation for the matching repo.
+	d.refreshPRGateFromWebhook("check_run", "befeast/OK-PLAYER")
+	d.refreshPRGateFromWebhook("check_suite", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 1 {
+		t.Fatalf("alpha refreshes = %d, want one coalesced wake-up", got)
+	}
+	if got := len(beta.refreshCh); got != 0 {
+		t.Fatalf("beta refreshes = %d, want 0 for an unrelated repo", got)
+	}
+
+	<-alpha.refreshCh
+	d.refreshPRGateFromWebhook("issues", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 0 {
+		t.Fatalf("non-gate event refreshes = %d, want 0", got)
+	}
+	d.refreshPRGateFromWebhook("status", "BeFeast/ok-player")
+	if got := len(alpha.refreshCh); got != 1 {
+		t.Fatalf("commit-status refreshes = %d, want 1", got)
+	}
+}
+
 func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	// Two configs that resolve to the same flow identity (same StateDir) are a
 	// true duplicate — the second must be skipped, not silently overwrite the
@@ -163,6 +196,11 @@ func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	if flows != 1 {
 		t.Fatalf("flows = %d, want 1 (duplicate flow identity skipped)", flows)
 	}
+	// The single deduped flow's run loop is launched as a goroutine by
+	// startFlow, so it may not have incremented started yet when waitForFleet
+	// returns. Wait for it to reach 1; startFlow ran exactly once, so it can
+	// never exceed 1 (avoids a race where a 0 read spuriously fails).
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 })
 	if got := atomic.LoadInt64(&run.started); got != 1 {
 		t.Fatalf("run loops started = %d, want 1", got)
 	}
@@ -489,6 +527,64 @@ func TestLogSupervisorDecisionEmitsStructuredLine(t *testing.T) {
 		if !strings.Contains(out, want) {
 			t.Fatalf("decision log %q missing %q", out, want)
 		}
+	}
+}
+
+func TestLogSupervisorDecisionSuppressesRepeatsAndEmitsRollup(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := state.SupervisorDecision{
+		RecommendedAction: "monitor_open_pr",
+		RecommendationID:  "supervisor:held",
+		FirstSeenAt:       base,
+		LastSeenAt:        base.Add(time.Hour),
+		SeenCount:         13,
+		Target:            &state.SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "blocked-label guard still holds",
+		JournalEvent:      state.SupervisorJournalSuppressed,
+	}
+	logSupervisorDecision("maestro", decision)
+	if buf.Len() != 0 {
+		t.Fatalf("suppressed decision logged %q", buf.String())
+	}
+
+	decision.JournalEvent = state.SupervisorJournalRollup
+	logSupervisorDecision("maestro", decision)
+	out := buf.String()
+	for _, want := range []string{
+		"still held, seen 13 times since 2026-07-21T10:00:00Z",
+		"action=monitor_open_pr",
+		"recommendation=supervisor:held",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("roll-up log %q missing %q", out, want)
+		}
+	}
+}
+
+func TestLogSupervisorDecisionEmitsTTLDisposition(t *testing.T) {
+	var buf bytes.Buffer
+	old := log.Writer()
+	log.SetOutput(&buf)
+	defer log.SetOutput(old)
+
+	logSupervisorDecision("maestro", state.SupervisorDecision{
+		RecommendedAction: "monitor_open_pr",
+		JournalEvent:      state.SupervisorJournalDisposition,
+		Disposition: &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionDropped,
+			Reason: state.RecommendationDispositionTTLExpired,
+		},
+	})
+	out := buf.String()
+	if !strings.Contains(out, "supervise recommendation disposition") ||
+		!strings.Contains(out, "disposition=dropped") ||
+		!strings.Contains(out, "disposition_reason=ttl_expired_unconsumed") {
+		t.Fatalf("disposition log = %q", out)
 	}
 }
 

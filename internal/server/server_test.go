@@ -311,6 +311,35 @@ func TestHandleStateReviewRetryLifecycleDisplay(t *testing.T) {
 	}
 }
 
+func TestBuildStateResponseIssueGuardRetryHold(t *testing.T) {
+	now := time.Now().UTC()
+	retryAt := now.Add(time.Minute)
+	st := state.NewState()
+	st.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber:     406,
+		IssueTitle:      "Blocked canonical retry",
+		Status:          state.StatusDead,
+		StartedAt:       now.Add(-time.Hour),
+		NextRetryAt:     &retryAt,
+		RetryHoldReason: "issue #406 has a current excluded label",
+	}
+
+	resp := buildStateResponse(&config.Config{Repo: "owner/repo", MaxParallel: 20}, st)
+	worker := findSessionInfo(t, resp.All, "ok-player-302")
+	if worker.DisplayStatus != string(state.DisplayWaitingForIssueGuard) {
+		t.Fatalf("display_status = %q, want %q", worker.DisplayStatus, state.DisplayWaitingForIssueGuard)
+	}
+	if worker.NeedsAttention || !worker.Live {
+		t.Fatalf("guarded retry attention/live = %v/%v, want false/true", worker.NeedsAttention, worker.Live)
+	}
+	if !contains(worker.StatusReason, "dispatch guard") || !contains(worker.NextAction, "same canonical session") {
+		t.Fatalf("guarded retry explanation = %q / %q", worker.StatusReason, worker.NextAction)
+	}
+	if resp.Summary[string(state.DisplayWaitingForIssueGuard)] != 1 {
+		t.Fatalf("summary waiting_for_issue_guard = %d, want 1", resp.Summary[string(state.DisplayWaitingForIssueGuard)])
+	}
+}
+
 func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	srv, cfg := setupTestServer(t)
 	cfg.Server.ReadOnly = true
@@ -337,8 +366,8 @@ func TestHandleState_ReadOnlyActionsDisabled(t *testing.T) {
 	}
 
 	worker := findSessionInfo(t, resp.All, "slot-2")
-	if len(worker.Actions) != 5 {
-		t.Fatalf("worker actions = %d, want 5", len(worker.Actions))
+	if len(worker.Actions) != 7 {
+		t.Fatalf("worker actions = %d, want 7", len(worker.Actions))
 	}
 	for _, action := range worker.Actions {
 		assertReadOnlyAction(t, action)
@@ -396,8 +425,17 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 		ProjectState:      state.SupervisorProjectState{Sessions: 2, PROpen: 1, Queued: 1, OpenPRs: 2},
 	}, state.DefaultSupervisorDecisionLimit)
 	st.RecordSupervisorDecision(state.SupervisorDecision{
-		ID:                "sup-latest",
-		CreatedAt:         now,
+		ID:               "sup-latest",
+		CreatedAt:        now,
+		RecommendationID: "supervisor:latest",
+		FirstSeenAt:      now.Add(-2 * time.Hour),
+		LastSeenAt:       now,
+		SeenCount:        25,
+		Disposition: &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionDropped,
+			Reason: state.RecommendationDispositionTTLExpired,
+			At:     now,
+		},
 		Project:           "test/repo",
 		Mode:              "read_only",
 		Summary:           "Issue #43 exhausted its retry budget and needs manual review.",
@@ -436,6 +474,15 @@ func TestHandleStateSupervisorRationale(t *testing.T) {
 	}
 	if resp.Supervisor.Latest.RecommendedAction != "review_retry_exhausted" {
 		t.Fatalf("latest action = %q", resp.Supervisor.Latest.RecommendedAction)
+	}
+	if resp.Supervisor.Latest.RecommendationID != "supervisor:latest" ||
+		!resp.Supervisor.Latest.FirstSeenAt.Equal(now.Add(-2*time.Hour)) ||
+		!resp.Supervisor.Latest.LastSeenAt.Equal(now) ||
+		resp.Supervisor.Latest.SeenCount != 25 {
+		t.Fatalf("latest recommendation observation = %#v", resp.Supervisor.Latest)
+	}
+	if resp.Supervisor.Latest.Disposition == nil || resp.Supervisor.Latest.Disposition.Reason != state.RecommendationDispositionTTLExpired {
+		t.Fatalf("latest disposition = %#v", resp.Supervisor.Latest.Disposition)
 	}
 	if resp.Supervisor.Latest.OperatorSentence != "Reviewing failed feedback on PR #20 before retrying work." {
 		t.Fatalf("latest operator sentence = %q", resp.Supervisor.Latest.OperatorSentence)
@@ -631,6 +678,43 @@ func TestApplySupervisorAttentionSessionTargetDoesNotFallback(t *testing.T) {
 	}
 	if infos[1].NeedsAttention || infos[1].StatusReason != "" || infos[1].NextAction != "" {
 		t.Fatalf("slot-2 attention = %#v, want no session-targeted fallback", infos[1])
+	}
+}
+
+func TestAllSessionInfosSuppressesDeadPIDFindingAfterRespawn(t *testing.T) {
+	now := time.Now().UTC()
+	pid := os.Getpid()
+	st := state.NewState()
+	st.Sessions["project-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "flatpak beta retry",
+		Status:      state.StatusRunning,
+		PID:         pid,
+		StartedAt:   now,
+		PRNumber:    388,
+	}
+	st.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:        "before-respawn",
+		CreatedAt: now.Add(-time.Minute),
+		StuckStates: []state.SupervisorStuckState{{
+			Code:              "dead_running_pid",
+			Severity:          "blocked",
+			Summary:           "Worker project-273 is marked running, but PID 481040 is not alive.",
+			RecommendedAction: "Run a Maestro reconciliation cycle.",
+			Target:            &state.SupervisorTarget{Issue: 345, PR: 388, Session: "project-273"},
+		}},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	infos := allSessionInfos(&config.Config{Repo: "BeFeast/ok-player"}, st)
+	if len(infos) != 1 {
+		t.Fatalf("session projections = %d, want 1", len(infos))
+	}
+	got := infos[0]
+	if got.Status != string(state.StatusRunning) || got.PID != pid || got.Alive == nil || !*got.Alive {
+		t.Fatalf("runtime tuple = status:%q pid:%d alive:%v, want coherent live replacement", got.Status, got.PID, got.Alive)
+	}
+	if !contains(got.StatusReason, "alive") || contains(got.StatusReason, "481040") || contains(got.StatusReason, "not alive") || got.NextAction != "" || got.NeedsAttention {
+		t.Fatalf("stale predecessor finding leaked into live projection: reason=%q next=%q attention=%v", got.StatusReason, got.NextAction, got.NeedsAttention)
 	}
 }
 
@@ -1420,6 +1504,8 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 		"stop_worker":        "Stop",
 		"mark_issue_ready":   "Mark ready",
 		"mark_issue_blocked": "Mark blocked",
+		"hold_merge":         "Hold merge",
+		"release_merge":      "Release merge",
 		"approve_merge":      "Approve merge",
 	}
 	if want, ok := wantLabels[action.ID]; ok && action.Label != want {
@@ -1441,7 +1527,7 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 	// dispatcher (requires_approval=false / safe_direct policy);
 	// restart_worker / stop_worker / approve_merge stay approval-gated.
 	switch action.ID {
-	case "mark_issue_ready", "mark_issue_blocked":
+	case "mark_issue_ready", "mark_issue_blocked", "hold_merge", "release_merge":
 		if action.RequiresApproval {
 			t.Fatalf("safe action %s should not require approval", action.ID)
 		}
@@ -1472,7 +1558,7 @@ func assertReadOnlyAction(t *testing.T, action controlAction) {
 // disabled reason must name the supported in-place alternative. Stop stays
 // enabled. A PR-less worker keeps Restart enabled.
 func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
-	withPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-0", IssueNumber: 42, PRNumber: 867})
+	withPR := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{Slot: "slot-0", IssueNumber: 42, PRNumber: 867})
 	restart := findControlAction(t, withPR, "restart_worker")
 	if !restart.Disabled {
 		t.Fatalf("restart_worker for an open-PR worker should be disabled, got %+v", restart)
@@ -1487,11 +1573,54 @@ func TestWorkerActionAffordances_RestartDisabledForOpenPR(t *testing.T) {
 	if stop.Disabled {
 		t.Fatalf("stop_worker for an open-PR worker should stay enabled, got %+v", stop)
 	}
+	hold := findControlAction(t, withPR, config.SupervisorActionHoldMerge)
+	release := findControlAction(t, withPR, config.SupervisorActionReleaseMerge)
+	if hold.Disabled || !release.Disabled || hold.RequiresApproval || release.RequiresApproval {
+		t.Fatalf("merge hold/release affordances = hold %+v release %+v", hold, release)
+	}
+	heldActions := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
+		Slot: "slot-0", IssueNumber: 42, PRNumber: 867, OperatorGateName: "label:blocked",
+	})
+	if !findControlAction(t, heldActions, config.SupervisorActionHoldMerge).Disabled || findControlAction(t, heldActions, config.SupervisorActionReleaseMerge).Disabled {
+		t.Fatalf("held merge actions = %+v", heldActions)
+	}
 
-	noPR := workerActionAffordances(false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
+	noPR := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{Slot: "slot-1", IssueNumber: 43})
 	restartNoPR := findControlAction(t, noPR, "restart_worker")
 	if restartNoPR.Disabled {
-		t.Fatalf("restart_worker for a PR-less worker should be enabled, got %+v", restartNoPR)
+		t.Fatalf("restart_worker for a PR-less worker without a retained worktree should be enabled, got %+v", restartNoPR)
+	}
+
+	retained := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
+		Slot: "slot-2", IssueNumber: 44, Worktree: "/srv/wt/slot-2",
+	})
+	restartRetained := findControlAction(t, retained, "restart_worker")
+	if !restartRetained.Disabled {
+		t.Fatalf("restart_worker for a retained PR-less worktree should be disabled, got %+v", restartRetained)
+	}
+	if !contains(restartRetained.DisabledReason, "retains a worktree") || !contains(restartRetained.DisabledReason, "same slot") {
+		t.Fatalf("disabled reason = %q, want preserved-work and same-slot repair guidance", restartRetained.DisabledReason)
+	}
+	repairRetained := findControlAction(t, retained, config.SupervisorActionSpawnRepairWorker)
+	if repairRetained.Disabled {
+		t.Fatalf("in-place repair for a retained PR-less worktree should be enabled, got %+v", repairRetained)
+	}
+	if !repairRetained.RequiresApproval || repairRetained.Target != "slot-2" || repairRetained.IssueNumber != 44 {
+		t.Fatalf("in-place repair action is not scoped to the canonical worker: %+v", repairRetained)
+	}
+	if !contains(repairRetained.Description, "retained worktree") || !contains(repairRetained.Description, "duplicate") {
+		t.Fatalf("repair description = %q, want retained-worktree and duplicate-prevention contract", repairRetained.Description)
+	}
+}
+
+func TestWorkerActionAffordances_MergedAndClosedSessionsHaveNoLifecycleControls(t *testing.T) {
+	for _, status := range []state.SessionStatus{state.StatusCodeLanded, state.StatusDone} {
+		actions := workerActionAffordances(newSafeActionTestCfg(), false, "/api/v1/actions", sessionInfo{
+			Slot: "slot-merged", IssueNumber: 42, PRNumber: 867, Status: string(status),
+		})
+		if len(actions) != 0 {
+			t.Fatalf("status %s actions = %+v, want no merge/restart/close lifecycle controls", status, actions)
+		}
 	}
 }
 

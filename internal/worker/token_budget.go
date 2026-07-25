@@ -12,17 +12,24 @@ import (
 )
 
 const TokenBudgetExceededOutcome = "token_budget_exceeded"
+const TokenBudgetMeasureUncached = "uncached_tokens"
+const TokenBudgetMeasureCodexRollout = "codex_rollout_tokens"
+const TokenBudgetMeasureInputOutputReasoning = "input_output_reasoning_tokens"
+const TokenBudgetMeasureProviderTotal = "provider_total_tokens"
+const TokenBudgetMeasureProviderTotalLegacy = "provider_total_tokens_legacy"
 
 var ErrTokenBudgetExceeded = errors.New(TokenBudgetExceededOutcome)
 
 // TokenBudgetMarker is the durable, non-sensitive handoff from the worker
 // stream process to orchestrator and Fleet reconciliation.
 type TokenBudgetMarker struct {
-	Outcome        string    `json:"outcome"`
-	Backend        string    `json:"backend"`
-	TokensObserved int       `json:"tokens_observed"`
-	MaxTokens      int       `json:"max_tokens"`
-	MeasuredAt     time.Time `json:"measured_at"`
+	Outcome          string    `json:"outcome"`
+	Backend          string    `json:"backend"`
+	TokensObserved   int       `json:"tokens_observed"`
+	MaxTokens        int       `json:"max_tokens"`
+	Measure          string    `json:"measure"`
+	WorkerGeneration uint64    `json:"worker_generation,omitempty"`
+	MeasuredAt       time.Time `json:"measured_at"`
 }
 
 func TokenBudgetMarkerPathForLog(logFile string) string {
@@ -48,10 +55,34 @@ func ReadTokenBudgetMarker(logFile string) (TokenBudgetMarker, bool) {
 	if json.Unmarshal(data, &marker) != nil || marker.Outcome != TokenBudgetExceededOutcome || marker.MaxTokens <= 0 {
 		return TokenBudgetMarker{}, false
 	}
+	if strings.TrimSpace(marker.Measure) == "" {
+		marker.Measure = TokenBudgetMeasureProviderTotalLegacy
+	}
 	return marker, true
 }
 
-func writeTokenBudgetMarker(path, backend string, observed, maxTokens int) error {
+// ReadTokenBudgetMarkerForAttempt rejects a marker written by a predecessor
+// process that reused the same stable slot log path. New markers carry the
+// exact worker generation. Timestamp matching is retained only for markers
+// written by an older Maestro version during a rolling upgrade.
+func ReadTokenBudgetMarkerForAttempt(logFile string, workerGeneration uint64, startedAt time.Time) (TokenBudgetMarker, bool) {
+	marker, ok := ReadTokenBudgetMarker(logFile)
+	if !ok {
+		return TokenBudgetMarker{}, false
+	}
+	if marker.WorkerGeneration > 0 {
+		if workerGeneration == 0 || marker.WorkerGeneration != workerGeneration {
+			return TokenBudgetMarker{}, false
+		}
+		return marker, true
+	}
+	if !startedAt.IsZero() && (marker.MeasuredAt.IsZero() || marker.MeasuredAt.Before(startedAt)) {
+		return TokenBudgetMarker{}, false
+	}
+	return marker, true
+}
+
+func writeTokenBudgetMarker(path, backend, measure string, observed, maxTokens int, workerGeneration uint64) error {
 	if path == "" {
 		return fmt.Errorf("empty token-budget marker path")
 	}
@@ -59,11 +90,13 @@ func writeTokenBudgetMarker(path, backend string, observed, maxTokens int) error
 		observed = maxTokens
 	}
 	marker := TokenBudgetMarker{
-		Outcome:        TokenBudgetExceededOutcome,
-		Backend:        backend,
-		TokensObserved: observed,
-		MaxTokens:      maxTokens,
-		MeasuredAt:     time.Now().UTC(),
+		Outcome:          TokenBudgetExceededOutcome,
+		Backend:          backend,
+		TokensObserved:   observed,
+		MaxTokens:        maxTokens,
+		Measure:          measure,
+		WorkerGeneration: workerGeneration,
+		MeasuredAt:       time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
 	if err != nil {
@@ -89,14 +122,37 @@ func StopCurrentProcessGroup() {
 
 type liveTokenMonitor struct {
 	backend          string
+	measure          string
 	maxTokens        int
 	totalTokens      int
 	claudeAssistants int
+	claudeMessages   map[string]int
 	codexThreadID    string
 }
 
 func newLiveTokenMonitor(backend string, maxTokens int) *liveTokenMonitor {
-	return &liveTokenMonitor{backend: strings.TrimSpace(backend), maxTokens: maxTokens}
+	return &liveTokenMonitor{
+		backend:        strings.TrimSpace(backend),
+		measure:        TokenBudgetMeasureForBackend(backend),
+		maxTokens:      maxTokens,
+		claudeMessages: make(map[string]int),
+	}
+}
+
+// TokenBudgetMeasureForBackend names the exact measure enforced by the live
+// stream monitor. Claude and Pi exclude cache reads; the other structured
+// backends retain their native token definitions.
+func TokenBudgetMeasureForBackend(backend string) string {
+	switch strings.TrimSpace(backend) {
+	case "claude", "pi":
+		return TokenBudgetMeasureUncached
+	case "codex":
+		return TokenBudgetMeasureCodexRollout
+	case "opencode":
+		return TokenBudgetMeasureInputOutputReasoning
+	default:
+		return TokenBudgetMeasureProviderTotal
+	}
 }
 
 func (m *liveTokenMonitor) observe(line string) (int, bool) {
@@ -117,14 +173,21 @@ func (m *liveTokenMonitor) observe(line string) (int, bool) {
 		switch fr.Type {
 		case "assistant":
 			if fr.Message != nil && fr.Message.Usage != nil {
-				m.claudeAssistants += claudeUsageTotal(fr.Message.Usage)
+				measured := claudeBudgetUsage(fr.Message.Usage)
+				messageID := strings.TrimSpace(fr.Message.ID)
+				if messageID == "" {
+					m.claudeAssistants += measured
+				} else if previous := m.claudeMessages[messageID]; measured > previous {
+					m.claudeAssistants += measured - previous
+					m.claudeMessages[messageID] = measured
+				}
 				if m.claudeAssistants > m.totalTokens {
 					m.totalTokens = m.claudeAssistants
 				}
 			}
 		case "result":
 			if fr.Usage != nil {
-				if total := claudeUsageTotal(fr.Usage); total > m.totalTokens {
+				if total := claudeBudgetUsage(fr.Usage); total > m.totalTokens {
 					m.totalTokens = total
 				}
 			}
@@ -160,7 +223,7 @@ func (m *liveTokenMonitor) observe(line string) (int, bool) {
 	case "pi":
 		var ev piUsageEvent
 		if json.Unmarshal([]byte(trimmed), &ev) == nil && ev.Type == "turn_end" && ev.Message != nil && ev.Message.Usage != nil {
-			m.totalTokens += piUsageTotal(ev.Message.Usage)
+			m.totalTokens += piBudgetUsage(ev.Message.Usage)
 		}
 	case "opencode":
 		var fr opencodeStreamFrame
@@ -257,4 +320,23 @@ func piUsageTotal(usage *piUsageBlock) int {
 		return 0
 	}
 	return usage.Input + usage.Output + usage.CacheRead + usage.CacheWrite
+}
+
+// claudeBudgetUsage is the live ceiling measure, intentionally distinct from
+// claudeUsageTotal (provider/cost telemetry). Cache reads are already-produced
+// context replayed into a later turn; charging them again makes the ceiling
+// grow by the whole context on every assistant response. The ceiling therefore
+// counts only uncached input, output, and freshly-created cache tokens.
+func claudeBudgetUsage(usage *claudeUsageBlock) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.InputTokens + usage.OutputTokens + usage.CacheCreationInputTokens
+}
+
+func piBudgetUsage(usage *piUsageBlock) int {
+	if usage == nil {
+		return 0
+	}
+	return usage.Input + usage.Output + usage.CacheWrite
 }

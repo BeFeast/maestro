@@ -17,6 +17,7 @@ import (
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/mergegate"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
@@ -250,6 +251,12 @@ type supervisorDecisionInfo struct {
 	QueueAnalysis     *state.SupervisorQueueAnalysis `json:"queue_analysis,omitempty"`
 	Queue             *supervisorQueueInfo           `json:"queue,omitempty"`
 	ApprovalID        string                         `json:"approval_id,omitempty"`
+
+	RecommendationID string                           `json:"recommendation_id,omitempty"`
+	FirstSeenAt      time.Time                        `json:"first_seen_at,omitempty"`
+	LastSeenAt       time.Time                        `json:"last_seen_at,omitempty"`
+	SeenCount        int                              `json:"seen_count,omitempty"`
+	Disposition      *state.RecommendationDisposition `json:"disposition,omitempty"`
 }
 
 type supervisorActionInfo struct {
@@ -291,6 +298,8 @@ type controlAction struct {
 	IssueNumber      int                           `json:"issue_number,omitempty"`
 	PRNumber         int                           `json:"pr_number,omitempty"`
 	Issues           []state.SupervisorIssueTarget `json:"issues,omitempty"`
+	Workers          []controlActionWorkerTarget   `json:"workers,omitempty"`
+	SkippedWorkers   []controlActionWorkerTarget   `json:"skipped_workers,omitempty"`
 	Mutating         bool                          `json:"mutating"`
 	RequiresApproval bool                          `json:"requires_approval"`
 	ApprovalPolicy   string                        `json:"approval_policy,omitempty"`
@@ -298,6 +307,13 @@ type controlAction struct {
 	DisabledReason   string                        `json:"disabled_reason,omitempty"`
 	Method           string                        `json:"method,omitempty"`
 	Endpoint         string                        `json:"endpoint,omitempty"`
+}
+
+type controlActionWorkerTarget struct {
+	Slot        string `json:"slot"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	PRNumber    int    `json:"pr_number,omitempty"`
+	Reason      string `json:"reason,omitempty"`
 }
 
 type controlActionRequest struct {
@@ -328,14 +344,52 @@ type sessionInfo struct {
 	NeedsAttention bool   `json:"needs_attention,omitempty"`
 	Live           bool   `json:"live"`
 	Backend        string `json:"backend,omitempty"`
+	// Provider-limit fields are the secret-free route/aggregate projection
+	// recorded by the orchestrator. Credential identifiers and raw proxy payloads
+	// are deliberately absent.
+	ProviderLimitBackend      string `json:"provider_limit_backend,omitempty"`
+	ProviderLimitReason       string `json:"provider_limit_reason,omitempty"`
+	ProviderLimitProvider     string `json:"provider_limit_provider,omitempty"`
+	ProviderLimitModel        string `json:"provider_limit_model,omitempty"`
+	ProviderLimitResetAt      string `json:"provider_limit_reset_at,omitempty"`
+	CredentialCandidates      int    `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool   `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int    `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool   `json:"credential_usable_known,omitempty"`
+	CredentialAggregateReason string `json:"credential_aggregate_reason,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model             string `json:"model,omitempty"`
-	PRNumber          int    `json:"pr_number,omitempty"`
-	PRURL             string `json:"pr_url,omitempty"`
-	TokensUsedAttempt int    `json:"tokens_used_attempt"`
-	TokensUsedTotal   int    `json:"tokens_used_total"`
-	WorkerOutcome     string `json:"worker_outcome,omitempty"`
+	Model                     string                `json:"model,omitempty"`
+	PRNumber                  int                   `json:"pr_number,omitempty"`
+	PRMerged                  bool                  `json:"pr_merged,omitempty"`
+	PRURL                     string                `json:"pr_url,omitempty"`
+	Phase                     string                `json:"phase,omitempty"`
+	PlanVersion               int                   `json:"plan_version,omitempty"`
+	AdvisorReviewRound        int                   `json:"advisor_review_round,omitempty"`
+	AdvisorMaxReviewRounds    int                   `json:"advisor_max_review_rounds,omitempty"`
+	AdvisorBackend            string                `json:"advisor_backend,omitempty"`
+	AdvisorModel              string                `json:"advisor_model,omitempty"`
+	AdvisorVerdict            string                `json:"advisor_verdict,omitempty"`
+	AdvisorUnresolvedFindings string                `json:"advisor_unresolved_findings,omitempty"`
+	AdvisorTerminalReason     string                `json:"advisor_terminal_reason,omitempty"`
+	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
+	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
+	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
+	PRGate                    *fleetPRGateState     `json:"pr_gate,omitempty"`
+	// prGateSnapshot is the latest durable, reconciled gate observation for
+	// this exact issue/PR. It is projection-only state: Fleet uses it to keep
+	// operator_state aligned with the current PR head/check rollup, but does not
+	// expose the internal snapshot on the session JSON shape.
+	prGateSnapshot           *state.PRGateSnapshot
+	TokensUsedAttempt        int    `json:"tokens_used_attempt"`
+	TokensUsedTotal          int    `json:"tokens_used_total"`
+	TokenBudgetTokensAttempt int    `json:"token_budget_tokens_attempt,omitempty"`
+	TokenBudgetMeasure       string `json:"token_budget_measure,omitempty"`
+	WorkerOutcome            string `json:"worker_outcome,omitempty"`
+	// ReleasedForRedispatch means a terminal session no longer owns the issue.
+	// Fleet duplicate projection must preserve this bit so an older completed
+	// PR cannot hide a genuine follow-up after the issue is reopened (#949).
+	ReleasedForRedispatch bool `json:"released_for_redispatch,omitempty"`
 	// #739: cache-aware split token breakdown when the backend stamped it
 	// (claude stream-json / Pi). Surfaced so the cost panel can show the
 	// cache-read discount; zero for backends that report only a combined total.
@@ -368,7 +422,9 @@ type sessionInfo struct {
 	PROpenRuntime          string                  `json:"pr_open_runtime,omitempty"`
 	PROpenRuntimeSeconds   int64                   `json:"pr_open_runtime_seconds,omitempty"`
 	StartedAt              string                  `json:"started_at"`
+	WorkerGeneration       uint64                  `json:"worker_generation,omitempty"`
 	FinishedAt             string                  `json:"finished_at,omitempty"`
+	IssueClosedAt          string                  `json:"issue_closed_at,omitempty"`
 	WorkerEndedAt          string                  `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string                  `json:"pr_opened_at,omitempty"`
 	NextRetryAt            string                  `json:"next_retry_at,omitempty"`
@@ -380,19 +436,49 @@ type sessionInfo struct {
 	HasLog                 bool                    `json:"has_log"`
 	RetryCount             int                     `json:"retry_count,omitempty"`
 	LastNotification       string                  `json:"last_notification,omitempty"`
+	OperatorGateName       string                  `json:"operator_gate_name,omitempty"`
+	OperatorGateAction     string                  `json:"operator_gate_required_action,omitempty"`
 	BackendSelection       *state.BackendSelection `json:"backend_selection,omitempty"`
 	// Attribution is the per-segment provider/model/variant/effort timeline
 	// recorded across spawn / respawn / fallover (#513, PR #518). The SPA
 	// renders the active segment inline on the session card and the full
 	// list with EndReason between segments in the worker drawer.
-	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
-	Actions     []controlAction            `json:"actions,omitempty"`
+	Attribution  []state.BackendAttribution `json:"attribution,omitempty"`
+	BackendDrift *backendDriftInfo          `json:"backend_drift,omitempty"`
+	Actions      []controlAction            `json:"actions,omitempty"`
+}
+
+type backendRuntimeSettings struct {
+	Provider string `json:"provider,omitempty"`
+	Model    string `json:"model,omitempty"`
+	Variant  string `json:"variant,omitempty"`
+	Effort   string `json:"effort,omitempty"`
+}
+
+type backendDriftInfo struct {
+	Stale             bool                   `json:"stale"`
+	Backend           string                 `json:"backend,omitempty"`
+	Reason            string                 `json:"reason,omitempty"`
+	Running           backendRuntimeSettings `json:"running"`
+	Effective         backendRuntimeSettings `json:"effective"`
+	Restartable       bool                   `json:"restartable"`
+	RefusalReason     string                 `json:"refusal_reason,omitempty"`
+	RecommendedAction string                 `json:"recommended_action,omitempty"`
 }
 
 func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
-	if marker, ok := worker.ReadTokenBudgetMarker(sess.LogFile); ok && sess.WorkerOutcome == "" {
+	tokenBudgetMeasure := sess.TokenBudgetMeasure
+	marker, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt)
+	if markerOK {
+		tokenBudgetMeasure = marker.Measure
+	}
+	if markerOK && sess.WorkerOutcome == "" {
 		view := *sess
-		if marker.TokensObserved > view.TokensUsedAttempt {
+		if marker.TokensObserved > view.TokenBudgetTokensAttempt {
+			view.TokenBudgetTokensAttempt = marker.TokensObserved
+		}
+		view.TokenBudgetMeasure = marker.Measure
+		if marker.Measure == worker.TokenBudgetMeasureProviderTotalLegacy && marker.TokensObserved > view.TokensUsedAttempt {
 			delta := marker.TokensObserved - view.TokensUsedAttempt
 			view.TokensUsedAttempt = marker.TokensObserved
 			view.TokensUsedTotal += delta
@@ -410,33 +496,64 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	}
 	now := time.Now().UTC()
 	info := sessionInfo{
-		Slot:              slot,
-		IssueNumber:       sess.IssueNumber,
-		IssueTitle:        sess.IssueTitle,
-		IssueURL:          githubIssueURL(repo, sess.IssueNumber),
-		Status:            string(sess.Status),
-		Backend:           sess.Backend,
-		Model:             sess.Model,
-		PRNumber:          sess.PRNumber,
-		PRURL:             githubPRURL(repo, sess.PRNumber),
-		TokensUsedAttempt: sess.TokensUsedAttempt,
-		TokensUsedTotal:   sess.TokensUsedTotal,
-		WorkerOutcome:     sess.WorkerOutcome,
-		TokensInput:       sess.TokensInput,
-		TokensOutput:      sess.TokensOutput,
-		TokensCacheRead:   sess.TokensCacheRead,
-		TokensCacheWrite:  sess.TokensCacheWrite,
-		CostUSDBackend:    sess.CostUSDBackend,
-		StartedAt:         sess.StartedAt.Format(time.RFC3339),
-		Worktree:          sess.Worktree,
-		Branch:            sess.Branch,
-		TmuxSession:       watchSessionName(slot, sess),
-		HasLog:            strings.TrimSpace(sess.LogFile) != "",
-		RetryCount:        sess.RetryCount,
-		LastNotification:  sess.LastNotifiedStatus,
-		BackendSelection:  sess.BackendSelection,
-		Attribution:       sess.Attribution,
-		Live:              state.SessionLiveAt(sess, now),
+		Slot:                      slot,
+		IssueNumber:               sess.IssueNumber,
+		IssueTitle:                sess.IssueTitle,
+		IssueURL:                  githubIssueURL(repo, sess.IssueNumber),
+		Status:                    string(sess.Status),
+		Backend:                   sess.Backend,
+		ProviderLimitBackend:      sess.ProviderLimitBackend,
+		ProviderLimitReason:       sess.ProviderLimitReason,
+		ProviderLimitProvider:     sess.ProviderLimitProvider,
+		ProviderLimitModel:        sess.ProviderLimitModel,
+		CredentialCandidates:      sess.CredentialCandidates,
+		CredentialCandidatesKnown: sess.CredentialCandidatesKnown,
+		CredentialUsable:          sess.CredentialUsable,
+		CredentialUsableKnown:     sess.CredentialUsableKnown,
+		CredentialAggregateReason: sess.CredentialAggregateReason,
+		Model:                     currentSessionModel(sess),
+		PRNumber:                  sess.PRNumber,
+		PRMerged:                  sess.PRMerged,
+		PRURL:                     githubPRURL(repo, sess.PRNumber),
+		Phase:                     string(sess.Phase),
+		PlanVersion:               sess.PlanVersion,
+		AdvisorReviewRound:        sess.AdvisorReviewRound,
+		AdvisorMaxReviewRounds:    sess.AdvisorMaxReviewRounds,
+		AdvisorBackend:            sess.AdvisorBackend,
+		AdvisorModel:              sess.AdvisorModel,
+		AdvisorVerdict:            sess.AdvisorVerdict,
+		AdvisorUnresolvedFindings: sess.AdvisorUnresolvedFindings,
+		AdvisorTerminalReason:     sess.AdvisorTerminalReason,
+		AdvisorBestEffort:         sess.AdvisorBestEffort,
+		AdvisorBypassed:           sess.AdvisorBypassed,
+		AdvisorReviews:            append([]state.AdvisorReview(nil), sess.AdvisorReviews...),
+		TokensUsedAttempt:         sess.TokensUsedAttempt,
+		TokensUsedTotal:           sess.TokensUsedTotal,
+		TokenBudgetTokensAttempt:  sess.TokenBudgetTokensAttempt,
+		TokenBudgetMeasure:        tokenBudgetMeasure,
+		WorkerOutcome:             sess.WorkerOutcome,
+		ReleasedForRedispatch:     sess.ReleasedForRedispatch,
+		TokensInput:               sess.TokensInput,
+		TokensOutput:              sess.TokensOutput,
+		TokensCacheRead:           sess.TokensCacheRead,
+		TokensCacheWrite:          sess.TokensCacheWrite,
+		CostUSDBackend:            sess.CostUSDBackend,
+		StartedAt:                 sess.StartedAt.Format(time.RFC3339),
+		WorkerGeneration:          sess.WorkerGeneration,
+		Worktree:                  sess.Worktree,
+		Branch:                    sess.Branch,
+		TmuxSession:               watchSessionName(slot, sess),
+		HasLog:                    strings.TrimSpace(sess.LogFile) != "",
+		RetryCount:                sess.RetryCount,
+		LastNotification:          sess.LastNotifiedStatus,
+		OperatorGateName:          sess.OperatorGateName,
+		OperatorGateAction:        sess.OperatorGateRequiredAction,
+		BackendSelection:          sess.BackendSelection,
+		Attribution:               sess.Attribution,
+		Live:                      state.SessionLiveAt(sess, now),
+	}
+	if sess.ProviderLimitResetAt != nil {
+		info.ProviderLimitResetAt = sess.ProviderLimitResetAt.UTC().Format(time.RFC3339)
 	}
 
 	// Calculate runtime breakdown (#426). The workflow runtime is the
@@ -451,6 +568,9 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		end = *sess.FinishedAt
 		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
 	}
+	if sess.IssueClosedAt != nil {
+		info.IssueClosedAt = sess.IssueClosedAt.Format(time.RFC3339)
+	}
 	workflowDur := end.Sub(sess.StartedAt).Round(time.Second)
 	info.Runtime = workflowDur.String()
 	info.RuntimeSeconds = int64(workflowDur / time.Second)
@@ -458,11 +578,14 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	info.WorkflowRuntimeSeconds = info.RuntimeSeconds
 
 	workerEnd := end
-	if sess.WorkerEndedAt != nil {
+	// A running attempt is authoritative over a stale terminal marker left by
+	// an older binary. This also repairs the live projection immediately after
+	// upgrading, before that session is respawned again.
+	if sess.Status == state.StatusRunning {
+		workerEnd = now
+	} else if sess.WorkerEndedAt != nil {
 		workerEnd = *sess.WorkerEndedAt
 		info.WorkerEndedAt = sess.WorkerEndedAt.Format(time.RFC3339)
-	} else if sess.Status == state.StatusRunning {
-		workerEnd = now
 	}
 	workerDur := workerEnd.Sub(sess.StartedAt).Round(time.Second)
 	if workerDur < 0 {
@@ -514,6 +637,23 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	return info
 }
 
+// currentSessionModel returns the model for the live route. A backend may not
+// self-report usage/model data immediately (or at all), so the active
+// attribution segment is the truthful configured fallback. Terminal sessions
+// retain the last self-reported model for historical display.
+func currentSessionModel(sess *state.Session) string {
+	if sess == nil {
+		return ""
+	}
+	if sess.Status == state.StatusRunning && len(sess.Attribution) > 0 {
+		active := sess.Attribution[len(sess.Attribution)-1]
+		if active.EndedAt == nil && active.Backend == sess.Backend && strings.TrimSpace(active.Model) != "" {
+			return active.Model
+		}
+	}
+	return sess.Model
+}
+
 func githubIssueURL(repo string, issueNumber int) string {
 	if issueNumber <= 0 || !validGitHubRepo(repo) {
 		return ""
@@ -561,6 +701,11 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 	return &supervisorDecisionInfo{
 		ID:                decision.ID,
 		CreatedAt:         decision.CreatedAt,
+		RecommendationID:  decision.RecommendationID,
+		FirstSeenAt:       decision.FirstSeenAt,
+		LastSeenAt:        decision.LastSeenAt,
+		SeenCount:         decision.SeenCount,
+		Disposition:       decision.Disposition,
 		Project:           decision.Project,
 		Mode:              decision.Mode,
 		PolicyRule:        decision.PolicyRule,
@@ -772,13 +917,22 @@ func watchSessionName(slot string, sess *state.Session) string {
 	return worker.TmuxSessionName(slot)
 }
 
-func allSessionInfos(repo string, st *state.State) []sessionInfo {
+func allSessionInfos(cfg *config.Config, st *state.State) []sessionInfo {
+	repo := ""
+	if cfg != nil {
+		repo = cfg.Repo
+	}
 	infos := make([]sessionInfo, 0, len(st.Sessions))
 	for slot, sess := range st.Sessions {
-		infos = append(infos, makeSessionInfo(repo, slot, sess))
+		info := makeSessionInfo(repo, slot, sess)
+		applyBackendDrift(cfg, &info)
+		infos = append(infos, info)
 	}
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	applyProjectStatusDisplay(infos, st)
+	for i := range infos {
+		applyMergeControlProjection(cfg, st, &infos[i])
+	}
 	sort.Slice(infos, func(i, j int) bool {
 		left, right := infos[i], infos[j]
 		li := state.StatusPriority(state.SessionStatus(left.Status))
@@ -792,6 +946,88 @@ func allSessionInfos(repo string, st *state.State) []sessionInfo {
 		return left.Slot < right.Slot
 	})
 	return infos
+}
+
+func applyMergeControlProjection(cfg *config.Config, st *state.State, info *sessionInfo) {
+	if st == nil || info == nil || info.PRNumber <= 0 {
+		return
+	}
+	control, ok := st.MergeControlForPR(info.PRNumber)
+	if !ok || (control.IssueNumber > 0 && control.IssueNumber != info.IssueNumber) {
+		return
+	}
+	gateName := "label:" + mergegate.PrimaryHoldLabel(cfg)
+	if control.Held {
+		info.OperatorGateName = gateName
+		info.OperatorGateAction = "Use Release merge after the operator hold is cleared and every review thread is resolved."
+		info.NeedsAttention = true
+		info.StatusReason = fmt.Sprintf("PR #%d is held by explicit merge control: %s", info.PRNumber, firstNonEmpty(control.HoldReason, "operator hold"))
+		info.NextAction = info.OperatorGateAction
+		return
+	}
+	if control.LastResult == "released" && strings.EqualFold(info.OperatorGateName, gateName) {
+		info.OperatorGateName = ""
+		info.OperatorGateAction = ""
+		if info.Status == string(state.StatusPROpen) {
+			info.NeedsAttention = false
+			info.StatusReason = ""
+			info.NextAction = "Wait for current CI, review threads, and merge labels to be re-evaluated."
+		}
+	}
+}
+
+func applyBackendDrift(cfg *config.Config, info *sessionInfo) {
+	if cfg == nil || info == nil || !info.Live || info.Backend == "" || len(info.Attribution) == 0 {
+		return
+	}
+	def, ok := cfg.Model.Backends[info.Backend]
+	if !ok {
+		return
+	}
+	seg := latestOpenAttribution(info.Attribution)
+	if seg == nil || seg.Backend != info.Backend {
+		return
+	}
+	running := backendRuntimeSettings{
+		Provider: strings.TrimSpace(seg.Provider),
+		Model:    strings.TrimSpace(seg.Model),
+		Variant:  strings.TrimSpace(seg.Variant),
+		Effort:   strings.TrimSpace(seg.Effort),
+	}
+	effective := backendRuntimeSettings{
+		Provider: strings.TrimSpace(def.Provider),
+		Model:    strings.TrimSpace(def.Model),
+		Variant:  strings.TrimSpace(def.Variant),
+		Effort:   strings.TrimSpace(def.Effort),
+	}
+	if running == effective {
+		return
+	}
+	drift := &backendDriftInfo{
+		Stale:     true,
+		Backend:   info.Backend,
+		Reason:    "running worker uses an immutable backend snapshot that differs from the current effective backend settings",
+		Running:   running,
+		Effective: effective,
+	}
+	if info.PRNumber > 0 {
+		drift.RefusalReason = fmt.Sprintf("worker has open PR #%d; use review-repair or handoff instead of destructive restart", info.PRNumber)
+	} else if state.SessionStatus(info.Status) == state.StatusRunning {
+		drift.Restartable = true
+		drift.RecommendedAction = config.SupervisorActionRestartWorker
+	} else {
+		drift.RefusalReason = "worker is not currently running"
+	}
+	info.BackendDrift = drift
+}
+
+func latestOpenAttribution(attribution []state.BackendAttribution) *state.BackendAttribution {
+	for i := len(attribution) - 1; i >= 0; i-- {
+		if attribution[i].EndedAt == nil {
+			return &attribution[i]
+		}
+	}
+	return nil
 }
 
 func applyProjectStatusDisplay(infos []sessionInfo, st *state.State) {
@@ -840,7 +1076,7 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			if !stuckTargetsSession(stuck, infos[i]) {
 				continue
 			}
-			if staleReviewFeedbackResolved(stuck, infos[i]) {
+			if staleSupervisorFindingResolved(stuck, infos[i]) {
 				continue
 			}
 			attention := supervisorStuckNeedsAttention(stuck)
@@ -859,6 +1095,26 @@ func applySupervisorAttention(infos []sessionInfo, latest *state.SupervisorDecis
 			break
 		}
 	}
+}
+
+func staleSupervisorFindingResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
+	if state.SessionStatus(info.Status) == state.StatusDone && strings.TrimSpace(info.IssueClosedAt) != "" {
+		return true
+	}
+	if staleReviewFeedbackResolved(stuck, info) {
+		return true
+	}
+	if stuck.Code != "dead_running_pid" {
+		return false
+	}
+	// Fleet derives PID and liveness from the current session projection. A
+	// supervisor decision recorded before an in-place respawn can still carry
+	// the dead predecessor's PID; never overwrite a coherent live tuple with
+	// that stale explanation.
+	if state.SessionStatus(info.Status) != state.StatusRunning {
+		return true
+	}
+	return info.Alive != nil && *info.Alive
 }
 
 func staleReviewFeedbackResolved(stuck state.SupervisorStuckState, info sessionInfo) bool {
@@ -894,10 +1150,10 @@ func supervisorStuckNeedsAttention(stuck state.SupervisorStuckState) bool {
 	return stuck.Severity == "blocked"
 }
 
-func sessionInfosWithActions(repo string, st *state.State, readOnly bool, endpoint string) []sessionInfo {
-	infos := allSessionInfos(repo, st)
+func sessionInfosWithActions(cfg *config.Config, st *state.State, readOnly bool, endpoint string) []sessionInfo {
+	infos := allSessionInfos(cfg, st)
 	for i := range infos {
-		infos[i].Actions = workerActionAffordances(readOnly, endpoint, infos[i])
+		infos[i].Actions = workerActionAffordances(cfg, readOnly, endpoint, infos[i])
 	}
 	return infos
 }
@@ -920,8 +1176,17 @@ func closeIssueBatchControlAction(readOnly bool, endpoint, target string, candid
 	return a
 }
 
-func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+func workerActionAffordances(cfg *config.Config, readOnly bool, endpoint string, worker sessionInfo) []controlAction {
+	// code_landed records a merged PR, and done records a terminal issue.
+	// Neither state has a live merge/restart/stop/label control surface; keep
+	// the row as audit history without describing the merged PR as open.
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusCodeLanded, state.StatusDone:
+		return nil
+	}
 	merge := newApprovalControlAction("approve_merge", "Approve merge", "Enqueue a cautious-gate approval to merge this PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	holdMerge := newSafeControlAction(config.SupervisorActionHoldMerge, "Hold merge", "Immediately place an audited merge hold on this issue and PR.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	releaseMerge := newSafeControlAction(config.SupervisorActionReleaseMerge, "Release merge", "Explicitly remove the audited merge hold; normal live gates are re-read before merge.", "pull_request", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
 	if worker.PRNumber == 0 {
 		// PR-less workers can't enqueue merge_pr regardless of read-only;
 		// surface a verb-specific reason. In read-only mode this still
@@ -933,8 +1198,35 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			merge.DisabledReason = "No PR is associated with this worker; approve merge becomes available once a PR is open."
 		}
+		setControlDisabled(&holdMerge, "No PR is associated with this worker; merge hold becomes available once a PR is open.")
+		setControlDisabled(&releaseMerge, "No PR is associated with this worker; merge hold becomes available once a PR is open.")
+	} else if gate := worker.PRGate; gate != nil {
+		switch {
+		case gate.Merged:
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("PR #%d is already merged; merge and review-repair controls are terminally unavailable.", worker.PRNumber)
+		case gate.MergeAction != nil && fleetMergeActionSuppressesDuplicate(gate.MergeAction.Status):
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("Merge already requested under approval %s (%s).", gate.MergeAction.ApprovalID, gate.MergeAction.Status)
+		case state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure || state.PRGateCIVerdict(gate.CI) == state.PRGateCIPending:
+			merge.Disabled = true
+			merge.DisabledReason = fmt.Sprintf("PR #%d cannot be merged while CI is %s.", worker.PRNumber, gate.CI)
+		case state.PRGateReviewDecision(gate.Review) == state.PRGateReviewBlocked:
+			merge.Disabled = true
+			merge.DisabledReason = firstNonEmpty(gate.ReviewSummary, "The review gate requires repair before merge.")
+		case state.PRGateReviewDecision(gate.Review) == state.PRGateReviewPending:
+			merge.Disabled = true
+			merge.DisabledReason = firstNonEmpty(gate.ReviewSummary, "The review gate is still pending.")
+		}
+	}
+	holdLabel := mergegate.PrimaryHoldLabel(cfg)
+	if strings.EqualFold(worker.OperatorGateName, "label:"+holdLabel) {
+		setControlDisabled(&holdMerge, fmt.Sprintf("PR #%d is already held by %s.", worker.PRNumber, holdLabel))
+	} else if worker.PRNumber > 0 {
+		setControlDisabled(&releaseMerge, fmt.Sprintf("PR #%d has no explicit %s merge hold to release.", worker.PRNumber, holdLabel))
 	}
 	restart := newApprovalControlAction("restart_worker", "Restart", "Enqueue a cautious-gate approval to restart this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly)
+	var repair *controlAction
 	if worker.PRNumber > 0 {
 		// #874: restarting a worker that already owns an open PR is the wrong
 		// control — restart_worker deletes the worktree, which would strand
@@ -949,13 +1241,62 @@ func workerActionAffordances(readOnly bool, endpoint string, worker sessionInfo)
 		} else {
 			restart.DisabledReason = fmt.Sprintf("This worker has open PR #%d; restart would delete its worktree and strand the PR branch. Use review-repair to address review feedback in place, or Stop to terminate.", worker.PRNumber)
 		}
+	} else if strings.TrimSpace(worker.Worktree) != "" {
+		// #964: PR-less does not mean disposable. A retained worktree can hold
+		// completed, uncommitted work; the current restart controller deletes it.
+		// Offer only the canonical in-place repair path for this state.
+		restart.Disabled = true
+		if readOnly {
+			restart.DisabledReason = readOnlyDisabledReason() + " Additionally, this worker retains a worktree; recover the same slot in place with repair instead of restarting."
+		} else {
+			restart.DisabledReason = "This worker retains a worktree that may contain completed work; restart would delete it. Recover the same slot and worktree in place with repair, or Stop to terminate."
+		}
+		inPlace := newApprovalControlAction(
+			config.SupervisorActionSpawnRepairWorker,
+			"Repair in place",
+			"Enqueue a cautious-gate repair that resumes this canonical slot, branch, and retained worktree without creating a duplicate.",
+			"worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly,
+		)
+		repair = &inPlace
 	}
-	return []controlAction{
+	actions := []controlAction{
 		restart,
 		newApprovalControlAction("stop_worker", "Stop", "Enqueue a cautious-gate approval to stop this worker.", "worker", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_ready", "Mark ready", "Add the maestro-ready label so the supervisor picks the issue up.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
 		newSafeControlAction("mark_issue_blocked", "Mark blocked", "Add the blocked label so the supervisor holds the issue.", "issue", worker.Slot, worker.IssueNumber, worker.PRNumber, endpoint, readOnly),
+		holdMerge,
+		releaseMerge,
 		merge,
+	}
+	if repair != nil {
+		actions = append(actions, *repair)
+	}
+	return actions
+}
+
+func setControlDisabled(action *controlAction, reason string) {
+	if action == nil {
+		return
+	}
+	reason = strings.TrimSpace(reason)
+	if action.Disabled && strings.TrimSpace(action.DisabledReason) != "" {
+		action.DisabledReason = strings.TrimSpace(action.DisabledReason) + " Additionally, " + reason
+		return
+	}
+	action.Disabled = true
+	action.DisabledReason = reason
+}
+
+func fleetMergeActionSuppressesDuplicate(status string) bool {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending,
+		state.ApprovalStatusApproved,
+		state.ApprovalStatusAwaitingDispatch,
+		state.ApprovalStatusExecuting,
+		state.ApprovalStatusExecuted:
+		return true
+	default:
+		return false
 	}
 }
 
@@ -1062,7 +1403,7 @@ func buildStateResponse(cfg *config.Config, st *state.State) stateResponse {
 
 	pricing := backendPricingMap(cfg)
 	var activeTokens, totalTokens int
-	for _, info := range sessionInfosWithActions(cfg.Repo, st, cfg.Server.ReadOnly, "/api/v1/actions") {
+	for _, info := range sessionInfosWithActions(cfg, st, cfg.Server.ReadOnly, "/api/v1/actions") {
 		info.CostUSDEstimate = sessionCostEstimate(info.Backend, info.TokensUsedTotal, info.TokensInput, info.TokensOutput, info.TokensCacheRead, info.TokensCacheWrite, pricing, info.CostUSDBackend)
 		resp.All = append(resp.All, info)
 		summaryStatus := info.Status
@@ -1096,10 +1437,14 @@ func outcomeStatusForState(cfg *config.Config, st *state.State) outcome.Status {
 	if cfg == nil || st == nil {
 		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
 	}
+	var status outcome.Status
 	if st.OutcomeHealth != nil {
-		return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt, *st.OutcomeHealth)
+		status = outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt, *st.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
 	}
-	return outcome.StatusFor(cfg.Outcome, st.DonePRCount(), st.LastMergeAt)
+	status = outcome.AttachRecovery(status, st.OutcomeRecovery)
+	return outcome.AttachGateStreaks(status, st.OutcomeGateStreaks)
 }
 
 func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
@@ -1114,7 +1459,7 @@ func (s *Server) handleWorkers(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	workers := sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions")
+	workers := sessionInfosWithActions(s.cfg, st, s.cfg.Server.ReadOnly, "/api/v1/actions")
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"workers": workers,
@@ -1159,7 +1504,7 @@ func (s *Server) handleIssue(w http.ResponseWriter, r *http.Request) {
 		Sessions:    make([]sessionInfo, 0),
 	}
 
-	for _, info := range sessionInfosWithActions(s.cfg.Repo, st, s.cfg.Server.ReadOnly, "/api/v1/actions") {
+	for _, info := range sessionInfosWithActions(s.cfg, st, s.cfg.Server.ReadOnly, "/api/v1/actions") {
 		if info.IssueNumber == issueNum {
 			resp.Sessions = append(resp.Sessions, info)
 		}

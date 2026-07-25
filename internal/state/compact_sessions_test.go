@@ -114,6 +114,51 @@ func TestCompactSessions_ActiveSessionsUntouched(t *testing.T) {
 	}
 }
 
+func TestCompactSessions_UnreleasedProcessLeaseIsNeverPruned(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	finished := now.Add(-90 * 24 * time.Hour)
+	s := NewState()
+	s.Sessions["leased-terminal"] = &Session{
+		IssueNumber:         920,
+		Status:              StatusFailed,
+		StartedAt:           finished.Add(-time.Hour),
+		FinishedAt:          &finished,
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g1.scope",
+		ProcessLeaseManager: "system",
+	}
+
+	res, err := s.CompactSessions(SessionRetentionPolicy{KeepLast: 0, MinAge: 0}, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Removed != 0 || s.Sessions["leased-terminal"] == nil {
+		t.Fatalf("unreleased process lease was compacted: result=%+v sessions=%v", res, s.Sessions)
+	}
+}
+
+func TestProcessLeaseMetadataSurvivesStateRoundTrip(t *testing.T) {
+	stateDir := t.TempDir()
+	s := NewState()
+	s.Sessions["sup-920"] = &Session{
+		IssueNumber:         920,
+		Status:              StatusRunning,
+		WorkerGeneration:    3,
+		ProcessLeaseUnit:    "maestro-worker-0123456789abcdef0123456789abcdef-g3.scope",
+		ProcessLeaseManager: "system",
+	}
+	if err := Save(stateDir, s); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := Load(stateDir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := loaded.Sessions["sup-920"]
+	if got == nil || got.ProcessLeaseUnit != s.Sessions["sup-920"].ProcessLeaseUnit || got.ProcessLeaseManager != "system" {
+		t.Fatalf("process lease did not survive restart boundary: %+v", got)
+	}
+}
+
 func TestCompactSessions_AgeFloorKeepsRecent(t *testing.T) {
 	// 30 done sessions all within the last 24h: nothing should be pruned
 	// because every one of them is younger than MinAge, even though the

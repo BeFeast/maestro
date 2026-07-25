@@ -10,6 +10,8 @@ import (
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // fakeActionGH records calls + lets tests stub errors.
@@ -21,6 +23,7 @@ type fakeActionGH struct {
 	addLabelErr    error
 	removeLabelErr error
 	commentErr     error
+	issue          github.Issue
 }
 
 type labelCall struct {
@@ -35,6 +38,12 @@ type commentCall struct {
 func (f *fakeActionGH) AddIssueLabel(issue int, label string) error {
 	f.addLabelCalls = append(f.addLabelCalls, labelCall{issue: issue, label: label})
 	return f.addLabelErr
+}
+func (f *fakeActionGH) GetIssue(number int) (github.Issue, error) {
+	if f.issue.Number == 0 {
+		return github.Issue{Number: number}, nil
+	}
+	return f.issue, nil
 }
 func (f *fakeActionGH) RemoveIssueLabel(issue int, label string) error {
 	f.removeLabelCalls = append(f.removeLabelCalls, labelCall{issue: issue, label: label})
@@ -213,6 +222,63 @@ func TestSafeAction_AddBlockedLabel_Executes(t *testing.T) {
 	}
 	if len(gh.addLabelCalls) != 1 || gh.addLabelCalls[0].label != "blocked" {
 		t.Fatalf("addLabelCalls = %+v, want one add of blocked", gh.addLabelCalls)
+	}
+}
+
+func TestSafeAction_HoldAndReleaseMerge_RecordAuditAndDurableEvidence(t *testing.T) {
+	cfg := newSafeActionTestCfg()
+	cfg.StateDir = t.TempDir()
+	st := state.NewState()
+	st.Sessions["slot-1"] = &state.Session{IssueNumber: 7, PRNumber: 70, Status: state.StatusPROpen}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		t.Fatal(err)
+	}
+	gh := &fakeActionGH{}
+	var audits []string
+	srv := New(cfg, nil)
+	srv.SetActionDeps(gh, func(actor, action, target, reason string) error {
+		audits = append(audits, action+" "+target+" "+reason)
+		return nil
+	})
+
+	hold := postAction(t, srv, `{"action_id":"hold_merge","issue_number":7,"pr_number":70,"actor":"operator","reason":"NO-SHIP"}`)
+	if hold.Code != http.StatusOK {
+		t.Fatalf("hold status = %d; body=%s", hold.Code, hold.Body.String())
+	}
+	if len(gh.addLabelCalls) != 1 || gh.addLabelCalls[0] != (labelCall{issue: 7, label: "blocked"}) {
+		t.Fatalf("hold labels = %+v", gh.addLabelCalls)
+	}
+	loaded := loadStateAt(t, cfg.StateDir)
+	control, ok := loaded.MergeControlForPR(70)
+	if !ok || !control.Held || control.HoldReason != "NO-SHIP" {
+		t.Fatalf("merge control after hold = %+v", control)
+	}
+	if got := findSessionInfo(t, allSessionInfos(cfg, loaded), "slot-1").OperatorGateName; got != "label:blocked" {
+		t.Fatalf("projected operator gate = %q", got)
+	}
+
+	issue := github.Issue{Number: 7}
+	issue.Labels = append(issue.Labels, struct {
+		Name string `json:"name"`
+	}{Name: "blocked"})
+	gh.issue = issue
+	release := postAction(t, srv, `{"action_id":"release_merge","issue_number":7,"pr_number":70,"actor":"operator","reason":"review complete"}`)
+	if release.Code != http.StatusOK {
+		t.Fatalf("release status = %d; body=%s", release.Code, release.Body.String())
+	}
+	if len(gh.removeLabelCalls) != 1 || gh.removeLabelCalls[0] != (labelCall{issue: 7, label: "blocked"}) {
+		t.Fatalf("release labels = %+v", gh.removeLabelCalls)
+	}
+	loaded = loadStateAt(t, cfg.StateDir)
+	control, ok = loaded.MergeControlForPR(70)
+	if !ok || control.Held || control.LastResult != "released" {
+		t.Fatalf("merge control after release = %+v", control)
+	}
+	if got := findSessionInfo(t, allSessionInfos(cfg, loaded), "slot-1").OperatorGateName; got != "" {
+		t.Fatalf("projected operator gate after release = %q", got)
+	}
+	if len(audits) != 2 || !strings.Contains(audits[0], "hold_merge") || !strings.Contains(audits[1], "release_merge") {
+		t.Fatalf("audits = %v", audits)
 	}
 }
 

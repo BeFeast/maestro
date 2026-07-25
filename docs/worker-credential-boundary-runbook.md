@@ -4,14 +4,14 @@ Maestro workers use one service-level private environment file. Generated
 `*-run.sh` files contain only variable names and that file's path; no worker gets
 a per-slot secret copy. Immediately before starting a worker, Maestro opens the
 file without following symlinks, verifies ownership and mode, allow-lists the
-provider variables, removes stale values inherited from tmux, and injects the
+worker provider/GitHub variables, removes stale values inherited from tmux, and injects the
 current values only into the worker process environment. Combined worker output
 is redacted from that same in-memory snapshot before JSONL or log persistence.
 
 The production boundary is an operator-owned file named by
-`MAESTRO_WORKER_CREDENTIALS_FILE`. If any known provider value is present in the
+`MAESTRO_WORKER_CREDENTIALS_FILE`. If any known worker credential value is present in the
 daemon environment without that reference, worker spawn fails closed. A worker
-that uses CLI-native authentication and has no ambient provider values may run
+that uses CLI-native authentication and has no ambient worker credential values may run
 without the file. Maestro never creates a fallback, project-local, or per-slot
 credential copy.
 
@@ -22,9 +22,9 @@ credential copy.
   or stricter). Symlinks in the path are rejected.
 - Use simple `KEY=value` assignments. Single- or double-quoted values are
   accepted. Only `ANTHROPIC_BASE_URL`, `ANTHROPIC_API_KEY`,
-  `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`,
-  `OPENAI_BASE_URL`, and `OPENAI_API_KEY` are passed to a worker; unrelated
-  assignments are ignored.
+  `ANTHROPIC_AUTH_TOKEN`, `CLIPROXY_API_KEY`, `GEMINI_API_KEY`, `GH_TOKEN`,
+  `GITHUB_TOKEN`, `OPENAI_BASE_URL`, and `OPENAI_API_KEY` are passed to a
+  worker; unrelated assignments are ignored.
 - A secret manager must write/rotate the file directly. Never place a value in a
   shell argument, issue, PR, note, unit, journal message, or pasteback.
 
@@ -45,7 +45,7 @@ perform it while merely reviewing the code change.
    Environment=MAESTRO_WORKER_CREDENTIALS_FILE=%h/.config/maestro/private/worker-proxy.env
    ```
 
-3. In the same change, remove every provider token/key from literal
+3. In the same change, remove every worker provider/GitHub token or key from literal
    `Environment=` lines and from any other drop-in. Keep non-secret settings such
    as `PATH` unchanged.
 4. Let the single daemon's normal SIGTERM path drain active workers, then reload
@@ -91,6 +91,55 @@ and raw proxy payloads must not enter Maestro state, Fleet API responses, or
 Mission Control. A per-credential cooldown is not surfaced as a provider
 failure; the proxy keeps rotating until a compatible credential succeeds or it
 returns the aggregate `model_cooldown` result.
+
+A terminal HTTP 529 `overloaded_error` has no credential-pool aggregate and is
+therefore surfaced separately as `model_overloaded`. Maestro applies only a
+short provider/model route cooldown and does not claim that all credentials are
+exhausted; credential selection and session-affinity failover remain owned by
+CLIProxyAPI.
+
+## Per-worker process ownership (#920)
+
+Credential isolation and process ownership share the same runner boundary but
+solve different problems. Every new worker attempt now receives a unique,
+generation-specific transient systemd unit under `maestro-workers.slice` (a
+scope normally, or the same lease in service form when isolated scratch is enabled).
+The persisted session fields `process_lease_unit` and
+`process_lease_manager` are the cleanup receipt; PID and tmux identity remain
+observations only.
+
+- In the production topology, `maestro.service` is a system unit. Worker scopes
+  are therefore created through the system manager with non-interactive
+  `sudo systemd-run --scope --uid=<service-user>`. Production does not depend on
+  `systemd-run --user --scope`, which cannot migrate a child out of the system
+  service cgroup and was rejected during #877.
+- The runner, model CLI, direct tool subprocesses, double-forked children, and
+  processes reparented to PID 1 remain in the same cgroup. The shared tmux
+  server is not the kill boundary and is never targeted as a group.
+- Stop, timeout, respawn, phase transition, failed start, and restart cleanup
+  signal the exact worker scope with SIGTERM, wait two seconds, then SIGKILL
+  only survivors in that scope. The synchronous `systemd-run` pane then closes
+  naturally. If a same-name tmux session remains, Maestro retains the receipt
+  and fails closed instead of killing a pane whose cgroup ownership is unproven.
+- If the system manager is temporarily unavailable, Maestro retains the lease
+  fields and retries cleanup on the next reconciliation cycle. Worktree cleanup
+  and state compaction refuse to discard a session while that receipt remains.
+- Legacy sessions with no process lease retain the ancestry sweep for migration
+  compatibility only. All new launches fail closed if their scope cannot be
+  created.
+
+The service user needs narrowly-scoped non-interactive permission for the
+existing system-scope launch command and for `systemctl show/kill` of
+`maestro-worker-*.scope`. Apply that operator policy alongside the binary; do
+not grant a wildcard permission to stop `maestro.service`, the shared worker
+slice, or arbitrary units.
+
+The opt-in integration test
+`TestProcessLeaseIntegrationReparentedChildAndNeighborIsolation` launches two
+workers, reparents a `setsid` child, removes one tmux pane first, and proves
+exact-scope teardown removes that complete lease while the neighboring worker
+remains alive. Run it on the production-topology systemd host with
+`MAESTRO_SYSTEMD_INTEGRATION=1 go test ./internal/tmuxsession -run ProcessLeaseIntegration`.
 
 ## Rollback
 

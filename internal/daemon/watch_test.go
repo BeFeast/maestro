@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // fakeWatchStore is an in-memory store that satisfies both ConfigLoader (so it
@@ -224,17 +225,129 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 	<-done
 }
 
+// #884: a config-store write that changes only max_live_workers must reach the
+// already-running orchestrator loop within one watch interval. The same flow
+// must survive both an effective no-op write and the capacity reconfiguration:
+// cancelling it would stop every in-flight worker owned by that flow.
+func TestWatchStoreMaxLiveWorkersOnlyReconfiguresRunningOrchestrator(t *testing.T) {
+	store := newFakeWatchStore()
+	cfg := testConfig(t, "owner/alpha")
+	cfg.MaxParallel = 1
+	store.Set("alpha", cfg)
+
+	capacityState := state.NewState()
+	capacityState.Sessions["gate"] = &state.Session{Status: state.StatusPROpen}
+
+	var started, stopped, reloads int64
+	var availableSlots, separated int64
+	publishCapacity := func(current *config.Config) {
+		cap := capacityState.Capacity(state.CapacityInput{
+			MaxParallel:          current.MaxParallel,
+			MaxLiveWorkers:       current.MaxLiveWorkers,
+			MaxConcurrentByState: current.MaxConcurrentByState,
+		})
+		atomic.StoreInt64(&availableSlots, int64(cap.AvailableSlots))
+		if cap.Separated {
+			atomic.StoreInt64(&separated, 1)
+		} else {
+			atomic.StoreInt64(&separated, 0)
+		}
+	}
+	run := func(ctx context.Context, current *config.Config, opts Options, reloadCh <-chan *config.Config) {
+		atomic.AddInt64(&started, 1)
+		defer atomic.AddInt64(&stopped, 1)
+		publishCapacity(current)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case next := <-reloadCh:
+				if next == nil {
+					continue
+				}
+				publishCapacity(next)
+				atomic.AddInt64(&reloads, 1)
+			}
+		}
+	}
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+		<-ctx.Done()
+	}
+	d := newWatchDaemon(store, run, sup)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- d.Run(ctx) }()
+
+	waitForNames(t, d, "alpha")
+	waitFor(t, func() bool { return atomic.LoadInt64(&started) == 1 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&availableSlots) == 0 })
+	if got := atomic.LoadInt64(&separated); got != 0 {
+		t.Fatalf("initial separated = %d, want 0", got)
+	}
+	// Let the per-project watcher seed its initial fingerprint before advancing
+	// updated_at; otherwise an unusually slow goroutine start could absorb the
+	// first write into its baseline instead of emitting it.
+	time.Sleep(2 * d.opts.WatchStoreInterval)
+
+	// A timestamp-only/no-op store write still produces a reload event, but it
+	// must not replace or cancel the running flow.
+	noOp := *cfg
+	store.Set("alpha", &noOp)
+	waitFor(t, func() bool { return atomic.LoadInt64(&reloads) >= 1 })
+	if got := atomic.LoadInt64(&started); got != 1 {
+		t.Fatalf("run loops started after no-op reload = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&stopped); got != 0 {
+		t.Fatalf("run loops stopped after no-op reload = %d, want 0", got)
+	}
+
+	// Change only max_live_workers. With one PR gate and max_parallel=1, the
+	// legacy model has no slot; separated accounting must expose one immediately.
+	edited := noOp
+	edited.MaxLiveWorkers = 1
+	store.Set("alpha", &edited)
+	waitFor(t, func() bool {
+		return atomic.LoadInt64(&reloads) >= 2 &&
+			atomic.LoadInt64(&separated) == 1 &&
+			atomic.LoadInt64(&availableSlots) == 1
+	})
+	waitFor(t, func() bool { return fleetProjectLiveWorkerLimit(t, d, "alpha") == 1 })
+	if got := atomic.LoadInt64(&started); got != 1 {
+		t.Fatalf("run loops started after effective reload = %d, want 1", got)
+	}
+	if got := atomic.LoadInt64(&stopped); got != 0 {
+		t.Fatalf("run loops stopped after effective reload = %d, want 0", got)
+	}
+
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned error: %v", err)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Run did not return after cancellation")
+	}
+	if got := atomic.LoadInt64(&stopped); got != 1 {
+		t.Fatalf("run loops stopped after daemon shutdown = %d, want 1", got)
+	}
+}
+
 func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testing.T) {
 	base := testConfig(t, "owner/alpha")
 	base.MaxParallel = 1
+	base.MaxLiveWorkers = 1
 	flow := &projectFlow{name: "alpha", cfg: base, holder: newConfigHolder(base)}
 	watchCh := make(chan *config.Config, 1)
 	orchCh := make(chan *config.Config, 1)
 	stale := *base
 	stale.MaxParallel = 2
+	stale.MaxLiveWorkers = 2
 	orchCh <- &stale // orchestrator is mid-cycle; its one-slot queue is full
 	latest := *base
 	latest.MaxParallel = 9
+	latest.MaxLiveWorkers = 3
 	watchCh <- &latest
 	close(watchCh)
 
@@ -244,8 +357,14 @@ func TestReloadPumpCoalescesToLatestConfigWhenOrchestratorChannelIsFull(t *testi
 	if got.MaxParallel != 9 {
 		t.Fatalf("queued reload max_parallel = %d, want latest value 9", got.MaxParallel)
 	}
+	if got.MaxLiveWorkers != 3 {
+		t.Fatalf("queued reload max_live_workers = %d, want latest value 3", got.MaxLiveWorkers)
+	}
 	if held := flow.holder.Load().MaxParallel; held != 9 {
 		t.Fatalf("holder max_parallel = %d, want 9", held)
+	}
+	if held := flow.holder.Load().MaxLiveWorkers; held != 3 {
+		t.Fatalf("holder max_live_workers = %d, want 3", held)
 	}
 }
 
@@ -297,11 +416,14 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 	store := newFakeWatchStore()
 	cfg := testConfig(t, "owner/alpha")
 	cfg.MaxParallel = 1
+	cfg.MaxLiveWorkers = 1
 	store.Set("alpha", cfg)
 
 	// The supervise stub polls the holder via getCfg() and records the latest
-	// MaxParallel it observed, modelling the real loop reading config each cycle.
+	// MaxParallel/MaxLiveWorkers it observed, modelling the real loop reading
+	// config each cycle.
 	var seenMax int64
+	var seenLiveLimit int64
 	run := func(ctx context.Context, c *config.Config, opts Options, reloadCh <-chan *config.Config) {
 		<-ctx.Done()
 	}
@@ -309,7 +431,9 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 		tick := time.NewTicker(3 * time.Millisecond)
 		defer tick.Stop()
 		for {
-			atomic.StoreInt64(&seenMax, int64(getCfg().MaxParallel))
+			current := getCfg()
+			atomic.StoreInt64(&seenMax, int64(current.MaxParallel))
+			atomic.StoreInt64(&seenLiveLimit, int64(current.MaxLiveWorkers))
 			select {
 			case <-ctx.Done():
 				return
@@ -326,19 +450,26 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 
 	waitForNames(t, d, "alpha")
 	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 1 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenLiveLimit) == 1 })
 	if got := fleetProjectMaxParallel(t, d, "alpha"); got != 1 {
 		t.Fatalf("dashboard max_parallel = %d, want 1 at startup", got)
 	}
+	if got := fleetProjectLiveWorkerLimit(t, d, "alpha"); got != 1 {
+		t.Fatalf("dashboard live_worker_limit = %d, want 1 at startup", got)
+	}
 
-	// Live edit: same StateDir keeps the same flow; only MaxParallel changes.
+	// Live edit: same StateDir keeps the same flow; hot capacity fields change.
 	edited := *cfg
 	edited.MaxParallel = 7
+	edited.MaxLiveWorkers = 3
 	store.Set("alpha", &edited)
 
 	// The supervise loop observes the new config through the holder...
 	waitFor(t, func() bool { return atomic.LoadInt64(&seenMax) == 7 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&seenLiveLimit) == 3 })
 	// ...and the dashboard snapshot reflects it too — both without a restart.
 	waitFor(t, func() bool { return fleetProjectMaxParallel(t, d, "alpha") == 7 })
+	waitFor(t, func() bool { return fleetProjectLiveWorkerLimit(t, d, "alpha") == 3 })
 
 	// No new flow was started: the edit reloaded the existing one in place.
 	d.mu.Lock()
@@ -382,6 +513,34 @@ func fleetProjectMaxParallel(t *testing.T, d *Daemon, name string) int {
 	for _, p := range resp.Projects {
 		if p.Name == name {
 			return p.MaxParallel
+		}
+	}
+	return -1
+}
+
+// fleetProjectLiveWorkerLimit reads live_worker_limit for the named project
+// from the live /api/v1/fleet snapshot, or -1 when the project is absent.
+func fleetProjectLiveWorkerLimit(t *testing.T, d *Daemon, name string) int {
+	t.Helper()
+	fleet := waitForFleet(t, d)
+	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
+	rec := httptest.NewRecorder()
+	fleet.HandlerForTest().ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("GET /api/v1/fleet = %d, want 200", rec.Code)
+	}
+	var resp struct {
+		Projects []struct {
+			Name            string `json:"name"`
+			LiveWorkerLimit int    `json:"live_worker_limit"`
+		} `json:"projects"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode fleet response: %v", err)
+	}
+	for _, p := range resp.Projects {
+		if p.Name == name {
+			return p.LiveWorkerLimit
 		}
 	}
 	return -1

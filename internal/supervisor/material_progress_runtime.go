@@ -9,6 +9,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 // materialProgressConfigRefreshCap bounds how long a live config edit can take
@@ -50,16 +51,24 @@ func EvaluateMaterialProgressOnce(cfg *config.Config, now time.Time) (bool, erro
 	if st.MaterialProgress == nil && budget <= 0 {
 		return false, nil
 	}
-	if st.MaterialProgress != nil && !st.MaterialProgress.EvaluationDue(budget, interval, now) {
-		return false, nil
+	evaluated := false
+	if st.MaterialProgress == nil || st.MaterialProgress.EvaluationDue(budget, interval, now) {
+		if _, err := recordMaterialProgress(cfg, st, now); err != nil {
+			return false, fmt.Errorf("material-progress evaluator: evaluate: %w", err)
+		}
+		if err := state.Save(cfg.StateDir, st); err != nil {
+			return false, fmt.Errorf("material-progress evaluator: save state: %w", err)
+		}
+		evaluated = true
 	}
-	if _, err := recordMaterialProgress(cfg, st, now); err != nil {
-		return false, fmt.Errorf("material-progress evaluator: evaluate: %w", err)
+	// Recovery reconciliation runs even inside the evaluation cadence. A prior
+	// owner may have crashed after claiming/stopping but before scheduling the
+	// existing orchestrator retry; the durable lease expiry, not a fresh
+	// watermark evaluation, controls that takeover.
+	if err := reconcileMaterialProgressRecoveries(cfg, now, defaultMaterialProgressRecoveryRuntime); err != nil {
+		return evaluated, fmt.Errorf("material-progress evaluator: reconcile recovery: %w", err)
 	}
-	if err := state.Save(cfg.StateDir, st); err != nil {
-		return false, fmt.Errorf("material-progress evaluator: save state: %w", err)
-	}
-	return true, nil
+	return evaluated, nil
 }
 
 // RunMaterialProgressEvaluator runs the durable per-project evaluation clock.
@@ -90,6 +99,24 @@ func RunMaterialProgressEvaluator(ctx context.Context, name string, getCfg func(
 			// deadline.
 			if _, err := EvaluateMaterialProgressOnce(cfg, time.Now().UTC()); err != nil {
 				log.Printf("[%s] evaluation failed (will retry): %v", logPrefix, err)
+			}
+			if _, err := EvaluateOutcomeRecoveryOnce(cfg, time.Now().UTC()); err != nil {
+				log.Printf("[%s] outcome recovery evaluation failed (will retry): %v", logPrefix, err)
+			}
+			if _, err := EvaluateGateFailureStreaksOnce(cfg, time.Now().UTC()); err != nil {
+				log.Printf("[%s] gate-fail-streak evaluation failed (will retry): %v", logPrefix, err)
+			}
+			// #977: reap orphan container-client wrappers on the watchdog
+			// interval. A `docker run` verification wrapper whose owning worker
+			// died lingers parentless (PPID=1) after its named container exits;
+			// it is a zombie, not active work, and must not be counted as
+			// progress. Host-global and idempotent — a non-empty report is
+			// logged for operator evidence; liveSessions is nil because the
+			// parentless-wrapper + terminal-container signal already spares any
+			// genuinely active verification command.
+			if report := worker.ReapOrphanContainerWrappers(nil); !report.Empty() {
+				log.Printf("[%s] reaped orphan container-client wrappers: killed=%v removed_containers=%v",
+					logPrefix, report.KilledWrappers, report.RemovedContainers)
 			}
 		}
 		if wait <= 0 {

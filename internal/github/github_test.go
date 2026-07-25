@@ -214,6 +214,38 @@ func TestCIStatusFromREST(t *testing.T) {
 		{name: "cancelled check fails", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "cancelled"}}, want: "failure"},
 		{name: "success checks pass", checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}}, want: "success"},
 		{
+			name: "new success supersedes same-head failed attempt",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "success",
+		},
+		{
+			name: "new failure supersedes same-head successful attempt",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "failure",
+		},
+		{
+			name: "new pending rerun supersedes same-head failure",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:49:50Z"},
+				{ID: 20, Name: "agent-lint", Status: "in_progress", StartedAt: "2026-07-18T06:51:30Z"},
+			},
+			want: "pending",
+		},
+		{
+			name: "different failing check remains authoritative",
+			checks: []greptileCheckRun{
+				{ID: 10, Name: "agent-lint", Status: "completed", Conclusion: "success", StartedAt: "2026-07-18T06:51:30Z"},
+				{ID: 20, Name: "build", Status: "completed", Conclusion: "failure", StartedAt: "2026-07-18T06:50:12Z"},
+			},
+			want: "failure",
+		},
+		{
 			name:     "green checks with empty combined pending succeed",
 			checks:   []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
 			combined: combinedStatusResponse{State: "pending", Statuses: nil},
@@ -249,6 +281,50 @@ func TestCIStatusFromREST(t *testing.T) {
 				t.Fatalf("ciStatusFromREST() = %q, want %q", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestHasPendingCheckRuns(t *testing.T) {
+	tests := []struct {
+		name   string
+		checks []greptileCheckRun
+		want   bool
+	}{
+		{name: "none"},
+		{name: "queued", checks: []greptileCheckRun{{Status: "queued"}}, want: true},
+		{name: "in progress", checks: []greptileCheckRun{{Status: "in_progress"}}, want: true},
+		{name: "waiting", checks: []greptileCheckRun{{Status: "waiting"}}, want: true},
+		{name: "requested", checks: []greptileCheckRun{{Status: "requested"}}, want: true},
+		{name: "unknown nonterminal", checks: []greptileCheckRun{{Status: "pending"}}, want: true},
+		{name: "success", checks: []greptileCheckRun{{Status: "completed", Conclusion: "success"}}},
+		{name: "failure", checks: []greptileCheckRun{{Status: "completed", Conclusion: "failure"}}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := hasPendingCheckRuns(tt.checks); got != tt.want {
+				t.Fatalf("hasPendingCheckRuns() = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+func TestParseCheckRunsKeepsLatestAttemptPerAppAndName(t *testing.T) {
+	checks, err := parseCheckRuns([]byte(`{
+		"check_runs": [
+			{"id": 30, "name": "agent-lint", "status": "completed", "conclusion": "success", "started_at": "2026-07-18T06:51:30Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 10, "name": "agent-lint", "status": "completed", "conclusion": "failure", "started_at": "2026-07-18T06:49:50Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 20, "name": "build", "status": "completed", "conclusion": "success", "started_at": "2026-07-18T06:50:12Z", "app": {"id": 15368, "slug": "github-actions"}},
+			{"id": 40, "name": "agent-lint", "status": "completed", "conclusion": "failure", "started_at": "2026-07-18T06:52:00Z", "app": {"id": 999, "slug": "another-app"}}
+		]
+	}`))
+	if err != nil {
+		t.Fatalf("parseCheckRuns() error = %v", err)
+	}
+	if len(checks) != 3 {
+		t.Fatalf("len(checks) = %d, want 3 logical contexts: %#v", len(checks), checks)
+	}
+	if checks[0].ID != 30 || checks[0].Conclusion != "success" {
+		t.Fatalf("github-actions agent-lint = %#v, want latest success id 30", checks[0])
 	}
 }
 
@@ -330,6 +406,69 @@ func TestGreptileCheckDecision(t *testing.T) {
 			wantFound: true,
 		},
 		{
+			name: "three of five requires repair even on successful check",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "success",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 3/5"},
+			}},
+			wantFound: true,
+		},
+		{
+			name: "four of five passes even on generic failed conclusion",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "failure",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 4/5"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name: "unrelated fraction does not override failed conclusion",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "failure",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "4/5 tests passed; review findings remain"},
+			}},
+			wantFound: true,
+		},
+		{
+			name: "five of five passes",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "success",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "Confidence Score: 5/5"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
+			name: "explicit ok to merge passes",
+			checks: []greptileCheckRun{{
+				Name: "Greptile Review", Status: "completed", Conclusion: "failure",
+				Output: struct {
+					Title   string `json:"title"`
+					Summary string `json:"summary"`
+					Text    string `json:"text"`
+				}{Summary: "OK to merge"},
+			}},
+			wantFound:   true,
+			wantApprove: true,
+		},
+		{
 			name:   "non-greptile is ignored",
 			checks: []greptileCheckRun{{Name: "CI", Conclusion: "success"}},
 		},
@@ -343,6 +482,77 @@ func TestGreptileCheckDecision(t *testing.T) {
 					gotFound, gotApprove, gotPending, tt.wantFound, tt.wantApprove, tt.wantPending)
 			}
 		})
+	}
+}
+
+func TestGreptileCommentDecisionIgnoresHumanMentionsAndUsesLatestBotVerdict(t *testing.T) {
+	comment := func(login, body string) issueComment {
+		var got issueComment
+		got.User.Login = login
+		got.Body = body
+		return got
+	}
+
+	found, approved := greptileCommentDecision([]issueComment{
+		comment("kossoy", "Please run @greptile review on the new exact head"),
+		comment("operator", "Greptile is still pending"),
+	})
+	if found || approved {
+		t.Fatalf("human Greptile mentions = (%t,%t), want no verdict", found, approved)
+	}
+
+	found, approved = greptileCommentDecision([]issueComment{
+		comment("greptile-app[bot]", "Not safe to merge"),
+		comment("kossoy", "@greptile review"),
+		comment("greptile-app[bot]", "Confidence Score: 4/5 — safe to merge"),
+	})
+	if !found || !approved {
+		t.Fatalf("latest Greptile bot verdict = (%t,%t), want approved", found, approved)
+	}
+
+	found, approved = greptileCommentDecision([]issueComment{
+		comment("greptile-app[bot]", "Confidence Score: 3/5\n**OK to merge**"),
+	})
+	if !found || !approved {
+		t.Fatalf("explicit OK to merge verdict = (%t,%t), want approved", found, approved)
+	}
+}
+
+func TestGreptileReviewSignalCarriesScoreAndVerdict(t *testing.T) {
+	for _, tt := range []struct {
+		text        string
+		wantScore   int
+		wantMax     int
+		wantPassed  bool
+		wantVerdict string
+	}{
+		{text: "Confidence Score: 3/5", wantScore: 3, wantMax: 5, wantVerdict: reviewVerdictRepairRequired},
+		{text: "Confidence Score: 4/5", wantScore: 4, wantMax: 5, wantPassed: true, wantVerdict: reviewVerdictPassed},
+		{text: "Confidence Score: 5/5", wantScore: 5, wantMax: 5, wantPassed: true, wantVerdict: reviewVerdictPassed},
+		{text: "3/5 — OK to merge", wantPassed: true, wantVerdict: reviewVerdictOKToMerge},
+		{text: "Confidence 3/5 — not OK to merge", wantScore: 3, wantMax: 5, wantVerdict: reviewVerdictRepairRequired},
+		{text: "Confidence Score: 4/5 — not yet OK to merge", wantScore: 4, wantMax: 5, wantVerdict: reviewVerdictRepairRequired},
+		{text: "Confidence Score: 4/5 — not currently okay to merge", wantScore: 4, wantMax: 5, wantVerdict: reviewVerdictRepairRequired},
+		{text: "Previously OK to merge; after the latest review it is not yet safe to merge", wantVerdict: reviewVerdictRepairRequired},
+		{text: "Previously not safe to merge; the latest review is OK to merge", wantPassed: true, wantVerdict: reviewVerdictOKToMerge},
+	} {
+		got := greptileSignalFromText(tt.text)
+		if got.Score != tt.wantScore || got.ScoreMax != tt.wantMax || got.Passed != tt.wantPassed || got.Verdict != tt.wantVerdict {
+			t.Fatalf("greptileSignalFromText(%q) = %+v", tt.text, got)
+		}
+	}
+}
+
+func TestGreptileReviewSignalIgnoresUnrelatedFractions(t *testing.T) {
+	for _, text := range []string{
+		"4/5 tests passed",
+		"4/5 findings remain",
+		"Rubric result: 5/5 for documentation quality",
+	} {
+		got := greptileSignalFromText(text)
+		if got.Observed || got.Score != 0 || got.ScoreMax != 0 || got.Passed {
+			t.Fatalf("greptileSignalFromText(%q) = %+v, want no review verdict", text, got)
+		}
 	}
 }
 

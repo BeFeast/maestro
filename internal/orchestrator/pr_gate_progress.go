@@ -47,6 +47,33 @@ func normalizePRGateCIVerdict(value string) state.PRGateCIVerdict {
 	}
 }
 
+// observePRGateCI reads the exact current PR head/check rollup and applies the
+// narrow mergeable-state compatibility rule used by the merge flow. It does
+// not mutate state: callers may enrich the returned transition with review
+// evidence before persisting it, or persist the CI-only observation when a
+// separate merge precondition (such as attribution) is safely deferred.
+func (o *Orchestrator) observePRGateCI(sess *state.Session, pr github.PR) (github.PRCheckRollup, string, state.PRGateTransition, bool, time.Time, error) {
+	ciRollup, err := o.prCheckRollup(pr.Number)
+	if err != nil {
+		return github.PRCheckRollup{}, "", state.PRGateTransition{}, false, time.Time{}, err
+	}
+	ciStatus := ciRollup.Verdict
+
+	// #424: an aggregate can remain pending after every required check is green.
+	// Only GitHub's clean mergeable state may override it; unstable can coexist
+	// with explicitly failed checks and therefore remains pending/failing.
+	if ciStatus == "pending" {
+		if mergeable, mergeState, mergeErr := o.prMergeStatus(pr.Number); mergeErr == nil && mergeable == "MERGEABLE" && mergeState == "clean" {
+			log.Printf("[orch] PR #%d (%s) aggregate CI=pending but mergeable_state=%s — treating as success (#424)", pr.Number, sess.Branch, mergeState)
+			ciStatus = "success"
+		}
+	}
+
+	log.Printf("[orch] PR #%d (%s) CI=%s", pr.Number, sess.Branch, ciStatus)
+	transition, observable := o.prGateTransitionForCI(sess, pr, ciRollup, ciStatus)
+	return ciRollup, ciStatus, transition, observable, time.Now().UTC(), nil
+}
+
 func (o *Orchestrator) persistPRGateTransition(s *state.State, transition state.PRGateTransition, now time.Time) {
 	if s == nil || strings.TrimSpace(transition.HeadSHA) == "" {
 		return
@@ -75,7 +102,7 @@ func (o *Orchestrator) prGateHeadMatches(prNumber int, expected string) bool {
 	return true
 }
 
-func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewDecision, string, string, int) {
+func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewDecision, string, string, int, []state.PRGateReviewStream) {
 	decision := state.PRGateReviewBlocked
 	switch {
 	case verdict.Pending:
@@ -85,6 +112,7 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 	}
 
 	streamParts := make([]string, 0, len(verdict.Streams))
+	streamFacts := make([]state.PRGateReviewStream, 0, len(verdict.Streams))
 	findingDigests := make([]string, 0)
 	for _, stream := range verdict.Streams {
 		perStreamFindings := make([]string, 0, len(stream.Findings))
@@ -99,13 +127,25 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 			findingDigests = append(findingDigests, digest)
 		}
 		sort.Strings(perStreamFindings)
+		streamFacts = append(streamFacts, state.PRGateReviewStream{
+			Name:          strings.TrimSpace(stream.Name),
+			Passed:        stream.Passed,
+			Pending:       stream.Pending,
+			Score:         stream.Score,
+			ScoreMax:      stream.ScoreMax,
+			Verdict:       state.PRGateReviewVerdict(stream.Verdict),
+			FindingsCount: len(stream.Findings),
+		})
 		streamParts = append(streamParts, prGateOpaqueFingerprint(
 			"stream="+strings.TrimSpace(stream.Name),
 			fmt.Sprintf("passed=%t", stream.Passed),
 			fmt.Sprintf("pending=%t", stream.Pending),
+			fmt.Sprintf("score=%d/%d", stream.Score, stream.ScoreMax),
+			"verdict="+strings.TrimSpace(stream.Verdict),
 			"findings="+strings.Join(perStreamFindings, ","),
 		))
 	}
+	sort.Slice(streamFacts, func(i, j int) bool { return streamFacts[i].Name < streamFacts[j].Name })
 	sort.Strings(streamParts)
 	sort.Strings(findingDigests)
 	verdictFingerprint := prGateOpaqueFingerprint(
@@ -116,16 +156,17 @@ func prGateReviewProgress(verdict github.ReviewGateVerdict) (state.PRGateReviewD
 	if len(findingDigests) > 0 {
 		findingFingerprint = prGateOpaqueFingerprint("findings=" + strings.Join(findingDigests, ","))
 	}
-	return decision, verdictFingerprint, findingFingerprint, len(findingDigests)
+	return decision, verdictFingerprint, findingFingerprint, len(findingDigests), streamFacts
 }
 
 func addPRGateReviewVerdict(transition *state.PRGateTransition, verdict github.ReviewGateVerdict) {
 	if transition == nil {
 		return
 	}
-	decision, verdictFingerprint, findingsFingerprint, findingsCount := prGateReviewProgress(verdict)
+	decision, verdictFingerprint, findingsFingerprint, findingsCount, streams := prGateReviewProgress(verdict)
 	transition.ReviewObserved = true
 	transition.ReviewDecision = decision
+	transition.ReviewStreams = streams
 	transition.ReviewVerdictFingerprint = verdictFingerprint
 	transition.ActionableFindingsFingerprint = findingsFingerprint
 	transition.ActionableFindingsCount = findingsCount

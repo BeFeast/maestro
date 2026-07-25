@@ -1,9 +1,13 @@
 package config
 
 import (
+	"encoding/json"
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Fleet-controllable settings: the cost/LLM control knobs (#839) that an
@@ -27,18 +31,23 @@ const (
 	SettingKindBool   = "bool"
 	SettingKindInt    = "int"
 	SettingKindString = "string"
+	SettingKindJSON   = "json"
 )
 
 // FleetSettingSpec describes one fleet-controllable knob: its dotted key (the
 // CLI / audit identifier), the path to it in a project YAML document (used by
 // the config store to detect a per-project override and to inject a fleet
 // default), its value kind (validation + scalar tag), and an accessor that
-// returns the resolved value as a display string.
+// returns the resolved value as a display string. FleetOnly specs live solely
+// in the settings table: they have no YAMLPath or project Config accessor, and
+// their registered Default is used when the fleet row is absent.
 type FleetSettingSpec struct {
-	Key      string
-	YAMLPath []string
-	Kind     string
-	Value    func(*Config) string
+	Key       string
+	YAMLPath  []string
+	Kind      string
+	FleetOnly bool
+	Default   string
+	Value     func(*Config) string
 }
 
 // FleetSettingSpecs returns the ordered registry of fleet-controllable settings.
@@ -47,6 +56,15 @@ type FleetSettingSpec struct {
 // wiring required.
 func FleetSettingSpecs() []FleetSettingSpec {
 	return []FleetSettingSpec{
+		{
+			Key:      "model.provider_lanes",
+			YAMLPath: []string{"model", "provider_lanes"},
+			Kind:     SettingKindJSON,
+			Value: func(c *Config) string {
+				out, _ := json.Marshal(c.Model.ProviderLanes)
+				return string(out)
+			},
+		},
 		{
 			Key:      "supervisor.enabled",
 			YAMLPath: []string{"supervisor", "enabled"},
@@ -84,6 +102,22 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			Value:    func(c *Config) string { return strconv.FormatBool(c.Supervisor.AlwaysConsultLLM) },
 		},
 		{
+			Key:      "supervisor.unchanged_decision_window_seconds",
+			YAMLPath: []string{"supervisor", "unchanged_decision_window_seconds"},
+			Kind:     SettingKindInt,
+			Value: func(c *Config) string {
+				return strconv.FormatInt(int64(c.Supervisor.EffectiveUnchangedDecisionWindow()/time.Second), 10)
+			},
+		},
+		{
+			Key:      "supervisor.recommendation_ttl_seconds",
+			YAMLPath: []string{"supervisor", "recommendation_ttl_seconds"},
+			Kind:     SettingKindInt,
+			Value: func(c *Config) string {
+				return strconv.FormatInt(int64(c.Supervisor.EffectiveRecommendationTTL()/time.Second), 10)
+			},
+		},
+		{
 			Key:      "supervisor.spec_groom.enabled",
 			YAMLPath: []string{"supervisor", "spec_groom", "enabled"},
 			Kind:     SettingKindBool,
@@ -106,6 +140,18 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			YAMLPath: []string{"worker_max_tokens"},
 			Kind:     SettingKindInt,
 			Value:    func(c *Config) string { return strconv.Itoa(c.WorkerMaxTokens) },
+		},
+		{
+			Key:       FleetMinLiveWorkersKey,
+			Kind:      SettingKindInt,
+			FleetOnly: true,
+			Default:   strconv.Itoa(DefaultFleetMinLiveWorkers),
+		},
+		{
+			Key:       FleetMaxLiveWorkersKey,
+			Kind:      SettingKindInt,
+			FleetOnly: true,
+			Default:   strconv.Itoa(DefaultFleetMaxLiveWorkers),
 		},
 		{
 			Key:      "stalled_progress_watchdog.enabled",
@@ -171,8 +217,106 @@ func NormalizeSettingValue(key, value string) (string, error) {
 		if err != nil {
 			return "", fmt.Errorf("setting %q wants an integer, got %q", key, value)
 		}
+		if spec.FleetOnly && n < 0 {
+			return "", fmt.Errorf("setting %q wants a non-negative integer, got %q", key, value)
+		}
 		return strconv.Itoa(n), nil
+	case SettingKindJSON:
+		var lanes []ProviderLane
+		if err := yaml.Unmarshal([]byte(v), &lanes); err != nil {
+			return "", fmt.Errorf("setting %q wants a provider-lane JSON/YAML array, got %q: %v", key, value, err)
+		}
+		seenProviders := map[string]bool{}
+		seenBackends := map[string]bool{}
+		for i := range lanes {
+			lanes[i].Provider = strings.ToLower(strings.TrimSpace(lanes[i].Provider))
+			lanes[i].Default = strings.TrimSpace(lanes[i].Default)
+			if lanes[i].Provider == "" || lanes[i].Default == "" {
+				return "", fmt.Errorf("setting %q lane %d requires provider and default", key, i)
+			}
+			if seenProviders[lanes[i].Provider] {
+				return "", fmt.Errorf("setting %q repeats provider %q", key, lanes[i].Provider)
+			}
+			seenProviders[lanes[i].Provider] = true
+			entries := append([]string{lanes[i].Default}, lanes[i].FallbackBackends...)
+			for j, raw := range entries {
+				name := strings.TrimSpace(raw)
+				if j > 0 {
+					lanes[i].FallbackBackends[j-1] = name
+				}
+				if name == "" || seenBackends[name] {
+					return "", fmt.Errorf("setting %q contains an empty or duplicate backend %q", key, name)
+				}
+				seenBackends[name] = true
+			}
+		}
+		out, err := json.Marshal(lanes)
+		if err != nil {
+			return "", err
+		}
+		return string(out), nil
 	default:
 		return v, nil
 	}
+}
+
+const (
+	FleetMinLiveWorkersKey = "fleet.min_live_workers"
+	FleetMaxLiveWorkersKey = "fleet.max_live_workers"
+
+	DefaultFleetMinLiveWorkers = 5
+	DefaultFleetMaxLiveWorkers = 10
+)
+
+// FleetConcurrencySettings is the daemon-wide live-worker band. The minimum is
+// a soft operating target; the maximum is a hard spawn ceiling shared by every
+// project flow. A stored zero disables that side of the band.
+type FleetConcurrencySettings struct {
+	MinLiveWorkers int
+	MaxLiveWorkers int
+}
+
+// ResolveFleetConcurrencySettings applies built-in defaults to missing keys and
+// validates the stored fleet-only values. Settings writes already normalize
+// values, but this read-side validation keeps the daemon fail-closed if the DB
+// was edited out of band.
+func ResolveFleetConcurrencySettings(settings map[string]string) (FleetConcurrencySettings, error) {
+	resolved := FleetConcurrencySettings{
+		MinLiveWorkers: DefaultFleetMinLiveWorkers,
+		MaxLiveWorkers: DefaultFleetMaxLiveWorkers,
+	}
+	for key, target := range map[string]*int{
+		FleetMinLiveWorkersKey: &resolved.MinLiveWorkers,
+		FleetMaxLiveWorkersKey: &resolved.MaxLiveWorkers,
+	} {
+		raw, ok := settings[key]
+		if !ok {
+			continue
+		}
+		norm, err := NormalizeSettingValue(key, raw)
+		if err != nil {
+			return FleetConcurrencySettings{}, err
+		}
+		n, err := strconv.Atoi(norm)
+		if err != nil {
+			return FleetConcurrencySettings{}, err
+		}
+		*target = n
+	}
+	if resolved.MinLiveWorkers > 0 && resolved.MaxLiveWorkers > 0 && resolved.MinLiveWorkers > resolved.MaxLiveWorkers {
+		return FleetConcurrencySettings{}, fmt.Errorf("%s (%d) cannot exceed %s (%d)", FleetMinLiveWorkersKey, resolved.MinLiveWorkers, FleetMaxLiveWorkersKey, resolved.MaxLiveWorkers)
+	}
+	return resolved, nil
+}
+
+// FleetSettingDisplayValue returns a stored fleet setting or its built-in
+// fleet-only default. The boolean reports whether the value came from the DB.
+func FleetSettingDisplayValue(spec FleetSettingSpec, settings map[string]string) (string, bool) {
+	if value, ok := settings[spec.Key]; ok {
+		return value, true
+	}
+	if spec.FleetOnly {
+		return spec.Default, false
+	}
+	return "", false
 }

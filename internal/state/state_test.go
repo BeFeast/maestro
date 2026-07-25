@@ -117,6 +117,27 @@ func TestDonePRCount(t *testing.T) {
 	}
 }
 
+func TestIssueDone_RequiresForgeClose(t *testing.T) {
+	s := NewState()
+	closedAt := time.Now().UTC()
+	s.Sessions["hist"] = &Session{IssueNumber: 406, Status: StatusDone, WorkerOutcome: "duplicate_dispatch_reconciled"}
+	if s.IssueDone(406) {
+		t.Fatal("historical done without IssueClosedAt must not starve ready redispatch")
+	}
+	s.Sessions["merged-open"] = &Session{IssueNumber: 439, Status: StatusDone, PRNumber: 560, FinishedAt: &closedAt}
+	if s.IssueDone(439) {
+		t.Fatal("done+PR with open forge issue must not report IssueDone (terminal_reconcile owns the lease)")
+	}
+	s.Sessions["closed"] = &Session{IssueNumber: 99, Status: StatusDone, IssueClosedAt: &closedAt}
+	if !s.IssueDone(99) {
+		t.Fatal("forge-closed done session must report IssueDone")
+	}
+	s.Sessions["closed"].ReleasedForRedispatch = true
+	if s.IssueDone(99) {
+		t.Fatal("released session must not report IssueDone")
+	}
+}
+
 func TestProjectStatusSynced(t *testing.T) {
 	s := NewState()
 	if s.ProjectStatusSynced(42, "in_progress") {
@@ -360,6 +381,107 @@ func TestBackendHealthMergeKeepsLatest(t *testing.T) {
 	}
 	if got := merged.BackendHealth["claude"]; got.State != BackendHealthAvailable || got.Reason != "manual_clear" {
 		t.Fatalf("merged claude health = %+v, want latest ours value", got)
+	}
+}
+
+func TestStateMergePreservesNewestSupervisorHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	base.SupervisorStuck = true
+	base.SupervisorStuckReason = "old pulse"
+	current := cloneState(base)
+	current.Sessions["other-writer"] = &Session{IssueNumber: 1, Status: StatusRunning}
+	ours := cloneState(base)
+	ours.LastRunOnceAt = time.Date(2026, 7, 17, 10, 44, 0, 0, time.UTC)
+	ours.SupervisorStuck = false
+	ours.SupervisorStuckReason = ""
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.LastRunOnceAt.Equal(ours.LastRunOnceAt) {
+		t.Fatalf("last_run_once_at = %s, want %s", merged.LastRunOnceAt, ours.LastRunOnceAt)
+	}
+	if merged.SupervisorStuck || merged.SupervisorStuckReason != "" {
+		t.Fatalf("new heartbeat did not clear stale verdict: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
+func TestStateMergePreservesWatchdogStuckAtSameHeartbeat(t *testing.T) {
+	base := NewState()
+	base.LastRunOnceAt = time.Date(2026, 7, 17, 10, 16, 0, 0, time.UTC)
+	current := cloneState(base)
+	current.SupervisorStuck = true
+	current.SupervisorStuckReason = "15-minute threshold exceeded"
+	ours := cloneState(base)
+	ours.BackendHealth["claude"] = BackendHealth{State: BackendHealthAvailable, Since: time.Now().UTC()}
+
+	merged, err := mergeStateSnapshots(base, current, ours)
+	if err != nil {
+		t.Fatalf("merge: %v", err)
+	}
+	if !merged.SupervisorStuck || merged.SupervisorStuckReason != current.SupervisorStuckReason {
+		t.Fatalf("watchdog verdict lost: stuck=%v reason=%q", merged.SupervisorStuck, merged.SupervisorStuckReason)
+	}
+}
+
+func TestSaveConcurrentWatchdogSecondWriteDoesNotRegressSupervisorHeartbeat(t *testing.T) {
+	dir := t.TempDir()
+	oldPulse := time.Date(2026, 7, 17, 11, 53, 50, 0, time.UTC)
+	newPulse := time.Date(2026, 7, 17, 12, 0, 2, 0, time.UTC)
+
+	seed := NewState()
+	seed.LastRunOnceAt = oldPulse
+	seed.SupervisorStuck = true
+	seed.SupervisorStuckReason = "old pulse exceeded threshold"
+	if err := Save(dir, seed); err != nil {
+		t.Fatalf("seed save: %v", err)
+	}
+
+	// The supervisor and the independently scheduled material-progress
+	// evaluator both retain snapshots loaded from the same old file.
+	supervisorState, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load supervisor state: %v", err)
+	}
+	watchdogState, err := Load(dir)
+	if err != nil {
+		t.Fatalf("load watchdog state: %v", err)
+	}
+
+	supervisorState.LastRunOnceAt = newPulse
+	supervisorState.SupervisorStuck = false
+	supervisorState.SupervisorStuckReason = ""
+	if err := Save(dir, supervisorState); err != nil {
+		t.Fatalf("supervisor save: %v", err)
+	}
+
+	// First watchdog save conflicts and three-way-merges with the newer pulse.
+	// copyFrom must update its long-lived in-memory snapshot as well as disk.
+	watchdogState.MaterialProgress = &MaterialProgress{LastEvaluatedAt: newPulse.Add(time.Second)}
+	if err := Save(dir, watchdogState); err != nil {
+		t.Fatalf("first watchdog save: %v", err)
+	}
+	if !watchdogState.LastRunOnceAt.Equal(newPulse) || watchdogState.SupervisorStuck || watchdogState.SupervisorStuckReason != "" {
+		t.Fatalf("watchdog snapshot kept stale heartbeat tuple after merge: pulse=%s stuck=%v reason=%q",
+			watchdogState.LastRunOnceAt, watchdogState.SupervisorStuck, watchdogState.SupervisorStuckReason)
+	}
+
+	// The next evaluator save is non-conflicting because rememberLoaded carries
+	// the merged file hash. Before #929, this exact save wrote the stale pulse
+	// back to disk even though the preceding merge had selected newPulse.
+	watchdogState.MaterialProgress.LastEvaluatedAt = newPulse.Add(2 * time.Second)
+	if err := Save(dir, watchdogState); err != nil {
+		t.Fatalf("second watchdog save: %v", err)
+	}
+	got, err := Load(dir)
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	if !got.LastRunOnceAt.Equal(newPulse) || got.SupervisorStuck || got.SupervisorStuckReason != "" {
+		t.Fatalf("second watchdog save regressed heartbeat tuple: pulse=%s stuck=%v reason=%q",
+			got.LastRunOnceAt, got.SupervisorStuck, got.SupervisorStuckReason)
 	}
 }
 
@@ -832,6 +954,15 @@ func TestIssueInProgress_CodeLandedCountsAsInProgress(t *testing.T) {
 	}
 }
 
+func TestIssueInProgress_OperatorGateCountsAsInProgress(t *testing.T) {
+	s := NewState()
+	s.Sessions["slot-1"] = &Session{IssueNumber: 102, Status: StatusDead, OperatorGateName: "label:operator-decision"}
+
+	if !s.IssueInProgress(102) {
+		t.Error("IssueInProgress should return true for operator-gated session")
+	}
+}
+
 func containsString(s, substr string) bool {
 	return len(s) >= len(substr) && searchString(s, substr)
 }
@@ -1004,6 +1135,10 @@ func TestFailedAttemptsForIssue(t *testing.T) {
 	s.Sessions["slot-7"] = &Session{IssueNumber: 42, Status: StatusRunning, PRNumber: 0, StartedAt: now}  // running — not counted
 	s.Sessions["slot-8"] = &Session{IssueNumber: 42, Status: StatusConflictFailed, PRNumber: 0}           // conflict — not counted
 	s.Sessions["slot-9"] = &Session{IssueNumber: 42, Status: StatusDead, PRNumber: 0, RateLimitHit: true} // rate-limited — not counted (#466)
+	s.Sessions["slot-10"] = &Session{
+		IssueNumber: 42, Status: StatusFailed, PRNumber: 0,
+		WorkerOutcome: string(DisplayTokenBudgetExceeded),
+	} // budget stop — not counted
 
 	if got := s.FailedAttemptsForIssue(42); got != 3 {
 		t.Errorf("FailedAttemptsForIssue(42) = %d, want 3", got)
@@ -1201,19 +1336,89 @@ func TestSessionDisplayStatusFor_StaleReviewRetryWorkerStaysRunning(t *testing.T
 	}
 }
 
+func TestSessionIssueGuardRetryHoldIsVisibleButNotActionableFailure(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	retryAt := now.Add(time.Minute)
+	sess := &Session{
+		IssueNumber:     406,
+		Status:          StatusDead,
+		StartedAt:       now.Add(-time.Hour),
+		NextRetryAt:     &retryAt,
+		RetryHoldReason: "issue #406 has a current excluded label",
+	}
+
+	if got := SessionDisplayStatusForAt(sess, nil, now); got != string(DisplayWaitingForIssueGuard) {
+		t.Fatalf("display = %q, want %q", got, DisplayWaitingForIssueGuard)
+	}
+	attention := SessionAttentionForAt(sess, nil, now)
+	if attention.NeedsAttention {
+		t.Fatalf("guarded retry must not need operator attention: %+v", attention)
+	}
+	if !containsString(attention.Reason, "dispatch guard") || !containsString(attention.NextAction, "same canonical session") {
+		t.Fatalf("guarded retry explanation = %+v, want truthful automatic-resume copy", attention)
+	}
+	if !SessionLiveAt(sess, now) {
+		t.Fatal("guarded retry must remain visible as a live canonical lease")
+	}
+}
+
 func TestSessionTokenBudgetExceededAttentionAndDisplay(t *testing.T) {
 	sess := &Session{
-		Status:            StatusFailed,
-		WorkerOutcome:     string(DisplayTokenBudgetExceeded),
-		TokensUsedAttempt: 85_000,
+		Status:                   StatusFailed,
+		WorkerOutcome:            string(DisplayTokenBudgetExceeded),
+		TokensUsedAttempt:        200_506,
+		TokenBudgetTokensAttempt: 77_030,
+		TokenBudgetMeasure:       "uncached_tokens",
 	}
 	if got := SessionDisplayStatusFor(sess, nil); got != string(DisplayTokenBudgetExceeded) {
 		t.Fatalf("display = %q, want %q", got, DisplayTokenBudgetExceeded)
 	}
 	attention := SessionAttentionFor(sess, nil)
-	if !attention.NeedsAttention || !containsString(attention.Reason, "token budget") || !containsString(attention.NextAction, "worker_max_tokens") {
+	if !attention.NeedsAttention || !containsString(attention.Reason, "token budget") || !containsString(attention.Reason, "77030 uncached_tokens") || containsString(attention.Reason, "200506") || !containsString(attention.NextAction, "worker_max_tokens") {
 		t.Fatalf("attention = %+v, want deterministic budget guidance", attention)
 	}
+}
+
+func TestSessionRepeatedUnexpectedExitAttentionAndDisplay(t *testing.T) {
+	sess := &Session{
+		Status:                StatusFailed,
+		WorkerOutcome:         WorkerOutcomeRepeatedUnexpectedExit,
+		RetryCount:            2,
+		UnexpectedExitRetries: 1,
+	}
+	if got := SessionDisplayStatusFor(sess, nil); got != string(DisplayRepeatedUnexpectedExit) {
+		t.Fatalf("display = %q, want %q", got, DisplayRepeatedUnexpectedExit)
+	}
+	attention := SessionAttentionFor(sess, nil)
+	if !attention.NeedsAttention || !containsString(attention.Reason, "zombie respawn loop") || !containsString(attention.NextAction, "restart intentionally") {
+		t.Fatalf("attention = %+v, want repeated-exit terminal guidance", attention)
+	}
+}
+
+func TestPrepareWorkerForOperatorRestartClearsTerminalLatch(t *testing.T) {
+	retryAt := time.Now().UTC()
+	sess := &Session{
+		Status:                StatusFailed,
+		WorkerOutcome:         WorkerOutcomeRepeatedUnexpectedExit,
+		LastNotifiedStatus:    WorkerOutcomeRepeatedUnexpectedExit,
+		RetryHoldReason:       "old hold",
+		RetryReason:           RetryReasonStalledProgress,
+		UnexpectedExitRetries: 1,
+		NextRetryAt:           &retryAt,
+	}
+
+	PrepareWorkerForOperatorRestart(sess)
+
+	if sess.WorkerOutcome != "" || sess.LastNotifiedStatus != "" || sess.RetryHoldReason != "" || sess.UnexpectedExitRetries != 0 {
+		t.Fatalf("terminal latch survived operator restart preparation: %+v", sess)
+	}
+	if sess.RetryReason != RetryReasonOperatorRestart {
+		t.Fatalf("retry reason = %q, want %q", sess.RetryReason, RetryReasonOperatorRestart)
+	}
+	if sess.Status != StatusFailed || sess.NextRetryAt != &retryAt {
+		t.Fatal("operator restart preparation must not own status or retry timing")
+	}
+	PrepareWorkerForOperatorRestart(nil)
 }
 
 func TestSessionDisplayStatusFor_BackendRateLimited(t *testing.T) {
@@ -1714,6 +1919,190 @@ func TestRecordSupervisorDecisionPrunesOldRecords(t *testing.T) {
 	latest := s.LatestSupervisorDecision()
 	if latest == nil || latest.ID != "sup-4" {
 		t.Fatalf("latest = %#v, want sup-4", latest)
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyCoalescesAndRollsUp(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-first",
+		CreatedAt:         base,
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100, Session: "slot-1"},
+		PolicyRule:        "runtime_state",
+		Summary:           "Monitor PR #1100 for issue #1022: CI status=pending",
+	}
+
+	first := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	if first.JournalEvent != SupervisorJournalInitial || first.SeenCount != 1 {
+		t.Fatalf("first observation = %+v, want initial/count=1", first)
+	}
+	second := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(5*time.Minute))
+	if second.JournalEvent != SupervisorJournalSuppressed || second.SeenCount != 2 {
+		t.Fatalf("second observation = %+v, want suppressed/count=2", second)
+	}
+	third := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(time.Hour))
+	if third.JournalEvent != SupervisorJournalRollup || third.SeenCount != 3 {
+		t.Fatalf("third observation = %+v, want rollup/count=3", third)
+	}
+	if len(s.SupervisorDecisions) != 1 {
+		t.Fatalf("decision episodes = %d, want 1", len(s.SupervisorDecisions))
+	}
+	latest := s.LatestSupervisorDecision()
+	if latest == nil || !latest.FirstSeenAt.Equal(base) || !latest.LastSeenAt.Equal(base.Add(time.Hour)) {
+		t.Fatalf("latest first/last = %+v", latest)
+	}
+	if latest.ID != "sup-first" || latest.RecommendationID == "" {
+		t.Fatalf("stable episode identity = id:%q recommendation:%q", latest.ID, latest.RecommendationID)
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyDropsExpiredRecommendation(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-expiring",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Monitor unchanged blocked PR",
+	}
+	s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+
+	expired := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(24*time.Hour))
+	if expired.JournalEvent != SupervisorJournalDisposition {
+		t.Fatalf("journal event = %q, want disposition", expired.JournalEvent)
+	}
+	if expired.Disposition == nil || expired.Disposition.Status != RecommendationDispositionDropped || expired.Disposition.Reason != RecommendationDispositionTTLExpired {
+		t.Fatalf("disposition = %+v, want dropped/ttl", expired.Disposition)
+	}
+	if !s.SupervisorRecommendationDropped(decision) {
+		t.Fatal("expired recommendation was not fenced from later actuation")
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyReturningIdentityStartsFreshEpisode(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	a := SupervisorDecision{
+		ID:                "sup-a-first",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Monitor PR #1100",
+	}
+	b := SupervisorDecision{
+		ID:                "sup-b",
+		RecommendedAction: "wait_for_review",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		Summary:           "Wait for review on PR #1100",
+	}
+
+	firstA := s.RecordSupervisorDecisionWithPolicy(a, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	s.RecordSupervisorDecisionWithPolicy(b, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(10*time.Minute))
+	a.ID = "sup-a-returned"
+	returnedA := s.RecordSupervisorDecisionWithPolicy(a, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(20*time.Minute))
+
+	if returnedA.JournalEvent != SupervisorJournalInitial || returnedA.SeenCount != 1 {
+		t.Fatalf("returned A = %+v, want a fresh transition episode", returnedA)
+	}
+	if returnedA.ID == firstA.ID || !returnedA.FirstSeenAt.Equal(base.Add(20*time.Minute)) {
+		t.Fatalf("returned A reused historical episode: first=%+v returned=%+v", firstA, returnedA)
+	}
+	if returnedA.Disposition != nil {
+		t.Fatalf("returned A inherited historical disposition: %+v", returnedA.Disposition)
+	}
+	if len(s.SupervisorDecisions) != 3 {
+		t.Fatalf("episodes = %d, want A -> B -> A", len(s.SupervisorDecisions))
+	}
+	if got := s.SupervisorDecisions[0].Disposition; got == nil || got.Reason != RecommendationDispositionSuperseded {
+		t.Fatalf("first A disposition = %+v, want superseded", got)
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyRollsUpMaterializedRecommendation(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := SupervisorDecision{
+		ID:                "sup-approval",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 1022},
+		Summary:           "Start a worker",
+	}
+	decision = s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	decision.ApprovalID = "approval-1"
+	decision.Disposition = &RecommendationDisposition{
+		Status: RecommendationDispositionMaterialized,
+		Reason: RecommendationDispositionApprovalRecorded,
+		At:     base,
+	}
+	if !s.UpdateSupervisorDecisionEpisode(decision) {
+		t.Fatal("materialized episode update failed")
+	}
+
+	rollup := s.RecordSupervisorDecisionWithPolicy(decision, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(time.Hour))
+	if rollup.JournalEvent != SupervisorJournalRollup || rollup.SeenCount != 2 {
+		t.Fatalf("materialized repeat = %+v, want hourly roll-up", rollup)
+	}
+	if rollup.ApprovalID != "approval-1" || rollup.Disposition == nil || rollup.Disposition.Status != RecommendationDispositionMaterialized {
+		t.Fatalf("materialization receipt was not preserved: %+v", rollup)
+	}
+}
+
+func TestMarkSupervisorRecommendationMaterialized(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	decision := s.RecordSupervisorDecisionWithPolicy(SupervisorDecision{
+		ID:                "sup-worker",
+		RecommendedAction: "spawn_worker",
+		Target:            &SupervisorTarget{Issue: 1022},
+		Summary:           "Start a worker",
+	}, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+
+	if !s.MarkSupervisorRecommendationMaterialized(decision.ID, RecommendationDispositionWorkerStarted, base.Add(time.Minute)) {
+		t.Fatal("worker-start materialization was not recorded")
+	}
+	latest := s.LatestSupervisorDecision()
+	if latest == nil || latest.Disposition == nil || latest.Disposition.Status != RecommendationDispositionMaterialized || latest.Disposition.Reason != RecommendationDispositionWorkerStarted {
+		t.Fatalf("latest disposition = %+v, want materialized/worker_started", latest)
+	}
+	if s.MarkSupervisorRecommendationMaterialized(decision.ID, RecommendationDispositionWorkerStarted, base.Add(2*time.Minute)) {
+		t.Fatal("terminal materialization changed on a duplicate receipt")
+	}
+}
+
+func TestRecordSupervisorDecisionWithPolicyLogsGuardTransitionsOnly(t *testing.T) {
+	s := NewState()
+	base := time.Date(2026, 7, 21, 10, 0, 0, 0, time.UTC)
+	blocked := SupervisorDecision{
+		ID:                "sup-blocked",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 1022, PR: 1100},
+		PolicyRule:        "supervisor.excluded_labels",
+		Summary:           `Do not repair while current issue label "blocked" excludes dispatch`,
+		Quiescent:         true,
+	}
+	first := s.RecordSupervisorDecisionWithPolicy(blocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base)
+	repeat := s.RecordSupervisorDecisionWithPolicy(blocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(3*time.Hour))
+	if first.JournalEvent != SupervisorJournalInitial || repeat.JournalEvent != SupervisorJournalSuppressed {
+		t.Fatalf("blocked events = %q, %q; want initial then suppressed", first.JournalEvent, repeat.JournalEvent)
+	}
+	if len(s.SupervisorDecisions) != 1 || repeat.SeenCount != 2 {
+		t.Fatalf("blocked episode = len:%d count:%d", len(s.SupervisorDecisions), repeat.SeenCount)
+	}
+
+	unblocked := blocked
+	unblocked.ID = "sup-unblocked"
+	unblocked.RecommendedAction = "spawn_repair_worker"
+	unblocked.PolicyRule = "runtime_state"
+	unblocked.Summary = "Start a repair worker"
+	unblocked.Quiescent = false
+	edge := s.RecordSupervisorDecisionWithPolicy(unblocked, DefaultSupervisorDecisionLimit, time.Hour, 24*time.Hour, base.Add(3*time.Hour+time.Minute))
+	if edge.JournalEvent != SupervisorJournalInitial || len(s.SupervisorDecisions) != 2 {
+		t.Fatalf("transition edge = %+v, episodes=%d", edge, len(s.SupervisorDecisions))
+	}
+	prior := s.SupervisorDecisions[0]
+	if prior.Disposition == nil || prior.Disposition.Reason != RecommendationDispositionSuperseded {
+		t.Fatalf("blocked episode disposition = %+v, want superseded", prior.Disposition)
 	}
 }
 

@@ -131,6 +131,7 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 		}
 		fleetName := server.UniqueFleetName(cfg.Repo, takenNames)
 		proj := server.NewFleetProjectWithGitHubNamed(fleetName, cfg)
+		wireApprovalExecutor(&proj)
 		if fleet != nil {
 			fleet.AddProject(proj)
 		}

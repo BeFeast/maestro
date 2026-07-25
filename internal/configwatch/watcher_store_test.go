@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/configstore"
 )
 
 // fakeStore is an in-memory ProjectStore so WatchStore can be exercised without
@@ -103,6 +104,43 @@ func TestWatchStore_DetectsConfigChange(t *testing.T) {
 		}
 	case <-time.After(3 * time.Second):
 		t.Fatal("timed out waiting for store reload")
+	}
+}
+
+func TestWatchStore_DetectsSharedBackendOnlyChange(t *testing.T) {
+	path := t.TempDir() + "/maestro.db"
+	store, err := configstore.Open(path)
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer store.Close()
+	if err := store.UpsertProject(context.Background(), "alpha", `
+repo: owner/alpha
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude --model opus --effort xhigh
+      effort: xhigh
+`); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	ch := WatchStore(ctx, store, "alpha", 20*time.Millisecond)
+
+	time.Sleep(time.Millisecond)
+	if err := store.UpsertBackend(context.Background(), "claude", "cmd: claude --model opus --effort high\neffort: high\n"); err != nil {
+		t.Fatalf("UpsertBackend: %v", err)
+	}
+	select {
+	case cfg := <-ch:
+		if got := cfg.Model.Backends["claude"].Effort; got != "high" {
+			t.Fatalf("reloaded backend effort = %q, want high", got)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("timed out waiting for backend-only store reload")
 	}
 }
 

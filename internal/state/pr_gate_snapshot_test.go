@@ -110,6 +110,65 @@ func TestRecordPRGateTransition_RejectsRawFingerprintMaterial(t *testing.T) {
 	}
 }
 
+func TestRecordPRGateTransition_TerminalMergeFreezesOpenPRReviewFacts(t *testing.T) {
+	st := NewState()
+	now := time.Date(2026, 7, 15, 14, 16, 0, 0, time.UTC)
+	head := strings.Repeat("a", 40)
+	passed, changed, err := st.RecordPRGateTransition(PRGateTransition{
+		Project: "owner/repo", IssueNumber: 19, PRNumber: 26, HeadSHA: head,
+		ReviewObserved: true, ReviewDecision: PRGateReviewPassed,
+		ReviewVerdictFingerprint: strings.Repeat("1", 16),
+		ReviewStreams: []PRGateReviewStream{{
+			Name: "greptile", Passed: true, Score: 4, ScoreMax: 5, Verdict: PRGateReviewVerdictOKToMerge,
+		}},
+	}, now)
+	if err != nil || !changed || passed.ReviewDecision != PRGateReviewPassed {
+		t.Fatalf("record pass: snapshot=%+v changed=%t err=%v", passed, changed, err)
+	}
+	merged, changed, err := st.RecordPRGateTransition(PRGateTransition{
+		Project: "owner/repo", IssueNumber: 19, PRNumber: 26, HeadSHA: head,
+		MergeObserved: true, MergeCommitSHA: strings.Repeat("f", 40), MergedAt: now.Add(2 * time.Minute),
+	}, now.Add(2*time.Minute))
+	if err != nil || !changed || merged.MergeCommitSHA == "" {
+		t.Fatalf("record merge: snapshot=%+v changed=%t err=%v", merged, changed, err)
+	}
+
+	late, changed, err := st.RecordPRGateTransition(PRGateTransition{
+		Project: "owner/repo", IssueNumber: 19, PRNumber: 26, HeadSHA: strings.Repeat("b", 40),
+		ReviewObserved: true, ReviewDecision: PRGateReviewBlocked,
+		ReviewVerdictFingerprint:      strings.Repeat("2", 16),
+		ActionableFindingsFingerprint: strings.Repeat("3", 16),
+		ActionableFindingsCount:       1,
+		ReviewStreams: []PRGateReviewStream{{
+			Name: "greptile", Score: 3, ScoreMax: 5, Verdict: PRGateReviewVerdictRepairRequired, FindingsCount: 1,
+		}},
+	}, now.Add(3*time.Minute))
+	if err != nil || changed {
+		t.Fatalf("late stale review changed terminal snapshot: snapshot=%+v changed=%t err=%v", late, changed, err)
+	}
+	if late.ReviewDecision != PRGateReviewPassed || len(late.ReviewStreams) != 1 || late.ReviewStreams[0].Score != 4 || !late.ReviewStreams[0].Passed {
+		t.Fatalf("terminal merge lost passing review fact: %+v", late)
+	}
+
+	repeated, changed, err := st.RecordPRGateTransition(PRGateTransition{
+		Project: "owner/repo", IssueNumber: 19, PRNumber: 26, HeadSHA: strings.Repeat("c", 40),
+		ReviewObserved: true, ReviewDecision: PRGateReviewBlocked,
+		ReviewVerdictFingerprint:      strings.Repeat("4", 16),
+		ActionableFindingsFingerprint: strings.Repeat("5", 16),
+		ActionableFindingsCount:       1,
+		ReviewStreams: []PRGateReviewStream{{
+			Name: "greptile", Score: 3, ScoreMax: 5, Verdict: PRGateReviewVerdictRepairRequired, FindingsCount: 1,
+		}},
+		MergeObserved: true, MergeCommitSHA: strings.Repeat("f", 40), MergedAt: now.Add(2 * time.Minute),
+	}, now.Add(4*time.Minute))
+	if err != nil || changed {
+		t.Fatalf("repeated merge plus stale review changed terminal snapshot: snapshot=%+v changed=%t err=%v", repeated, changed, err)
+	}
+	if repeated.HeadSHA != head || repeated.ReviewDecision != PRGateReviewPassed || len(repeated.ReviewStreams) != 1 || repeated.ReviewStreams[0].Score != 4 {
+		t.Fatalf("repeated terminal observation replaced captured facts: %+v", repeated)
+	}
+}
+
 func TestMergePRGateSnapshots_PrefersNewestGeneration(t *testing.T) {
 	t0 := time.Date(2026, 7, 13, 12, 0, 0, 0, time.UTC)
 	old := PRGateSnapshot{

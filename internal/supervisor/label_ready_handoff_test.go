@@ -26,6 +26,9 @@ func TestRunOnce_SafeReadyLabelAppliedDespiteLLMRiskInflation(t *testing.T) {
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
 	// ... and did NOT gate it behind approval_required (only delete_worktree).
 	cfg.Supervisor.ApprovalRequired = []string{config.SupervisorActionDeleteWorktree}
+	// Force the LLM path so we can still prove inflation cannot block the safe
+	// mutation (hands-off short-circuits risk=safe by default).
+	cfg.Supervisor.AlwaysConsultLLM = true
 
 	reader := &fakeReader{issues: []github.Issue{testIssue(266, "auth handoff")}}
 

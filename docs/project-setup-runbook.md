@@ -229,6 +229,13 @@ outcome:
   healthcheck_url: https://app.example.com/healthz
   source_repo_path: /path/to/local/clone
   runtime_host: production host or platform
+  # Opt-in bounded hands-off recovery for a failing health signal. The
+  # entrypoint must refuse duplicate external side effects itself.
+  recovery_mode: disabled          # disabled | automatic
+  # recovery_command: ./scripts/recover-live-outcome.sh
+  recovery_interval_seconds: 60
+  recovery_cooldown_minutes: 20
+  recovery_timeout_seconds: 120
   non_goals:
     - Rewrite unrelated subsystems
 
@@ -269,11 +276,12 @@ telegram:
 | `worktree_base` | Directory where maestro creates per-worker worktrees |
 | `issue_labels` | Only pick issues with at least one of these labels (OR semantics) |
 | `exclude_labels` | Skip issues with any of these labels |
-| `outcome` | Project operating brief used by the supervisor to judge runtime progress |
+| `outcome` | Project operating brief used by the supervisor to judge runtime progress; optional `recovery_mode: automatic` runs one leased, cooldown-bounded, idempotent recovery command after a failing health result and verifies health again |
 | `supervisor` | Optional local policy for supervisor queue order, safe actions, dispatch SLA, and issue-type skips |
 | `model.backends.<name>.mcp` | Optional worker MCP attachment for that backend; omitted means no MCP tools |
 | `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |
 | `max_parallel` | Maximum concurrent worker sessions |
+| `worker_runtime` | Opt-in durable worker lease runtime. `isolated` gives every attempt a private disk-backed `/tmp`, Go temp directory, Cargo target directory, and exact systemd cleanup boundary; `legacy` is the temporary rollback path. See [isolated worker runtime rollout](worker-runtime-runbook.md) |
 | `delivery` | Post-merge delivery block (#872): `mode` (disabled/approval_required/automatic), exact-SHA repo-relative `command` and `verify_command`, timeouts, config-only `target`/`rollback`, and mandatory persistence-safe target/verification/rollback labels. Default-safe: a merge mints an expiring approval and runs nothing until approved |
 | `deploy_cmd` | Deprecated (#872): legacy shell command run automatically after merge; folds into `delivery.mode: automatic` with a deprecation warning |
 | `session_prefix` | Prefix for tmux session names |
@@ -281,7 +289,7 @@ telegram:
 | `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
 | `hooks.pre_tool` | Optional command run inside worker sessions before matching tool calls |
 
-Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker.
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker. Identical recommendations are journaled at most once per `supervisor.unchanged_decision_window_seconds` (default 3600), and an unconsumed recommendation receives a dropped disposition after `supervisor.recommendation_ttl_seconds` (default 86400).
 
 For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
 
@@ -314,9 +322,51 @@ model:
   backends:
     claude:
       cmd: claude
+      effort: high
     codex:
       cmd: codex
+      effort: high
 ```
+
+`model.backends.<name>.effort` is the backend's default reasoning-effort policy for newly started workers. For Claude-compatible workers Maestro emits `--effort <value>`; for Codex-compatible workers it emits `-c model_reasoning_effort=<value>`; backends without a supported effort flag receive no effort flag. A configured backend effort replaces stale effort pins in Claude/Codex `cmd` or `extra_args`; routing-tier or pipeline phase effort overrides are narrower per-dispatch overrides and are shown in backend-selection/effective-config surfaces so an operator can tell whether the backend default or the dispatch override applied.
+
+### Provider-local defaults and fallbacks
+
+Use provider lanes when the project should exhaust models within one provider
+before advancing to the next provider:
+
+```yaml
+model:
+  provider_lanes:
+    - provider: anthropic
+      default: claude
+    - provider: openai
+      default: sol
+      fallback_backends: [gpt55]
+  backends:
+    claude:
+      cmd: claude
+      provider: anthropic
+      model: fable-5
+      effort: high
+    sol:
+      cmd: codex
+      provider: openai
+      model: gpt-5.6-sol
+      effort: high
+    gpt55:
+      cmd: codex
+      provider: openai
+      model: gpt-5.5
+      effort: high
+```
+
+The route is deterministic: `claude -> sol -> gpt55`. Existing
+`model:<backend>` labels still select their named backend, and an explicit
+`model.fallback_backends` list remains a backward-compatible project override.
+Do not leave fallback intent implicit: without either provider lanes or an
+explicit chain, Maestro uses only `model.default` and will not sort the backend
+map to invent a route.
 
 ### Optional: sub-agent model policy (`subagent_hint`)
 
@@ -474,6 +524,12 @@ identical apply is a reported no-op; an identity conflict is a hard
 stop that never overwrites a row by name. Both emit a machine-readable receipt
 (store, project id, fingerprint, effect, daemon-reconciliation expectation, exact
 next commands) for scripted bootstrap adapters.
+
+For an existing row, the input may be either its backend-free stored project
+YAML or a `config-store export` that re-attaches fleet-shared `model.backends`.
+Plan resolves backend references from the target store without writing it. Any
+definition carried by an export must exactly match that store; missing or
+divergent definitions fail closed and must be changed at fleet scope instead.
 
 The running `maestro daemon --watch-store` observes the new row within one poll
 interval and starts exactly one flow — no restart, no `systemctl` step per project.

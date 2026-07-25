@@ -62,7 +62,7 @@ func TestBackendFromLabels_EmptyModelValue(t *testing.T) {
 }
 
 func TestBackendFromLabels_AllKnownBackends(t *testing.T) {
-	backends := []string{"claude", "codex", "gemini", "cline"}
+	backends := []string{"claude", "codex", "gemini", "kimi", "cline"}
 	for _, b := range backends {
 		issue := makeIssue(10, "Test", "model:"+b)
 		got := BackendFromLabels(issue)
@@ -168,6 +168,30 @@ func TestResolveBackend_DefaultFallback(t *testing.T) {
 	}
 	if reason != "default" {
 		t.Errorf("ResolveBackend() reason = %q, want %q", reason, "default")
+	}
+}
+
+func TestResolveBackend_ProviderLaneDefault(t *testing.T) {
+	cfg := &config.Config{
+		Model: config.ModelConfig{
+			Default: "legacy",
+			ProviderLanes: []config.ProviderLane{
+				{Provider: "anthropic", Default: "claude"},
+				{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+			},
+			Backends: map[string]config.BackendDef{
+				"legacy": {Cmd: "legacy"},
+				"claude": {Cmd: "claude", Provider: "anthropic"},
+				"sol":    {Cmd: "codex", Provider: "openai"},
+				"gpt55":  {Cmd: "codex", Provider: "openai"},
+			},
+		},
+		Routing: config.RoutingConfig{Mode: "manual"},
+	}
+
+	decision := New(cfg).ResolveBackendDecision(makeIssue(909, "provider default"))
+	if decision.Backend != "claude" || decision.Reason != ReasonDefault {
+		t.Fatalf("decision = %+v, want claude/default", decision)
 	}
 }
 

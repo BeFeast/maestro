@@ -55,12 +55,13 @@ func TestRespawnDueRetries_IssueClosed_RetiresInsteadOfRespawning(t *testing.T) 
 	pastTime := time.Now().UTC().Add(-1 * time.Second)
 	s := state.NewState()
 	s.Sessions["ok-player-1"] = &state.Session{
-		IssueNumber: 133,
-		IssueTitle:  "closed while backoff ran",
-		Status:      state.StatusDead,
-		RetryCount:  1,
-		NextRetryAt: &pastTime,
-		Branch:      "feat/ok-player-1-133-test",
+		IssueNumber:     133,
+		IssueTitle:      "closed while backoff ran",
+		Status:          state.StatusDead,
+		RetryCount:      1,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #133 has a current excluded label",
+		Branch:          "feat/ok-player-1-133-test",
 	}
 
 	o.respawnDueRetries(s, 10)
@@ -74,6 +75,9 @@ func TestRespawnDueRetries_IssueClosed_RetiresInsteadOfRespawning(t *testing.T) 
 	}
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt must be cleared when the retry is retired")
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("retry hold must be cleared when the issue closes: %q", sess.RetryHoldReason)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set when the retry is retired")
@@ -93,14 +97,15 @@ func TestRespawnDueRetries_SessionPRMerged_RetiresInsteadOfRespawning(t *testing
 	pastTime := time.Now().UTC().Add(-1 * time.Second)
 	s := state.NewState()
 	s.Sessions["ok-player-1"] = &state.Session{
-		IssueNumber: 133,
-		IssueTitle:  "review retry with merged PR",
-		Status:      state.StatusDead,
-		RetryCount:  1,
-		NextRetryAt: &pastTime,
-		Branch:      "feat/ok-player-1-133-test",
-		Worktree:    "/tmp/maestro-ok-player-1",
-		PRNumber:    135,
+		IssueNumber:     133,
+		IssueTitle:      "review retry with merged PR",
+		Status:          state.StatusDead,
+		RetryCount:      1,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #133 has a current excluded label",
+		Branch:          "feat/ok-player-1-133-test",
+		Worktree:        "/tmp/maestro-ok-player-1",
+		PRNumber:        135,
 	}
 
 	o.respawnDueRetries(s, 10)
@@ -115,15 +120,17 @@ func TestRespawnDueRetries_SessionPRMerged_RetiresInsteadOfRespawning(t *testing
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt must be cleared when the retry is retired")
 	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("retry hold must be cleared when the PR merges: %q", sess.RetryHoldReason)
+	}
 }
 
 // Regression for the BeFeast/ok-player 2026-07-02 incident (#800): CI fails on
-// the PR, the CI-retry path closes it and schedules a backoff retry; an
-// operator then pushes a fix, reopens the PR, and merges it. When the backoff
-// elapses the orchestrator must NOT respawn — the closed-then-merged PR is
-// tracked via LastClosedPRNumber and invalidates the retry even though the
+// the PR and schedules an in-place backoff retry; an operator then pushes a fix
+// and merges that same open PR. When the backoff elapses the orchestrator must
+// NOT respawn — the retained canonical PR invalidates the retry even though the
 // issue itself is still open (maestro PRs carry no auto-closing keywords).
-func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *testing.T) {
+func TestRespawnDueRetries_PROpenDuringCIRetryThenMerged_NoRespawn(t *testing.T) {
 	respawned := false
 	o := zombieRetryOrchestrator(t, &respawned)
 	o.ghPRChecksOutputFn = func(prNumber int) (string, error) { return "build failed", nil }
@@ -142,21 +149,21 @@ func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *t
 	}
 	s.Sessions["ok-player-1"] = sess
 
-	// Step 1: CI fails — maestro closes PR #135 and schedules a retry.
-	o.handleCIFailureRetry(s, "ok-player-1", sess, github.PR{Number: 135, HeadRefName: sess.Branch})
+	// Step 1: CI fails — maestro retains PR #135 and schedules an in-place retry.
+	o.handleCIFailureRetry(s, "ok-player-1", sess, github.PR{Number: 135, HeadRefName: sess.Branch}, "")
 
 	if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
 		t.Fatalf("after CI-retry: status = %q nextRetryAt = %v, want dead with a scheduled retry", sess.Status, sess.NextRetryAt)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("after CI-retry: PRNumber = %d, want 0 (PR closed)", sess.PRNumber)
+	if sess.PRNumber != 135 {
+		t.Fatalf("after CI-retry: PRNumber = %d, want 135 (canonical PR retained)", sess.PRNumber)
 	}
-	if sess.LastClosedPRNumber != 135 {
-		t.Fatalf("after CI-retry: LastClosedPRNumber = %d, want 135", sess.LastClosedPRNumber)
+	if sess.LastClosedPRNumber == 135 {
+		t.Fatalf("after CI-retry: LastClosedPRNumber = %d, canonical PR must remain open", sess.LastClosedPRNumber)
 	}
 
-	// Step 2: operator pushes a fix, reopens PR #135, and merges it. The
-	// issue stays open (no auto-closing keywords on maestro PRs).
+	// Step 2: operator pushes a fix and merges PR #135 during backoff. The issue
+	// stays open (no auto-closing keywords on maestro PRs).
 	o.isPRMergedFn = func(prNumber int) (bool, error) {
 		return prNumber == 135, nil
 	}
@@ -171,7 +178,7 @@ func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *t
 	o.respawnDueRetries(s, 10)
 
 	if respawned {
-		t.Fatal("worker must NOT respawn after the CI-closed PR was reopened and merged")
+		t.Fatal("worker must NOT respawn after the retained PR merged during CI backoff")
 	}
 	if sess.Status != state.StatusCodeLanded {
 		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
@@ -181,6 +188,45 @@ func TestRespawnDueRetries_PRClosedByCIRetryThenReopenedAndMerged_NoRespawn(t *t
 	}
 	if sess.NextRetryAt != nil {
 		t.Fatal("NextRetryAt must be cleared when the retry is retired")
+	}
+}
+
+// #1013: markCodeLanded is the shared sink for every merge-detection path
+// (retireStaleRetry, reconcile branch-merge, outcome verification, …). A
+// canonical retry deliberately held behind a current issue-guard label carries
+// NextRetryAt + RetryHoldReason; when any of those paths observes the merge the
+// hold must not outlive it, regardless of which caller reached the sink and
+// whether that caller pre-cleared the fields. Pin the invariant to the sink so
+// a future merge path added without an explicit clear cannot resurrect the
+// "false operator attention forever" state.
+func TestMarkCodeLanded_ClearsHeldRetry(t *testing.T) {
+	o := &Orchestrator{cfg: &config.Config{Repo: "owner/repo"}}
+
+	pastTime := time.Now().UTC().Add(-1 * time.Second)
+	sess := &state.Session{
+		IssueNumber:     406,
+		IssueTitle:      "held retry that merged out-of-band",
+		Status:          state.StatusDead,
+		RetryCount:      3,
+		NextRetryAt:     &pastTime,
+		RetryHoldReason: "issue #406 has a current excluded label",
+		Branch:          "feat/ok-player-302-406-test",
+		PRNumber:        388,
+	}
+
+	o.markCodeLanded(sess, 388)
+
+	if sess.Status != state.StatusCodeLanded {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusCodeLanded)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatal("NextRetryAt must be cleared at the code_landed sink")
+	}
+	if sess.RetryHoldReason != "" {
+		t.Fatalf("issue-guard hold must be cleared at the code_landed sink: %q", sess.RetryHoldReason)
+	}
+	if sess.PRNumber != 388 {
+		t.Fatalf("PRNumber = %d, want 388 (canonical PR preserved)", sess.PRNumber)
 	}
 }
 

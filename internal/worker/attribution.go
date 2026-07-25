@@ -7,6 +7,85 @@ import (
 	"github.com/befeast/maestro/internal/state"
 )
 
+// beginSessionAttempt resets fields whose meaning is scoped to the currently
+// executing backend process while preserving issue/worktree identity and the
+// cumulative attribution/token history. Recovery and phase transitions reuse
+// the same state.Session, so leaving a previous attempt's terminal timestamp or
+// self-reported model behind makes a live replacement look finished (and can
+// label a Sol worker as Fable in Mission Control).
+func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, reason, previousEndReason string, now time.Time) {
+	if sess == nil {
+		return
+	}
+	now = now.UTC()
+	sess.WorkerGeneration++
+	sess.StartedAt = now
+	sess.FinishedAt = nil
+	sess.WorkerEndedAt = nil
+	sess.Status = state.StatusRunning
+	sess.Backend = backendName
+	sess.Model = ""
+	sess.CostUSDBackend = 0
+	sess.UsageTokensWatermark = 0
+	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensWatermark = 0
+	sess.TokenBudgetTokensAttempt = 0
+	sess.TokenBudgetMeasure = ""
+	sess.WorkerOutcome = ""
+	sess.WorkerLeaseID = ""
+	sess.WorkerLeaseUnit = ""
+	sess.WorkerLeaseScope = ""
+	sess.WorkerScratchDir = ""
+	sess.WorkerLeaseManifest = ""
+	sess.WorkerLeaseAttention = ""
+	// An approved operator restart is authority to bypass only the old
+	// attempt's terminal budget/zombie latch while it is queued. Once the new
+	// process exists, clear that handoff so ordinary live budget enforcement and
+	// unexpected-exit policy apply to this attempt normally.
+	if sess.RetryReason == state.RetryReasonOperatorRestart {
+		sess.RetryReason = ""
+	}
+	// A scheduled retry owns NextRetryAt only until a replacement process has
+	// actually started. Keeping the elapsed timestamp on a Running attempt makes
+	// Fleet report contradictory queued/running state and lets a later terminal
+	// transition accidentally inherit an already-due retry.
+	sess.NextRetryAt = nil
+	recordBackendAttribution(cfg, sess, backendName, reason, previousEndReason, now)
+}
+
+// AdoptLiveRuntime repairs the persisted runtime projection after a worker
+// process was started successfully but the state write that followed lost a
+// concurrent compare-and-merge race. The caller must first prove the exact
+// tmux session, pane PID, and worktree identity; this function deliberately
+// performs no process discovery of its own.
+//
+// Adoption starts a new observable attempt at the time Maestro recovered
+// ownership. That is an honest lower bound for worker_runtime and avoids
+// reusing terminal timestamps/token watermarks from the attempt whose state
+// was stranded. Issue, worktree, branch, and PR identity stay unchanged.
+func AdoptLiveRuntime(cfg *config.Config, sess *state.Session, pid int, tmuxName string, observedAt time.Time) {
+	if sess == nil || pid <= 0 || tmuxName == "" {
+		return
+	}
+	leaseID, leaseUnit, leaseScope := sess.WorkerLeaseID, sess.WorkerLeaseUnit, sess.WorkerLeaseScope
+	scratchDir, manifest := sess.WorkerScratchDir, sess.WorkerLeaseManifest
+	leaseAttention := sess.WorkerLeaseAttention
+	beginSessionAttempt(cfg, sess, sess.Backend, "runtime_adoption", "runtime_state_lost", observedAt)
+	sess.WorkerLeaseID = leaseID
+	sess.WorkerLeaseUnit = leaseUnit
+	sess.WorkerLeaseScope = leaseScope
+	sess.WorkerScratchDir = scratchDir
+	sess.WorkerLeaseManifest = manifest
+	sess.WorkerLeaseAttention = leaseAttention
+	sess.PID = pid
+	sess.TmuxSession = tmuxName
+	sess.NextRetryAt = nil
+	sess.RestartCheckpointAt = nil
+	sess.LastNotifiedStatus = ""
+	sess.LastOutputHash = ""
+	sess.LastOutputChangedAt = time.Time{}
+}
+
 // recordBackendAttribution appends a new BackendAttribution segment to
 // sess.Attribution and closes the previous one's EndedAt + EndReason.
 // Called from every place that sets sess.Backend (Start, Respawn,

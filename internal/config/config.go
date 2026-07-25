@@ -33,6 +33,41 @@ type TelegramConfig struct {
 	DigestMode  bool   `yaml:"digest_mode"`  // batch notifications per cycle instead of sending immediately
 }
 
+// NotifyConfig (#1018) carries lightweight push-notification transports that
+// live alongside the Telegram digest channel. The first transport is ntfy —
+// a plain HTTP POST push channel the supervisor/orchestrator/watchdog use to
+// emit alert-class notifications (gate-fail streaks, idle stalls, delivery
+// advances). Absent config = no ntfy fan-out; the Telegram path is unaffected.
+type NotifyConfig struct {
+	Ntfy NtfyConfig `yaml:"ntfy"`
+}
+
+// NtfyConfig configures the ntfy push transport. Topic is a per-project value
+// (fleet config supplies the default, a project overrides it). The auth token
+// is NEVER stored in config or repo: TokenEnv names an environment variable /
+// secret-store key the process reads at send time.
+type NtfyConfig struct {
+	BaseURL  string `yaml:"base_url"`  // e.g. https://ntfy.sh or a self-hosted base URL
+	Topic    string `yaml:"topic"`     // per-project topic (fleet default, project override)
+	TokenEnv string `yaml:"token_env"` // env var name holding the bearer token; the token itself is never stored here
+}
+
+// Enabled reports whether the ntfy transport has enough config to POST.
+func (c NtfyConfig) Enabled() bool {
+	return strings.TrimSpace(c.BaseURL) != "" && strings.TrimSpace(c.Topic) != ""
+}
+
+// Token resolves the ntfy bearer token from the configured env var. Returns ""
+// when TokenEnv is unset or the env var is unset/empty. Callers treat "" as
+// "unauthenticated ntfy" (public topics need no token).
+func (c NtfyConfig) Token() string {
+	env := strings.TrimSpace(c.TokenEnv)
+	if env == "" {
+		return ""
+	}
+	return strings.TrimSpace(os.Getenv(env))
+}
+
 // BackendDef defines a model backend CLI.
 type BackendDef struct {
 	Cmd        string    `yaml:"cmd"`
@@ -41,12 +76,10 @@ type BackendDef struct {
 	Enabled    *bool     `yaml:"enabled"`     // nil means enabled for backward compatibility
 	MCP        MCPConfig `yaml:"mcp,omitempty"`
 
-	// #513: optional per-backend attribution metadata. Lets the
-	// dashboard / commit trailer record which provider+model actually
-	// produced the work, beyond the shim name. All four are optional;
-	// absent fields render as "—" in UI and are omitted from commit
-	// trailers. Backends that don't set them keep working unchanged
-	// (legacy behaviour preserved).
+	// #513/#1000: optional per-backend attribution metadata. Maestro stores it
+	// in durable session state and surfaces it in Fleet Mission Control; it must
+	// never be injected into product commits. All four fields are optional, and
+	// absent values render as "—" in the UI (legacy behavior preserved).
 	Provider string `yaml:"provider,omitempty"` // e.g. "anthropic", "openai", "groq"
 	Model    string `yaml:"model,omitempty"`    // e.g. "opus-4.8", "gpt-5.5", "llama-3.3-70b-versatile"
 	Variant  string `yaml:"variant,omitempty"`  // e.g. "opus[1m]", "fast", "sonnet"
@@ -61,14 +94,11 @@ type BackendDef struct {
 	TierModel  string `yaml:"-" json:"-"`
 	TierEffort string `yaml:"-" json:"-"`
 
-	// #737: opt-in structured usage capture. When true, a claude-kind backend
-	// runs in `--output-format stream-json --verbose` mode and the worker
-	// runner pipes its NDJSON through `maestro stream-split`, which writes the
-	// raw frames to a side-channel slot.jsonl (parsed for tokens/cost) while
-	// keeping slot.log human-readable. Off by default: plain `claude -p` text
-	// mode prints no parseable token total, so usage/cost stay 0 (the #737
-	// symptom) until an operator opts in. Overridable via extra_args (a
-	// trailing --output-format wins). Only the claude kind consumes this today.
+	// #737/#947: opt-in structured usage capture for backends whose JSON mode
+	// is optional (claude/codex/opencode). The worker runner pipes NDJSON through
+	// `maestro stream-split`, which writes raw frames to slot.jsonl for usage
+	// accounting while keeping slot.log human-readable. Kimi is structured by
+	// default and does not require this flag.
 	UsageStream bool `yaml:"usage_stream,omitempty"`
 
 	// #507: NonAgentic marks a backend that is a TEXT-COMPLETION helper,
@@ -120,6 +150,13 @@ type BackendDef struct {
 	// matches ordinary work output (a prompt echo, test output) causes
 	// false backend gating. Validated to compile at config parse.
 	UsageLimitPatterns []string `yaml:"usage_limit_patterns,omitempty"`
+
+	// SupervisorAttemptTimeoutSeconds overrides supervisor.attempt_timeout_seconds
+	// for this backend when it serves a supervisor consult. Set it on slow
+	// print-mode carriers (claude CLI at high effort ≈ 180) so the walk gives
+	// them a real chance instead of billing a generation and killing it at the
+	// 45s default. Workers are unaffected — this is a supervisor-only knob.
+	SupervisorAttemptTimeoutSeconds int `yaml:"supervisor_attempt_timeout_seconds,omitempty"`
 
 	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
 	// delegate grunt subtasks to cheaper sub-agent models instead of
@@ -350,6 +387,46 @@ type ModelConfig struct {
 	Default          string                `yaml:"default"` // "claude", "codex", etc.
 	Backends         map[string]BackendDef `yaml:"backends"`
 	FallbackBackends []string              `yaml:"fallback_backends"` // ordered list of backends to try when rate-limited
+	// ProviderLanes declares provider-local defaults and fallback order. When
+	// fallback_backends is set, that legacy explicit backend chain remains the
+	// project override. Otherwise lanes compose in declaration order, with each
+	// provider's default followed by its local fallbacks before the next provider.
+	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
+	// HoldOnCooldown makes quota-class backend cooldowns a wait, not a cascade:
+	// when the routed backend is cooling down with a known reset inside the
+	// configured window, dispatch/retry hold for that reset instead of walking
+	// the fallback chain. See HoldOnCooldownConfig.
+	HoldOnCooldown HoldOnCooldownConfig `yaml:"hold_on_cooldown,omitempty"`
+}
+
+// HoldOnCooldownConfig controls hold-vs-cascade semantics for quota-class
+// backend cooldowns (provider_limit, usage_limit, model_cooldown,
+// model_overloaded, quota_pressure). Off, a cooling backend cascades work onto
+// the next fallback rung immediately — under a fleet-wide primary cooldown
+// that dumps every project onto one fallback seat (2026-07 live: an Anthropic
+// cooldown pushed ~80% of the week's tokens through the single ChatGPT seat).
+// On, a cooldown whose RetryAfter lands within max_wait_minutes holds the work
+// for the reset; only unknown or beyond-window resets (weekly caps), and
+// non-quota failures (auth_failure, model_unavailable, disabled), still
+// cascade.
+type HoldOnCooldownConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxWaitMinutes bounds how long a hold may wait for a stated reset.
+	// 0 means the default (360 = 6h, covering a 5-hour subscription window);
+	// resets further out than this cascade to the next rung as before.
+	MaxWaitMinutes int `yaml:"max_wait_minutes,omitempty"`
+}
+
+// defaultHoldOnCooldownMaxWait covers a full 5-hour subscription window with
+// slack; a stated reset beyond it (e.g. a weekly cap) is not worth idling for.
+const defaultHoldOnCooldownMaxWait = 360 * time.Minute
+
+// MaxWait returns the bounded hold window as a duration.
+func (h HoldOnCooldownConfig) MaxWait() time.Duration {
+	if h.MaxWaitMinutes > 0 {
+		return time.Duration(h.MaxWaitMinutes) * time.Minute
+	}
+	return defaultHoldOnCooldownMaxWait
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -464,7 +541,7 @@ func (c GitHubMirrorConfig) ReconcileInterval() time.Duration {
 // unit's ExecStop drain semantics intact.
 type SelfDeployConfig struct {
 	Enabled        bool     `yaml:"enabled"`          // default false (opt-in)
-	Script         string   `yaml:"script"`           // deploy script path (default: <local_path>/scripts/self-deploy.sh)
+	Script         string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
 	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
 	InstallViaSudo bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
 	Scope          string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
@@ -472,6 +549,11 @@ type SelfDeployConfig struct {
 	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
 	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
 	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+	// RestartTimeoutSeconds bounds only the blocking systemctl restart step. It is
+	// deliberately much smaller than TimeoutMinutes so Fleet unavailability is
+	// reported shortly after the daemon's bounded drain, not hidden under the
+	// overall build/deploy budget (#966).
+	RestartTimeoutSeconds int `yaml:"restart_timeout_seconds"`
 
 	// #722: minimum interval between self-deploy triggers. The deploy restarts
 	// the run-loop's own unit, so a burst of merges — or a run-loop restarted by
@@ -560,6 +642,19 @@ func (c SelfDeployConfig) EffectiveTimeoutMinutes() int {
 	return 30
 }
 
+// DefaultSelfDeployRestartTimeoutSeconds covers the daemon's default four-minute
+// whole-shutdown deadline plus a fixed 30-second process-start grace. Keep this
+// separate from the 30-minute build/deploy timeout: a blocked restart means Fleet
+// is unavailable and must surface promptly (#966).
+const DefaultSelfDeployRestartTimeoutSeconds = 270
+
+func (c SelfDeployConfig) EffectiveRestartTimeoutSeconds() int {
+	if c.RestartTimeoutSeconds > 0 {
+		return c.RestartTimeoutSeconds
+	}
+	return DefaultSelfDeployRestartTimeoutSeconds
+}
+
 // EffectiveMinIntervalMinutes returns the debounce window between self-deploy
 // triggers (#722). Because the deploy restarts the run-loop's own unit, a burst
 // of merges (or a run-loop restarted mid-deploy) must not re-fire a fresh
@@ -578,6 +673,8 @@ const (
 	SupervisorActionRemoveReadyLabel    = "remove_ready_label"
 	SupervisorActionAddBlockedLabel     = "add_blocked_label"
 	SupervisorActionRemoveBlockedLabel  = "remove_blocked_label"
+	SupervisorActionHoldMerge           = "hold_merge"
+	SupervisorActionReleaseMerge        = "release_merge"
 	SupervisorActionAddIssueComment     = "add_issue_comment"
 	SupervisorActionMergePR             = "merge_pr"
 	SupervisorActionCloseIssue          = "close_issue"
@@ -600,6 +697,16 @@ const (
 	// respawn.
 	SupervisorActionRestartWorker = "restart_worker"
 	SupervisorActionStopWorker    = "stop_worker"
+	// SupervisorActionSpawnRepairWorker resumes one explicitly reserved
+	// issue/session in place. Unlike restart_worker it preserves a retained
+	// worktree and never allocates a replacement slot.
+	SupervisorActionSpawnRepairWorker = "spawn_repair_worker"
+	// SupervisorActionRestartStaleBackendWorkers is a fleet helper surfaced
+	// when running workers' immutable attribution differs from the current
+	// effective backend settings (#900). It only enqueues per-worker
+	// restart_worker approvals for PR-less workers; open-PR workers are skipped
+	// and must use in-place repair/handoff.
+	SupervisorActionRestartStaleBackendWorkers = "restart_stale_backend_workers"
 	// SupervisorActionSpawnReviewRepair is the auto review-repair respawn verb
 	// minted by the supervisor when a green+mergeable PR is settled
 	// retry_exhausted on review feedback and at least one Greptile P0/P1
@@ -827,12 +934,25 @@ type SupervisorConfig struct {
 	ReviewRepair            SupervisorReviewRepairConfig    `yaml:"review_repair" json:"review_repair,omitempty"`
 	PreflightCommand        string                          `yaml:"preflight_command" json:"preflight_command,omitempty"`
 	CompletionGates         SupervisorCompletionGatesConfig `yaml:"completion_gates" json:"completion_gates,omitempty"`
+	OperatorGate            SupervisorOperatorGateConfig    `yaml:"operator_gate" json:"operator_gate,omitempty"`
 	SafeActions             []string                        `yaml:"safe_actions" json:"safe_actions,omitempty"`
 	ApprovalRequired        []string                        `yaml:"approval_required" json:"approval_required,omitempty"`
 	AllowedActions          []string                        `yaml:"allowed_actions" json:"allowed_actions,omitempty"`
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
+	// AttemptTimeoutSeconds bounds ONE supervisor LLM backend attempt. Default
+	// 45s — calibrated for fast print-mode backends (codex/sol). A slow carrier
+	// (claude CLI at high effort through a proxy) needs more; give it a
+	// per-backend override (model.backends.<name>.supervisor_attempt_timeout_seconds)
+	// instead of raising this global. Burn RCA 2026-07-24: a chain of three
+	// claude-binary candidates under the 45s default produced ~365
+	// paid-and-discarded generations in 4.5h — every attempt billed
+	// server-side, then killed client-side before the answer arrived.
+	AttemptTimeoutSeconds int `yaml:"attempt_timeout_seconds" json:"attempt_timeout_seconds,omitempty"`
+	// TotalTimeoutSeconds bounds the whole candidate walk for one consult so a
+	// slow chain can never overrun the supervise interval. Default 180s.
+	TotalTimeoutSeconds int `yaml:"total_timeout_seconds" json:"total_timeout_seconds,omitempty"`
 	// AlwaysConsultLLM restores the pre-#837 behavior of calling the supervisor
 	// LLM on every enabled cycle, even when the deterministic guardrail already
 	// decided a safe, mutation-free action (action=none / wait_* / monitor_open_pr).
@@ -860,7 +980,70 @@ type SupervisorConfig struct {
 	// the approval-gated edit_issue_body verb.
 	SpecGroom SupervisorSpecGroomConfig `yaml:"spec_groom" json:"spec_groom,omitempty"`
 
+	// NonFunctionalPaths lists extra doublestar globs whose EXCLUSIVE change in a
+	// merged PR must not settle a bug issue (#1020): a docs-only QA record is a
+	// record delivery, not a fix, so the session is released for fresh dispatch
+	// instead of silencing the issue. docs/** is always included; this field only
+	// extends the set (for example a project-specific records/ or qa/ tree).
+	NonFunctionalPaths []string `yaml:"non_functional_paths" json:"non_functional_paths,omitempty"`
+
+	// Recommendation lifecycle policy. Zero selects the built-in defaults;
+	// negative values are rejected during normalization.
+	UnchangedDecisionWindowSeconds int `yaml:"unchanged_decision_window_seconds" json:"unchanged_decision_window_seconds,omitempty"`
+	RecommendationTTLSeconds       int `yaml:"recommendation_ttl_seconds" json:"recommendation_ttl_seconds,omitempty"`
+
 	excludedLabelsSet bool
+}
+
+const (
+	defaultUnchangedDecisionWindow = time.Hour
+	defaultRecommendationTTL       = 24 * time.Hour
+)
+
+// EffectiveUnchangedDecisionWindow returns the durable journal suppression
+// window for identical recommendations. Zero keeps the default at one hour.
+func (c SupervisorConfig) EffectiveUnchangedDecisionWindow() time.Duration {
+	if c.UnchangedDecisionWindowSeconds <= 0 {
+		return defaultUnchangedDecisionWindow
+	}
+	return time.Duration(c.UnchangedDecisionWindowSeconds) * time.Second
+}
+
+// EffectiveRecommendationTTL returns the maximum age of an unconsumed
+// recommendation before it is durably dropped with a disposition reason.
+func (c SupervisorConfig) EffectiveRecommendationTTL() time.Duration {
+	if c.RecommendationTTLSeconds <= 0 {
+		return defaultRecommendationTTL
+	}
+	return time.Duration(c.RecommendationTTLSeconds) * time.Second
+}
+
+// defaultNonFunctionalPaths mirrors pipeline.DefaultNonFunctionalPaths. It is
+// duplicated here to keep the config package free of a dependency on pipeline
+// (pipeline imports config, so the reverse edge would be an import cycle).
+var defaultNonFunctionalPaths = []string{"docs/**"}
+
+// EffectiveNonFunctionalPaths returns the non-functional path globs used to
+// classify a merged PR as a documentation/record delivery (#1020): the docs/**
+// default unioned with any project-configured extensions, de-duplicated with
+// input order preserved (defaults first).
+func (c SupervisorConfig) EffectiveNonFunctionalPaths() []string {
+	seen := make(map[string]struct{}, len(defaultNonFunctionalPaths)+len(c.NonFunctionalPaths))
+	out := make([]string, 0, len(defaultNonFunctionalPaths)+len(c.NonFunctionalPaths))
+	for _, group := range [][]string{defaultNonFunctionalPaths, c.NonFunctionalPaths} {
+		for _, p := range group {
+			p = strings.TrimSpace(p)
+			if p == "" {
+				continue
+			}
+			if _, ok := seen[p]; ok {
+				continue
+			}
+			seen[p] = struct{}{}
+			out = append(out, p)
+		}
+	}
+	return out
 }
 
 // SupervisorSpecGroomConfig gates the spec-lint + grooming capability (#851).
@@ -877,6 +1060,16 @@ type SupervisorSpecGroomConfig struct {
 	// still gets its lint comment but keeps its normal labeling flow). Has no
 	// effect unless Enabled is also true.
 	RequireLintPass bool `yaml:"require_lint_pass" json:"require_lint_pass,omitempty"`
+}
+
+// SupervisorOperatorGateConfig describes deliberate human/operator holds that
+// must be treated as waiting states, not retryable implementation failures.
+// Check names are machine-readable check-run names or commit-status contexts;
+// shell-style globs are allowed for repository-specific naming variants.
+type SupervisorOperatorGateConfig struct {
+	CheckNames     []string `yaml:"check_names" json:"check_names,omitempty"`
+	Labels         []string `yaml:"labels" json:"labels,omitempty"`
+	RequiredAction string   `yaml:"required_action" json:"required_action,omitempty"`
 }
 
 // SpecGroomOn reports whether the spec-lint + grooming capability is enabled
@@ -1366,7 +1559,7 @@ func (a ServerAuthConfig) ResolvedActorName() string {
 	return name
 }
 
-// RoleConfig defines settings for a single pipeline role (planner,
+// RoleConfig defines settings for a single pipeline role (planner, advisor,
 // implementer, validator).
 type RoleConfig struct {
 	Enabled           bool   `yaml:"enabled"`
@@ -1383,13 +1576,24 @@ type RoleConfig struct {
 	Effort string `yaml:"effort"`
 }
 
-// PipelineConfig controls the planner → implementer → validator phase pipeline
-// and deterministic pre-worker context preparation phases.
+const (
+	DefaultAdvisorReviewRounds = 2
+	MaxAdvisorReviewRounds     = 5
+)
+
+// PipelineConfig controls the planner → optional advisor → implementer →
+// validator phase pipeline and deterministic pre-worker context preparation
+// phases.
 type PipelineConfig struct {
-	// Phase-based pipeline (planner → implementer → validator)
-	Enabled   bool       `yaml:"enabled"`   // enable 3-phase pipeline globally (default: false; issue label pipeline:full opts in per worker)
-	Planner   RoleConfig `yaml:"planner"`   // planner role settings
-	Validator RoleConfig `yaml:"validator"` // validator role settings
+	// Phase-based pipeline (planner → optional advisor → implementer → validator)
+	Enabled bool       `yaml:"enabled"` // enable the phase pipeline globally (default: false; issue labels can opt in per worker)
+	Planner RoleConfig `yaml:"planner"` // planner role settings
+	Advisor RoleConfig `yaml:"advisor"` // independent, review-only plan advisor (default: disabled)
+	// AdvisorReviewRounds bounds Advisor passes across planner revisions. Zero
+	// means the default of two; parse rejects values above the hard cap of five.
+	AdvisorReviewRounds int        `yaml:"advisor_review_rounds"`
+	AdvisorBestEffort   bool       `yaml:"advisor_best_effort"` // explicit auditable bypass instead of fail-closed (default: false)
+	Validator           RoleConfig `yaml:"validator"`           // validator role settings
 	// Implementer carries the implement phase's own backend/effort override (#841)
 	// so the token-heavy implement phase can run on a cheap backend + low effort
 	// while plan/validate keep the strong model. Empty backend falls back to
@@ -1402,6 +1606,20 @@ type PipelineConfig struct {
 	Research       bool  `yaml:"research"`        // scan repo context before worker starts (default: false)
 	PlanValidation *bool `yaml:"plan_validation"` // heuristic plan coverage check before coding starts (default: true)
 	TestMapping    *bool `yaml:"test_mapping"`    // map requirements to verify commands (default: true)
+}
+
+// EffectiveAdvisorReviewRounds returns the bounded number of Advisor passes.
+// Directly-constructed configs are clamped defensively even though Parse rejects
+// values above the hard cap.
+func (p PipelineConfig) EffectiveAdvisorReviewRounds() int {
+	rounds := p.AdvisorReviewRounds
+	if rounds <= 0 {
+		rounds = DefaultAdvisorReviewRounds
+	}
+	if rounds > MaxAdvisorReviewRounds {
+		return MaxAdvisorReviewRounds
+	}
+	return rounds
 }
 
 // PlanValidationEnabled returns whether plan validation is enabled (default: true).
@@ -1557,6 +1775,20 @@ type ReviewRetriggerConfig struct {
 	Enabled         *bool `yaml:"enabled"`          // default: true
 	PendingMinutes  int   `yaml:"pending_minutes"`  // re-trigger after this many minutes of greptile=pending on one head (default: 10)
 	CooldownMinutes int   `yaml:"cooldown_minutes"` // minimum minutes between re-trigger comments per session (default: 30)
+	// MaxAttempts caps how many re-trigger comments one session may post for
+	// a single head. Without a cap a permanently silent reviewer collects a
+	// "@greptile review" comment every cooldown window forever (live 2026-07:
+	// Greptile paused after exhausting its free credits and every wedged PR
+	// kept accruing comments). Default 3; <= 0 means the default, and a
+	// deliberate "never stop" is spelled as a large number.
+	MaxAttempts int `yaml:"max_attempts,omitempty"`
+	// MissingAfterMinutes makes an UNOBSERVED review gate non-blocking once the
+	// gate has been silent this long on one head — no check run, no comment,
+	// nothing. 0 (default) preserves today's behavior: a silent gate holds the
+	// PR forever. A reviewer that DOES answer still hard-blocks regardless of
+	// this value, so enabling it never weakens a working gate; it only bounds
+	// the wait on a reviewer that never shows up.
+	MissingAfterMinutes int `yaml:"missing_after_minutes,omitempty"`
 }
 
 // Active reports whether the stale-review re-trigger runs. Default true —
@@ -1585,6 +1817,35 @@ func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
 		return 30 * time.Minute
 	}
 	return time.Duration(c.CooldownMinutes) * time.Minute
+}
+
+// EffectiveMaxAttempts caps re-trigger comments per head; 0 means unlimited,
+// which is the default.
+//
+// The cap is deliberately opt-in. Capping by default would REMOVE the only
+// automatic recovery an untouched install has: before this knob existed, a
+// wedged gate kept being nudged every cooldown window, so a review service that
+// came back hours later was woken by the next nudge and the PR merged
+// hands-off. A default cap silences those nudges after N tries while the
+// escape hatch that would release the PR (missing_after_minutes) is itself
+// off by default — turning "eventually self-heals" into "wedged forever" for an
+// operator who changed nothing. An operator who sets a cap is accepting that
+// trade, and should set missing_after_minutes with it.
+func (c ReviewRetriggerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts <= 0 {
+		return 0
+	}
+	return c.MaxAttempts
+}
+
+// MissingReviewGraceOrZero returns how long a fully silent review gate may hold
+// a PR before it is treated as non-blocking, or 0 when the operator has not
+// opted in (today's block-forever behavior).
+func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
+	if c.MissingAfterMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.MissingAfterMinutes) * time.Minute
 }
 
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting
@@ -1866,6 +2127,164 @@ func windowsDriveAbsPath(p string) bool {
 	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
 }
 
+// RemoteRunnerConfig is the deliberately small, project-scoped SSH adapter
+// used by the remote-worker spike (#1058). The control plane still owns issue
+// selection, durable state, the local tmux/process lease, and a lightweight
+// shadow worktree. Only the agent CLI and its canonical working tree move to
+// the configured host.
+//
+// Enabled is an explicit opt-in and defaults false. CredentialsFile names a
+// private file that exists on the runner; Maestro never reads it on the
+// control-plane host or copies credential values over SSH.
+type RemoteRunnerConfig struct {
+	Enabled         bool     `yaml:"enabled"`
+	Target          string   `yaml:"target"`           // ssh target, e.g. runner@example.internal
+	RepoPath        string   `yaml:"repo_path"`        // existing clone on the runner
+	WorktreeBase    string   `yaml:"worktree_base"`    // runner-side parent for per-slot worktrees
+	BaseBranch      string   `yaml:"base_branch"`      // default: main
+	SSHCommand      string   `yaml:"ssh_command"`      // default: ssh
+	SSHArgs         []string `yaml:"ssh_args"`         // argv entries before target; no shell parsing
+	MaestroCommand  string   `yaml:"maestro_command"`  // runner-side binary; default: maestro
+	CredentialsFile string   `yaml:"credentials_file"` // optional runner-side private credential file
+}
+
+func validateRemoteRunner(cfg *Config) error {
+	if cfg == nil || !cfg.RemoteRunner.Enabled {
+		return nil
+	}
+	r := &cfg.RemoteRunner
+	if strings.TrimSpace(r.SSHCommand) == "" {
+		r.SSHCommand = "ssh"
+	}
+	r.SSHCommand = strings.TrimSpace(r.SSHCommand)
+	if strings.TrimSpace(r.MaestroCommand) == "" {
+		r.MaestroCommand = "maestro"
+	}
+	r.MaestroCommand = strings.TrimSpace(r.MaestroCommand)
+	if strings.TrimSpace(r.BaseBranch) == "" {
+		r.BaseBranch = "main"
+	}
+	r.BaseBranch = strings.TrimSpace(r.BaseBranch)
+	if err := validateRemoteCommandToken("ssh_command", r.SSHCommand); err != nil {
+		return err
+	}
+	if err := validateRemoteCommandToken("maestro_command", r.MaestroCommand); err != nil {
+		return err
+	}
+	target := strings.TrimSpace(r.Target)
+	if target == "" || strings.HasPrefix(target, "-") || containsControlOrSpace(target) {
+		return fmt.Errorf("config: remote_runner.target must be a non-empty ssh target without whitespace or a leading '-'")
+	}
+	r.Target = target
+	r.RepoPath = strings.TrimSpace(r.RepoPath)
+	r.WorktreeBase = strings.TrimSpace(r.WorktreeBase)
+	r.CredentialsFile = strings.TrimSpace(r.CredentialsFile)
+	if err := validateRemoteAbsolutePath("repo_path", r.RepoPath, false); err != nil {
+		return err
+	}
+	if err := validateRemoteAbsolutePath("worktree_base", r.WorktreeBase, false); err != nil {
+		return err
+	}
+	if r.CredentialsFile != "" {
+		if err := validateRemoteAbsolutePath("credentials_file", r.CredentialsFile, true); err != nil {
+			return err
+		}
+	}
+	if err := validateRemoteGitRef("base_branch", r.BaseBranch); err != nil {
+		return err
+	}
+	if err := validateRemoteSSHArgs(r.SSHArgs); err != nil {
+		return err
+	}
+	if cfg.AutoRebase {
+		return fmt.Errorf("config: remote_runner requires auto_rebase: false in the v1 spike; rebase automation still operates on the control-plane shadow worktree")
+	}
+	if cfg.ValidationContract {
+		return fmt.Errorf("config: remote_runner does not support validation_contract in the v1 spike")
+	}
+	if cfg.Pipeline.Enabled {
+		return fmt.Errorf("config: remote_runner does not support pipeline.enabled in the v1 spike")
+	}
+	if cfg.Hooks.AfterCreate != "" || cfg.Hooks.BeforeRun != "" || cfg.Hooks.AfterRun != "" || cfg.Hooks.BeforeRemove != "" ||
+		cfg.Hooks.PreTool.Command != "" || cfg.Hooks.PostEdit.Command != "" {
+		return fmt.Errorf("config: remote_runner does not support lifecycle or tool hooks in the v1 spike")
+	}
+	return nil
+}
+
+func validateRemoteCommandToken(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.HasPrefix(value, "-") || containsControlOrSpace(value) {
+		return fmt.Errorf("config: remote_runner.%s must be one executable path or name without whitespace", name)
+	}
+	return nil
+}
+
+func validateRemoteSSHArgs(args []string) error {
+	needsValue := map[string]bool{
+		"-B": true, "-b": true, "-c": true, "-E": true, "-e": true,
+		"-F": true, "-I": true, "-i": true, "-J": true, "-L": true,
+		"-l": true, "-m": true, "-O": true, "-o": true, "-p": true,
+		"-Q": true, "-R": true, "-S": true, "-W": true, "-w": true,
+	}
+	expectValue := false
+	for i, arg := range args {
+		if strings.ContainsAny(arg, "\x00\r\n") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must not contain NUL or newlines", i)
+		}
+		if expectValue {
+			if arg == "" {
+				return fmt.Errorf("config: remote_runner.ssh_args[%d] must not be empty", i)
+			}
+			expectValue = false
+			continue
+		}
+		if arg == "" || arg == "--" || !strings.HasPrefix(arg, "-") {
+			return fmt.Errorf("config: remote_runner.ssh_args[%d] must be an ssh option, not a target or remote command", i)
+		}
+		expectValue = needsValue[arg]
+	}
+	if expectValue {
+		return fmt.Errorf("config: remote_runner.ssh_args ends with an option that requires a value")
+	}
+	return nil
+}
+
+func validateRemoteAbsolutePath(name, value string, allowFile bool) error {
+	value = strings.TrimSpace(value)
+	if value == "" || strings.ContainsAny(value, "\x00\r\n") || !pathpkg.IsAbs(value) {
+		return fmt.Errorf("config: remote_runner.%s must be an absolute runner-side POSIX path", name)
+	}
+	clean := pathpkg.Clean(value)
+	if clean != value || clean == "/" {
+		return fmt.Errorf("config: remote_runner.%s must be normalized and must not be '/'", name)
+	}
+	if !allowFile && strings.HasSuffix(value, "/") {
+		return fmt.Errorf("config: remote_runner.%s must not have a trailing slash", name)
+	}
+	return nil
+}
+
+func validateRemoteGitRef(name, value string) error {
+	value = strings.TrimSpace(value)
+	if value == "" || value == "@" || strings.ContainsAny(value, "\x00\r\n ~^:?*[\\") || strings.HasPrefix(value, "-") ||
+		strings.HasPrefix(value, ".") || strings.Contains(value, "/.") || strings.HasSuffix(value, ".lock") ||
+		strings.HasPrefix(value, "/") || strings.HasSuffix(value, "/") || strings.HasSuffix(value, ".") ||
+		strings.Contains(value, "..") || strings.Contains(value, "@{") || strings.Contains(value, "//") {
+		return fmt.Errorf("config: remote_runner.%s is not a safe git branch name", name)
+	}
+	return nil
+}
+
+func containsControlOrSpace(value string) bool {
+	for _, r := range value {
+		if unicode.IsControl(r) || unicode.IsSpace(r) {
+			return true
+		}
+	}
+	return false
+}
+
 type Config struct {
 	Server     ServerConfig     `yaml:"server"`
 	Supervisor SupervisorConfig `yaml:"supervisor"`
@@ -1881,13 +2300,15 @@ type Config struct {
 	Outcome                         outcome.Brief                 `yaml:"outcome"`
 	LocalPath                       string                        `yaml:"local_path"`
 	WorktreeBase                    string                        `yaml:"worktree_base"`
+	WorkerRuntime                   WorkerRuntimeConfig           `yaml:"worker_runtime,omitempty"`
+	RemoteRunner                    RemoteRunnerConfig            `yaml:"remote_runner"`
 	MaxParallel                     int                           `yaml:"max_parallel"`
 	MaxLiveWorkers                  int                           `yaml:"max_live_workers"`              // #814: cap on live implementation workers (StatusRunning). When >0, pr_open PR-gate sessions no longer consume spawn capacity, so a gate-bound queue keeps dispatching live workers up to this limit. 0 = legacy (pr_open counts against max_parallel).
 	MaxConcurrentByState            map[string]int                `yaml:"max_concurrent_by_state"`       // per-state concurrency limits (e.g. "running": 5, "pr_open": 2)
 	MaxRuntimeMinutes               int                           `yaml:"max_runtime_minutes"`           // max worker runtime in minutes (default: 120)
 	WorkerSilentTimeoutMinutes      int                           `yaml:"worker_silent_timeout_minutes"` // deprecated (#887): terminal-output-only kill; superseded by stalled_progress_watchdog. Kills a running worker if tmux output hash doesn't change for N minutes (0 = disabled)
 	StalledProgressWatchdog         StalledProgressWatchdogConfig `yaml:"stalled_progress_watchdog"`     // #887: explicit-opt-in durable multi-signal watchdog (20-minute max silence when enabled with no override)
-	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // kill worker when token usage exceeds this threshold (0 = unlimited)
+	WorkerMaxTokens                 int                           `yaml:"worker_max_tokens"`             // per-attempt live token budget; Claude/Pi exclude cache reads (0 = unlimited)
 	WorkerSoftTokenThreshold        *float64                      `yaml:"worker_soft_token_threshold"`   // fraction of worker_max_tokens to trigger checkpoint+respawn (default: 0.8, 0 = disabled)
 	MaxRetriesPerIssue              int                           `yaml:"max_retries_per_issue"`         // max failed worker sessions per issue before giving up (default: 3, 0 = unlimited)
 	AutoRebase                      bool                          `yaml:"auto_rebase"`                   // auto-attempt rebase for conflicting sessions (default: true)
@@ -1916,6 +2337,7 @@ type Config struct {
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
 	AutoRetryRebaseConflicts        bool                          `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
 	Telegram                        TelegramConfig                `yaml:"telegram"`
+	Notify                          NotifyConfig                  `yaml:"notify"` // #1018: ntfy push transport + alert-class routing
 	Versioning                      VersioningConfig              `yaml:"versioning"`
 	SelfDeploy                      SelfDeployConfig              `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
 	GitHubProjects                  GitHubProjectsConfig          `yaml:"github_projects"`
@@ -1944,6 +2366,11 @@ type Config struct {
 	// configstore.Load; nil for file-loaded configs. Not serialized and ignored
 	// by config equality — it is display provenance for effective_config only.
 	SettingsSources map[string]string `yaml:"-" json:"-"`
+	// FleetOnlySettings carries the resolved values of daemon/control-plane
+	// settings that have no project-YAML field. Config-store loads populate it
+	// for Mission Control display; file-loaded configs leave it nil and use the
+	// registered built-in defaults.
+	FleetOnlySettings map[string]string `yaml:"-" json:"-"`
 }
 
 // LoadFrom loads config from a specific path.
@@ -2128,6 +2555,9 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
+	if cfg.Pipeline.AdvisorReviewRounds < 0 || cfg.Pipeline.AdvisorReviewRounds > MaxAdvisorReviewRounds {
+		return nil, fmt.Errorf("config: pipeline.advisor_review_rounds must be between 1 and %d when set (0 uses the default of %d)", MaxAdvisorReviewRounds, DefaultAdvisorReviewRounds)
+	}
 
 	// #869: optional project identity metadata. A present project_id must be a
 	// UUID; a present management_home must satisfy its field contract. Both are
@@ -2136,6 +2566,12 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateManagementHome(cfg.ManagementHome); err != nil {
+		return nil, err
+	}
+	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {
+		return nil, err
+	}
+	if err := validateRemoteRunner(cfg); err != nil {
 		return nil, err
 	}
 	if !cfg.Delivery.ValidMode() {
@@ -2214,6 +2650,7 @@ func parse(data []byte) (*Config, error) {
 	// Expand ~ in paths
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
+	cfg.WorkerRuntime.ScratchRoot = expandHome(cfg.WorkerRuntime.ScratchRoot)
 	cfg.Outcome = cfg.Outcome.Normalized()
 	if cfg.Outcome.Configured() {
 		cfg.Outcome.SourceRepoPath = expandHome(cfg.Outcome.SourceRepoPath)
@@ -2225,6 +2662,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.BugPrompt = expandHome(cfg.BugPrompt)
 	cfg.EnhancementPrompt = expandHome(cfg.EnhancementPrompt)
 	cfg.Pipeline.Planner.Prompt = expandHome(cfg.Pipeline.Planner.Prompt)
+	cfg.Pipeline.Advisor.Prompt = expandHome(cfg.Pipeline.Advisor.Prompt)
 	cfg.Pipeline.Implementer.Prompt = expandHome(cfg.Pipeline.Implementer.Prompt)
 	cfg.Pipeline.Validator.Prompt = expandHome(cfg.Pipeline.Validator.Prompt)
 	cfg.Supervisor.Prompt = expandHome(cfg.Supervisor.Prompt)
@@ -2271,7 +2709,11 @@ func parse(data []byte) (*Config, error) {
 
 	// Model backend defaults
 	if cfg.Model.Default == "" {
-		cfg.Model.Default = "claude"
+		if len(cfg.Model.FallbackBackends) == 0 && len(cfg.Model.ProviderLanes) > 0 && strings.TrimSpace(cfg.Model.ProviderLanes[0].Default) != "" {
+			cfg.Model.Default = strings.TrimSpace(cfg.Model.ProviderLanes[0].Default)
+		} else {
+			cfg.Model.Default = "claude"
+		}
 	}
 	if cfg.Model.Backends == nil {
 		cfg.Model.Backends = make(map[string]BackendDef)
@@ -2281,6 +2723,12 @@ func parse(data []byte) (*Config, error) {
 		if _, ok := cfg.Model.Backends["claude"]; !ok {
 			cfg.Model.Backends["claude"] = BackendDef{Cmd: cfg.ClaudeCmd}
 		}
+	}
+	// Provider lanes must reference explicit backend definitions. Validate before
+	// the legacy model.default compatibility block below can synthesize a backend
+	// for the effective default.
+	if err := validateProviderLanes(cfg); err != nil {
+		return nil, err
 	}
 
 	// Ensure the default backend is always present in the map
@@ -2306,7 +2754,20 @@ func parse(data []byte) (*Config, error) {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
 		}
 	}
-
+	if cfg.Model.HoldOnCooldown.MaxWaitMinutes < 0 {
+		return nil, fmt.Errorf("config: model.hold_on_cooldown.max_wait_minutes = %d; want >= 0 (0 uses the default window)", cfg.Model.HoldOnCooldown.MaxWaitMinutes)
+	}
+	if cfg.Supervisor.AttemptTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.attempt_timeout_seconds = %d; want >= 0 (0 uses the 45s default)", cfg.Supervisor.AttemptTimeoutSeconds)
+	}
+	if cfg.Supervisor.TotalTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.total_timeout_seconds = %d; want >= 0 (0 uses the 180s default)", cfg.Supervisor.TotalTimeoutSeconds)
+	}
+	for name, def := range cfg.Model.Backends {
+		if def.SupervisorAttemptTimeoutSeconds < 0 {
+			return nil, fmt.Errorf("config: model.backends.%s.supervisor_attempt_timeout_seconds = %d; want >= 0", name, def.SupervisorAttemptTimeoutSeconds)
+		}
+	}
 	// #704: quota calibration sanity. Capacities must be non-negative and
 	// the dispatch threshold a fraction in (0, 1]; a percent-style value
 	// (e.g. 85) almost certainly means the operator meant 0.85, so fail
@@ -2360,9 +2821,6 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Supervisor.ApprovalRequiredActions == nil {
 		cfg.Supervisor.ApprovalRequiredActions = []string{
 			"review_retry_exhausted",
-			"spawn_worker",
-			"spawn_repair_worker",
-			"spawn_review_repair",
 			"label_issue_ready",
 			"add_ready_label",
 			"open_child_issue",
@@ -2491,6 +2949,9 @@ func parse(data []byte) (*Config, error) {
 
 	if err := normalizeSupervisorPolicy(&cfg.Supervisor); err != nil {
 		return nil, err
+	}
+	if err := cfg.Outcome.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 
 	return cfg, nil
@@ -2683,6 +3144,12 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	if policy.DispatchSLASeconds < 0 {
 		return fmt.Errorf("supervisor.dispatch_sla_seconds must be >= 0")
 	}
+	if policy.UnchangedDecisionWindowSeconds < 0 {
+		return fmt.Errorf("supervisor.unchanged_decision_window_seconds must be >= 0")
+	}
+	if policy.RecommendationTTLSeconds < 0 {
+		return fmt.Errorf("supervisor.recommendation_ttl_seconds must be >= 0")
+	}
 	policy.ExcludedLabels = normalizeStringList(policy.ExcludedLabels)
 	policy.AllowIssueTypes = normalizeStringList(policy.AllowIssueTypes)
 	policy.SafeActions = normalizeActionList(policy.SafeActions)
@@ -2698,6 +3165,9 @@ func normalizeSupervisorPolicy(policy *SupervisorConfig) error {
 	policy.CompletionGates.LiveVisualCommand = strings.TrimSpace(policy.CompletionGates.LiveVisualCommand)
 	policy.CompletionGates.DeploymentStatusCmd = strings.TrimSpace(policy.CompletionGates.DeploymentStatusCmd)
 	policy.CompletionGates.VerificationLabel = strings.TrimSpace(policy.CompletionGates.VerificationLabel)
+	policy.OperatorGate.CheckNames = normalizeStringList(policy.OperatorGate.CheckNames)
+	policy.OperatorGate.Labels = normalizeStringList(policy.OperatorGate.Labels)
+	policy.OperatorGate.RequiredAction = strings.TrimSpace(policy.OperatorGate.RequiredAction)
 	if policy.DynamicWave.DependencyUnblock.Enabled == nil &&
 		policy.DynamicWave.Active() &&
 		policy.DynamicWave.OwnsReadyLabel &&
@@ -2869,11 +3339,12 @@ func (c *Config) manualRoutingLabelPinWarning() string {
 		return ""
 	}
 	if strings.TrimSpace(c.Pipeline.Planner.Backend) != "" ||
+		strings.TrimSpace(c.Pipeline.Advisor.Backend) != "" ||
 		strings.TrimSpace(c.Pipeline.Validator.Backend) != "" {
 		return ""
 	}
 	return fmt.Sprintf(
-		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
+		"config: %d backends are configured but routing.mode is %q and no pipeline.{planner,advisor,validator}.backend is set — backend selection will be by model:<name> label or model.default only, not by task content. Set routing.mode: policy for task-aware routing, routing.mode: auto for LLM routing, or per-role pipeline backends for role-based routing.",
 		len(c.Model.Backends),
 		coalesceRoutingMode(c.Routing.Mode),
 	)
@@ -2934,21 +3405,25 @@ func mergeApprovalGatedVerbs(approvalRequired []string) []string {
 
 func knownSupervisorActions() map[string]bool {
 	return map[string]bool{
-		SupervisorActionAddReadyLabel:       true,
-		SupervisorActionRemoveReadyLabel:    true,
-		SupervisorActionAddBlockedLabel:     true,
-		SupervisorActionRemoveBlockedLabel:  true,
-		SupervisorActionAddIssueComment:     true,
-		SupervisorActionMergePR:             true,
-		SupervisorActionCloseIssue:          true,
-		SupervisorActionCloseIssueBatch:     true,
-		SupervisorActionDeleteWorktree:      true,
-		SupervisorActionChangeGlobalConfig:  true,
-		SupervisorActionApplyLessonProposal: true,
-		SupervisorActionSpawnReviewRepair:   true,
-		SupervisorActionRestartWorker:       true,
-		SupervisorActionStopWorker:          true,
-		SupervisorActionEditIssueBody:       true,
+		SupervisorActionAddReadyLabel:              true,
+		SupervisorActionRemoveReadyLabel:           true,
+		SupervisorActionAddBlockedLabel:            true,
+		SupervisorActionRemoveBlockedLabel:         true,
+		SupervisorActionHoldMerge:                  true,
+		SupervisorActionReleaseMerge:               true,
+		SupervisorActionAddIssueComment:            true,
+		SupervisorActionMergePR:                    true,
+		SupervisorActionCloseIssue:                 true,
+		SupervisorActionCloseIssueBatch:            true,
+		SupervisorActionDeleteWorktree:             true,
+		SupervisorActionChangeGlobalConfig:         true,
+		SupervisorActionApplyLessonProposal:        true,
+		SupervisorActionSpawnRepairWorker:          true,
+		SupervisorActionSpawnReviewRepair:          true,
+		SupervisorActionRestartWorker:              true,
+		SupervisorActionRestartStaleBackendWorkers: true,
+		SupervisorActionStopWorker:                 true,
+		SupervisorActionEditIssueBody:              true,
 	}
 }
 
@@ -2958,6 +3433,8 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionRemoveReadyLabel,
 		SupervisorActionAddBlockedLabel,
 		SupervisorActionRemoveBlockedLabel,
+		SupervisorActionHoldMerge,
+		SupervisorActionReleaseMerge,
 		SupervisorActionAddIssueComment,
 		SupervisorActionMergePR,
 		SupervisorActionCloseIssue,
@@ -2965,8 +3442,10 @@ func knownSupervisorActionNames() []string {
 		SupervisorActionDeleteWorktree,
 		SupervisorActionChangeGlobalConfig,
 		SupervisorActionApplyLessonProposal,
+		SupervisorActionSpawnRepairWorker,
 		SupervisorActionSpawnReviewRepair,
 		SupervisorActionRestartWorker,
+		SupervisorActionRestartStaleBackendWorkers,
 		SupervisorActionStopWorker,
 		SupervisorActionEditIssueBody,
 	}

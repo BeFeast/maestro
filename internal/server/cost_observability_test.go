@@ -494,6 +494,70 @@ func TestBuildFleetCostObservability_SelfReportedCostWins(t *testing.T) {
 	}
 }
 
+func TestBuildFleetCostObservability_UsageUnreliableIsNotSilentZeroActivity(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	cfg := &config.Config{Model: config.ModelConfig{Backends: map[string]config.BackendDef{"grok": {}}}}
+	st := &state.State{Sessions: map[string]*state.Session{
+		"sup-946": {
+			IssueNumber:    946,
+			IssueTitle:     "proxy usage telemetry",
+			Backend:        "grok",
+			Status:         state.StatusDone,
+			StartedAt:      now.Add(-time.Minute),
+			FinishedAt:     timePtr(now),
+			CostUSDBackend: 0.125,
+			Attribution: []state.BackendAttribution{{
+				Backend:               "grok",
+				UsageUnreliable:       true,
+				UsageUnreliableReason: "terminal_result_missing_usage",
+				UsageUnreliableScope:  state.UsageUnreliableScopeAccounting,
+			}},
+		},
+	}}
+
+	got := buildFleetCostObservability(cfg, st, now)
+	if got.Lifetime.Sessions != 1 || got.Lifetime.UsageUnreliableSessions != 1 {
+		t.Fatalf("lifetime = %+v, want one explicitly unreliable session", got.Lifetime)
+	}
+	if got.Lifetime.Tokens != 0 {
+		t.Fatalf("lifetime tokens = %d, want unavailable 0 lower bound", got.Lifetime.Tokens)
+	}
+	if math.Abs(got.Lifetime.USD-0.125) > 1e-9 {
+		t.Fatalf("lifetime USD = %f, want backend-reported 0.125", got.Lifetime.USD)
+	}
+	if len(got.PerIssue) != 1 || got.PerIssue[0].UsageUnreliableSessions != 1 {
+		t.Fatalf("per_issue = %+v, want explicit usage-unreliable rollup", got.PerIssue)
+	}
+}
+
+func TestBuildFleetCostObservability_LiveBudgetDegradationKeepsTerminalAccountingReliable(t *testing.T) {
+	now := time.Date(2026, 7, 21, 12, 0, 0, 0, time.UTC)
+	cfg := &config.Config{Model: config.ModelConfig{Backends: map[string]config.BackendDef{"grok": {}}}}
+	st := &state.State{Sessions: map[string]*state.Session{
+		"sup-live": {
+			Backend:         "grok",
+			Status:          state.StatusDone,
+			StartedAt:       now.Add(-time.Minute),
+			FinishedAt:      timePtr(now),
+			TokensUsedTotal: 26_064,
+			Attribution: []state.BackendAttribution{{
+				Backend:               "grok",
+				UsageUnreliable:       true,
+				UsageUnreliableReason: "live_assistant_zero_input_or_output",
+				UsageUnreliableScope:  state.UsageUnreliableScopeLiveBudget,
+			}},
+		},
+	}}
+
+	got := buildFleetCostObservability(cfg, st, now)
+	if got.Lifetime.Tokens != 26_064 || got.Lifetime.Sessions != 1 {
+		t.Fatalf("lifetime = %+v, want exact terminal accounting", got.Lifetime)
+	}
+	if got.Lifetime.UsageUnreliableSessions != 0 {
+		t.Fatalf("live-budget-only degradation polluted accounting rollup: %+v", got.Lifetime)
+	}
+}
+
 // TestSessionCostEstimate_Precedence covers the per-session cost helper's
 // self-reported > split > blended precedence (#739).
 func TestSessionCostEstimate_Precedence(t *testing.T) {
@@ -528,6 +592,22 @@ func TestSessionCostEstimate_Precedence(t *testing.T) {
 	// Unknown backend with split tokens → 0.
 	if got := sessionCostEstimate("unknown", total, input, output, cacheRead, cacheWrite, pricing, 0); got != 0 {
 		t.Errorf("unknown backend split = %f, want 0", got)
+	}
+}
+
+func TestSessionCostEstimate_KimiSplitUsage(t *testing.T) {
+	pricing := map[string]config.BackendPricing{
+		"moonshot-primary": {
+			InputUSDPerMtok:      2,
+			OutputUSDPerMtok:     8,
+			CacheReadUSDPerMtok:  0.5,
+			CacheWriteUSDPerMtok: 2,
+		},
+	}
+	got := sessionCostEstimate("moonshot-primary", 2650, 2100, 180, 350, 20, pricing, 0)
+	want := (2100*2 + 180*8 + 350*0.5 + 20*2) / 1_000_000.0
+	if math.Abs(got-want) > 1e-9 {
+		t.Fatalf("Kimi split estimate = %f, want %f", got, want)
 	}
 }
 

@@ -72,11 +72,13 @@ export function mapFleetResponse(raw, now = Date.now()) {
     Number(summary.outcome_drift || 0) +
     Number(summary.no_eligible_issues || 0);
   const providerModelHealth = aggregateProviderModelHealth(raw.projects || [], now);
+  const tmpfsHygiene = mapTmpfsHygiene(raw.tmpfs_hygiene);
 
   return {
     raw,
     readOnly: raw.read_only === true,
     emergency: mapEmergency(raw.emergency),
+    tmpfsHygiene,
     refreshedAt: raw.refreshed_at || "",
     nextAction: raw.next_action || null,
     verdict: pickVerdictTuple(raw.verdict, raw.operator_brief),
@@ -93,7 +95,7 @@ export function mapFleetResponse(raw, now = Date.now()) {
     heartbeatBpm: estimateHeartbeatBpm(summary, raw.verdict?.tone),
     workerCount: Number(summary.running || 0),
     prCount: Number(summary.pr_open || 0),
-    attentionCount,
+    attentionCount: attentionCount + (tmpfsHygiene?.pressure ? 1 : 0),
     activeApprovals: Number(summary.approvals_pending || 0),
     selfResolvingCount: selfResolving,
     throughputMerged7d: Number(summary.throughput_merged_7d || 0),
@@ -106,6 +108,25 @@ export function mapFleetResponse(raw, now = Date.now()) {
     providerModelHealth,
     backendQuota: aggregateBackendQuota(raw.projects || [], providerModelHealth),
     costObservability: mapCostObservability(raw.cost_observability),
+  };
+}
+
+export function mapTmpfsHygiene(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  return {
+    timestamp: String(raw.timestamp || ""),
+    mode: String(raw.mode || ""),
+    tmpfs: raw.tmpfs === true,
+    usePct: Number(raw.use_pct || 0),
+    pressure: raw.pressure === true,
+    attentionCode: String(raw.attention_code || ""),
+    reclaimableBytes: Number(raw.reclaimable_bytes || 0),
+    freedBytes: Number(raw.freed_bytes || 0),
+    protectedEntries: Number(raw.protected_entries || 0),
+    deletedEntries: Number(raw.deleted_entries || 0),
+    partialEntries: Number(raw.partial_entries || 0),
+    procScanErrors: Number(raw.proc_scan_errors || 0),
+    error: String(raw.error || ""),
   };
 }
 
@@ -651,6 +672,7 @@ function mapProject(project, workers, now) {
   const slug = slugifyProject(project.name);
   const queue = project.queue_snapshot || {};
   const outcome = project.outcome || {};
+	const dispatchHold = project.dispatch_hold || {};
 	const pulse = project.supervisor_pulse || {};
   return {
     slug,
@@ -670,9 +692,17 @@ function mapProject(project, workers, now) {
     failed: Number(project.failed || 0),
     sessions: Number(project.sessions || 0),
     needsAttention: Number(project.needs_attention || 0),
+    actions: Array.isArray(project.actions) ? project.actions : [],
     operatorState: project.operator_state || {},
+    prStates: Array.isArray(project.pr_states) ? project.pr_states.map(mapPRGate).filter(Boolean) : [],
     outcome,
     queueSnapshot: queue,
+    dispatchHold: {
+      active: dispatchHold.active === true,
+      reasonClass: String(dispatchHold.reason_class || ""),
+      detail: String(dispatchHold.detail || ""),
+      since: String(dispatchHold.since || ""),
+    },
     freshness: project.freshness || {},
     supervisor: project.supervisor || {},
 	supervisorPulse: pulse,
@@ -745,8 +775,10 @@ function mapWatchdogEvent(raw) {
   return {
     action: String(raw.action || ""),
     outcome: String(raw.outcome || ""),
+	stage: String(raw.stage || ""),
     recommendationId: String(raw.recommendation_id || ""),
     reason: String(raw.reason || ""),
+	leaseGeneration: Number(raw.lease_generation || 0),
     phase: String(raw.phase || ""),
     at: String(raw.at || ""),
     completedAt: String(raw.completed_at || ""),
@@ -767,14 +799,19 @@ function mapEffectiveConfig(raw) {
     modelPolicy: {
       default: String(policy.default || ""),
       fallbackBackends: Array.isArray(policy.fallback_backends) ? policy.fallback_backends.map(String) : [],
+      providerLanes: Array.isArray(policy.provider_lanes) ? policy.provider_lanes.map(mapProviderLane) : [],
+      resolvedRoute: arrayOfString(policy.resolved_route),
+      selectionReason: String(policy.selection_reason || ""),
       backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
       routing: {
         mode: String((policy.routing || {}).mode || ""),
         routerModel: String((policy.routing || {}).router_model || ""),
         routerModelName: String((policy.routing || {}).router_model_name || ""),
         allowMeteredBackend: (policy.routing || {}).allow_metered_backend === true,
+        tiers: Array.isArray((policy.routing || {}).tiers) ? (policy.routing || {}).tiers.map(mapEffectiveRoutingTier) : [],
       },
     },
+    pipeline: mapEffectivePipeline(raw.pipeline),
     maxParallel: Number(raw.max_parallel || 0),
     reviewGate: String(raw.review_gate || ""),
     labels: {
@@ -822,6 +859,14 @@ function mapEffectiveConfig(raw) {
   };
 }
 
+function mapProviderLane(raw) {
+  return {
+    provider: String(raw?.provider || ""),
+    default: String(raw?.default || ""),
+    fallbackBackends: arrayOfString(raw?.fallback_backends),
+  };
+}
+
 // mapSettingSource maps one fleet-controllable cost/LLM knob (#839): its
 // effective value and the layer it came from (builtin/fleet/project). isDefault
 // drives the "non-default override" highlight in the Settings panel.
@@ -849,6 +894,32 @@ function mapEffectiveBackend(raw) {
     outputUSDPerMtok: Number(raw?.output_usd_per_mtok || 0),
     pricingClass: String(raw?.pricing_class || ""),
     metered: raw?.metered === true,
+  };
+}
+
+function mapEffectiveRoutingTier(raw) {
+  return {
+    name: String(raw?.name || ""),
+    backend: String(raw?.backend || ""),
+    effort: String(raw?.effort || ""),
+    model: String(raw?.model || ""),
+    rank: Number(raw?.rank || 0),
+  };
+}
+
+function mapEffectivePipeline(raw) {
+  const role = value => ({
+    enabled: value?.enabled === true,
+    backend: String(value?.backend || ""),
+    effort: String(value?.effort || ""),
+  });
+  return {
+    planner: role(raw?.planner || {}),
+    advisor: role(raw?.advisor || {}),
+    implementer: role(raw?.implementer || {}),
+    validator: role(raw?.validator || {}),
+    advisorReviewRounds: Number(raw?.advisor_review_rounds || 0),
+    advisorBestEffort: raw?.advisor_best_effort === true,
   };
 }
 
@@ -892,6 +963,18 @@ export function projectBoardIssueURL(board, issueNumber) {
 }
 
 export function mapProjectState(project) {
+	const op = project.operator_state || {};
+	const kind = op.kind || "idle";
+	const label = op.label || "idle";
+	if (kind === "code_landed") {
+		return { state: "ok", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
+	if (kind === "merge_in_progress") {
+		return { state: "watch", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
+	if (kind === "merge_action_required" || kind === "review_repair") {
+		return { state: "stuck", label, pr: op.pr_number ? { num: op.pr_number, label } : undefined };
+	}
   if (!(project.outcome || {}).configured) {
     return { state: "idle", label: "unconfigured" };
   }
@@ -901,9 +984,6 @@ export function mapProjectState(project) {
   if (project.freshness?.stale) {
     return { state: "unknown", label: "stale" };
   }
-  const op = project.operator_state || {};
-  const label = op.label || "idle";
-  const kind = op.kind || "idle";
 
   if (Number(project.running || 0) > 0 || kind === "working") {
     return { state: "live", label, count: project.running };
@@ -924,6 +1004,8 @@ export function mapProjectState(project) {
   if (
     kind === "stale_worker" ||
     kind === "dispatch_failure" ||
+    kind === "merge_action_required" ||
+    kind === "review_repair" ||
     Number(project.needs_attention || 0) > Number(project.self_resolving || 0)
   ) {
     return { state: "stuck", label };
@@ -942,6 +1024,9 @@ export function mapProjectState(project) {
 
 function projectSummaryLine(project) {
   const op = project.operator_state || {};
+	if (["code_landed", "merge_in_progress", "merge_action_required", "review_repair"].includes(String(op.kind || "")) && op.summary) {
+		return op.summary;
+	}
   if (!(project.outcome || {}).configured) {
     return "No outcome configured";
   }
@@ -982,6 +1067,102 @@ function mapWorker(worker) {
     done: worker.status === "done",
     stuck: taxonomy.section === "stuck",
     stuckReason: taxonomy.section === "stuck" ? worker.status_reason || status : "",
+    prGate: mapPRGate(worker.pr_gate),
+    backendDrift: mapBackendDrift(worker.backend_drift),
+    advisor: mapAdvisor(worker),
+  };
+}
+
+export function mapPRGate(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const streams = Array.isArray(raw.review_streams)
+    ? raw.review_streams.map(stream => ({
+      name: String(stream?.name || ""),
+      passed: stream?.passed === true,
+      pending: stream?.pending === true,
+      score: Number(stream?.score || 0),
+      scoreMax: Number(stream?.score_max || 0),
+      verdict: String(stream?.verdict || ""),
+      findingsCount: Number(stream?.findings_count || 0),
+      summary: String(stream?.summary || ""),
+    }))
+    : [];
+  const merge = raw.merge_action && typeof raw.merge_action === "object"
+    ? {
+      approvalId: String(raw.merge_action.approval_id || ""),
+      status: String(raw.merge_action.status || ""),
+      label: String(raw.merge_action.label || ""),
+      summary: String(raw.merge_action.summary || ""),
+      nextAction: String(raw.merge_action.next_action || ""),
+      actionRequired: raw.merge_action.action_required === true,
+      updatedAt: String(raw.merge_action.updated_at || ""),
+    }
+    : null;
+  return {
+    prNumber: Number(raw.pr_number || 0),
+    ci: String(raw.ci || ""),
+    review: String(raw.review || ""),
+    reviewSummary: String(raw.review_summary || ""),
+    reviewStreams: streams,
+    mergeAction: merge,
+    merged: raw.merged === true,
+    mergedAt: String(raw.merged_at || ""),
+    summary: String(raw.summary || ""),
+    updatedAt: String(raw.updated_at || ""),
+  };
+}
+
+export function mapAdvisor(worker) {
+  if (!worker || !(worker.advisor_backend || worker.advisor_verdict || worker.advisor_terminal_reason || worker.advisor_review_round || worker.phase === "advisor")) {
+    return null;
+  }
+  return {
+    phase: String(worker.phase || ""),
+    planVersion: Number(worker.plan_version || 0),
+    reviewRound: Number(worker.advisor_review_round || 0),
+    maxReviewRounds: Number(worker.advisor_max_review_rounds || 0),
+    backend: String(worker.advisor_backend || ""),
+    model: String(worker.advisor_model || ""),
+    verdict: String(worker.advisor_verdict || ""),
+    unresolvedFindings: String(worker.advisor_unresolved_findings || ""),
+    terminalReason: String(worker.advisor_terminal_reason || ""),
+    bestEffort: worker.advisor_best_effort === true,
+    bypassed: worker.advisor_bypassed === true,
+    reviews: Array.isArray(worker.advisor_reviews) ? worker.advisor_reviews.map(review => ({
+      planVersion: Number(review?.plan_version || 0),
+      reviewRound: Number(review?.review_round || 0),
+      backend: String(review?.backend || ""),
+      model: String(review?.model || ""),
+      verdict: String(review?.verdict || ""),
+      findings: String(review?.findings || ""),
+      terminalReason: String(review?.terminal_reason || ""),
+      bypassed: review?.bypassed === true,
+      reviewedAt: String(review?.reviewed_at || ""),
+    })) : [],
+  };
+}
+
+function mapBackendDrift(raw) {
+  if (!raw || raw.stale !== true) return null;
+  return {
+    stale: true,
+    backend: String(raw.backend || ""),
+    reason: String(raw.reason || ""),
+    running: mapBackendRuntimeSettings(raw.running),
+    effective: mapBackendRuntimeSettings(raw.effective),
+    restartable: raw.restartable === true,
+    refusalReason: String(raw.refusal_reason || ""),
+    recommendedAction: String(raw.recommended_action || ""),
+  };
+}
+
+function mapBackendRuntimeSettings(raw) {
+  raw = raw || {};
+  return {
+    provider: String(raw.provider || ""),
+    model: String(raw.model || ""),
+    variant: String(raw.variant || ""),
+    effort: String(raw.effort || ""),
   };
 }
 
@@ -1012,6 +1193,13 @@ export function workerStatusTaxonomy(worker) {
   const status = String(worker.status || "");
   const display = String(worker.display_status || "");
 
+  // GitHub issue closure reconciles the session to terminal done. Historical
+  // worker outcomes/display tokens remain available for audit, but they must
+  // not pull the closed issue back into the SPA's stuck/actionable section.
+  if (status === "done" && String(worker.issue_closed_at || "") !== "") {
+    return { label: "done", tone: "ok", section: "done" };
+  }
+
   if (display === "token_budget_exceeded" || worker.worker_outcome === "token_budget_exceeded") {
     return { label: "token budget exceeded", tone: "stuck", section: "stuck" };
   }
@@ -1026,6 +1214,18 @@ export function workerStatusTaxonomy(worker) {
       tone: display === "review_retry_recheck" ? "watch" : "info",
       section: "running",
     };
+  }
+
+  if (display === "waiting_for_issue_guard") {
+    return { label: "waiting for issue guard", tone: "policy", section: "recent" };
+  }
+
+  if (display.startsWith("merge_")) {
+    const label = display.replace(/_/g, " ");
+    if (display === "merge_requested" || display === "merge_rejected" || display === "merge_execution_failed" || display === "merge_deferred") {
+      return { label, tone: display === "merge_execution_failed" ? "stuck" : "watch", section: "stuck" };
+    }
+    return { label, tone: display === "merge_executed" ? "ok" : "info", section: "recent" };
   }
 
   if (display === "backend_rate_limited") {
@@ -1046,6 +1246,10 @@ export function workerStatusTaxonomy(worker) {
   // swaps the model id (distinct remediation from an auth outage).
   if (display === "backend_model_unavailable") {
     return { label: "model unavailable", tone: "watch", section: "stuck" };
+  }
+
+  if (display === "backend_model_overloaded") {
+    return { label: "model overloaded", tone: "watch", section: "stuck" };
   }
 
   if (display === "blocked" && !isStuckStatus(status)) {
@@ -1095,6 +1299,33 @@ export function workerNextAction(worker) {
   const status = String(worker.rawStatus || worker.status || "");
   const display = String(worker.displayStatus || worker.display_status || "");
   const fallback = worker.next_action || worker.status_reason || "";
+  const gate = worker.prGate || mapPRGate(worker.pr_gate);
+
+  if (gate?.merged) {
+    return {
+      text: fallback || gate.summary || "PR merged and code landed.",
+      buttons: worker.pr_url ? [{ label: "Open PR →", href: worker.pr_url }] : [],
+    };
+  }
+
+  if (gate?.mergeAction) {
+    const buttons = [];
+    if (gate.mergeAction.status === "pending" && gate.mergeAction.approvalId) {
+      buttons.push({ label: "Open approval →", href: `/approvals?id=${encodeURIComponent(gate.mergeAction.approvalId)}` });
+    }
+    if (worker.pr_url) buttons.push({ label: "Open PR →", href: worker.pr_url });
+    return {
+      text: fallback || gate.mergeAction.nextAction || gate.summary,
+      buttons,
+    };
+  }
+
+  if (display === "waiting_for_issue_guard") {
+    return {
+      text: fallback || "Canonical retry is held by the issue's current dispatch guard and will resume in place after it clears.",
+      buttons: worker.issue_url ? [{ label: "Open issue →", href: worker.issue_url }] : [],
+    };
+  }
 
   if (display === "backend_rate_limited") {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
@@ -1118,6 +1349,15 @@ export function workerNextAction(worker) {
     const backend = String(worker.provider_limit_backend || worker.backend || "the backend");
     return {
       text: `Backend ${backend} cannot load its configured model (unavailable or no access). Swap the model id or restore access; the retry budget is preserved.`,
+      buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
+    };
+  }
+
+  if (display === "backend_model_overloaded") {
+    const provider = String(worker.provider_limit_provider || worker.provider || worker.provider_limit_backend || worker.backend || "the provider");
+    const model = String(worker.provider_limit_model || worker.model || "the requested model");
+    return {
+      text: `${provider}/${model} is temporarily overloaded. Maestro kept the retry budget and can use another model on the same provider.`,
       buttons: [{ label: "Open backend health →", action: "openBackendHealth" }],
     };
   }
@@ -1231,7 +1471,7 @@ export function mapDeliveryApproval(raw) {
 }
 
 export function isPendingApproval(approval) {
-  return (approval.status || "") === "pending";
+  return (approval.status || "") === "pending" && approval.target_terminal !== true;
 }
 
 // isExecutionSkippedApproval is the SPA-side predicate for the post-#492
@@ -1288,6 +1528,7 @@ function slugifyProjectForCommand(name) {
 }
 
 function approvalTone(approval) {
+  if (approval.target_terminal === true) return "idle";
   if (String(approval.action || "").trim() === "apply_lesson_proposal") return "idle";
   if (approval.past_sla) return "stuck";
   if ((approval.status || "") === "pending") return "watch";
@@ -1454,14 +1695,19 @@ function workerActuallyRunning(worker) {
 export function supervisorDecisionsFromProject(project, now) {
   const latest = project.supervisor?.latest;
   if (!latest) return [];
-  const created = parseTimestamp(latest.created_at);
-  if (!created) return [];
+  const lastSeen = parseTimestamp(latest.last_seen_at || latest.created_at);
+  if (!lastSeen) return [];
   return [{
-    t: created,
+    t: lastSeen,
     verb: latest.recommended_action || latest.status || "decision",
     note: latest.summary || latest.operator_sentence || "",
     conf: Number(latest.confidence || 0),
     warn: project.needsAttention > 0 || project.operatorState?.kind === "monitoring_pr",
+    recommendationId: String(latest.recommendation_id || ""),
+    firstSeen: parseTimestamp(latest.first_seen_at || latest.created_at),
+    lastSeen,
+    seenCount: Math.max(1, Number(latest.seen_count || 1)),
+    disposition: latest.disposition || null,
   }];
 }
 

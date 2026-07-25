@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -20,8 +21,17 @@ import (
 
 var searchGuardedCommands = []string{"rg", "find", "grep"}
 
-// workerCredentialEnvKeys are the provider credential env vars the worker
-// harness needs to reach CLIProxyAPI / upstream APIs. The daemon inherits them
+var searchGuardrailInstallMu sync.Mutex
+
+const (
+	searchGuardrailDirName     = "search-guardrails"
+	searchGuardrailMarker      = "[maestro] search guardrail:"
+	searchGuardrailScriptMark  = "# maestro-search-guardrail-wrapper"
+	searchGuardrailWrapperMode = 0o755
+)
+
+// workerCredentialEnvKeys are the provider and GitHub credential env vars the
+// worker harness needs to reach CLIProxyAPI / upstream APIs and open PRs. The daemon inherits them
 // from its own private credential boundary (an operator-managed systemd
 // EnvironmentFile / MAESTRO_WORKER_CREDENTIALS_FILE), but `tmux new-session`
 // does not propagate them into a fresh worker session by default (#822). They
@@ -35,6 +45,8 @@ var workerCredentialEnvKeys = []string{
 	"ANTHROPIC_AUTH_TOKEN",
 	"CLIPROXY_API_KEY",
 	"GEMINI_API_KEY",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
 	"OPENAI_BASE_URL",
 	"OPENAI_API_KEY",
 }
@@ -47,6 +59,8 @@ var workerCredentialSecretKeys = []string{
 	"ANTHROPIC_AUTH_TOKEN",
 	"CLIPROXY_API_KEY",
 	"GEMINI_API_KEY",
+	"GH_TOKEN",
+	"GITHUB_TOKEN",
 	"OPENAI_API_KEY",
 }
 
@@ -84,27 +98,148 @@ const (
 )
 
 func ensureSearchGuardrailWrappers(stateDir string) (string, error) {
+	searchGuardrailInstallMu.Lock()
+	defer searchGuardrailInstallMu.Unlock()
+
 	if strings.TrimSpace(stateDir) == "" {
 		return "", fmt.Errorf("empty state dir")
 	}
-	guardDir := filepath.Join(stateDir, "search-guardrails")
+	guardDir, err := filepath.Abs(filepath.Join(stateDir, searchGuardrailDirName))
+	if err != nil {
+		return "", fmt.Errorf("prepare search guardrails: resolve destination directory")
+	}
+
+	// Resolve every target from the daemon's PATH before creating or publishing
+	// wrappers. In particular, never let a nested Maestro worker pin an older
+	// wrapper inherited through PATH as the "real" command.
+	targets := make(map[string]string, len(searchGuardedCommands))
+	for _, name := range searchGuardedCommands {
+		target, err := resolveTrustedSearchCommand(name, guardDir)
+		if err != nil {
+			return "", fmt.Errorf("prepare search guardrail %s: resolve trusted executable", name)
+		}
+		targets[name] = target
+	}
+
 	if err := os.MkdirAll(guardDir, 0755); err != nil {
-		return "", fmt.Errorf("create search guardrail dir: %w", err)
+		return "", fmt.Errorf("prepare search guardrails: create destination directory")
 	}
 	for _, name := range searchGuardedCommands {
 		path := filepath.Join(guardDir, name)
-		if err := os.WriteFile(path, []byte(searchGuardrailWrapperScript), 0755); err != nil {
-			return "", fmt.Errorf("write search guardrail wrapper %s: %w", name, err)
+		content := buildSearchGuardrailWrapperScript(name, targets[name], guardDir)
+		if searchGuardrailWrapperCurrent(path, content) {
+			continue
+		}
+		if err := writeFileAtomicMode(guardDir, path, content, searchGuardrailWrapperMode); err != nil {
+			// These errors can be surfaced through worker failures and eventually
+			// copied to GitHub. Keep the command and failed stage, but not a private
+			// state-directory path from the underlying filesystem error.
+			return "", fmt.Errorf("prepare search guardrail %s: install wrapper atomically", name)
 		}
 	}
 	return guardDir, nil
 }
 
-const searchGuardrailWrapperScript = `#!/bin/sh
-cmd=${0##*/}
-real_path=$(PATH="${MAESTRO_ORIGINAL_PATH:-$PATH}" command -v "$cmd" 2>/dev/null)
-if [ -z "$real_path" ]; then
-  echo "[maestro] search guardrail: unable to locate real $cmd" >&2
+func searchGuardrailWrapperCurrent(path, content string) bool {
+	f, err := openFilePathNoFollow(path, unix.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != searchGuardrailWrapperMode {
+		return false
+	}
+	if err := checkOwnedByUs(path, info); err != nil {
+		return false
+	}
+	data, err := io.ReadAll(io.LimitReader(f, int64(len(content)+1)))
+	return err == nil && string(data) == content
+}
+
+func resolveTrustedSearchCommand(name, guardDir string) (string, error) {
+	for _, dir := range filepath.SplitList(os.Getenv("PATH")) {
+		if dir == "" {
+			dir = "."
+		}
+		candidate, err := filepath.Abs(filepath.Join(dir, name))
+		if err != nil || isSearchGuardrailPath(candidate, guardDir) {
+			continue
+		}
+		info, err := os.Stat(candidate)
+		if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
+			continue
+		}
+		resolved, err := filepath.EvalSymlinks(candidate)
+		if err != nil {
+			continue
+		}
+		resolved, err = filepath.Abs(resolved)
+		if err != nil || isSearchGuardrailPath(resolved, guardDir) {
+			continue
+		}
+		if isMaestroSearchGuardrailExecutable(resolved) {
+			continue
+		}
+		return resolved, nil
+	}
+	return "", fmt.Errorf("no executable outside a search guardrail directory")
+}
+
+func isMaestroSearchGuardrailExecutable(path string) bool {
+	f, err := openFilePathNoFollow(path, unix.O_RDONLY)
+	if err != nil {
+		return false
+	}
+	defer f.Close()
+	data, err := io.ReadAll(io.LimitReader(f, 64<<10))
+	if err != nil {
+		return false
+	}
+	return bytes.Contains(data, []byte(searchGuardrailScriptMark)) ||
+		bytes.Contains(data, []byte(searchGuardrailMarker))
+}
+
+func isSearchGuardrailPath(path, guardDir string) bool {
+	path = filepath.Clean(path)
+	guardDir = filepath.Clean(guardDir)
+	if rel, err := filepath.Rel(guardDir, path); err == nil && rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
+		return true
+	}
+	for dir := filepath.Dir(path); dir != filepath.Dir(dir); dir = filepath.Dir(dir) {
+		if filepath.Base(dir) == searchGuardrailDirName {
+			return true
+		}
+	}
+	return false
+}
+
+func buildSearchGuardrailWrapperScript(name, realPath, guardDir string) string {
+	return `#!/bin/sh
+` + searchGuardrailScriptMark + `
+cmd=` + shellQuote(name) + `
+real_path=` + shellQuote(realPath) + `
+guard_dir=` + shellQuote(guardDir) + `
+
+case "$real_path" in
+  "$guard_dir"|"$guard_dir"/*|*/search-guardrails/*)
+    echo "[maestro] search guardrail: refusing unsafe executable for $cmd" >&2
+    exit 126
+    ;;
+esac
+if [ "$real_path" = "$0" ] || [ "$real_path" -ef "$0" ] 2>/dev/null; then
+  echo "[maestro] search guardrail: refusing self-execution for $cmd" >&2
+  exit 126
+fi
+for guard_path in "$guard_dir"/*; do
+  [ -e "$guard_path" ] || continue
+  if [ "$real_path" -ef "$guard_path" ] 2>/dev/null; then
+    echo "[maestro] search guardrail: refusing unsafe executable for $cmd" >&2
+    exit 126
+  fi
+done
+if [ ! -f "$real_path" ] || [ ! -x "$real_path" ]; then
+  echo "[maestro] search guardrail: trusted executable unavailable for $cmd" >&2
   exit 127
 fi
 
@@ -324,6 +459,7 @@ fi
 
 exec "$real_path" "$@"
 `
+}
 
 // streamSplit configures the worker runner to route a backend's structured
 // NDJSON stream through `maestro stream-split` before tee: the raw frames are
@@ -336,6 +472,7 @@ type streamSplit struct {
 	JSONLPath  string // side-channel file for raw NDJSON frames (slot.jsonl)
 	MaxTokens  int    // active per-attempt hard ceiling (0 = accounting only)
 	MarkerPath string // deterministic budget-stop marker written before termination
+	Generation uint64 // durable worker generation stamped into the marker
 }
 
 // logPipeline builds the trailing `| ... | tee -a LOG` stage. When split is
@@ -354,6 +491,9 @@ func logPipeline(split *streamSplit, logFile string) string {
 	if split.MaxTokens > 0 {
 		splitter += " --max-tokens " + strconv.Itoa(split.MaxTokens)
 		splitter += " --budget-marker " + shellQuote(split.MarkerPath)
+		if split.Generation > 0 {
+			splitter += " --worker-generation " + strconv.FormatUint(split.Generation, 10)
+		}
 	}
 	return "2>&1 | " + splitter + " | " + tee
 }
@@ -392,6 +532,16 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 }
 
 func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit) error {
+	// Resolve argv[0] while the daemon is generating the runner. A long-lived
+	// tmux server can retain an older PATH than maestro.service, so leaving a
+	// bare command such as "claude" makes retry/repair launches depend on stale
+	// tmux state. Every launch path writes through this helper; persisting the
+	// absolute service-resolved path therefore covers initial spawn, retry,
+	// repair, fallback, phase transition, and in-place resume uniformly.
+	resolvedArgs, err := resolveWorkerCommandPath(args)
+	if err != nil {
+		return err
+	}
 	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
 	if err != nil {
 		return err
@@ -412,11 +562,37 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 			return fmt.Errorf("clear stale token-budget marker: %w", err)
 		}
 	}
-	runnerContent := buildWorkerRunnerScript(args, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
+	runnerContent := buildWorkerRunnerScript(resolvedArgs, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
 	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, runnerContent, workerRunnerScriptMode); err != nil {
 		return fmt.Errorf("write runner script: %w", err)
 	}
 	return nil
+}
+
+func resolveWorkerCommandPath(args []string) ([]string, error) {
+	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
+		return nil, fmt.Errorf("worker command is empty")
+	}
+	name := strings.TrimSpace(args[0])
+	resolved := name
+	if !filepath.IsAbs(name) {
+		path, err := exec.LookPath(name)
+		if err != nil {
+			return nil, fmt.Errorf("resolve worker executable %q from maestro service PATH: %w", name, err)
+		}
+		resolved, err = filepath.Abs(path)
+		if err != nil {
+			return nil, fmt.Errorf("make worker executable %q absolute: %w", path, err)
+		}
+	}
+	if info, err := os.Stat(resolved); err != nil {
+		return nil, fmt.Errorf("validate worker executable %q: %w", resolved, err)
+	} else if info.IsDir() || info.Mode()&0111 == 0 {
+		return nil, fmt.Errorf("worker executable %q is not executable", resolved)
+	}
+	out := append([]string(nil), args...)
+	out[0] = resolved
+	return out, nil
 }
 
 // resolveWorkerCredentialsFile returns the single authoritative private path the
@@ -431,7 +607,7 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 //     symlinked, or foreign-owned) target is a hard error so a spawn fails
 //     closed rather than reading an insecure secret file.
 //   - Otherwise no raw credential may be ambient. CLI-native auth can proceed
-//     with an empty reference; any known provider value without the explicit
+//     with an empty reference; any known worker credential value without the explicit
 //     service-file boundary fails the spawn closed. Maestro never manufactures
 //     a project-local or per-worker secret copy.
 func resolveWorkerCredentialsFile(stateDir string) (string, error) {
@@ -447,7 +623,7 @@ func resolveWorkerCredentialsFile(stateDir string) (string, error) {
 	}
 	for _, key := range workerCredentialEnvKeys {
 		if os.Getenv(key) != "" {
-			return "", fmt.Errorf("%s must name the authoritative private service credential file when provider environment variables are set", workerCredentialsFileEnvVar)
+			return "", fmt.Errorf("%s must name the authoritative private service credential file when worker credential environment variables are set", workerCredentialsFileEnvVar)
 		}
 	}
 	return "", nil
@@ -1033,7 +1209,7 @@ func ScrubLegacyRunArtifacts(stateDir string) {
 		log.Printf("[worker] scrub credential artifacts: %v", err)
 	}
 	if redacted > 0 {
-		log.Printf("[worker] redacted provider credential values from %d historical text artifact(s) (#888)", redacted)
+		log.Printf("[worker] redacted worker credential values from %d historical text artifact(s) (#888)", redacted)
 	}
 }
 

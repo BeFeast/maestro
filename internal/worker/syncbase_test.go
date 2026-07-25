@@ -113,6 +113,47 @@ func TestSyncBaseBranch_DirtyCheckoutFailsLoudly(t *testing.T) {
 	}
 }
 
+func TestSyncBaseBranch_IgnoresUntrackedAgentHarnessDirs(t *testing.T) {
+	_, local, seed := setupOriginAndClone(t)
+	advanceOrigin(t, seed, "v2\n")
+
+	harnessFiles := map[string]string{
+		".claude/settings.json": "{}\n",
+		".codex/session.json":   "{}\n",
+		".cursor/rules.md":      "local rules\n",
+		".entire/state.json":    "{}\n",
+	}
+	for path, content := range harnessFiles {
+		writeTestFile(t, local, path, content)
+	}
+
+	if err := SyncBaseBranch(local, "main"); err != nil {
+		t.Fatalf("SyncBaseBranch with agent harness dirs: %v", err)
+	}
+	if got, want := revParse(t, local, "main"), revParse(t, local, "origin/main"); got != want {
+		t.Fatalf("local main = %s, want origin/main %s", got, want)
+	}
+	for path, want := range harnessFiles {
+		if got := readTestFile(t, local, path); got != want {
+			t.Fatalf("harness file %s = %q, want preserved %q", path, got, want)
+		}
+	}
+}
+
+func TestSyncBaseBranch_UnrelatedUntrackedFileStillFails(t *testing.T) {
+	_, local, seed := setupOriginAndClone(t)
+	advanceOrigin(t, seed, "v2\n")
+	writeTestFile(t, local, "scratch.txt", "local scratch\n")
+
+	err := SyncBaseBranch(local, "main")
+	if err == nil {
+		t.Fatal("expected error for unrelated untracked file")
+	}
+	if !strings.Contains(err.Error(), "dirty") || !strings.Contains(err.Error(), "scratch.txt") {
+		t.Fatalf("expected dirty scratch.txt error, got: %v", err)
+	}
+}
+
 func TestSyncBaseBranch_AdvancesUncheckedBaseBranch(t *testing.T) {
 	_, local, seed := setupOriginAndClone(t)
 	advanceOrigin(t, seed, "v2\n")

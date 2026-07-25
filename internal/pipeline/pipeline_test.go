@@ -55,6 +55,16 @@ func TestInitialPhase(t *testing.T) {
 			},
 			expected: state.PhaseImplement,
 		},
+		{
+			name: "advisor dependency starts planner",
+			cfg: config.Config{
+				Pipeline: config.PipelineConfig{
+					Enabled: true,
+					Advisor: config.RoleConfig{Enabled: true},
+				},
+			},
+			expected: state.PhasePlan,
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -70,19 +80,23 @@ func TestNextPhase(t *testing.T) {
 	tests := []struct {
 		name      string
 		completed state.Phase
+		advisor   bool
 		validator bool
 		expected  state.Phase
 	}{
-		{"plan → implement", state.PhasePlan, false, state.PhaseImplement},
-		{"implement → validate (validator enabled)", state.PhaseImplement, true, state.PhaseValidate},
-		{"implement → none (validator disabled)", state.PhaseImplement, false, state.PhaseNone},
-		{"validate → none", state.PhaseValidate, true, state.PhaseNone},
-		{"none → none", state.PhaseNone, false, state.PhaseNone},
+		{"plan → implement", state.PhasePlan, false, false, state.PhaseImplement},
+		{"plan → advisor", state.PhasePlan, true, false, state.PhaseAdvisor},
+		{"advisor → implement", state.PhaseAdvisor, true, false, state.PhaseImplement},
+		{"implement → validate (validator enabled)", state.PhaseImplement, false, true, state.PhaseValidate},
+		{"implement → none (validator disabled)", state.PhaseImplement, false, false, state.PhaseNone},
+		{"validate → none", state.PhaseValidate, false, true, state.PhaseNone},
+		{"none → none", state.PhaseNone, false, false, state.PhaseNone},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			cfg := &config.Config{
 				Pipeline: config.PipelineConfig{
+					Advisor:   config.RoleConfig{Enabled: tt.advisor},
 					Validator: config.RoleConfig{Enabled: tt.validator},
 				},
 			}
@@ -155,6 +169,7 @@ func TestBackendForPhase(t *testing.T) {
 		Model: config.ModelConfig{Default: "claude"},
 		Pipeline: config.PipelineConfig{
 			Planner:     config.RoleConfig{Backend: "haiku"},
+			Advisor:     config.RoleConfig{Backend: "reviewer"},
 			Implementer: config.RoleConfig{Backend: "codex"},
 			Validator:   config.RoleConfig{Backend: "sonnet"},
 		},
@@ -162,6 +177,9 @@ func TestBackendForPhase(t *testing.T) {
 
 	if got := BackendForPhase(cfg, state.PhasePlan); got != "haiku" {
 		t.Errorf("plan backend: got %q, want haiku", got)
+	}
+	if got := BackendForPhase(cfg, state.PhaseAdvisor); got != "reviewer" {
+		t.Errorf("advisor backend: got %q, want reviewer", got)
 	}
 	// #841: the implement phase now honors pipeline.implementer.backend when set.
 	if got := BackendForPhase(cfg, state.PhaseImplement); got != "codex" {
@@ -184,10 +202,23 @@ func TestBackendForPhase(t *testing.T) {
 	}
 }
 
+func TestBackendForPhaseUsesProviderLaneDefault(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "legacy",
+		ProviderLanes: []config.ProviderLane{
+			{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+		},
+	}}
+	if got := BackendForPhase(cfg, state.PhasePlan); got != "sol" {
+		t.Fatalf("planner backend = %q, want provider-lane default sol", got)
+	}
+}
+
 func TestEffortForPhase(t *testing.T) {
 	cfg := &config.Config{
 		Pipeline: config.PipelineConfig{
 			Planner:     config.RoleConfig{Effort: "xhigh"},
+			Advisor:     config.RoleConfig{Effort: "high"},
 			Implementer: config.RoleConfig{Effort: "low"},
 			Validator:   config.RoleConfig{Effort: "high"},
 		},
@@ -195,6 +226,9 @@ func TestEffortForPhase(t *testing.T) {
 
 	if got := EffortForPhase(cfg, state.PhasePlan); got != "xhigh" {
 		t.Errorf("plan effort: got %q, want xhigh", got)
+	}
+	if got := EffortForPhase(cfg, state.PhaseAdvisor); got != "high" {
+		t.Errorf("advisor effort: got %q, want high", got)
 	}
 	if got := EffortForPhase(cfg, state.PhaseImplement); got != "low" {
 		t.Errorf("implement effort: got %q, want low", got)
@@ -225,14 +259,21 @@ func TestApplyPhaseEffort(t *testing.T) {
 		},
 	}
 
-	// Effort set → clone carries the effort as a TierEffort override on the
-	// selected backend def, without mutating the base config.
+	// Effort set → clone carries the effort as both attribution metadata and a
+	// TierEffort argv override on the selected backend def, without mutating the
+	// base config.
 	got := ApplyPhaseEffort(base, "codex", state.PhaseImplement)
 	if got == base {
 		t.Fatal("expected a cloned config when effort is applied")
 	}
+	if effort := got.Model.Backends["codex"].Effort; effort != "low" {
+		t.Errorf("clone Effort: got %q, want low", effort)
+	}
 	if te := got.Model.Backends["codex"].TierEffort; te != "low" {
 		t.Errorf("clone TierEffort: got %q, want low", te)
+	}
+	if effort := base.Model.Backends["codex"].Effort; effort != "" {
+		t.Errorf("base config was mutated: Effort=%q, want empty", effort)
 	}
 	if te := base.Model.Backends["codex"].TierEffort; te != "" {
 		t.Errorf("base config was mutated: TierEffort=%q, want empty", te)
@@ -254,6 +295,7 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 		MaxRuntimeMinutes: 120,
 		Pipeline: config.PipelineConfig{
 			Planner:     config.RoleConfig{MaxRuntimeMinutes: 30},
+			Advisor:     config.RoleConfig{MaxRuntimeMinutes: 20},
 			Implementer: config.RoleConfig{MaxRuntimeMinutes: 90},
 			Validator:   config.RoleConfig{MaxRuntimeMinutes: 45},
 		},
@@ -261,6 +303,9 @@ func TestMaxRuntimeForPhase(t *testing.T) {
 
 	if got := MaxRuntimeForPhase(cfg, state.PhasePlan); got != 30 {
 		t.Errorf("plan runtime: got %d, want 30", got)
+	}
+	if got := MaxRuntimeForPhase(cfg, state.PhaseAdvisor); got != 20 {
+		t.Errorf("advisor runtime: got %d, want 20", got)
 	}
 	if got := MaxRuntimeForPhase(cfg, state.PhaseImplement); got != 90 {
 		t.Errorf("implement runtime: got %d, want 90", got)

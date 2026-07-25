@@ -15,6 +15,7 @@ const statusRank = {
   pr_open: 1,
   review_retry_pending: 2,
   review_retry_backoff: 2,
+	waiting_for_issue_guard: 2,
   queued: 2,
   code_landed: 3,
   dead: 4,

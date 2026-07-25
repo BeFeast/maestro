@@ -7,6 +7,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -38,6 +39,8 @@ func (b *blockingGH) MergePR(pr int) error {
 	}
 	return nil
 }
+func (b *blockingGH) MergePRAtHead(pr int, _ string) error { return b.MergePR(pr) }
+func (b *blockingGH) PRHeadSHA(int) (string, error)        { return testMergeHeadSHA, nil }
 func (b *blockingGH) CloseIssue(issue int, comment string) error {
 	atomic.AddInt32(&b.calls, 1)
 	return nil
@@ -64,6 +67,13 @@ func (b *blockingGH) EditIssueBody(issue int, body string) error {
 func (b *blockingGH) IssueBody(issue int) (string, error) {
 	return "", nil
 }
+func (b *blockingGH) GetIssue(number int) (github.Issue, error) {
+	return github.Issue{Number: number}, nil
+}
+func (b *blockingGH) PRLabels(int) ([]string, error) { return nil, nil }
+func (b *blockingGH) PRUnresolvedReviewThreadsOnHead(int) (string, []github.ReviewThread, error) {
+	return testMergeHeadSHA, nil, nil
+}
 
 // --- #488: per-approval-ID lock (concurrent Execute) -----------------------
 
@@ -73,7 +83,7 @@ func TestExecute_ConcurrentSameApproval_OnlyOneSideEffect(t *testing.T) {
 	gh := &blockingGH{gate: gate, released: released}
 	ex := &Executor{GH: gh, Cfg: newCfg()}
 
-	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7}, "merge", "")
+	a := mkApproval(config.SupervisorActionMergePR, &state.SupervisorTarget{PR: 7, HeadSHA: testMergeHeadSHA}, "merge", "")
 
 	results := make(chan Result, 2)
 	go func() { results <- ex.Execute(a) }()
@@ -150,6 +160,86 @@ func TestExecute_DeleteWorktree_SlotMatchesProceeds(t *testing.T) {
 	}
 	if len(wt.calls) != 1 {
 		t.Fatalf("expected 1 RemoveWorktree call, got %d", len(wt.calls))
+	}
+}
+
+func TestExecute_DeleteWorktree_ApprovedRepairOwnsSameSlot(t *testing.T) {
+	wt := &fakeWT{}
+	st := state.NewState()
+	st.Sessions["sup-77"] = &state.Session{
+		IssueNumber: 812,
+		PRNumber:    900,
+		Status:      state.StatusRetryExhausted,
+		Worktree:    "/srv/wt/sup-77",
+	}
+	st.Approvals = append(st.Approvals, state.Approval{
+		ID:     "approval-repair-812",
+		Action: "spawn_repair_worker",
+		Target: &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900},
+		Status: state.ApprovalStatusAwaitingDispatch,
+	})
+	ex := &Executor{
+		Worktrees: wt,
+		Cfg:       newCfg(),
+		State:     st,
+		Sessions:  fakeSessionLookup(st.Sessions),
+	}
+	a := mkApproval(config.SupervisorActionDeleteWorktree, &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900}, "stale", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(wt.calls) != 0 {
+		t.Fatalf("RemoveWorktree was called %d times", len(wt.calls))
+	}
+}
+
+func TestExecute_DeleteWorktree_FallbackReloadsCanonicalReplacement(t *testing.T) {
+	wt := &fakeWT{}
+	stateDir := t.TempDir()
+	canonical := state.NewState()
+	canonical.Sessions["sup-77"] = &state.Session{
+		IssueNumber:      812,
+		PRNumber:         900,
+		PID:              758258,
+		TmuxSession:      "maestro-sup-77",
+		Status:           state.StatusRunning,
+		Worktree:         "/srv/wt/sup-77",
+		StartedAt:        time.Now().UTC(),
+		WorkerGeneration: 2,
+	}
+	if err := state.Save(stateDir, canonical); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := newCfg()
+	cfg.StateDir = stateDir
+	ex := &Executor{
+		Worktrees: wt,
+		Cfg:       cfg,
+		// The cached lookup predates the replacement and selects the fallback
+		// path because it has no canonical worktree claim.
+		Sessions: fakeSessionLookup{
+			"sup-77": &state.Session{
+				IssueNumber:      812,
+				PRNumber:         900,
+				Status:           state.StatusRetryExhausted,
+				StartedAt:        time.Now().UTC().Add(-2 * time.Hour),
+				WorkerGeneration: 1,
+			},
+		},
+		PIDAlive:  func(int) bool { return true },
+		TmuxAlive: func(string) bool { return true },
+	}
+	a := mkApproval(config.SupervisorActionDeleteWorktree, &state.SupervisorTarget{Session: "sup-77", Issue: 812, PR: 900}, "stale", "")
+
+	res := ex.Execute(a)
+	if res.Status != state.ApprovalStatusExecutionFailed || res.Err == nil {
+		t.Fatalf("res = %+v, want execution_failed", res)
+	}
+	if len(wt.calls) != 0 {
+		t.Fatalf("RemoveWorktree was called %d times", len(wt.calls))
 	}
 }
 

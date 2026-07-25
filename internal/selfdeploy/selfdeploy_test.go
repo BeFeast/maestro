@@ -2,6 +2,7 @@ package selfdeploy
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -150,6 +151,7 @@ func TestTriggerCommand(t *testing.T) {
 		"--units maestro.service",
 		"--result-file " + ResultPath(cfg.StateDir),
 		"--timeout-seconds 1800",
+		"--restart-timeout-seconds 270",
 		"--pr 698",
 		"--scope user",
 		"--health-url http://127.0.0.1:8788/api/v1/state",
@@ -312,6 +314,114 @@ func TestTriggerCommandMissingScript(t *testing.T) {
 	if _, _, err := TriggerCommand(cfg, 1, time.Now().UTC()); err == nil {
 		t.Fatal("want error for missing script")
 	}
+}
+
+// #1077: without a git remote tip, Resolve falls back to the checkout script so
+// unit tests and air-gapped hosts still launch.
+func TestResolveDeployScriptFallsBackToCheckout(t *testing.T) {
+	cfg := triggerTestConfig(t)
+	got, err := ResolveDeployScript(cfg)
+	if err != nil {
+		t.Fatalf("ResolveDeployScript: %v", err)
+	}
+	want := filepath.Join(cfg.LocalPath, "scripts", "self-deploy.sh")
+	if got != want {
+		t.Fatalf("got %q, want checkout fallback %q", got, want)
+	}
+}
+
+// #1077: default path stages origin/main's script into the state dir so a
+// stale feature-branch checkout cannot brick deploys.
+func TestResolveDeployScriptStagesOriginMain(t *testing.T) {
+	cfg := triggerTestConfig(t)
+	seedGitCheckoutWithOriginMain(t, cfg.LocalPath, "#!/bin/bash\n# from-origin-main\n")
+
+	got, err := ResolveDeployScript(cfg)
+	if err != nil {
+		t.Fatalf("ResolveDeployScript: %v", err)
+	}
+	want := filepath.Join(cfg.StateDir, stagedDeployScriptName)
+	if got != want {
+		t.Fatalf("got %q, want staged %q", got, want)
+	}
+	body, err := os.ReadFile(got)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(body), "from-origin-main") {
+		t.Fatalf("staged script body missing marker:\n%s", body)
+	}
+
+	// Stale checkout content must not be what Trigger invokes.
+	if err := os.WriteFile(filepath.Join(cfg.LocalPath, "scripts", "self-deploy.sh"), []byte("#!/bin/bash\n# stale-checkout\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	name, args, err := TriggerCommand(cfg, 1077, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("TriggerCommand: %v", err)
+	}
+	if name == "" {
+		t.Fatal("empty launcher name")
+	}
+	joined := strings.Join(args, " ")
+	if !strings.Contains(joined, want) {
+		t.Fatalf("TriggerCommand must invoke staged script %q; got:\n%s", want, joined)
+	}
+	if strings.Contains(joined, filepath.Join(cfg.LocalPath, "scripts", "self-deploy.sh")) {
+		t.Fatalf("TriggerCommand must not invoke stale checkout script; got:\n%s", joined)
+	}
+}
+
+// #1077: explicit self_deploy.script override is used as-is (no staging).
+func TestResolveDeployScriptHonorsExplicitOverride(t *testing.T) {
+	cfg := triggerTestConfig(t)
+	seedGitCheckoutWithOriginMain(t, cfg.LocalPath, "#!/bin/bash\n# from-origin-main\n")
+	override := filepath.Join(cfg.LocalPath, "custom-deploy.sh")
+	if err := os.WriteFile(override, []byte("#!/bin/bash\n# override\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	cfg.SelfDeploy.Script = override
+
+	got, err := ResolveDeployScript(cfg)
+	if err != nil {
+		t.Fatalf("ResolveDeployScript: %v", err)
+	}
+	if got != override {
+		t.Fatalf("got %q, want override %q", got, override)
+	}
+}
+
+// seedGitCheckoutWithOriginMain turns dir into a tiny git repo whose
+// refs/remotes/origin/main tip contains scripts/self-deploy.sh with body.
+func seedGitCheckoutWithOriginMain(t *testing.T, dir, scriptBody string) {
+	t.Helper()
+	script := filepath.Join(dir, "scripts", "self-deploy.sh")
+	if err := os.MkdirAll(filepath.Dir(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(script, []byte(scriptBody), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	run := func(args ...string) {
+		t.Helper()
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=test",
+			"GIT_AUTHOR_EMAIL=test@example.com",
+			"GIT_COMMITTER_NAME=test",
+			"GIT_COMMITTER_EMAIL=test@example.com",
+		)
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	run("init")
+	run("config", "user.email", "test@example.com")
+	run("config", "user.name", "test")
+	run("add", "scripts/self-deploy.sh")
+	run("commit", "-m", "seed")
+	run("branch", "-M", "main")
+	run("update-ref", "refs/remotes/origin/main", "HEAD")
 }
 
 func TestFindingDeployed(t *testing.T) {

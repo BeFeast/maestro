@@ -51,12 +51,12 @@ type BackendConfig struct {
 	Provider   string   // per-backend provider field; resolves the exec path for custom-named backends (#684)
 	Model      string   // optional model name for role-specific backend calls (#513 attribution metadata)
 	Effort     string   // optional reasoning effort for role-specific backend calls (#513 attribution metadata)
-	// TierModel/TierEffort carry a routing tier's per-tier override (#783/#792
-	// P1-A), DISTINCT from the #513 attribution Model/Effort above. Only these
-	// are threaded into the worker argv by appendTierModelEffort, so the #513
-	// attribution fields never leak into a non-policy config's dispatch.
-	TierModel  string
-	TierEffort string
+	// BackendEffort is the backend row's default reasoning-effort policy (#900).
+	// TierModel/TierEffort carry a routing tier or pipeline phase override
+	// (#783/#841), DISTINCT from the #513 attribution Model/Effort above.
+	BackendEffort string
+	TierModel     string
+	TierEffort    string
 	// UsageStream opts a structured-stream worker into emitting NDJSON usage
 	// frames on a side-channel slot.jsonl: claude `--output-format stream-json
 	// --verbose` (#737) and codex `exec --json` (#738). Off by default;
@@ -83,6 +83,7 @@ var knownBackends = map[string]Backend{
 	"cline":    clineBackend{},
 	"codex":    codexBackend{},
 	"gemini":   geminiBackend{},
+	"kimi":     kimiBackend{},
 	"opencode": opencodeBackend{},
 	"pi":       piBackend{},
 }
@@ -97,6 +98,7 @@ func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 		claudeCmd = "claude"
 	}
 	binary, cmdArgs := splitCmd(claudeCmd)
+	cmdArgs, cfg.ExtraArgs = stripConfiguredEffortPins(cmdArgs, cfg.ExtraArgs, config.BackendKindClaude, cfg)
 	// Deliver the prompt via stdin, not as a CLI argument. Worker prompts are
 	// usually bounded but grow on retries (CI-failure context + Greptile review
 	// comments are appended), so a large PR can push a single argv past the
@@ -117,8 +119,7 @@ func (claudeBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*
 	if err != nil {
 		return nil, "", err
 	}
-	// #783: thread a routing tier's model/effort override into argv (skipped
-	// when the operator pinned them in cmd/extra_args).
+	// #783/#900: thread the effective model/effort policy into argv.
 	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindClaude, cfg)
 	args = append(args, cfg.ExtraArgs...)
 	cmd := exec.Command(binary, args...)
@@ -137,6 +138,7 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 		codexCmd = "codex"
 	}
 	binary, cmdArgs := splitCmd(codexCmd)
+	cmdArgs, cfg.ExtraArgs = stripConfiguredEffortPins(cmdArgs, cfg.ExtraArgs, config.BackendKindCodex, cfg)
 	args := append(cmdArgs, "exec", "--dangerously-bypass-approvals-and-sandbox", "-C", worktree)
 	// #738: opt-in structured streaming so usage (tokens) can be parsed from
 	// the NDJSON side-channel. `codex exec --json` emits JSONL events incl. a
@@ -151,19 +153,30 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	if err != nil {
 		return nil, "", err
 	}
-	// #783: thread a routing tier's model/effort override into argv. codex takes
-	// the reasoning effort as `-c model_reasoning_effort=<e>`; skipped when the
-	// operator pinned the model/effort in cmd/extra_args.
+	// #783/#900: thread the effective model/effort policy into argv. codex takes
+	// the reasoning effort as `-c model_reasoning_effort=<e>`.
 	args = appendTierModelEffort(args, pinnedArgs(cmdArgs, cfg), config.BackendKindCodex, cfg)
 	args = append(args, cfg.ExtraArgs...)
 	if cfg.TokenBudget > 0 {
 		// codex exec's public JSONL reports usage only at turn completion. The
 		// native rollout budget is enforced inside the agent loop after every
 		// provider response, including sub-agent work, so it is the enforceable
-		// live proxy for the configured Maestro ceiling.
+		// live proxy for the configured Maestro ceiling. Codex 0.144 changed
+		// rollout_budget from a boolean feature to a configured feature object:
+		// `--enable rollout_budget` now replaces that object and discards its
+		// limit. Set the object's enabled field directly and provide the required
+		// reminder thresholds instead.
+		reminders := make([]string, 0, 2)
+		for _, divisor := range []int{5, 10} {
+			threshold := cfg.TokenBudget / divisor
+			if threshold > 0 && threshold < cfg.TokenBudget {
+				reminders = append(reminders, strconv.Itoa(threshold))
+			}
+		}
 		args = append(args,
-			"--enable", "rollout_budget",
+			"-c", "features.rollout_budget.enabled=true",
 			"-c", fmt.Sprintf("features.rollout_budget.limit_tokens=%d", cfg.TokenBudget),
+			"-c", fmt.Sprintf("features.rollout_budget.reminder_at_remaining_tokens=[%s]", strings.Join(reminders, ",")),
 			"-c", "features.rollout_budget.sampling_token_weight=1.0",
 			"-c", "features.rollout_budget.prefill_token_weight=1.0",
 		)
@@ -172,6 +185,39 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	cmd := exec.Command(binary, args...)
 	cmd.Dir = worktree
 	// Stdin redirection is handled by the runner script — no file opened here
+	return cmd, promptFile, nil
+}
+
+// --- Kimi Backend ---
+
+// kimiBackend runs Kimi Code CLI in non-interactive print mode. Print mode
+// implicitly enables Kimi's AFK/auto-approval behavior; with no -p/--prompt
+// value, a non-TTY stdin is read as the prompt. Keeping the prompt out of argv
+// avoids the Linux MAX_ARG_STRLEN ceiling for retry-expanded worker prompts.
+//
+// Kimi's stream-json contract is the first-class output mode here rather than
+// an opt-in. The stream splitter preserves the raw JSONL for usage accounting
+// and renders assistant/tool messages into the human-readable worker log.
+type kimiBackend struct{}
+
+func (kimiBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
+	kimiCmd := cfg.Cmd
+	if kimiCmd == "" {
+		kimiCmd = "kimi"
+	}
+	binary, cmdArgs := splitCmd(kimiCmd)
+	pinned := pinnedArgs(cmdArgs, cfg)
+	args := append([]string(nil), cmdArgs...)
+	if !argsHaveFlag(pinned, "--print") {
+		args = append(args, "--print")
+	}
+	if !argsHaveOutputFormat(pinned) {
+		args = append(args, "--output-format=stream-json")
+	}
+	args = appendTierModelEffort(args, pinned, config.BackendKindKimi, cfg)
+	args = append(args, cfg.ExtraArgs...)
+	cmd := exec.Command(binary, args...)
+	cmd.Dir = worktree
 	return cmd, promptFile, nil
 }
 
@@ -357,8 +403,7 @@ func (genericBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (
 }
 
 // argsHaveCodexEffort reports whether codex's reasoning-effort knob is already
-// pinned via `-c model_reasoning_effort=...` in cmd/extra_args, so a tier's
-// effort override is skipped instead of producing a conflicting -c override.
+// present via `-c model_reasoning_effort=...` in cmd/extra_args.
 func argsHaveCodexEffort(args []string) bool {
 	for _, a := range args {
 		if strings.Contains(a, "model_reasoning_effort") {
@@ -366,6 +411,61 @@ func argsHaveCodexEffort(args []string) bool {
 		}
 	}
 	return false
+}
+
+func configuredReasoningEffort(cfg BackendConfig) string {
+	if effort := strings.TrimSpace(cfg.TierEffort); effort != "" {
+		return effort
+	}
+	return strings.TrimSpace(cfg.BackendEffort)
+}
+
+func stripConfiguredEffortPins(cmdArgs, extraArgs []string, kind string, cfg BackendConfig) ([]string, []string) {
+	if configuredReasoningEffort(cfg) == "" {
+		return cmdArgs, extraArgs
+	}
+	switch kind {
+	case config.BackendKindClaude:
+		return stripFlagWithOptionalValue(cmdArgs, "--effort"), stripFlagWithOptionalValue(extraArgs, "--effort")
+	case config.BackendKindCodex:
+		return stripCodexEffortArgs(cmdArgs), stripCodexEffortArgs(extraArgs)
+	default:
+		return cmdArgs, extraArgs
+	}
+}
+
+func stripFlagWithOptionalValue(args []string, flag string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == flag {
+			if i+1 < len(args) {
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(a, flag+"=") {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
+}
+
+func stripCodexEffortArgs(args []string) []string {
+	out := make([]string, 0, len(args))
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if a == "-c" && i+1 < len(args) && strings.Contains(args[i+1], "model_reasoning_effort") {
+			i++
+			continue
+		}
+		if strings.Contains(a, "model_reasoning_effort") {
+			continue
+		}
+		out = append(out, a)
+	}
+	return out
 }
 
 // appendTierModelEffort threads a routing tier's optional per-tier model/effort
@@ -379,16 +479,17 @@ func argsHaveCodexEffort(args []string) bool {
 // The flag spelling is backend-specific: codex takes the reasoning effort as
 // `-c model_reasoning_effort=<e>` and claude takes `--effort <e>`; all three
 // take `--model <m>`. gemini has no reasoning-effort flag (RFC §2.4 step 5 only
-// names codex/claude), so a tier effort is dropped for it rather than emitting
+// names codex/claude), so an effort is dropped for it rather than emitting
 // an unsupported `--effort` that would crash the worker (#792 P2-D). An operator
-// who already pinned the model/effort in cmd or extra_args wins — the override
-// is skipped to avoid a duplicate or conflicting flag. pinned is the union of
-// the backend's cmd-prefix args and extra_args.
+// who already pinned the model in cmd or extra_args wins. Configured effort is
+// canonicalized before this helper for Claude/Codex so stale cmd/extra_args
+// effort pins do not silently override a backend-row update (#900). pinned is
+// the union of the backend's cmd-prefix args and extra_args.
 func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig) []string {
 	if model := strings.TrimSpace(cfg.TierModel); model != "" && !argsHaveFlag(pinned, "--model") {
 		args = append(args, "--model", model)
 	}
-	effort := strings.TrimSpace(cfg.TierEffort)
+	effort := configuredReasoningEffort(cfg)
 	if effort == "" {
 		return args
 	}
@@ -414,21 +515,23 @@ func appendTierModelEffort(args, pinned []string, kind string, cfg BackendConfig
 
 // workerBackendConfig builds the worker BackendConfig from a resolved backend
 // def. TierModel/TierEffort carry a routing tier's override DISTINCTLY from the
-// #513 attribution Model/Effort so only a real policy tier override reaches the
-// worker argv (see appendTierModelEffort) — the attribution metadata never
-// leaks into a non-policy config's dispatch (#792 P1-A).
+// #513 attribution Model/Effort, but backend Effort now also acts as the stored
+// backend's default reasoning-effort policy (#900). A tier/phase override still
+// rides TierEffort and wins for that single dispatch; otherwise the backend's
+// configured Effort is emitted through the backend-correct flag spelling.
 func workerBackendConfig(def config.BackendDef) BackendConfig {
 	return BackendConfig{
-		Cmd:         def.Cmd,
-		ExtraArgs:   def.ExtraArgs,
-		PromptMode:  def.PromptMode,
-		Provider:    def.Provider,
-		Model:       def.Model,
-		Effort:      def.Effort,
-		TierModel:   def.TierModel,
-		TierEffort:  def.TierEffort,
-		UsageStream: def.UsageStream,
-		MCP:         def.MCP,
+		Cmd:           def.Cmd,
+		ExtraArgs:     def.ExtraArgs,
+		PromptMode:    def.PromptMode,
+		Provider:      def.Provider,
+		Model:         def.Model,
+		Effort:        def.Effort,
+		BackendEffort: def.Effort,
+		TierModel:     def.TierModel,
+		TierEffort:    def.TierEffort,
+		UsageStream:   def.UsageStream,
+		MCP:           def.MCP,
 	}
 }
 
@@ -616,17 +719,21 @@ func maestroExecutablePath() (string, bool) {
 }
 
 // streamSplitForBackend returns the worker runner's stream-split configuration,
-// or nil when the plain `tee` pipeline should be used. Only a structured-stream
-// backend (claude #737, codex #738) with usage_stream opted in streams NDJSON;
-// when the maestro binary cannot be resolved it degrades to nil (plain tee).
-// The resolved backend kind is passed to the splitter so it renders the right
-// human-readable form into slot.log.
-func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string) *streamSplit {
+// or nil when the plain `tee` pipeline should be used. Claude/codex/opencode
+// require usage_stream; Kimi is structured by default, while Pi is structured
+// when its live budget needs the side channel. When the maestro binary cannot
+// be resolved this degrades to nil (plain tee). The resolved kind is passed to
+// the splitter so it renders the right human-readable form into slot.log.
+func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string, workerGeneration uint64) *streamSplit {
 	kind := resolveBackendKind(backendName, cfg)
-	if !cfg.UsageStream && !(cfg.TokenBudget > 0 && kind == config.BackendKindPi) {
+	if kind == config.BackendKindKimi {
+		if !kimiUsesStreamJSON(cfg) {
+			return nil
+		}
+	} else if !cfg.UsageStream && !(cfg.TokenBudget > 0 && kind == config.BackendKindPi) {
 		return nil
 	}
-	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindOpencode && kind != config.BackendKindPi {
+	if kind != config.BackendKindClaude && kind != config.BackendKindCodex && kind != config.BackendKindKimi && kind != config.BackendKindOpencode && kind != config.BackendKindPi {
 		return nil
 	}
 	bin, ok := maestroExecutablePath()
@@ -639,12 +746,44 @@ func streamSplitForBackend(backendName string, cfg BackendConfig, logFile string
 		JSONLPath:  JSONLPathForLog(logFile),
 		MaxTokens:  cfg.TokenBudget,
 		MarkerPath: TokenBudgetMarkerPathForLog(logFile),
+		Generation: workerGeneration,
 	}
+}
+
+// kimiUsesStreamJSON reports whether the effective Kimi output format is the
+// structured default. An operator can explicitly pin a different format in cmd
+// or extra_args; in that case the command still runs, but no JSON side channel
+// is installed and usage remains unavailable.
+func kimiUsesStreamJSON(cfg BackendConfig) bool {
+	_, cmdArgs := splitCmd(cfg.Cmd)
+	format, pinned := argsFlagValue(pinnedArgs(cmdArgs, cfg), "--output-format")
+	return !pinned || strings.EqualFold(strings.TrimSpace(format), "stream-json")
+}
+
+func argsFlagValue(args []string, flag string) (string, bool) {
+	var value string
+	found := false
+	for i := 0; i < len(args); i++ {
+		arg := args[i]
+		if arg == flag {
+			found = true
+			if i+1 < len(args) {
+				value = args[i+1]
+				i++
+			}
+			continue
+		}
+		if strings.HasPrefix(arg, flag+"=") {
+			found = true
+			value = strings.TrimPrefix(arg, flag+"=")
+		}
+	}
+	return value, found
 }
 
 // BuildWorkerCmd creates the right exec.Cmd for a backend. The backend name,
 // provider field, and cmd binary resolve to a CLI-specific builder (claude,
-// codex, gemini, cline — see resolveBackendKind); anything else uses the
+// codex, gemini, kimi, cline — see resolveBackendKind); anything else uses the
 // generic builder with prompt_mode from config.
 // Returns the command, an optional stdinFile path (for backends that read
 // the prompt via stdin, e.g. claude/codex), and any error.
@@ -686,6 +825,8 @@ func validateLiveTokenBudget(backendName string, cfg BackendConfig) error {
 		if !cfg.UsageStream || argsHaveFlag(cfg.ExtraArgs, "--format") {
 			return fmt.Errorf("worker_max_tokens=%d requires OpenCode usage_stream with Maestro-managed JSON output", cfg.TokenBudget)
 		}
+	case config.BackendKindKimi:
+		return fmt.Errorf("worker_max_tokens=%d cannot be enforced live for Kimi: stream-json does not guarantee response-by-response usage; disable the budget or select a backend with live token telemetry", cfg.TokenBudget)
 	default:
 		return fmt.Errorf("worker_max_tokens=%d cannot be enforced live for backend %q; disable the budget or use claude, codex, pi, or opencode structured usage", cfg.TokenBudget, backendName)
 	}
@@ -747,6 +888,30 @@ func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, workt
 		cmd := exec.Command(binary, args...)
 		cmd.Dir = worktree
 		return cmd, "", nil
+	case "kimi":
+		kimiCmd := cfg.Cmd
+		if kimiCmd == "" {
+			kimiCmd = "kimi"
+		}
+		binary, cmdArgs := splitCmd(kimiCmd)
+		pinned := pinnedArgs(cmdArgs, cfg)
+		args := append([]string(nil), cmdArgs...)
+		if !argsHaveFlag(pinned, "--print") {
+			args = append(args, "--print")
+		}
+		if !argsHaveFlag(pinned, "--plan") {
+			args = append(args, "--plan")
+		}
+		if !argsHaveFlag(pinned, "--final-message-only") {
+			args = append(args, "--final-message-only")
+		}
+		if model := strings.TrimSpace(cfg.Model); model != "" && !argsHaveFlag(pinned, "--model") {
+			args = append(args, "--model", model)
+		}
+		args = append(args, cfg.ExtraArgs...)
+		cmd := exec.Command(binary, args...)
+		cmd.Dir = worktree
+		return cmd, promptFile, nil
 	case "cline":
 		promptData, err := os.ReadFile(promptFile)
 		if err != nil {

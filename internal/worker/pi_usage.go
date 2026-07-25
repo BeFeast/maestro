@@ -11,14 +11,15 @@ import (
 // usage block (input/output/cacheRead/cacheWrite tokens + a self-computed
 // cost) and the provider/model that produced them.
 type PiUsage struct {
-	Provider    string  // last provider seen on a usage-bearing event
-	Model       string  // last model seen on a usage-bearing event
-	Input       int     // sum of input tokens across turns
-	Output      int     // sum of output tokens across turns
-	CacheRead   int     // sum of cache-read tokens across turns
-	CacheWrite  int     // sum of cache-write tokens across turns
-	TotalTokens int     // Input + Output + CacheRead + CacheWrite
-	CostUSD     float64 // sum of Pi self-reported cost.total across turns
+	Provider     string  // last provider seen on a usage-bearing event
+	Model        string  // last model seen on a usage-bearing event
+	Input        int     // sum of input tokens across turns
+	Output       int     // sum of output tokens across turns
+	CacheRead    int     // sum of cache-read tokens across turns
+	CacheWrite   int     // sum of cache-write tokens across turns
+	TotalTokens  int     // Input + Output + CacheRead + CacheWrite
+	BudgetTokens int     // Input + Output + CacheWrite (cache reads excluded)
+	CostUSD      float64 // sum of Pi self-reported cost.total across turns
 }
 
 // piUsageEvent is the subset of a Pi AgentSessionEvent line that carries
@@ -144,6 +145,7 @@ func ParsePiUsage(text string) (PiUsage, bool) {
 		seen = true
 	}
 	out.TotalTokens = out.Input + out.Output + out.CacheRead + out.CacheWrite
+	out.BudgetTokens = out.Input + out.Output + out.CacheWrite
 	return out, seen
 }
 

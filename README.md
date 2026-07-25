@@ -59,6 +59,16 @@ You only need one — whichever you have access to.
 ### Optional for Go repositories
 - **`gopls`** — enables symbol-aware pre-worker research context for Go modules (`go install golang.org/x/tools/gopls@latest`)
 
+### Entire checkpoints in the Maestro dogfood repo
+
+The public `BeFeast/maestro` repository may use Entire for optional local
+checkpoint history. Its committed `.entire/settings.json` keeps
+`strategy_options.push_sessions` set to `false` (and telemetry disabled)
+because session payloads can contain prompts, tool calls, and local paths;
+redaction is best-effort and does not make those payloads safe to publish. Do
+not push `entire/*` refs. This is a repo-local dogfood policy, not fleet-wide
+Maestro integration.
+
 ### Verify prerequisites
 ```bash
 git --version        # any recent version
@@ -247,11 +257,16 @@ management_home:
   vault_path: Dev/Areas/project
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
+worker_runtime:                     # config-gated private scratch on the durable worker lease
+  mode: legacy                     # legacy (default rollback path) | isolated
+  scope: system                    # system (shipped service) | user
+  scratch_root: /var/tmp/maestro-workers
+  memory_max_mb: 0                 # optional per-worker hard cap; 0 uses the isolated aggregate slice only
 stalled_progress_watchdog:         # explicit opt-in multi-signal evaluator
   enabled: true
-  max_silence_minutes: 20          # record a recommendation after no material progress; no actuator yet
+  max_silence_minutes: 20          # exact-lease worker recovery; runtime-live contract remains canary-gated
   eval_interval_seconds: 60        # independent local evaluation cadence
-worker_max_tokens: 0               # kill worker when cumulative token usage exceeds this (0 = unlimited)
+worker_max_tokens: 0               # per-attempt live budget; Claude/Pi exclude cache reads (0 = unlimited)
 auto_rebase: true                  # auto-rebase conflicting PR branches (default: true)
 merge_strategy: sequential         # "sequential" (default) or "parallel"
 merge_interval_seconds: 30         # minimum seconds between merges in sequential mode
@@ -279,6 +294,10 @@ telegram:
 
 `issue_label` is still supported for backward compatibility, but `issue_labels` is recommended for new configs.
 
+For the explicit, default-off SSH worker spike, including runner provisioning,
+short-lived credential handling, measurements, rollback, and exact zombie
+cleanup, see the [remote worker runbook](docs/remote-runner-spike.md).
+
 ## AI Backends
 
 Maestro supports multiple AI coding agents. Configure via `model:` in `maestro.yaml`:
@@ -293,6 +312,9 @@ model:
       cmd: codex         # OpenAI Codex CLI
     gemini:
       cmd: gemini        # Google Gemini CLI
+    kimi:
+      cmd: kimi          # MoonshotAI Kimi Code CLI
+      provider: moonshot
     cline:
       cmd: cline         # Cline CLI (e.g. SAP AI Core / any OpenAI-compatible provider)
 ```
@@ -314,6 +336,12 @@ model:
 > Auth: `gemini auth` or set `GEMINI_API_KEY`
 
 > [!NOTE]
+> **Kimi** — MoonshotAI Kimi Code CLI
+> Install: `uv tool install --python 3.13 kimi-cli` | `kimi --version`
+> Worker mode: prompt via stdin, `--print --output-format=stream-json`.
+> Auth and proxy routing: see [`docs/kimi-backend.md`](docs/kimi-backend.md).
+
+> [!NOTE]
 > **Cline** — Cline CLI, supports any OpenAI-compatible provider (including SAP AI Core, Azure OpenAI, etc.)
 > Install: `bun add -g cline` | `cline --version`
 > Config: `~/.cline/data/globalState.json` + `secrets.json` — configure provider and model before use.
@@ -324,9 +352,9 @@ model:
 
 Backends do not have to be named after the CLI they run. A custom key (e.g. a model nickname) keeps full CLI-specific behaviour — permission-bypass flags and stdin prompt delivery — as long as Maestro can tell which CLI it wraps. Resolution order:
 
-1. the backend name itself (`claude`, `codex`, `gemini`, `cline`),
-2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `cline` → Cline),
-3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `cline`).
+1. the backend name itself (`claude`, `codex`, `gemini`, `kimi`, `cline`),
+2. the `provider` field (`anthropic`/`claude` → Claude, `openai`/`codex` → Codex, `google`/`gemini` → Gemini, `moonshot`/`kimi` → Kimi, `cline` → Cline),
+3. the binary basename of `cmd` (`claude`, `codex`, `gemini`, `kimi`, `cline`).
 
 ```yaml
 model:
@@ -342,7 +370,7 @@ model:
 
 A backend that matches none of the above falls back to the generic exec path: `prompt_mode` applies, no permission-bypass flag is added, and Maestro logs a startup warning naming the backend. Use the generic path only for genuinely custom CLIs.
 
-### Claude / Codex usage capture (tokens + cost)
+### Structured usage capture (tokens + cost)
 
 Plain `claude -p` text mode prints no parseable token total, and `codex exec` text mode only prints a fuzzy single total — so a worker's `tokens_used_total` and USD cost are unreliable or `0`. Opt a `claude` or `codex` backend into structured usage capture with `usage_stream: true`:
 
@@ -363,6 +391,76 @@ model:
 
 When enabled, the worker runs the backend in structured-stream mode (`claude --output-format stream-json --verbose`, or `codex exec --json`) and its NDJSON is piped through `maestro stream-split`, which writes the raw frames to a side-channel `<slot>.jsonl` (parsed for `input`/`output`/cache tokens) while keeping `<slot>.log` human-readable. The session then reports non-zero split tokens in `maestro history --json` and the `/api/v1/fleet` cost panel. Off by default; an operator-pinned `--output-format` (claude) or `--json` (codex) in `extra_args` overrides it. Claude reports its own `total_cost_usd`; codex does not, so its cost is **virtual** — computed from the configured `pricing` block (tokens-only `$0` when no rates are set). (The `pi` backend captures usage natively and needs no opt-in.)
 
+Kimi uses stream-json by default and needs no `usage_stream` opt-in. When its
+stream carries native `input_other`, `output`, `input_cache_read`, and
+`input_cache_creation` usage, Maestro feeds those fields into the same
+watermark and split-cost path. See the Kimi runbook for the upstream telemetry
+and live-budget limitations.
+
+#### Claude harness through CLIProxyAPI: non-Anthropic telemetry smoke (2026-07-21)
+
+Claude Code 2.1.216 was exercised in the same structured worker shape used by
+Maestro, with the proxy URL/credential inherited from the environment (values
+were neither printed nor captured):
+
+```sh
+printf 'Reply with exactly the word PONG.\n' |
+  claude --model <model> --effort low -p \
+    --output-format stream-json --verbose \
+    --dangerously-skip-permissions
+```
+
+All three translated upstreams completed successfully and emitted plausible,
+non-zero usage on the terminal `result` frame:
+
+| Requested/init model | Assistant model | Input | Output | Cache read | Total | `total_cost_usd` | Frame note |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- |
+| `kimi-k3` | `kimi-k3` | 17,535 | 20 | 6,144 | 23,699 | 0.091247 | assistant output was `0`; live cap under-counts output |
+| `grok-4.5` | `grok-4.5-build` | 24,762 | 22 | 1,280 | 26,064 | 0.125000 | assistant usage was all zero; live cap is terminal-only |
+| `gpt-5.6-sol` | `gpt-5.6-sol` | 21,581 | 6 | 0 | 21,587 | 0.111585 | assistant usage was all zero; live cap is terminal-only |
+
+This confirms that the terminal result is authoritative for history/cost
+accounting, but it also finds a live-enforcement degradation: none of the three
+routes supplied fully plausible input/output usage on assistant frames. Kimi
+under-counted generated output until the result; Grok and Sol supplied no live
+count at all. A sanitized Grok capture (identifiers/timing removed; frame shapes
+and usage retained) lives at
+`internal/worker/testdata/claude_proxy_grok_4_5_stream.jsonl` and is round-tripped
+through `stream-split` in the Go test suite.
+
+`--effort low` was harmless for every route: the deployed proxy accepted all
+three calls, and current CLIProxyAPI model metadata declares a `low` reasoning
+level for Kimi K3, Grok 4.5, and GPT-5.6 Sol. CLIProxyAPI's thinking translation
+maps supported levels to the upstream request and strips the setting for a route
+that declares no thinking support; Maestro therefore keeps emitting the normal
+Claude `--effort` flag rather than special-casing model names.
+
+Maestro now logs and persists both degradation scopes on the active backend
+attribution:
+
+- `usage_unreliable_scope: live_budget` when assistant usage has a zero
+  input/output field. A later complete result still makes history/cost exact,
+  but `worker_max_tokens` was not enforceable response-by-response for that
+  segment.
+- `usage_unreliable_scope: accounting` when a successful terminal result omits
+  `usage` or reports zero input/output. Token totals are then a lower bound, and
+  the cost-observability API includes the session in
+  `usage_unreliable_sessions` instead of dropping it as no activity.
+
+In either scope, `0` tokens means unavailable — never progress. The live token
+monitor does not synthesize a budget hit or kill from missing usage; the
+stalled-progress watchdog remains driven by terminal/checkpoint, worktree/Git,
+process/tmux, and PR-review signals rather than token counters. Operators using
+a positive hard cap should therefore treat these three proxy routes as
+degraded until CLIProxyAPI supplies non-zero assistant-frame input and output.
+
+**External dashboard comparison remains operator verification.** The worker
+environment has proxy request credentials but no access to the external usage
+sink/dashboard, and current CLIProxyAPI usage-queue reads are destructive. The
+numbers above are the captured translated stream values, not an independently
+claimed dashboard match; keep issue #946 open until an operator compares these
+three request rows in the deployed dashboard.
+
 When `worker_max_tokens` is positive, structured usage is no longer optional:
 Maestro fails the worker start closed if the selected backend/output mode cannot
 enforce a live ceiling. Claude, Pi, and OpenCode stop from their usage event
@@ -370,6 +468,12 @@ stream; Codex combines cumulative rollout `token_count` telemetry with its
 native rollout budget inside the agent loop (`--ephemeral` is rejected).
 Enforcement lags by at most one provider response, not by the orchestration poll
 interval.
+
+For Claude and Pi, `worker_max_tokens` counts input + output + newly written
+cache tokens and excludes cache reads. Cache reads remain in session and cost
+telemetry, but replaying the same cached context on later turns does not consume
+the live ceiling again. Fleet exposes the current budget numerator separately as
+`token_budget_tokens_attempt` with `token_budget_measure: uncached_tokens`.
 
 ### Optional worker MCP tools
 

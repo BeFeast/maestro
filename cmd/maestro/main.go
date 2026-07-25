@@ -32,6 +32,7 @@ import (
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/versioning"
 	"github.com/befeast/maestro/internal/watch"
 	"github.com/befeast/maestro/internal/worker"
@@ -65,6 +66,7 @@ Commands:
   history       Show recently completed sessions
   digest        Write the morning operator digest across all fleet projects
   cleanup       Remove worktrees for all completed/dead sessions
+  tmpfs-hygiene Protect-aware allowlisted /tmp tmpfs sweep (dry-run/apply JSONL)
   version-bump  Bump project version based on merged PR labels
   selfcheck     Run the bundled behavioral smoke gate (self-deploy pre-finalize check)
   version       Print version
@@ -170,6 +172,11 @@ Digest flags:
   sessions with open PRs, blocked issues whose blockers are resolved, PRs with
   stale unresolved review findings, promotable issues, and a per-project
   health line. See docs/digest-runbook.md for a systemd timer example.
+
+Tmpfs hygiene flags:
+  --dry-run             Inspect and report reclaimable entries without deleting
+  --apply               Apply the allowlisted sweep
+  --store string        Config store used to protect local/worktree paths
 
 Watch:
   maestro watch             Open tmux dashboard attached to live worker sessions
@@ -383,6 +390,8 @@ func main() {
 		digestCmd(args)
 	case "cleanup":
 		cleanupCmd(args)
+	case "tmpfs-hygiene":
+		tmpfsHygieneCmd(args)
 	case "version-bump":
 		versionBumpCmd(args)
 	case "selfcheck":
@@ -391,6 +400,8 @@ func main() {
 		streamSplitCmd(args)
 	case "_worker-exec":
 		workerExecCmd(args)
+	case "_worker-lease-cleanup":
+		workerLeaseCleanupCmd(args)
 	case "_watch-updater":
 		watchUpdaterCmd(args)
 	case "_watch-tail":
@@ -1441,6 +1452,7 @@ func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			state.PrepareWorkerForOperatorRestart(sess)
 			// worker.Stop deleted the worktree; drop the stale pointers so
 			// respawnDueRetries fresh-respawns instead of RespawnInPlace
 			// against a directory that no longer exists (#874).
@@ -2041,6 +2053,15 @@ func showOutcomeStatus(cfg *config.Config, s *state.State) {
 	if status.HealthSummary != "" {
 		fmt.Printf("Outcome check:  %s\n", status.HealthSummary)
 	}
+	if status.Recovery != nil {
+		fmt.Printf("Recovery:       %s\n", valueOrDash(status.Recovery.Status))
+		if status.Recovery.Summary != "" {
+			fmt.Printf("Recovery state: %s\n", status.Recovery.Summary)
+		}
+		if !status.Recovery.NextEligibleAt.IsZero() {
+			fmt.Printf("Recovery next:  %s\n", status.Recovery.NextEligibleAt.UTC().Format(time.RFC3339))
+		}
+	}
 	if status.NextAction != "" {
 		fmt.Printf("Outcome next:   %s\n", status.NextAction)
 	}
@@ -2050,10 +2071,13 @@ func outcomeStatusForState(cfg *config.Config, s *state.State) outcome.Status {
 	if cfg == nil || s == nil {
 		return outcome.StatusFor(outcome.Brief{}, 0, time.Time{})
 	}
+	var status outcome.Status
 	if s.OutcomeHealth != nil {
-		return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt, *s.OutcomeHealth)
+		status = outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt, *s.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
 	}
-	return outcome.StatusFor(cfg.Outcome, s.DonePRCount(), s.LastMergeAt)
+	return outcome.AttachRecovery(status, s.OutcomeRecovery)
 }
 
 func valueOrDash(value string) string {
@@ -2088,13 +2112,10 @@ func logsCmd(args []string) {
 
 			// If worker's tmux session is alive, attach to it for live output
 			tmuxName := worker.TmuxSessionName(slotName)
-			if sess.Status == state.StatusRunning && exec.Command("tmux", "has-session", "-t", tmuxName).Run() == nil {
-				tmuxPath, err := exec.LookPath("tmux")
-				if err != nil {
-					log.Fatalf("find tmux: %v", err)
-				}
+			if sess.Status == state.StatusRunning && tmuxsession.HasSession(tmuxName) {
+				tmuxPath, tmuxArgs := tmuxsession.ClientArgsForSession(tmuxName, "attach-session", "-t", "="+tmuxName+":", "-r")
 				fmt.Printf("Attaching to tmux session %s (read-only)...\n", tmuxName)
-				syscall.Exec(tmuxPath, []string{"tmux", "attach-session", "-t", tmuxName, "-r"}, os.Environ())
+				syscall.Exec(tmuxPath, tmuxArgs, os.Environ())
 				log.Fatalf("exec tmux attach: should not reach here")
 			}
 
@@ -2306,7 +2327,7 @@ func tmuxSessionAlive(name string) bool {
 	if strings.TrimSpace(name) == "" {
 		return false
 	}
-	return exec.Command("tmux", "has-session", "-t", name).Run() == nil
+	return tmuxsession.HasSession(name)
 }
 
 func watchCmd(args []string) {

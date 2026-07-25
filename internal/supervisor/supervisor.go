@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -83,6 +84,7 @@ const (
 	ErrorClassGitHubNotFound    = "github_not_found"
 	ErrorClassGitHubRateLimited = "github_rate_limited"
 	ErrorClassUnsupportedClient = "unsupported_client"
+	ErrorClassSupervisorBackend = "supervisor_backend_unavailable"
 
 	SeverityInfo    = "info"
 	SeverityWarning = "warning"
@@ -108,6 +110,14 @@ type Mutator interface {
 
 type prCIStatusReader interface {
 	PRCIStatus(prNumber int) (string, error)
+}
+
+type prCheckRollupReader interface {
+	PRCheckRollup(prNumber int) (github.PRCheckRollup, error)
+}
+
+type prHeadSHAReader interface {
+	PRHeadSHA(prNumber int) (string, error)
 }
 
 type prGreptileReader interface {
@@ -357,6 +367,8 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	} else if decisionRequiresApproval(cfg, decision) {
 		decision.RequiresApproval = true
 	}
+	state.PrepareSupervisorRecommendation(&decision)
+	decision.Quiescent = supervisorDecisionQuiescent(decision)
 	if !cfg.Supervisor.DryRun {
 		// Execute any approvals that were transitioned to status=approved
 		// outside this loop (CLI approve already executes inline; this
@@ -373,8 +385,24 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		if mutator, ok := reader.(Mutator); ok {
 			engine.runSpecGroom(st, mutator)
 		}
-		applyOrMintDecision(cfg, st, reader, &decision)
-		st.RecordSupervisorDecision(decision, state.DefaultSupervisorDecisionLimit)
+		// Observe before acting: the recorder expires an unchanged episode at its
+		// TTL boundary, so the cycle that drops it can never race through to an
+		// actuator. A changed recommendation starts a fresh episode and remains
+		// eligible on that transition edge.
+		decision = st.RecordSupervisorDecisionWithPolicy(
+			decision,
+			state.DefaultSupervisorDecisionLimit,
+			cfg.Supervisor.EffectiveUnchangedDecisionWindow(),
+			cfg.Supervisor.EffectiveRecommendationTTL(),
+			decision.CreatedAt,
+		)
+		if !decision.RecommendationDropped() {
+			applyOrMintDecision(cfg, st, reader, &decision)
+			if disposition := supervisorDecisionMaterialization(decision); disposition != nil && decision.Disposition == nil {
+				decision.Disposition = disposition
+			}
+			st.UpdateSupervisorDecisionEpisode(decision)
+		}
 		// Phase 1.2 (#499): stamp the last-run heartbeat just before save
 		// so the watchdog goroutine in cmd/maestro can see this cycle
 		// completed. Also clear any stale SupervisorStuck flag set by a
@@ -384,6 +412,18 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		st.SupervisorStuck = false
 		st.SupervisorStuckReason = ""
 		if err := state.Save(cfg.StateDir, st); err != nil {
+			// The orchestrator, supervisor, and watchdog share state.json. A
+			// conflicting orchestrator write can legitimately make this full
+			// snapshot lose its compare-and-merge race even though Decide completed.
+			// Persist the liveness fields against a freshly loaded snapshot so Fleet
+			// never reports a dead control loop for a cycle that actually ran. The
+			// original error is still returned: decision/approval persistence remains
+			// fail-closed and is retried on the next scheduled cycle.
+			if errors.Is(err, state.ErrStateConflict) {
+				if heartbeatErr := persistSupervisorHeartbeat(cfg.StateDir, st.LastRunOnceAt); heartbeatErr != nil {
+					return state.SupervisorDecision{}, fmt.Errorf("save state: %w (heartbeat recovery: %v)", err, heartbeatErr)
+				}
+			}
 			return state.SupervisorDecision{}, fmt.Errorf("save state: %w", err)
 		}
 		// #497: bound state.Sessions growth by compacting old terminal
@@ -393,6 +433,62 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		compactTerminalSessions(cfg, st, "supervisor")
 	}
 	return decision, nil
+}
+
+func supervisorDecisionMaterialization(decision state.SupervisorDecision) *state.RecommendationDisposition {
+	at := decision.CreatedAt
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	if strings.TrimSpace(decision.ApprovalID) != "" {
+		return &state.RecommendationDisposition{
+			Status: state.RecommendationDispositionMaterialized,
+			Reason: state.RecommendationDispositionApprovalRecorded,
+			At:     at.UTC(),
+		}
+	}
+	for _, mutation := range decision.Mutations {
+		if mutation.Status == MutationStatusSucceeded {
+			return &state.RecommendationDisposition{
+				Status: state.RecommendationDispositionMaterialized,
+				Reason: state.RecommendationDispositionSafeAction,
+				At:     at.UTC(),
+			}
+		}
+	}
+	return nil
+}
+
+func supervisorDecisionQuiescent(decision state.SupervisorDecision) bool {
+	if decision.PolicyRule == PolicyRuleExcludedLabels {
+		return true
+	}
+	analysis := decision.QueueAnalysis
+	return analysis != nil && analysis.OpenIssues > 0 && analysis.EligibleCandidates == 0 &&
+		analysis.ExcludedIssues == analysis.OpenIssues
+}
+
+func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
+	if at.IsZero() {
+		at = time.Now().UTC()
+	}
+	for attempt := 0; attempt < 8; attempt++ {
+		latest, err := state.Load(stateDir)
+		if err != nil {
+			return err
+		}
+		latest.LastRunOnceAt = at.UTC()
+		latest.SupervisorStuck = false
+		latest.SupervisorStuckReason = ""
+		if err := state.Save(stateDir, latest); err != nil {
+			if errors.Is(err, state.ErrStateConflict) {
+				continue
+			}
+			return err
+		}
+		return nil
+	}
+	return fmt.Errorf("supervisor heartbeat state remained conflicted after bounded retries")
 }
 
 // applyOrMintDecision is the post-decision side-effect stage of RunOnce,
@@ -570,10 +666,14 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open PRs: %w", err)
 	}
 	projectState.OpenPRs = len(prs)
+	projectState.OpenPRNumbers = supervisorOpenPRNumbers(prs)
 	cache := newResolutionCache(e.reader)
 	stuckStates := e.detectStuckStates(st, now, prs, nil, nil, nil, false, cache)
+	var deferredOpenPR *deferredOpenPRMonitor
+	var deferredBudgetSlot string
+	var deferredBudgetSess *state.Session
 
-	if slot, sess, pr, ok := e.sessionWithOpenPR(st, prs, cache); ok {
+	if slot, sess, pr, mergeReady, mergeHeadSHA, mergeReasons, ok := e.sessionWithOpenPR(st, prs, cache); ok {
 		// #565: auto review-repair respawn. When a green+mergeable PR is
 		// settled retry_exhausted on review feedback AND Greptile flags
 		// ≥1 P0/P1 inline comment on its current head SHA, mint a
@@ -595,27 +695,47 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 
 		if e.openPRNeedsRepair(st, stuckStates, slot, sess, pr) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
-				"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
-				"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
-			)
-			decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
-				fmt.Sprintf("Start a repair worker for issue #%d; PR #%d is not enough to prove the live outcome.", sess.IssueNumber, pr.Number),
-				RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
-			return decision, nil
-		}
-		// #512 (Phase 1.6): if the PR is actually ready to merge — not draft,
-		// mergeable, CI green, Greptile approved (when configured) — recommend
-		// merge_pr (risk=mutating, cautious-gate gates approval). Without this
-		// rule, every CLEAN/SUCCESS PR sat in pr_open forever while supervisor
-		// emitted monitor_open_pr loops; the reasoning even claimed "Maestro will
-		// merge when the merge gate allows it" — aspirational, never implemented.
-		if ready, mergeReasons := e.openPRReadyToMerge(slot, sess, pr); ready {
+			guardReason, guardErr := e.currentIssueRepairGuard(sess.IssueNumber)
+			if guardErr != nil {
+				guardReason = fmt.Sprintf("current issue dispatch guards could not be verified: %v", guardErr)
+			}
+			if guardReason != "" {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"Repair dispatch is fail-closed against the issue's current forge state",
+					guardReason,
+				)
+				// Hands-off: a guarded/blocked open PR must not freeze spare
+				// slots — defer the monitor decision and try backlog fill.
+				if projectState.AvailableSlots > 0 {
+					deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr, guardReason: guardReason}
+					baseReasons = appendReasons(reasons,
+						"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
+					)
+				} else {
+					target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+					decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+						fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", sess.IssueNumber, guardReason),
+						RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+					decision.StuckStates = stuckStates
+					return decision, nil
+				}
+			} else {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", slot, pr.Number),
+					"The worker is not actively repairing this PR while it is draft, failing checks, blocked by review, or the live outcome is still failing",
+					"Starting a repair worker would mutate local worktrees, so supervisor records an explicit repair recommendation",
+				)
+				decision := e.decision(st, now, projectState, ActionSpawnRepairWorker,
+					fmt.Sprintf("Start a repair worker for issue #%d; PR #%d is not enough to prove the live outcome.", sess.IssueNumber, pr.Number),
+					RiskMutating, 0.9, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}, PolicyRuleRuntimeState, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
+		} else if mergeReady {
 			summary := fmt.Sprintf("Merge PR #%d for issue #%d — checks green, mergeable, review gates passed.", pr.Number, sess.IssueNumber)
 			reasons := appendReasons(baseReasons, mergeReasons...)
-			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+			target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, HeadSHA: mergeHeadSHA, Session: slot}
 			decision := e.decision(st, now, projectState, ActionMergePR,
 				summary,
 				RiskMutating, 0.9, target, PolicyRuleRuntimeState, reasons)
@@ -623,28 +743,38 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 			return decision, nil
 		}
 
-		// PR exists but is not yet merge-ready. Stay on monitor_open_pr but
-		// surface the actual blocker (CI pending, review missing, draft, etc.)
-		// in the summary instead of claiming auto-merge will happen.
-		monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
-		summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
-			"No GitHub mutation is needed for supervisor mode",
-		)
-		reasons = appendReasons(reasons, monitorReasons...)
-		if sess.Status == state.StatusRetryExhausted {
-			reasons = appendReasons(reasons,
-				fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
-				"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+		// Hands-off fill (2026-07-22): a non-urgent open PR must NOT starve
+		// spare capacity when backlog exists. Defer monitor_open_pr until we
+		// know whether eligible backlog remains; if none, resume monitoring.
+		// (Guarded/blocked repair may already have deferred above.)
+		if deferredOpenPR == nil {
+			if projectState.AvailableSlots <= 0 {
+				monitorReasons := e.monitorOpenPRReasons(slot, sess, pr)
+				summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", pr.Number, sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s is associated with open PR #%d", slot, pr.Number),
+					"No GitHub mutation is needed for supervisor mode",
+				)
+				reasons = appendReasons(reasons, monitorReasons...)
+				if sess.Status == state.StatusRetryExhausted {
+					reasons = appendReasons(reasons,
+						fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", slot, pr.Number),
+						"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+					)
+				}
+				target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
+				decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+					summary,
+					RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+				decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
+				return decision, nil
+			}
+			deferredOpenPR = &deferredOpenPRMonitor{slot: slot, sess: sess, pr: pr}
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Open PR #%d for issue #%d is monitored passively while spare capacity remains", pr.Number, sess.IssueNumber),
+				"Prefer backlog label/spawn over exclusive monitor_open_pr when AvailableSlots>0 and backlog exists",
 			)
 		}
-		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: pr.Number, Session: slot}
-		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-			summary,
-			RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, pr, monitorReasons))
-		return decision, nil
 	}
 
 	if slot, sess, ok := runningSession(st); ok && e.shouldWaitForRunningWorker(st) {
@@ -660,42 +790,35 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 
 	if slot, sess, ok := tokenBudgetExceededSession(st); ok {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Session %s for issue #%d stopped deterministically at worker_max_tokens", slot, sess.IssueNumber),
-			"Restarting or re-planning automatically would spend more tokens without an operator budget decision",
+		// Hands-off fill (#1106): a historical token-budget stop on one issue
+		// must never freeze the whole project with exclusive ActionNone. Always
+		// continue; surface the budget stop as a stuck-state note if no other
+		// backlog remains. Capacity-full cases fall through to wait_for_capacity
+		// / monitor_open_pr like any other fill path.
+		deferredBudgetSlot, deferredBudgetSess = slot, sess
+		baseReasons = appendReasons(baseReasons,
+			fmt.Sprintf("Session %s for issue #%d previously hit worker_max_tokens", slot, sess.IssueNumber),
+			"Continue backlog fill instead of freezing the project on a budget stop",
 		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d is stopped at its worker token budget and needs an operator budget decision.", sess.IssueNumber),
-			RiskSafe, 0.99, &state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		return decision, nil
 	}
 
 	if !e.cfg.Supervisor.OrderedQueueActive() && !e.cfg.Supervisor.DynamicWave.Active() {
-		if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
-				"Retry-exhausted work requires a human decision before more automation",
-			)
-			decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
-				fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
-				RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
-			decision.StuckStates = stuckStates
-			return decision, nil
+		// When an open PR is already deferred for spare-slot fill, do not let
+		// retry_exhausted monopolize the cycle — resume deferred monitor if
+		// backlog probe finds nothing (pending CI must stay monitor_open_pr).
+		if deferredOpenPR == nil {
+			if slot, sess, ok := e.retryExhaustedSession(st, cache); ok {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Session %s for issue #%d is retry_exhausted", slot, sess.IssueNumber),
+					"Retry-exhausted work requires a human decision before more automation",
+				)
+				decision := e.decision(st, now, projectState, ActionReviewRetryExhausted,
+					fmt.Sprintf("Issue #%d exhausted its retry budget and needs manual review.", sess.IssueNumber),
+					RiskApprovalGated, 0.93, &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}, PolicyRuleRuntimeState, reasons)
+				decision.StuckStates = stuckStates
+				return decision, nil
+			}
 		}
-	}
-
-	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
-		reasons := appendReasons(baseReasons,
-			stuck.Summary,
-			fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
-			"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
-		)
-		decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
-			"Verify outcome health before starting more issue work.",
-			RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
-		decision.StuckStates = stuckStates
-		return decision, nil
 	}
 
 	issues, err := e.reader.ListOpenIssues(nil)
@@ -703,6 +826,55 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, fmt.Errorf("list open issues: %w", err)
 	}
 	projectState.OpenIssues = len(issues)
+
+	// F8 / sustained hands-off (2026-07-22): a red/unknown outcome must NOT
+	// permanently idle the project when backlog exists. The old early-return
+	// ActionCheckOutcomeHealth path stopped add_ready_label / spawn while
+	// ActiveSessions()==0, so after workers finished the ready queue drained
+	// and the fleet sat at 0 until a human kicked it. Prefer promoting or
+	// dispatching eligible backlog; only recommend outcome verification when
+	// there is truly nothing actionable left.
+	if stuck := noOutcomeProgressStuckState(stuckStates); stuck != nil && len(st.ActiveSessions()) == 0 {
+		policyProbe, probeErr := e.policyCandidateIssues(st, issues)
+		if probeErr != nil {
+			return state.SupervisorDecision{}, probeErr
+		}
+		hasActionable := false
+		if policyProbe.dynamicWave {
+			hasActionable = len(policyProbe.candidates) > 0
+		} else {
+			eligibleProbe, _, eligErr := e.eligibleIssues(st, policyProbe.candidates, true)
+			if eligErr != nil {
+				return state.SupervisorDecision{}, eligErr
+			}
+			hasActionable = len(eligibleProbe) > 0
+		}
+		if !hasActionable {
+			if deferredOpenPR != nil {
+				return e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR), nil
+			}
+			reasons := appendReasons(baseReasons,
+				stuck.Summary,
+				fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
+				"No actionable backlog remains; recommend outcome verification before inventing new throughput",
+				"Supervisor remains read-only for deploy/runtime; it does not run deploy commands",
+			)
+			decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
+				"Verify outcome health before starting more issue work.",
+				RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
+			decision.StuckStates = stuckStates
+			decision.QueueAnalysis = &state.SupervisorQueueAnalysis{
+				PolicyRule:         e.defaultPolicyRule(),
+				OpenIssues:         len(issues),
+				EligibleCandidates: 0,
+			}
+			return decision, nil
+		}
+		baseReasons = appendReasons(baseReasons,
+			stuck.Summary,
+			"Outcome is unhealthy, but actionable backlog remains — prefer label/spawn over idling on check_outcome_health",
+		)
+	}
 
 	if slot, sess, issue, ok, err := e.retryExhaustedRepairCandidate(st, issues, cache); err != nil {
 		return state.SupervisorDecision{}, err
@@ -725,7 +897,7 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		return state.SupervisorDecision{}, err
 	}
 	if policyResult.dynamicWave {
-		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult, cache)
+		return e.decideDynamicWave(st, now, projectState, baseReasons, prs, issues, policyResult, cache, deferredOpenPR, deferredBudgetSlot, deferredBudgetSess)
 	}
 	candidates := policyResult.candidates
 	policySkipped := policyResult.skipped
@@ -743,81 +915,86 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	}
 
 	if len(eligible) > 0 {
-		issue := eligible[0]
-		if projectState.AvailableSlots <= 0 {
+		var openPRBlocker *github.Issue
+		for _, issue := range eligible {
+			if projectState.AvailableSlots <= 0 {
+				reasons := appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+				)
+				decision := e.decision(st, now, projectState, ActionWaitForCapacity,
+					fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
+					RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+				decision.StuckStates = stuckStates
+				return withAnalysis(decision), nil
+			}
+
+			hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+			if err != nil {
+				return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+			}
+			if hasOpenPR {
+				if openPRBlocker == nil {
+					copied := issue
+					openPRBlocker = &copied
+				}
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d already has an open PR — skip for spare-slot backlog fill", issue.Number),
+				)
+				continue
+			}
+
+			// Race protection: refuse to recommend a spawn for an issue that
+			// has already been closed since the listing snapshot (post-merge
+			// race) or whose session is already Done/code_landed.
+			if cache.isIssueClosed(issue.Number) {
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d closed between listing and dispatch — skip", issue.Number),
+				)
+				continue
+			}
+			if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+				baseReasons = appendReasons(baseReasons,
+					fmt.Sprintf("Issue #%d already reached Done in state — skip duplicate spawn", issue.Number),
+				)
+				continue
+			}
+
 			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+				issueLabelReason(e.requiredIssueLabels()),
+				fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
+				outcomeIssueReason(outcomeStatus, issue),
+				"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 			)
-			decision := e.decision(st, now, projectState, ActionWaitForCapacity,
-				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+			if preflight, ok := e.evaluatePreflight(false, true); !ok {
+				stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+				blockedReasons := appendReasons(reasons,
+					"Preflight gate failed; refusing to recommend a worker spawn",
+					"Preflight: "+preflight.Reason,
+				)
+				decision := e.decision(st, now, projectState, ActionPreflightFailed,
+					fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+					RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, blockedReasons)
+				decision.StuckStates = stuckStates
+				return withAnalysis(decision), nil
+			}
+			decision := e.decision(st, now, projectState, ActionSpawnWorker,
+				fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
+				RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
 			return withAnalysis(decision), nil
 		}
-
-		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
-		if err != nil {
-			return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
-		}
-		if hasOpenPR {
+		if openPRBlocker != nil {
 			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", issue.Number),
+				fmt.Sprintf("Issue #%d is eligible but GitHub already has an open PR referencing it", openPRBlocker.Number),
+				"No later eligible issue was dispatchable without duplicating open-PR work",
 				"Supervisor mode should not dispatch duplicate work",
 			)
 			decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-				RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
+				fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", openPRBlocker.Number),
+				RiskSafe, 0.87, &state.SupervisorTarget{Issue: openPRBlocker.Number}, policyRule, reasons)
 			decision.StuckStates = stuckStates
 			return withAnalysis(decision), nil
 		}
-
-		// Race protection: refuse to recommend a spawn for an issue that
-		// has already been closed since the listing snapshot (post-merge
-		// race) or whose session is already Done/code_landed.
-		if cache.isIssueClosed(issue.Number) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
-			)
-			decision := e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
-				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-		if e.sessionRecentlyDoneForIssue(st, issue.Number) {
-			reasons := appendReasons(baseReasons,
-				fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
-			)
-			decision := e.decision(st, now, projectState, ActionNone,
-				fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
-				RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-
-		reasons := appendReasons(baseReasons,
-			issueLabelReason(e.requiredIssueLabels()),
-			fmt.Sprintf("Issue #%d is the next eligible issue", issue.Number),
-			outcomeIssueReason(outcomeStatus, issue),
-			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
-		)
-		if preflight, ok := e.evaluatePreflight(false, true); !ok {
-			stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
-			blockedReasons := appendReasons(reasons,
-				"Preflight gate failed; refusing to recommend a worker spawn",
-				"Preflight: "+preflight.Reason,
-			)
-			decision := e.decision(st, now, projectState, ActionPreflightFailed,
-				fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
-				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, policyRule, blockedReasons)
-			decision.StuckStates = stuckStates
-			return withAnalysis(decision), nil
-		}
-		decision := e.decision(st, now, projectState, ActionSpawnWorker,
-			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, policyRule, reasons)
-		decision.StuckStates = stuckStates
-		return withAnalysis(decision), nil
 	}
 
 	if policyRule == PolicyRuleOrderedQueue && len(candidates) == 1 {
@@ -897,6 +1074,10 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 	}
 
+	if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
+		return withAnalysis(decision), nil
+	}
+
 	reasons := appendReasons(baseReasons,
 		fmt.Sprintf("Checked %d open issue(s)", len(issues)),
 		"No worker is running, no PR needs attention, and no eligible issue is ready",
@@ -904,10 +1085,39 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 	for _, reason := range firstN(skipped, 3) {
 		reasons = append(reasons, reason)
 	}
+	if deferredOpenPR != nil {
+		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)), nil
+	}
+	// #1106: historical token_budget with spare slots must stay a stuck-state
+	// note, never an exclusive ActionNone that looks like a project freeze.
+	stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
 	decision := e.decision(st, now, projectState, ActionNone,
 		"No action is currently recommended.", RiskSafe, 0.8, nil, policyRule, reasons)
 	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+// currentIssueRepairGuard re-reads the current open issue before the
+// supervisor recommends repair for an existing PR. PR/session state alone is
+// insufficient authority: an operator may have added blocked (or another
+// excluded label) after the worker/approval was created. A missing issue is
+// treated as closed and a read failure is returned so the caller can fail
+// closed without minting another approval.
+func (e *Engine) currentIssueRepairGuard(issueNumber int) (string, error) {
+	issues, err := e.reader.ListOpenIssues(nil)
+	if err != nil {
+		return "", err
+	}
+	for _, issue := range issues {
+		if issue.Number != issueNumber {
+			continue
+		}
+		if label, ok := firstMatchingIssueLabel(issue, e.dynamicWaveExcludedLabels()); ok {
+			return fmt.Sprintf("current issue label %q excludes repair dispatch", label), nil
+		}
+		return "", nil
+	}
+	return "issue is not currently open", nil
 }
 
 func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) {
@@ -920,6 +1130,11 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 		if sess == nil || sess.WorkerOutcome != worker.TokenBudgetExceededOutcome {
 			continue
 		}
+		// Operator/orchestrator already released this stop for redispatch —
+		// do not keep surfacing ActionNone / freezing fill on a settled budget.
+		if sess.ReleasedForRedispatch {
+			continue
+		}
 		if best == nil || sess.StartedAt.After(best.StartedAt) {
 			bestSlot, best = slot, sess
 		}
@@ -927,7 +1142,77 @@ func tokenBudgetExceededSession(st *state.State) (string, *state.Session, bool) 
 	return bestSlot, best, best != nil
 }
 
-func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache) (state.SupervisorDecision, error) {
+// appendTokenBudgetStuck records a historical token-budget stop as a stuck
+// state without turning it into the exclusive recommended action (#1106).
+func appendTokenBudgetStuck(base []state.SupervisorStuckState, slot string, sess *state.Session) []state.SupervisorStuckState {
+	if sess == nil || sess.IssueNumber <= 0 {
+		return base
+	}
+	for _, existing := range base {
+		if existing.Code == state.StuckTokenBudgetExceeded && existing.Target != nil && existing.Target.Session == slot {
+			return base
+		}
+	}
+	return appendStuck(base, stuckState(state.StuckTokenBudgetExceeded, SeverityWarning,
+		fmt.Sprintf("Issue #%d previously stopped at worker_max_tokens on session %s; spare capacity must still fill other backlog", sess.IssueNumber, slot),
+		"Continue label/spawn for other eligible issues; raise worker_max_tokens only for intentional redispatch of this issue",
+		false,
+		&state.SupervisorTarget{Issue: sess.IssueNumber, Session: slot},
+		fmt.Sprintf("worker_outcome=%s", sess.WorkerOutcome),
+	))
+}
+
+// deferredOpenPRMonitor holds a non-urgent open-PR monitor decision that is
+// postponed while spare capacity is used to fill backlog (hands-off band).
+type deferredOpenPRMonitor struct {
+	slot        string
+	sess        *state.Session
+	pr          github.PR
+	guardReason string // non-empty when repair was blocked by a current-issue guard
+}
+
+func (e *Engine) decisionMonitorOpenPR(
+	st *state.State,
+	now time.Time,
+	projectState state.SupervisorProjectState,
+	baseReasons []string,
+	stuckStates []state.SupervisorStuckState,
+	def deferredOpenPRMonitor,
+) state.SupervisorDecision {
+	target := &state.SupervisorTarget{Issue: def.sess.IssueNumber, PR: def.pr.Number, Session: def.slot}
+	if def.guardReason != "" {
+		reasons := appendReasons(baseReasons,
+			fmt.Sprintf("Session %s is associated with open PR #%d, but the PR is not progressing", def.slot, def.pr.Number),
+			"Repair dispatch is fail-closed against the issue's current forge state",
+			def.guardReason,
+		)
+		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+			fmt.Sprintf("Do not start a repair worker for issue #%d while its current dispatch guard holds: %s", def.sess.IssueNumber, def.guardReason),
+			RiskSafe, 0.98, target, PolicyRuleExcludedLabels, reasons)
+		decision.StuckStates = stuckStates
+		return decision
+	}
+	monitorReasons := e.monitorOpenPRReasons(def.slot, def.sess, def.pr)
+	summary := fmt.Sprintf("Monitor PR #%d for issue #%d: %s", def.pr.Number, def.sess.IssueNumber, summarizeMonitorReasons(monitorReasons))
+	reasons := appendReasons(baseReasons,
+		fmt.Sprintf("Session %s is associated with open PR #%d", def.slot, def.pr.Number),
+		"No GitHub mutation is needed for supervisor mode",
+	)
+	reasons = appendReasons(reasons, monitorReasons...)
+	if def.sess.Status == state.StatusRetryExhausted {
+		reasons = appendReasons(reasons,
+			fmt.Sprintf("Session %s is retry_exhausted but still has open PR #%d", def.slot, def.pr.Number),
+			"Retry exhaustion does not block normal PR merge flow when checks and review gates pass",
+		)
+	}
+	decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
+		summary,
+		RiskSafe, 0.9, target, PolicyRuleRuntimeState, reasons)
+	decision.StuckStates = appendStuck(stuckStates, pendingChecksStuckState(target, def.pr, monitorReasons))
+	return decision
+}
+
+func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, issues []github.Issue, result policyCandidateResult, cache *resolutionCache, deferredOpenPR *deferredOpenPRMonitor, deferredBudgetSlot string, deferredBudgetSess *state.Session) (state.SupervisorDecision, error) {
 	candidates := result.candidates
 	analysis := result.analysis
 	outcomeStatus := e.outcomeStatus(st)
@@ -968,6 +1253,9 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 	}
 
 	if len(candidates) == 0 {
+		if decision, ok := e.noBacklogOutcomeDecision(st, now, projectState, baseReasons, prs, stuckStates); ok {
+			return withAnalysis(decision), nil
+		}
 		reasons := appendReasons(baseReasons,
 			fmt.Sprintf("Dynamic wave checked %d open issue(s)", len(issues)),
 			fmt.Sprintf("Dynamic wave found %d eligible candidate(s), %d excluded issue(s), %d held/meta issue(s), %d blocked-by-dependency issue(s), and %d issue(s) in non-runnable project status", analysis.EligibleCandidates, analysis.ExcludedIssues, analysis.HeldIssues, analysis.BlockedByDependencyIssues, analysis.NonRunnableProjectStatusCount),
@@ -1025,118 +1313,184 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			return withAnalysis(decision), nil
 		}
 
+		stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
 		decision := e.decision(st, now, projectState, ActionNone,
 			"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, reasons)
+		if deferredOpenPR != nil {
+			decision = e.decisionMonitorOpenPR(st, now, projectState, reasons, stuckStates, *deferredOpenPR)
+		}
+		decision.StuckStates = stuckStates
 		return withAnalysis(decision), nil
 	}
 
-	issue := candidates[0]
-	if projectState.AvailableSlots <= 0 {
+	// Walk candidates until one is dispatchable. A leading candidate that
+	// already has an open PR must NOT freeze the whole project when later
+	// candidates (and AvailableSlots) remain — that was the live ok-player
+	// failure mode (eligible=5, action=monitor_open_pr on #406, live→0).
+	var openPRBlocker *github.Issue
+	for _, issue := range candidates {
+		if projectState.AvailableSlots <= 0 {
+			reasons := appendReasons(baseReasons,
+				fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
+				fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+			)
+			decision := e.decision(st, now, projectState, ActionWaitForCapacity,
+				fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
+				RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			return withAnalysis(decision), nil
+		}
+
+		hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
+		if err != nil {
+			return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
+		}
+		if hasOpenPR {
+			if openPRBlocker == nil {
+				copied := issue
+				openPRBlocker = &copied
+			}
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d already has an open PR — skip for spare-slot backlog fill", issue.Number),
+			)
+			continue
+		}
+
+		// A gate-fail-streak issue is Maestro reporting that a scheduled gate
+		// failed N times — it is a notification, not a triaged task. Whether a
+		// worker can fix it depends entirely on what the gate checks: repo code,
+		// or an external service Maestro has no reach into. Auto-promoting it
+		// spawns workers against outages they cannot fix (live 2026-07-23:
+		// ok-folio's LAN healthcheck flapped under host load and the fleet
+		// ground through 31 failed sessions on the minted issues). The operator
+		// decides; an explicitly labelled streak issue still runs normally.
+		//
+		// This must stay ahead of the SelectedCandidate assignment below: with
+		// owns_ready_label enabled, a skipped-but-selected candidate is handed
+		// to applySupervisorOwnedReadyFilter, which admits it to the dispatch
+		// list even though the decision itself was `none`.
+		if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is an auto-minted gate-fail-streak report — it needs an operator to judge whether the gate failure is repo-fixable before it enters the queue", issue.Number),
+			)
+			continue
+		}
+
+		if analysis != nil {
+			analysis.SelectedCandidate = supervisorIssueCandidate(issue)
+		}
+
+		queueCandidate := e.dynamicQueueActionCandidate(st, issue, issues)
+		if queueCandidate != nil {
+			mutations := queueCandidate.plannedMutations(e.cfg)
+			reasons := appendReasons(baseReasons,
+				queueLabelReason(queueCandidate.readyLabel, ""),
+				fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+				outcomeIssueReason(outcomeStatus, issue),
+			)
+			risk := RiskMutating
+			if len(mutations) > 0 {
+				risk = RiskSafe
+				reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
+			}
+			decision := e.decision(st, now, projectState, ActionLabelIssueReady,
+				fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
+				risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			decision.Mutations = mutations
+			return withAnalysis(decision), nil
+		}
+
+		if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is waiting for a ready label mutation to appear — skip for later candidates", issue.Number),
+			)
+			continue
+		}
+
+		// Race protection: refuse to recommend spawn for an issue that has
+		// already been closed since the issue listing snapshot was taken
+		// (post-merge close race). Cache hits are cheap because the broader
+		// supervisor cycle reuses the same resolutionCache.
+		if cache != nil && cache.isIssueClosed(issue.Number) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d closed between listing and dispatch — skip", issue.Number),
+			)
+			continue
+		}
+		if e.sessionRecentlyDoneForIssue(st, issue.Number) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d already has a Done/code-landed session — skip duplicate spawn", issue.Number),
+			)
+			continue
+		}
+
 		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d is eligible but no worker slot is available", issue.Number),
+			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
+			outcomeIssueReason(outcomeStatus, issue),
+			"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
 		)
-		decision := e.decision(st, now, projectState, ActionWaitForCapacity,
-			fmt.Sprintf("Issue #%d is eligible, but all worker slots are occupied.", issue.Number),
-			RiskSafe, 0.86, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+		if preflight, ok := e.evaluatePreflight(false, true); !ok {
+			stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
+			blockedReasons := appendReasons(reasons,
+				"Preflight gate failed; refusing to recommend a worker spawn",
+				"Preflight: "+preflight.Reason,
+			)
+			decision := e.decision(st, now, projectState, ActionPreflightFailed,
+				fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
+				RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, blockedReasons)
+			return withAnalysis(decision), nil
+		}
+		decision := e.decision(st, now, projectState, ActionSpawnWorker,
+			fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
+			RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
 
-	hasOpenPR, err := e.reader.HasOpenPRForIssue(issue.Number)
-	if err != nil {
-		return state.SupervisorDecision{}, fmt.Errorf("check open PR for issue #%d: %w", issue.Number, err)
-	}
-	if hasOpenPR {
+	if openPRBlocker != nil {
+		if deferredOpenPR != nil {
+			return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR)), nil
+		}
 		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d already has an open PR", issue.Number),
+			fmt.Sprintf("Dynamic wave selected issue #%d", openPRBlocker.Number),
+			fmt.Sprintf("Issue #%d already has an open PR", openPRBlocker.Number),
+			"No later dynamic-wave candidate was dispatchable without duplicating open-PR work",
 			"Supervisor mode should not dispatch duplicate work",
 		)
 		decision := e.decision(st, now, projectState, ActionMonitorOpenPR,
-			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", issue.Number),
-			RiskSafe, 0.87, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+			fmt.Sprintf("Issue #%d already has an open PR; monitor that PR instead of starting work.", openPRBlocker.Number),
+			RiskSafe, 0.87, &state.SupervisorTarget{Issue: openPRBlocker.Number}, PolicyRuleDynamicWave, reasons)
 		return withAnalysis(decision), nil
 	}
-
-	queueCandidate := e.dynamicQueueActionCandidate(st, issue, issues)
-	if queueCandidate != nil {
-		mutations := queueCandidate.plannedMutations(e.cfg)
-		reasons := appendReasons(baseReasons,
-			queueLabelReason(queueCandidate.readyLabel, ""),
-			fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
-			outcomeIssueReason(outcomeStatus, issue),
-		)
-		risk := RiskMutating
-		if len(mutations) > 0 {
-			risk = RiskSafe
-			reasons = appendReasons(reasons, "Supervisor policy allows the planned safe queue mutation")
-		}
-		decision := e.decision(st, now, projectState, ActionLabelIssueReady,
-			fmt.Sprintf("Prepare issue #%d for the dynamic wave by %s.", issue.Number, plannedMutationPhrase(queueCandidate.neededMutations())),
-			risk, 0.82, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		decision.Mutations = mutations
-		return withAnalysis(decision), nil
+	if deferredOpenPR != nil {
+		return withAnalysis(e.decisionMonitorOpenPR(st, now, projectState, baseReasons, stuckStates, *deferredOpenPR)), nil
 	}
-
-	if !matchesRequiredLabels(issue, e.requiredIssueLabels()) {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			"Selected issue is waiting for a ready label mutation to appear in GitHub issue data",
-		)
-		for _, reason := range firstN(result.skipped, 3) {
-			reasons = append(reasons, reason)
-		}
-		decision := e.decision(st, now, projectState, ActionNone,
-			"No action is currently recommended while the selected issue waits for its ready label.", RiskSafe, 0.8, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		return withAnalysis(decision), nil
-	}
-
-	// Race protection: refuse to recommend spawn for an issue that has
-	// already been closed since the issue listing snapshot was taken
-	// (post-merge close race). Cache hits are cheap because the broader
-	// supervisor cycle reuses the same resolutionCache.
-	if cache != nil && cache.isIssueClosed(issue.Number) {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d closed between listing and dispatch; refusing to spawn a duplicate worker", issue.Number),
-		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d closed after listing; supervisor will re-evaluate on the next cycle.", issue.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		return withAnalysis(decision), nil
-	}
-	if e.sessionRecentlyDoneForIssue(st, issue.Number) {
-		reasons := appendReasons(baseReasons,
-			fmt.Sprintf("Dynamic wave selected issue #%d", issue.Number),
-			fmt.Sprintf("Issue #%d already has a Done/code-landed session in state; refusing to spawn another worker", issue.Number),
-		)
-		decision := e.decision(st, now, projectState, ActionNone,
-			fmt.Sprintf("Issue #%d already reached Done in state; supervisor refuses to dispatch a duplicate worker.", issue.Number),
-			RiskSafe, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
-		return withAnalysis(decision), nil
-	}
-
-	reasons := appendReasons(baseReasons,
-		issueLabelReason(e.requiredIssueLabels()),
-		fmt.Sprintf("Dynamic wave selected issue #%d by priority and issue number", issue.Number),
-		outcomeIssueReason(outcomeStatus, issue),
-		"Starting a worker would mutate local worktrees, so supervisor only records the recommendation",
-	)
-	if preflight, ok := e.evaluatePreflight(false, true); !ok {
-		stuckStates = append(stuckStates, preflightFailedStuckState(preflight, "spawn_worker"))
-		blockedReasons := appendReasons(reasons,
-			"Preflight gate failed; refusing to recommend a worker spawn",
-			"Preflight: "+preflight.Reason,
-		)
-		decision := e.decision(st, now, projectState, ActionPreflightFailed,
-			fmt.Sprintf("Preflight blocked worker spawn for issue #%d: %s", issue.Number, preflight.Reason),
-			RiskApprovalGated, 0.9, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, blockedReasons)
-		return withAnalysis(decision), nil
-	}
-	decision := e.decision(st, now, projectState, ActionSpawnWorker,
-		fmt.Sprintf("Start a worker for issue #%d: %s", issue.Number, issue.Title),
-		RiskMutating, 0.84, &state.SupervisorTarget{Issue: issue.Number}, PolicyRuleDynamicWave, reasons)
+	stuckStates = appendTokenBudgetStuck(stuckStates, deferredBudgetSlot, deferredBudgetSess)
+	decision := e.decision(st, now, projectState, ActionNone,
+		"No issue is currently eligible under the dynamic wave policy.", RiskSafe, 0.8, nil, PolicyRuleDynamicWave, baseReasons)
+	decision.StuckStates = stuckStates
 	return withAnalysis(decision), nil
+}
+
+// noBacklogOutcomeDecision preserves the runtime-health recommendation only
+// after queue handling has had a chance to label or dispatch actionable work.
+// Previously this check ran before ListOpenIssues, so a failing/unknown outcome
+// plus zero active sessions starved both add_ready_label and spawn_worker and
+// could leave the whole fleet at zero workers until an operator intervened.
+func (e *Engine) noBacklogOutcomeDecision(st *state.State, now time.Time, projectState state.SupervisorProjectState, baseReasons []string, prs []github.PR, stuckStates []state.SupervisorStuckState) (state.SupervisorDecision, bool) {
+	stuck := noOutcomeProgressStuckState(stuckStates)
+	if stuck == nil || len(st.ActiveSessions()) != 0 {
+		return state.SupervisorDecision{}, false
+	}
+	reasons := appendReasons(baseReasons,
+		stuck.Summary,
+		fmt.Sprintf("Open PRs observed: %d; PR presence does not prove the live outcome is fixed", len(prs)),
+		"No actionable backlog remains after queue policy evaluation",
+		"Supervisor remains read-only; it recommends outcome verification but does not run deploy or runtime commands",
+	)
+	decision := e.decision(st, now, projectState, ActionCheckOutcomeHealth,
+		"Verify outcome health before starting more issue work.",
+		RiskSafe, 0.86, nil, PolicyRuleRuntimeState, reasons)
+	decision.StuckStates = stuckStates
+	return decision, true
 }
 
 func (e *Engine) decision(st *state.State, now time.Time, ps state.SupervisorProjectState, action, summary, risk string, confidence float64, target *state.SupervisorTarget, policyRule string, reasons []string) state.SupervisorDecision {
@@ -1428,10 +1782,16 @@ func (e *Engine) outcomeStatus(st *state.State) outcome.Status {
 		mergedPRs = st.DonePRCount()
 		lastMergeAt = st.LastMergeAt
 	}
+	var status outcome.Status
 	if st != nil && st.OutcomeHealth != nil {
-		return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt, *st.OutcomeHealth)
+		status = outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt, *st.OutcomeHealth)
+	} else {
+		status = outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
 	}
-	return outcome.StatusFor(e.cfg.Outcome, mergedPRs, lastMergeAt)
+	if st != nil {
+		status = outcome.AttachRecovery(status, st.OutcomeRecovery)
+	}
+	return status
 }
 
 func outcomeDecisionReason(status outcome.Status) string {
@@ -1528,7 +1888,12 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 		}
 		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
 
-		if sess.Status == state.StatusRunning {
+		// #877: a session the daemon deliberately checkpointed on shutdown
+		// (RestartCheckpointAt set) is marked running with a now-dead pid ONLY
+		// until the next reconcile resumes it in place. It is not stuck and needs
+		// no operator action, so suppress the transient dead-pid / runtime / silent
+		// findings that would otherwise nudge a reconcile of a self-healing slot.
+		if sess.Status == state.StatusRunning && sess.RestartCheckpointAt == nil {
 			if sess.PID <= 0 {
 				findings = append(findings, stuckState("dead_running_pid", SeverityBlocked,
 					fmt.Sprintf("Worker %s is marked running, but no live process is recorded.", slot),
@@ -1565,11 +1930,19 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolved(st, sess, cache) {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 &&
+			state.SessionProvesFailedAttempt(sess) && !e.retryExhaustedSessionResolved(st, sess, cache) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
 				fmt.Sprintf("Session %s status=retry_exhausted retry_count=%d", slot, sess.RetryCount)))
+		}
+
+		if sess.WorkerOutcome == worker.TokenBudgetExceededOutcome && !sess.ReleasedForRedispatch {
+			findings = append(findings, stuckState(state.StuckTokenBudgetExceeded, SeverityWarning,
+				fmt.Sprintf("Issue #%d previously stopped at worker_max_tokens on session %s.", sess.IssueNumber, slot),
+				"Continue label/spawn for other eligible issues; raise worker_max_tokens only for intentional redispatch of this issue.", false, target,
+				fmt.Sprintf("worker_outcome=%s", sess.WorkerOutcome)))
 		}
 
 		if sess.PreviousAttemptFeedbackKind == state.RetryReasonReviewFeedback && e.staleReviewFeedbackNeedsAttention(sess) {
@@ -1621,12 +1994,16 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 			}
 		}
 	}
+	canonicalOwners := e.canonicalOpenPROwners(st, byNumber, byBranch, cache)
 
 	var findings []state.SupervisorStuckState
 	seenPRs := make(map[int]struct{})
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil {
+			continue
+		}
+		if !sessionCanStillBlockProgress(sess.Status) {
 			continue
 		}
 		if e.sessionResolvedOnGitHub(sess, cache) {
@@ -1652,10 +2029,30 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		if sess.PRNumber == 0 {
 			target.PR = pr.Number
 		}
+		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
+			continue
+		}
+		// A live worker is already the actuator for this exact PR. Reporting the
+		// same review/CI gate as a separate stuck target makes Fleet claim the
+		// active repair is blocked and lets it head-of-line block another PR that
+		// has no worker. Worker silence is tracked independently by the bounded
+		// material-progress watchdog; only return this PR to gate supervision
+		// after the worker leaves the running state.
+		if sess.Status == state.StatusRunning && sess.PID > 0 {
+			continue
+		}
 		if _, ok := seenPRs[pr.Number]; ok {
 			continue
 		}
 		seenPRs[pr.Number] = struct{}{}
+
+		if attention, ok := state.OperatorGateAttention(sess); ok {
+			findings = append(findings, stuckState("operator_gate", SeverityInfo,
+				attention.Reason,
+				attention.NextAction, false, target,
+				fmt.Sprintf("Session %s status=%s pr=%d operator_gate=%s", slot, sess.Status, pr.Number, sess.OperatorGateName)))
+			continue
+		}
 
 		if pr.IsDraft {
 			findings = append(findings, stuckState("draft_pr", SeverityInfo,
@@ -1874,6 +2271,7 @@ func (e *Engine) detectPromptStuckStates() []state.SupervisorStuckState {
 		{name: "bug_prompt", path: e.cfg.BugPrompt},
 		{name: "enhancement_prompt", path: e.cfg.EnhancementPrompt},
 		{name: "pipeline.planner.prompt", path: e.cfg.Pipeline.Planner.Prompt},
+		{name: "pipeline.advisor.prompt", path: e.cfg.Pipeline.Advisor.Prompt},
 		{name: "pipeline.validator.prompt", path: e.cfg.Pipeline.Validator.Prompt},
 	}
 	for i, path := range e.cfg.PromptSections {
@@ -1967,6 +2365,23 @@ func (e *Engine) projectState(st *state.State) state.SupervisorProjectState {
 		RetryExhausted: countSessions(st, state.StatusRetryExhausted),
 		AvailableSlots: availableSlots(e.cfg, st),
 	}
+}
+
+func supervisorOpenPRNumbers(prs []github.PR) []int {
+	numbers := make([]int, 0, len(prs))
+	seen := make(map[int]struct{}, len(prs))
+	for _, pr := range prs {
+		if pr.Number <= 0 {
+			continue
+		}
+		if _, ok := seen[pr.Number]; ok {
+			continue
+		}
+		seen[pr.Number] = struct{}{}
+		numbers = append(numbers, pr.Number)
+	}
+	sort.Ints(numbers)
+	return numbers
 }
 
 type policyCandidateResult struct {
@@ -2080,8 +2495,8 @@ func (e *Engine) dynamicWaveCandidateIssues(st *state.State, issues []github.Iss
 }
 
 func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issues []github.Issue) (string, dynamicSkipCategory, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", dynamicSkipOther, nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, dynamicSkipOther, nil
 	}
 	if st.IssueDone(issue.Number) {
 		if !e.canTreatIssueDoneForOutcome(st) {
@@ -2126,6 +2541,20 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issu
 	return "", dynamicSkipOther, nil
 }
 
+func issueInProgressSkipReason(st *state.State, issueNumber int) (string, bool) {
+	if st == nil {
+		return "", false
+	}
+	claim, ok := st.IssueClaimFor(issueNumber)
+	if !ok {
+		return "", false
+	}
+	if claim.Status == string(state.StatusCodeLanded) {
+		return "already in progress (code_landed, awaiting verification)", true
+	}
+	return "already in progress", true
+}
+
 func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, string, error) {
 	queue := e.cfg.Supervisor.OrderedQueue
 	if queue.IsDone(issueNumber) {
@@ -2137,9 +2566,6 @@ func (e *Engine) orderedQueueIssueDone(st *state.State, issueNumber int) (bool, 
 		return false, "", fmt.Errorf("check issue closed: %w", err)
 	}
 	if closed {
-		if !e.canTreatIssueDoneForOutcome(st) {
-			return false, "issue is closed but outcome health is not verified", nil
-		}
 		return true, "issue is closed", nil
 	}
 
@@ -2428,8 +2854,8 @@ func (e *Engine) issueQueueSkipReason(st *state.State, issue github.Issue, block
 }
 
 func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (string, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, nil
 	}
 	if st.IssueDone(issue.Number) {
 		return "already completed in state", nil
@@ -2440,6 +2866,9 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
 	}
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
+	}
 	policyExcludedLabels := e.policyExcludedLabels()
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(e.excludeLabels(), label) || hasLabelName(policyExcludedLabels, label)) {
 		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
@@ -2449,6 +2878,9 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 	}
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
+	}
+	if label, ok := firstMatchingIssueLabel(issue, e.operatorGateLabels()); ok {
+		return fmt.Sprintf("held by operator gate label %q", label), nil
 	}
 	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
 		return "excluded by supervisor policy label", nil
@@ -2467,8 +2899,8 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 }
 
 func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.Issue, excludeLabels []string, ignoredBlockedLabel string) (string, error) {
-	if st.IssueInProgress(issue.Number) {
-		return "already in progress", nil
+	if reason, ok := issueInProgressSkipReason(st, issue.Number); ok {
+		return reason, nil
 	}
 	if st.IssueDone(issue.Number) {
 		return "already completed in state", nil
@@ -2485,6 +2917,12 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
 	}
+	// Gate-streak intake is enabled independently of dynamic-wave policy, so the
+	// hold cannot live only in decideDynamicWave: the default eligibility path
+	// and the repair path both reach dispatch through here.
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
+	}
 	policyExcludedLabels := excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(excludeLabels, label) || hasLabelName(policyExcludedLabels, label)) {
 		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
@@ -2494,6 +2932,9 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 	}
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" && !strings.EqualFold(blockedLabel, ignoredBlockedLabel) && github.HasLabel(issue, []string{blockedLabel}) {
 		return "blocked by supervisor policy label", nil
+	}
+	if label, ok := firstMatchingIssueLabel(issue, excludeLabelsExcept(e.operatorGateLabels(), ignoredBlockedLabel)); ok {
+		return fmt.Sprintf("held by operator gate label %q", label), nil
 	}
 	if _, ok := firstMatchingIssueLabel(issue, policyExcludedLabels); ok {
 		return "excluded by supervisor policy label", nil
@@ -2577,30 +3018,83 @@ func sessionWithOpenPR(st *state.State, prs []github.PR) (string, *state.Session
 	return "", nil, github.PR{}, false
 }
 
-func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool) {
+func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *resolutionCache) (string, *state.Session, github.PR, bool, string, []string, bool) {
 	branchToPR := make(map[string]github.PR, len(prs))
 	numberToPR := make(map[int]github.PR, len(prs))
 	for _, pr := range prs {
 		branchToPR[pr.HeadRefName] = pr
 		numberToPR[pr.Number] = pr
 	}
+	canonicalOwners := e.canonicalOpenPROwners(st, numberToPR, branchToPR, cache)
+	// Attention states must not sit behind an ordinary open PR merely because
+	// its slot sorts earlier. This is especially important when the earlier PR
+	// is intentionally blocked for QA: a later conflict_failed/retry_exhausted
+	// canonical PR still needs the project's one actionable recommendation.
+	// Keep the sort order as a deterministic tie-breaker within each rank.
+	bestRank := 3
+	var bestSlot string
+	var bestSession *state.Session
+	var bestPR github.PR
+	var bestReady bool
+	var bestMergeHeadSHA string
+	var bestMergeReasons []string
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || e.sessionResolvedOnGitHub(sess, cache) {
+		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
+		var pr github.PR
+		var found bool
 		if sess.Branch != "" {
-			if pr, ok := branchToPR[sess.Branch]; ok {
-				return slot, sess, pr, true
+			pr, found = branchToPR[sess.Branch]
+		}
+		if !found && sess.PRNumber > 0 {
+			pr, found = numberToPR[sess.PRNumber]
+		}
+		if !found {
+			continue
+		}
+		if ownerSlot := canonicalOwners[pr.Number]; ownerSlot != "" && ownerSlot != slot {
+			continue
+		}
+		// Do not spend the project's single supervisor recommendation monitoring
+		// a PR that already has a live exact worker. This preserves parallel
+		// hands-off repair: another independent overdue PR can be selected now,
+		// while the worker watchdog remains responsible for the running attempt.
+		if sess.Status == state.StatusRunning && sess.PID > 0 {
+			continue
+		}
+		// Evaluate merge eligibility across the whole candidate set before
+		// choosing one session. Previously every ordinary pr_open candidate had
+		// the same rank, so the lexicographically first slot (often an old
+		// blocked draft) prevented a later CLEAN green PR from ever reaching the
+		// merge rule. One ready PR is the highest-priority action in sequential
+		// merge mode; attention states remain next, then passive PR gates.
+		ready, mergeHeadSHA, mergeReasons := e.openPRReadyToMerge(slot, sess, pr)
+		rank := 2
+		if ready {
+			rank = 0
+		} else {
+			switch sess.Status {
+			case state.StatusRetryExhausted, state.StatusConflictFailed, state.StatusFailed, state.StatusDead:
+				rank = 1
 			}
 		}
-		if sess.PRNumber > 0 {
-			if pr, ok := numberToPR[sess.PRNumber]; ok {
-				return slot, sess, pr, true
-			}
+		if bestSession == nil || rank < bestRank {
+			bestRank = rank
+			bestSlot, bestSession, bestPR = slot, sess, pr
+			bestReady, bestMergeHeadSHA, bestMergeReasons = ready, mergeHeadSHA, mergeReasons
+		}
+		if bestRank == 0 {
+			// sortedSessionNames provides the deterministic tie-break among
+			// equally merge-ready PRs; no later candidate can outrank this one.
+			break
 		}
 	}
-	return "", nil, github.PR{}, false
+	if bestSession != nil {
+		return bestSlot, bestSession, bestPR, bestReady, bestMergeHeadSHA, bestMergeReasons, true
+	}
+	return "", nil, github.PR{}, false, "", nil, false
 }
 
 func runningSession(st *state.State) (string, *state.Session, bool) {
@@ -2623,17 +3117,34 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 	if availableSlots(e.cfg, st) <= 0 {
 		return false
 	}
-	// #556: a retry-exhausted session has spent its retry budget — spawning
-	// another repair worker would not be effective, and the executor refuses
-	// `spawn_repair_worker` because the verb is not in the action registry.
-	// Falling through here lets the deterministic path land on
-	// monitor_open_pr (or merge_pr when the feedback was addressed and the
-	// PR is now green) instead of looping on the refused verb each cycle.
-	if sess.Status == state.StatusRetryExhausted {
+	// A retry-exhausted session may still need an explicitly approved in-place
+	// repair (for example, a real rebase conflict on its canonical open PR).
+	// spawn_repair_worker is now a registered awaiting-dispatch action, so the
+	// cautious gate can safely authorize that recovery without creating a new
+	// slot, worktree, or PR.
+	if mergeReader, ok := e.reader.(prMergeableReader); ok {
+		if mergeable, err := mergeReader.PRMergeable(pr.Number); err == nil &&
+			strings.EqualFold(strings.TrimSpace(mergeable), "CONFLICTING") {
+			return true
+		}
+	}
+	if _, ok := state.OperatorGateAttention(sess); ok {
 		return false
 	}
-	if pr.IsDraft {
-		return true
+	// A draft/WIP marker means the PR still needs lifecycle work, but it does
+	// not make that work actionable while the exact current head is already
+	// being tested. Recommending a repair here disagrees with the executor's
+	// current-head guard, burns one supervisor call every cycle, and presents a
+	// false action in Fleet. Conflicts remain actionable above; failed CI and an
+	// unavailable/unknown CI read retain the existing fail-closed repair path.
+	ciStatus := ""
+	if ciReader, ok := e.reader.(prCIStatusReader); ok {
+		if current, err := ciReader.PRCIStatus(pr.Number); err == nil {
+			ciStatus = strings.ToLower(strings.TrimSpace(current))
+		}
+		if ciStatus == "pending" {
+			return false
+		}
 	}
 	for _, stuck := range stuckStates {
 		if stuck.Target != nil {
@@ -2645,7 +3156,7 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			}
 		}
 		switch stuck.Code {
-		case "failing_checks", "greptile_not_approved":
+		case "failing_checks", "greptile_not_approved", "unmergeable_pr":
 			return true
 		case "stale_review_feedback":
 			// Review feedback from a PREVIOUS attempt does not mean the
@@ -2655,17 +3166,35 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 			// instead of looping on spawn_repair_worker, which the executor
 			// refuses (not in the action registry) and wedges a green PR
 			// forever.
-			if ready, _ := e.openPRReadyToMerge(slot, sess, pr); ready {
+			if ready, _, _ := e.openPRReadyToMerge(slot, sess, pr); ready {
 				return false
 			}
 			return true
 		case "retry_exhausted_open_pr":
 			return stuck.Severity == SeverityBlocked
 		case state.StuckNoOutcomeProgress:
+			if e.automaticOutcomeRecoveryOwnsFailure(st) {
+				return false
+			}
 			return e.outcomeStatus(st).HealthState == outcome.HealthFailing
 		}
 	}
+	if pr.IsDraft {
+		status := e.outcomeStatus(st)
+		if e.automaticOutcomeRecoveryOwnsFailure(st) && status.HealthState == outcome.HealthFailing && ciStatus == "success" {
+			return false
+		}
+		return true
+	}
 	return false
+}
+
+func (e *Engine) automaticOutcomeRecoveryOwnsFailure(st *state.State) bool {
+	if e == nil || e.cfg == nil || !e.cfg.Outcome.AutomaticRecoveryEnabled() ||
+		st == nil || st.OutcomeHealth == nil || st.OutcomeHealth.State != outcome.HealthFailing {
+		return false
+	}
+	return st.OutcomeRecovery.OwnsActiveFailure(e.now())
 }
 
 // openPRReadyToMerge returns (true, reasons[]) when a session's open PR can
@@ -2677,17 +3206,35 @@ func (e *Engine) openPRNeedsRepair(st *state.State, stuckStates []state.Supervis
 // Strict: an UNKNOWN mergeable, "pending" CI, or "unknown" review state
 // blocks the merge. We never speculate — a missing signal is treated as
 // "not ready" so we don't merge a PR whose state we couldn't read.
-func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.PR) (bool, []string) {
+func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.PR) (bool, string, []string) {
 	if sess == nil {
-		return false, nil
+		return false, "", nil
 	}
 	if pr.IsDraft {
-		return false, nil
+		return false, "", nil
 	}
+	// CI must be green. Production readers expose the current-head rollup so
+	// a real queued/in-progress check-run can never be confused with the
+	// legacy commit-status-only pending state handled by #425.
+	rollupReader, ok := e.reader.(prCheckRollupReader)
+	if !ok {
+		// Aggregate CI alone cannot distinguish an active check-run from a
+		// stale legacy commit status. Without the current-head rollup, the
+		// merge-state override is unsafe, so fail closed.
+		return false, "", nil
+	}
+	rollup, err := rollupReader.PRCheckRollup(pr.Number)
+	if err != nil || !rollup.Complete || strings.TrimSpace(rollup.HeadSHA) == "" {
+		return false, "", nil
+	}
+	rollupHeadSHA := strings.TrimSpace(rollup.HeadSHA)
+	ciStatus := rollup.Verdict
+	pendingCheckRuns := rollup.PendingCheckRuns
+
 	// #543: GitHub LIST endpoint never populates `mergeable`; fetch via
-	// single-PR endpoint when reader supports it. Without this every
-	// PR.Mergeable read here was "" → "UNKNOWN" → merge_pr never
-	// recommended.
+	// single-PR endpoint when reader supports it. Read it after the rollup so
+	// the final head identity check below proves every gate was observed for
+	// one unchanged PR head.
 	mergeable := strings.ToUpper(strings.TrimSpace(pr.Mergeable))
 	if mr, ok := e.reader.(prMergeableReader); ok {
 		if fresh, err := mr.PRMergeable(pr.Number); err == nil {
@@ -2695,21 +3242,14 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		}
 	}
 	if mergeable != "MERGEABLE" {
-		return false, nil
+		return false, "", nil
 	}
 
-	// CI must be green. PRCIStatus is an optional reader interface; when
-	// the reader does not implement it we conservatively refuse to merge.
-	ciReader, ok := e.reader.(prCIStatusReader)
-	if !ok {
-		return false, nil
-	}
-	ciStatus, err := ciReader.PRCIStatus(pr.Number)
-	if err != nil {
-		return false, nil
-	}
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
+		if pendingCheckRuns || !legacyStatusOnlyPending(rollup) {
+			return false, "", nil
+		}
 		// #425 (sup-98): the aggregate PRCIStatus can stick at "pending"
 		// long after every required check has gone green — the most common
 		// cause is a legacy commit-status (used by some review bots) that
@@ -2719,7 +3259,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		// "blocked" / "behind" / "dirty" / "" / "unknown" all stay
 		// not-ready.
 		if !mergeStateAllowsMerge(e.reader, pr.Number) {
-			return false, nil
+			return false, "", nil
 		}
 	}
 
@@ -2730,13 +3270,27 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 		if err != nil {
-			return false, nil
+			return false, "", nil
 		}
 		if pending {
-			return false, nil
+			return false, "", nil
 		}
 		if !approved {
-			return false, nil
+			return false, "", nil
+		}
+	}
+
+	// A force-push or repair commit can land between the rollup read and the
+	// merge decision. Production readers expose PRHeadSHA; fail closed unless
+	// the current head still matches the exact head whose checks were read.
+	if rollupHeadSHA != "" {
+		headReader, ok := e.reader.(prHeadSHAReader)
+		if !ok {
+			return false, "", nil
+		}
+		currentHead, err := headReader.PRHeadSHA(pr.Number)
+		if err != nil || strings.TrimSpace(currentHead) != rollupHeadSHA {
+			return false, "", nil
 		}
 	}
 
@@ -2756,7 +3310,47 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	if _, ok := e.reader.(prGreptileReader); ok {
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
 	}
-	return true, reasons
+	return true, rollupHeadSHA, reasons
+}
+
+// legacyStatusOnlyPending proves the narrow #425 exception: the aggregate
+// verdict is pending because at least one legacy commit status is pending,
+// while every observed check-run is complete and non-blocking. Any missing,
+// unfamiliar, or failed signal keeps the deterministic merge path closed.
+func legacyStatusOnlyPending(rollup github.PRCheckRollup) bool {
+	if !strings.EqualFold(strings.TrimSpace(rollup.Verdict), "pending") {
+		return false
+	}
+
+	pendingLegacyStatus := false
+	for _, signal := range rollup.Signals {
+		source := strings.ToLower(strings.TrimSpace(signal.Source))
+		status := strings.ToLower(strings.TrimSpace(signal.Status))
+		conclusion := strings.ToLower(strings.TrimSpace(signal.Conclusion))
+
+		switch source {
+		case "check_run":
+			if status != "completed" {
+				return false
+			}
+			switch conclusion {
+			case "success", "neutral", "skipped":
+			default:
+				return false
+			}
+		case "commit_status":
+			switch status {
+			case "pending":
+				pendingLegacyStatus = true
+			case "success":
+			default:
+				return false
+			}
+		default:
+			return false
+		}
+	}
+	return pendingLegacyStatus
 }
 
 // monitorOpenPRReasons returns a short list of human-readable reasons
@@ -2765,6 +3359,9 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 // honest text instead of a single "monitor" word.
 func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr github.PR) []string {
 	var reasons []string
+	if sess != nil && strings.TrimSpace(sess.OperatorGateName) != "" {
+		reasons = append(reasons, fmt.Sprintf("Operator gate %q is waiting for a human decision", sess.OperatorGateName))
+	}
 	if pr.IsDraft {
 		reasons = append(reasons, "PR is still a draft")
 	}
@@ -2953,7 +3550,8 @@ func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int)
 func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted {
+		if sess == nil || sess.Status != state.StatusRetryExhausted ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {
@@ -2974,7 +3572,8 @@ func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.
 	}
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 {
+		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {
@@ -3190,8 +3789,20 @@ func (e *Engine) dynamicWaveExcludedLabels() []string {
 	labels := []string{"blocked", "wontfix", "question", "duplicate", "invalid"}
 	labels = append(labels, e.cfg.ExcludeLabels...)
 	labels = append(labels, e.policyExcludedLabels()...)
+	labels = append(labels, e.operatorGateLabels()...)
 	if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
 		labels = append(labels, blockedLabel)
+	}
+	return uniqueLabelNames(labels)
+}
+
+func (e *Engine) operatorGateLabels() []string {
+	labels := []string{"operator-decision", "blocked"}
+	if e != nil && e.cfg != nil {
+		if blockedLabel := strings.TrimSpace(e.cfg.Supervisor.BlockedLabel); blockedLabel != "" {
+			labels = append(labels, blockedLabel)
+		}
+		labels = append(labels, e.cfg.Supervisor.OperatorGate.Labels...)
 	}
 	return uniqueLabelNames(labels)
 }
@@ -4038,6 +4649,36 @@ func openPRForSession(sess *state.Session, byNumber map[int]github.PR, byBranch 
 	return github.PR{}, false
 }
 
+// canonicalOpenPROwners elects one actionable session identity for each open
+// PR. Historical issue/session rows can legitimately remain after an in-place
+// continuation or repair, but they must not compete with the continuation in
+// stuck-state, operator-state, or repair selection. A live worker wins while it
+// is advancing the PR; otherwise the newest unresolved session owns the gate.
+func (e *Engine) canonicalOpenPROwners(st *state.State, byNumber map[int]github.PR, byBranch map[string]github.PR, cache *resolutionCache) map[int]string {
+	owners := make(map[int]string)
+	if st == nil {
+		return owners
+	}
+	for _, slot := range sortedSessionNames(st) {
+		sess := st.Sessions[slot]
+		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
+			continue
+		}
+		pr, found := openPRForSession(sess, byNumber, byBranch)
+		if !found {
+			continue
+		}
+		ownerSlot, exists := owners[pr.Number]
+		if !exists || prSessionOwnerPrecedes(slot, sess, ownerSlot, st.Sessions[ownerSlot]) {
+			owners[pr.Number] = slot
+		}
+	}
+	return owners
+}
+
 func sessionCanStillBlockProgress(status state.SessionStatus) bool {
 	switch status {
 	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusFailed, state.StatusDead, state.StatusRetryExhausted:
@@ -4144,31 +4785,58 @@ func commandBinary(cmd, fallback string) string {
 	return fields[0]
 }
 
-// newWorkerController wires worker.Stop + state transitions into the
+// NewWorkerController wires worker process control + state transitions into the
 // approver WorkerController interface (#567). The supervisor's
 // executeApprovedApprovals loop uses this to apply approved
 // restart_worker / stop_worker verbs from the fleet snapshot.
 //
 //   - stop_worker: terminate the worker, mark the session StatusDead,
-//     clear NextRetryAt so the orchestrator does NOT respawn.
+//     clear NextRetryAt so the orchestrator does NOT respawn, and preserve the
+//     worktree/branch/PR for later inspection or repair.
 //   - restart_worker: terminate the worker, mark StatusDead with
 //     NextRetryAt = now so respawnDueRetries picks it up on the next
 //     dispatcher cycle. worker.Stop removed the worktree, so the stale
 //     worktree/PR pointers are cleared (#874) — otherwise respawnDueRetries
 //     would choose RespawnInPlace against a directory that no longer exists.
-func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
+//     A session that still retains a worktree is refused here at the
+//     destructive boundary (#964): restart never deletes retained canonical
+//     work, so recovery for such a slot must go through spawn_repair_worker.
+func NewWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 	return approver.WorkerControllerFuncs{
 		Stop: func(slot string, sess *state.Session) error {
-			if err := worker.Stop(cfg, slot, sess); err != nil {
+			alreadyStopped := sess == nil || sess.PID <= 0 || !worker.IsAlive(sess.PID)
+			if err := worker.StopProcess(slot, sess); err != nil {
 				return err
 			}
 			now := time.Now().UTC()
-			sess.Status = state.StatusDead
-			sess.FinishedAt = &now
-			sess.NextRetryAt = nil
+			if sess != nil {
+				sess.Status = state.StatusDead
+				sess.FinishedAt = &now
+				sess.NextRetryAt = nil
+			}
+			if alreadyStopped {
+				return approver.ErrWorkerAlreadyStopped
+			}
 			return nil
 		},
 		Restart: func(slot string, sess *state.Session) error {
+			// #964: restart is destructive — worker.Stop below runs
+			// `git worktree remove --force` on sess.Worktree before the
+			// orchestrator respawns the slot. The approver executor already
+			// fences restart_worker away from any session that retains a
+			// worktree (open PR or PR-less durable work) and routes recovery to
+			// spawn_repair_worker in place. Enforce the same invariant here at
+			// the destructive boundary itself so the guarantee does not depend
+			// on a single upstream gate: a future control path, a reconcile that
+			// reaches the controller directly, or a regression that drops the
+			// executor fence must not silently delete a retained canonical
+			// worktree. Fail closed instead of removing it.
+			if sess != nil && strings.TrimSpace(sess.Worktree) != "" {
+				return fmt.Errorf(
+					"restart_worker refused: slot %s retains worktree %s; destructive restart would discard it — use spawn_repair_worker to recover the same slot in place",
+					slot, sess.Worktree,
+				)
+			}
 			if err := worker.Stop(cfg, slot, sess); err != nil {
 				return err
 			}
@@ -4176,6 +4844,7 @@ func newWorkerController(cfg *config.Config) approver.WorkerControllerFuncs {
 			sess.Status = state.StatusDead
 			sess.FinishedAt = &now
 			sess.NextRetryAt = &now
+			state.PrepareWorkerForOperatorRestart(sess)
 			clearWorktreeAfterRestart(sess)
 			return nil
 		},
@@ -4325,7 +4994,7 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
-		Workers:   newWorkerController(cfg),
+		Workers:   NewWorkerController(cfg),
 		State:     st,
 	}
 	for _, a := range approvals {

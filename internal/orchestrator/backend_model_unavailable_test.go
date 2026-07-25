@@ -2,6 +2,8 @@ package orchestrator
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 
@@ -235,6 +237,85 @@ func TestCheckSessions_ModelUnavailableDeadWorker_FallsOverToNextBackend(t *test
 	}
 	if failed := s.FailedAttemptsForIssue(192); failed != 0 {
 		t.Fatalf("FailedAttemptsForIssue(192) = %d, want 0", failed)
+	}
+}
+
+// #918: an unrelated worker death whose terminal output contains application
+// 404s must take the ordinary worker-failure path. It must not gate the healthy
+// backend, preserve the attempt as a provider failure, or jump to a fallback.
+func TestReconcileRunningSessions_DomainError404SchedulesNormalRetry(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "worker.log")
+	output := "running media error tests\n" +
+		`assert_eq!(state.last_load_error.as_deref(), Some("libmpv error 404"));` +
+		"\nHTTP 404/retry\n"
+	if err := os.WriteFile(logFile, []byte(output), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-1"] = &state.Session{
+		IssueNumber: 918,
+		IssueTitle:  "media playback errors",
+		Status:      state.StatusRunning,
+		PID:         525255,
+		TmuxSession: "maestro-ok-player-1",
+		Branch:      "feat/ok-player-1-918-media-errors",
+		Worktree:    dir,
+		Backend:     "sol",
+		StartedAt:   time.Now().UTC().Add(-2 * time.Minute),
+		LogFile:     logFile,
+	}
+
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:               "owner/repo",
+			MaxRetriesPerIssue: 3,
+			Model: config.ModelConfig{
+				Default:          "sol",
+				FallbackBackends: []string{"gpt55"},
+				Backends: map[string]config.BackendDef{
+					"sol":   {Cmd: "codex"},
+					"gpt55": {Cmd: "codex"},
+				},
+			},
+		},
+		notifier:            &notify.Notifier{},
+		pidAliveFn:          func(pid int) bool { return false },
+		tmuxSessionExistsFn: func(name string) bool { return false },
+		listOpenPRsFn:       func() ([]github.PR, error) { return []github.PR{}, nil },
+		remoteBranchExistsFn: func(branch string) (bool, error) {
+			return false, nil
+		},
+		isRateLimitedFn:      func(logFile string) bool { return false },
+		authFailureFromLogFn: func(logFile string) (bool, string) { return false, "" },
+		usageLimitFromLogFn: func(logFile string, extraPatterns []string) (bool, string) {
+			return false, ""
+		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return github.Issue{Number: number, Title: "media playback errors"}, nil
+		},
+	}
+
+	if !o.reconcileRunningSessions(s) {
+		t.Fatal("expected reconciliation to report changes")
+	}
+
+	sess := s.Sessions["ok-player-1"]
+	if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
+		t.Fatalf("status = %q retry=%v, want dead with an ordinary retry scheduled", sess.Status, sess.NextRetryAt)
+	}
+	if sess.RetryCount != 1 {
+		t.Fatalf("RetryCount = %d, want 1 for the normal worker-failure policy", sess.RetryCount)
+	}
+	if sess.RateLimitHit || sess.ProviderLimitReason != "" {
+		t.Fatalf("provider failure metadata set for domain 404 output: RateLimitHit=%v reason=%q", sess.RateLimitHit, sess.ProviderLimitReason)
+	}
+	if sess.BackendSelection != nil || len(sess.TriedBackends) != 0 {
+		t.Fatalf("fallback metadata set for domain 404 output: selection=%+v tried=%v", sess.BackendSelection, sess.TriedBackends)
+	}
+	if _, ok := s.BackendHealth["sol"]; ok {
+		t.Fatalf("BackendHealth[sol] = %+v, want no gate for domain 404 output", s.BackendHealth["sol"])
 	}
 }
 

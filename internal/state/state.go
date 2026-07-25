@@ -38,6 +38,12 @@ const (
 	DisplayReviewRetryPending SessionDisplayStatus = "review_retry_pending"
 	DisplayReviewRetryRunning SessionDisplayStatus = "review_retry_running"
 	DisplayReviewRetryRecheck SessionDisplayStatus = "review_retry_recheck"
+	// DisplayWaitingForIssueGuard marks a canonical retry that is deliberately
+	// held because the issue currently carries a configured exclude label. The
+	// retry still owns its issue/worktree lease, but it is not a failed worker
+	// requiring operator attention; removing the guard lets the same session
+	// resume on the next orchestrator cycle.
+	DisplayWaitingForIssueGuard SessionDisplayStatus = "waiting_for_issue_guard"
 	// DisplayBackendRateLimited marks a session whose worker exited because its
 	// backend hit a provider usage limit with no fallback available. It is a
 	// distinct, non-failure display token so operators do not confuse a
@@ -59,6 +65,11 @@ const (
 	// compatible credential pool for one requested model. Other models on the
 	// provider remain eligible.
 	DisplayBackendModelCooldown SessionDisplayStatus = "backend_model_cooldown"
+	// DisplayBackendModelOverloaded marks a model-scoped transient capacity
+	// failure (for example Anthropic HTTP 529). It is distinct from a missing
+	// model and from credential-pool exhaustion so operators see the right
+	// remediation while other models on the provider remain eligible.
+	DisplayBackendModelOverloaded SessionDisplayStatus = "backend_model_overloaded"
 	// DisplayBackendUsageLimit marks a session whose worker exited because
 	// its backend's account usage quota is exhausted (#805; live: codex
 	// "You've hit your usage limit") with no fallback available. Distinct
@@ -69,10 +80,30 @@ const (
 	// DisplayTokenBudgetExceeded is a deterministic worker stop, not a retryable
 	// process death or provider outage.
 	DisplayTokenBudgetExceeded SessionDisplayStatus = "token_budget_exceeded"
-	LiveSessionRecentWindow                         = 24 * time.Hour
+	// DisplayRepeatedUnexpectedExit marks a worker whose one automatic
+	// unexpected-exit recovery also disappeared without producing a PR. This is
+	// terminal: another automatic spawn would be a zombie loop, not recovery.
+	DisplayRepeatedUnexpectedExit SessionDisplayStatus = WorkerOutcomeRepeatedUnexpectedExit
+	LiveSessionRecentWindow                            = 24 * time.Hour
 )
 
-const RetryReasonReviewFeedback = "review_feedback"
+const (
+	RetryReasonReviewFeedback  = "review_feedback"
+	RetryReasonStalledProgress = "stalled_progress"
+	RetryReasonOperatorRestart = "operator_restart"
+
+	// WorkerOutcomeRepeatedUnexpectedExit is the durable terminal reason for a
+	// worker that disappeared again after Maestro already gave the same
+	// canonical session one automatic unexpected-exit recovery.
+	WorkerOutcomeRepeatedUnexpectedExit = "repeated_unexpected_exit"
+	// WorkerOutcomeDuplicateDispatchReconciled marks a SIBLING session that
+	// Maestro itself retired while reconciling duplicate dispatches for one
+	// issue: its durable work was proven patch-equivalent or handed off to the
+	// canonical session, and only its dispatcher claim was released. It is
+	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
+	// must not consume the per-issue retry budget.
+	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
+)
 
 const (
 	BackendHealthAvailable = "available"
@@ -96,6 +127,11 @@ const (
 	// has rotated through every compatible credential and found none usable.
 	// It must never become a provider-wide BackendHealth gate.
 	BackendBlockModelCooldown = "model_cooldown"
+	// BackendBlockModelOverloaded gates one provider/model route after a
+	// terminal upstream overload response (for example Anthropic HTTP 529).
+	// Unlike model_cooldown it does not claim the credential pool is exhausted,
+	// and unlike model_unavailable it does not imply an invalid model id.
+	BackendBlockModelOverloaded = "model_overloaded"
 	// BackendBlockUsageLimit gates a backend whose CLI died because the
 	// account's usage quota is exhausted (#805; live: codex "You've hit
 	// your usage limit ... try again at 12:30 PM" killed every worker on
@@ -152,12 +188,18 @@ type BackendCandidate struct {
 
 // BackendSelection is an audit record for worker backend choice.
 type BackendSelection struct {
-	SelectedBackend string             `json:"selected_backend,omitempty"`
-	SelectionReason string             `json:"selection_reason"`
-	TaskType        string             `json:"task_type,omitempty"`
-	CandidateScores []BackendCandidate `json:"candidate_scores,omitempty"`
-	HardPin         bool               `json:"hard_pin,omitempty"`
-	PreviousBackend string             `json:"previous_backend,omitempty"`
+	SelectedBackend string `json:"selected_backend,omitempty"`
+	SelectionReason string `json:"selection_reason"`
+	// RouteSelectionReason identifies the effective route source used to order
+	// fallbacks: provider_lanes, explicit_backend_chain, or model_default_only.
+	RouteSelectionReason string             `json:"route_selection_reason,omitempty"`
+	TaskType             string             `json:"task_type,omitempty"`
+	CandidateScores      []BackendCandidate `json:"candidate_scores,omitempty"`
+	HardPin              bool               `json:"hard_pin,omitempty"`
+	PreviousBackend      string             `json:"previous_backend,omitempty"`
+	// HoldUntil (RFC3339) is set when hold_on_cooldown suppressed a fallback
+	// cascade: no backend was selected and the work waits for this instant.
+	HoldUntil string `json:"hold_until,omitempty"`
 
 	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
 	// strength tier the policy resolved to; Effort/Model are the per-tier
@@ -176,80 +218,150 @@ type Phase string
 const (
 	PhaseNone      Phase = ""          // legacy single-phase mode (no pipeline)
 	PhasePlan      Phase = "plan"      // planner: creates MAESTRO_PLAN.md + VALIDATION.md
+	PhaseAdvisor   Phase = "advisor"   // advisor: independently reviews the plan before implementation
 	PhaseImplement Phase = "implement" // implementer: writes code based on plan
 	PhaseValidate  Phase = "validate"  // validator: checks assertions, gates PR creation
 )
 
+// AdvisorReview is one durable, auditable Advisor verdict. The session also
+// carries the latest projection for fast Fleet rendering; this slice preserves
+// the full bounded review history across restarts and later phase transitions.
+type AdvisorReview struct {
+	PlanVersion    int       `json:"plan_version"`
+	ReviewRound    int       `json:"review_round"`
+	Backend        string    `json:"backend,omitempty"`
+	Model          string    `json:"model,omitempty"`
+	Verdict        string    `json:"verdict,omitempty"`
+	Findings       string    `json:"findings,omitempty"`
+	TerminalReason string    `json:"terminal_reason,omitempty"`
+	Bypassed       bool      `json:"bypassed,omitempty"`
+	ReviewedAt     time.Time `json:"reviewed_at"`
+}
+
 type Session struct {
-	IssueNumber int           `json:"issue_number"`
-	IssueTitle  string        `json:"issue_title"`
-	Worktree    string        `json:"worktree"`
-	Branch      string        `json:"branch"`
-	PID         int           `json:"pid"`
-	TmuxSession string        `json:"tmux_session,omitempty"`
-	LogFile     string        `json:"log_file"`
-	StartedAt   time.Time     `json:"started_at"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	Status      SessionStatus `json:"status"`
-	PRNumber    int           `json:"pr_number,omitempty"`
-	Backend     string        `json:"backend,omitempty"` // "claude", "codex", etc.
+	IssueNumber int    `json:"issue_number"`
+	IssueTitle  string `json:"issue_title"`
+	Worktree    string `json:"worktree"`
+	Branch      string `json:"branch"`
+	PID         int    `json:"pid"`
+	TmuxSession string `json:"tmux_session,omitempty"`
+	// ProcessLeaseUnit is the exact per-attempt systemd unit that owns the
+	// runner and every descendant it launches. Unlike PID/tmux ancestry, cgroup
+	// membership survives double-forking and reparenting. ProcessLeaseManager is
+	// "system" for the production system-service topology and "user" only for
+	// non-service development launches. Both remain set until teardown has
+	// confirmed the unit empty, so a replacement daemon can retry cleanup
+	// exactly once without guessing from a stale pane PID.
+	ProcessLeaseUnit    string    `json:"process_lease_unit,omitempty"`
+	ProcessLeaseManager string    `json:"process_lease_manager,omitempty"`
+	LogFile             string    `json:"log_file"`
+	StartedAt           time.Time `json:"started_at"`
+	// WorkerGeneration is the durable lease generation for the process that
+	// owns this canonical session. Every successful spawn, respawn, phase
+	// transition, or live-runtime adoption advances it. Destructive cleanup
+	// captures and revalidates this exact value before touching the worktree.
+	WorkerGeneration uint64 `json:"worker_generation,omitempty"`
+	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
+	// Unit/scope intentionally duplicate the process receipt so reconciliation
+	// can reject corrupted cross-ownership without inventing another owner.
+	WorkerLeaseID        string        `json:"worker_lease_id,omitempty"`
+	WorkerLeaseUnit      string        `json:"worker_lease_unit,omitempty"`
+	WorkerLeaseScope     string        `json:"worker_lease_scope,omitempty"`
+	WorkerScratchDir     string        `json:"worker_scratch_dir,omitempty"`
+	WorkerLeaseManifest  string        `json:"worker_lease_manifest,omitempty"`
+	WorkerLeaseAttention string        `json:"worker_lease_attention,omitempty"`
+	FinishedAt           *time.Time    `json:"finished_at,omitempty"`
+	Status               SessionStatus `json:"status"`
+	PRNumber             int           `json:"pr_number,omitempty"`
+	PRMerged             bool          `json:"pr_merged,omitempty"` // authoritative merge evidence retained after a closed issue transitions from code_landed/pr_open to done
+	Backend              string        `json:"backend,omitempty"`   // "claude", "codex", etc.
 	// #730: model + self-reported cost captured from the backend's own
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                    string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
-	CostUSDBackend           float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark     int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of a backend usage stream's full-log cumulative token count (Pi --mode json, claude stream-json); persists across respawns so re-parsing the appended log/jsonl does not double-count prior attempts
-	LongRunning              bool       `json:"long_running,omitempty"`
-	RebaseAttempted          bool       `json:"rebase_attempted,omitempty"`
-	NotifiedCIFail           bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
-	LastNotifiedStatus       string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
-	LiveVerificationNotified bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
-	RetryCount               int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
-	MaintenanceRetryCount    int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
-	NextRetryAt              *time.Time `json:"next_retry_at,omitempty"`
-	LastOutputHash           string     `json:"last_output_hash,omitempty"`
-	LastOutputChangedAt      time.Time  `json:"last_output_changed_at,omitempty"`
-	TokensUsedAttempt        int        `json:"tokens_used_attempt,omitempty"` // tokens consumed in current attempt (reset on respawn)
-	TokensUsedTotal          int        `json:"tokens_used_total,omitempty"`   // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
-	WorkerOutcome            string     `json:"worker_outcome,omitempty"`      // deterministic terminal worker outcome, e.g. token_budget_exceeded
+	Model                      string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
+	CostUSDBackend             float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
+	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
+	LongRunning                bool       `json:"long_running,omitempty"`
+	RebaseAttempted            bool       `json:"rebase_attempted,omitempty"`
+	NotifiedCIFail             bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
+	LastNotifiedStatus         string     `json:"last_notified_status,omitempty"`       // dedup: last notification type sent
+	LiveVerificationNotified   bool       `json:"live_verification_notified,omitempty"` // #570 one-shot: hold-for-live-verification board sync + operator notification already fired
+	RetryCount                 int        `json:"retry_count,omitempty"`                // per-session retry counter; the global per-issue limit (max_retries_per_issue) combines this with FailedAttemptsForIssue
+	UnexpectedExitRetries      int        `json:"unexpected_exit_retries,omitempty"`    // automatic recoveries consumed by process/tmux disappearance; independently capped to prevent zombie respawn loops
+	MaintenanceRetryCount      int        `json:"maintenance_retry_count,omitempty"`    // bounded post-PR maintenance attempts (review feedback / rebase conflict repair), separate from implementation retries
+	NextRetryAt                *time.Time `json:"next_retry_at,omitempty"`
+	RetryHoldReason            string     `json:"retry_hold_reason,omitempty"` // current dispatch guard holding a scheduled canonical retry; does not release its issue/worktree lease
+	LastOutputHash             string     `json:"last_output_hash,omitempty"`
+	LastOutputChangedAt        time.Time  `json:"last_output_changed_at,omitempty"`
+	TokensUsedAttempt          int        `json:"tokens_used_attempt,omitempty"`           // tokens consumed in current attempt (reset on respawn)
+	TokensUsedTotal            int        `json:"tokens_used_total,omitempty"`             // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
+	TokenBudgetTokensAttempt   int        `json:"token_budget_tokens_attempt,omitempty"`   // current-attempt usage under TokenBudgetMeasure; kept separate from inclusive cost telemetry
+	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // high-water mark for the current attempt's cumulative budget measure
+	TokenBudgetMeasure         string     `json:"token_budget_measure,omitempty"`          // explicit live-ceiling measure, e.g. uncached_tokens
+	WorkerOutcome              string     `json:"worker_outcome,omitempty"`                // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
 	// the cost panel can price each dimension separately — cache_read tokens
 	// dominate an agentic run and cost ~10% of input, so blending them into
 	// TokensUsedTotal over-states cost. Zero for backends that do not stamp a
 	// split; the cost rollup then falls back to the blended estimate.
-	TokensInput                 int               `json:"tokens_input,omitempty"`                   // cumulative non-cached input tokens
-	TokensOutput                int               `json:"tokens_output,omitempty"`                  // cumulative output (generated) tokens
-	TokensCacheRead             int               `json:"tokens_cache_read,omitempty"`              // cumulative cache-read (reused context) tokens, discounted
-	TokensCacheWrite            int               `json:"tokens_cache_write,omitempty"`             // cumulative cache-write (cache creation) tokens
-	QuotaTokensAccounted        int               `json:"quota_tokens_accounted,omitempty"`         // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
-	RateLimitHit                bool              `json:"rate_limit_hit,omitempty"`                 // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
-	TriedBackends               []string          `json:"tried_backends,omitempty"`                 // backends already attempted (for backend-failure fallback)
-	ProviderLimitBackend        string            `json:"provider_limit_backend,omitempty"`         // backend that hit a provider capacity limit or auth failure
-	ProviderLimitReason         string            `json:"provider_limit_reason,omitempty"`          // backend block signature or class (e.g. BackendBlockAuthFailure)
-	ProviderLimitResetAt        *time.Time        `json:"provider_limit_reset_at,omitempty"`        // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
-	ProviderLimitProvider       string            `json:"provider_limit_provider,omitempty"`        // secret-free provider route for model-scoped failures
-	ProviderLimitModel          string            `json:"provider_limit_model,omitempty"`           // requested model for model-scoped failures
-	CredentialCandidates        int               `json:"credential_candidates,omitempty"`          // aggregate candidate count reported by the proxy
-	CredentialCandidatesKnown   bool              `json:"credential_candidates_known,omitempty"`    // distinguishes an omitted count from a real zero
-	CredentialUsable            int               `json:"credential_usable,omitempty"`              // candidates usable for ProviderLimitModel
-	CredentialUsableKnown       bool              `json:"credential_usable_known,omitempty"`        // distinguishes an omitted count from a real zero
-	CredentialAggregateReason   string            `json:"credential_aggregate_reason,omitempty"`    // aggregate proxy reason; never a credential identifier
-	BackendSelection            *BackendSelection `json:"backend_selection,omitempty"`              // latest backend selection audit record
-	Phase                       Phase             `json:"phase,omitempty"`                          // current pipeline phase (empty = legacy single-phase)
-	PipelineFull                bool              `json:"pipeline_full,omitempty"`                  // true when issue label opted this session into plan/implement/validate
-	ValidationFails             int               `json:"validation_fails,omitempty"`               // number of failed validation attempts
-	ValidationFeedback          string            `json:"validation_feedback,omitempty"`            // feedback from last failed validation
-	CIFailureOutput             string            `json:"ci_failure_output,omitempty"`              // CI failure output captured before retry (passed to next worker as context)
-	FailingCheckContext         string            `json:"failing_check_context,omitempty"`          // #857: bounded excerpt of a check-run still failing on the PR head, carried into a retry so the worker sees the red check its previous push introduced (consumed on respawn)
-	PreviousAttemptFeedback     string            `json:"previous_attempt_feedback,omitempty"`      // feedback from previous failed PR attempt
-	PreviousAttemptFeedbackKind string            `json:"previous_attempt_feedback_kind,omitempty"` // review_feedback, rebase_conflict
-	RetryReason                 string            `json:"retry_reason,omitempty"`                   // current retry lifecycle reason, e.g. review_feedback
-	LastClosedPRNumber          int               `json:"last_closed_pr_number,omitempty"`          // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
-	ReleasedForRedispatch       bool              `json:"released_for_redispatch,omitempty"`        // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
-	CheckpointFile              string            `json:"checkpoint_file,omitempty"`                // path to CHECKPOINT.md saved at soft token threshold
-	DeploymentFinishedAt        *time.Time        `json:"deployment_finished_at,omitempty"`         // set when the post-merge deploy hook succeeds
+	TokensInput                     int               `json:"tokens_input,omitempty"`                       // cumulative non-cached input tokens
+	TokensOutput                    int               `json:"tokens_output,omitempty"`                      // cumulative output (generated) tokens
+	TokensCacheRead                 int               `json:"tokens_cache_read,omitempty"`                  // cumulative cache-read (reused context) tokens, discounted
+	TokensCacheWrite                int               `json:"tokens_cache_write,omitempty"`                 // cumulative cache-write (cache creation) tokens
+	QuotaTokensAccounted            int               `json:"quota_tokens_accounted,omitempty"`             // portion of TokensUsedTotal already accrued into BackendQuotaUsage windows (#704)
+	RateLimitHit                    bool              `json:"rate_limit_hit,omitempty"`                     // true when the worker died on a transient backend block (provider limit or auth failure, #693); excludes the session from the per-issue retry budget
+	TriedBackends                   []string          `json:"tried_backends,omitempty"`                     // backends already attempted (for backend-failure fallback)
+	ProviderLimitBackend            string            `json:"provider_limit_backend,omitempty"`             // backend that hit a provider capacity limit or auth failure
+	ProviderLimitReason             string            `json:"provider_limit_reason,omitempty"`              // backend block signature or class (e.g. BackendBlockAuthFailure)
+	ProviderLimitResetAt            *time.Time        `json:"provider_limit_reset_at,omitempty"`            // provider-stated reset time parsed from the limit message ("try again at ..."), UTC
+	ProviderLimitProvider           string            `json:"provider_limit_provider,omitempty"`            // secret-free provider route for model-scoped failures
+	ProviderLimitModel              string            `json:"provider_limit_model,omitempty"`               // requested model for model-scoped failures
+	CredentialCandidates            int               `json:"credential_candidates,omitempty"`              // aggregate candidate count reported by the proxy
+	CredentialCandidatesKnown       bool              `json:"credential_candidates_known,omitempty"`        // distinguishes an omitted count from a real zero
+	CredentialUsable                int               `json:"credential_usable,omitempty"`                  // candidates usable for ProviderLimitModel
+	CredentialUsableKnown           bool              `json:"credential_usable_known,omitempty"`            // distinguishes an omitted count from a real zero
+	CredentialAggregateReason       string            `json:"credential_aggregate_reason,omitempty"`        // aggregate proxy reason; never a credential identifier
+	BackendSelection                *BackendSelection `json:"backend_selection,omitempty"`                  // latest backend selection audit record
+	Phase                           Phase             `json:"phase,omitempty"`                              // current pipeline phase (empty = legacy single-phase)
+	PipelineFull                    bool              `json:"pipeline_full,omitempty"`                      // true when issue label opted this session into plan/implement/validate
+	PipelineAdvised                 bool              `json:"pipeline_advised,omitempty"`                   // true when issue label explicitly opted this session into the advised pipeline
+	PlanVersion                     int               `json:"plan_version,omitempty"`                       // canonical plan generation completed by the planner
+	AdvisorReviewRound              int               `json:"advisor_review_round,omitempty"`               // current/latest bounded Advisor pass
+	AdvisorMaxReviewRounds          int               `json:"advisor_max_review_rounds,omitempty"`          // review budget pinned when the gate starts
+	AdvisorBackend                  string            `json:"advisor_backend,omitempty"`                    // actual Advisor backend used
+	AdvisorModel                    string            `json:"advisor_model,omitempty"`                      // configured or self-reported Advisor model
+	AdvisorVerdict                  string            `json:"advisor_verdict,omitempty"`                    // PLAN_APPROVED, PLAN_REVISE, PLAN_INVALID, or PLAN_BYPASSED
+	AdvisorUnresolvedFindings       string            `json:"advisor_unresolved_findings,omitempty"`        // exact latest findings that still block implementation
+	AdvisorFindingsLedger           string            `json:"advisor_findings_ledger,omitempty"`            // compact accumulated findings passed back to the planner
+	AdvisorTerminalReason           string            `json:"advisor_terminal_reason,omitempty"`            // fail-closed or bypass reason
+	AdvisorBestEffort               bool              `json:"advisor_best_effort,omitempty"`                // explicit config opt-out from fail-closed behavior
+	AdvisorBypassed                 bool              `json:"advisor_bypassed,omitempty"`                   // terminal Advisor failure was explicitly bypassed
+	AdvisorReviews                  []AdvisorReview   `json:"advisor_reviews,omitempty"`                    // bounded review history
+	AdvisorBaselineHead             string            `json:"advisor_baseline_head,omitempty"`              // internal review-only invariant snapshot
+	AdvisorBaselineWorktree         string            `json:"advisor_baseline_worktree,omitempty"`          // internal review-only invariant snapshot
+	AdvisorBaselineRemoteRefs       string            `json:"advisor_baseline_remote_refs,omitempty"`       // internal review-only invariant snapshot
+	AdvisorBaselinePlanDigest       string            `json:"advisor_baseline_plan_digest,omitempty"`       // internal review-only invariant snapshot
+	AdvisorBaselineValidationDigest string            `json:"advisor_baseline_validation_digest,omitempty"` // internal review-only invariant snapshot
+	ValidationFails                 int               `json:"validation_fails,omitempty"`                   // number of failed validation attempts
+	ValidationFeedback              string            `json:"validation_feedback,omitempty"`                // feedback from last failed validation
+	CIFailureOutput                 string            `json:"ci_failure_output,omitempty"`                  // CI failure output captured before retry (passed to next worker as context)
+	FailingCheckContext             string            `json:"failing_check_context,omitempty"`              // #857: bounded excerpt of a check-run still failing on the PR head, carried into a retry so the worker sees the red check its previous push introduced (consumed on respawn)
+	PreviousAttemptFeedback         string            `json:"previous_attempt_feedback,omitempty"`          // feedback from previous failed PR attempt
+	PreviousAttemptFeedbackKind     string            `json:"previous_attempt_feedback_kind,omitempty"`     // review_feedback, rebase_conflict
+	RetryReason                     string            `json:"retry_reason,omitempty"`                       // current retry lifecycle reason, e.g. review_feedback
+	OperatorGateName                string            `json:"operator_gate_name,omitempty"`                 // explicit human/operator gate holding this PR; cleared when the gate opens
+	OperatorGateRequiredAction      string            `json:"operator_gate_required_action,omitempty"`      // concise operator action needed to clear OperatorGateName
+	LastClosedPRNumber              int               `json:"last_closed_pr_number,omitempty"`              // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
+	ReleasedForRedispatch           bool              `json:"released_for_redispatch,omitempty"`            // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
+	IssueClosedAt                   *time.Time        `json:"issue_closed_at,omitempty"`                    // authoritative GitHub issue closure observed by standing reconciliation; keeps external lifecycle truth separate from deployment/outcome history
+	LastTerminalReconcileAt         *time.Time        `json:"last_terminal_reconcile_at,omitempty"`         // #940: last successful authoritative issue/PR reconciliation for a terminal session. Bounds historical forge polling while preserving the 10-minute hands-off SLA across daemon restarts
+	CheckpointFile                  string            `json:"checkpoint_file,omitempty"`                    // path to CHECKPOINT.md saved at soft token threshold
+	RestartCheckpointAt             *time.Time        `json:"restart_checkpoint_at,omitempty"`              // #877/#966: set when the daemon deliberately checkpoints this still-running worker on shutdown. A non-nil value tells the next daemon to adopt the same surviving isolated PID/worktree, or resume the same logical session in place if the worker exited, exactly once. Cleared on successful adoption/resume so it cannot duplicate.
+	DeploymentFinishedAt            *time.Time        `json:"deployment_finished_at,omitempty"`             // set when the post-merge deploy hook succeeds
+	CodeLandedVerifyDeadline        *time.Time        `json:"code_landed_verify_deadline,omitempty"`        // #1020: when a code_landed session was first observed failing its blocking outcome check; past this the fix is judged ineffective if the SAME fingerprint persists
+	OutcomeFailureFingerprint       string            `json:"outcome_failure_fingerprint,omitempty"`        // #1020: stable identity of the blocking outcome failure captured when the deadline was armed; a changed fingerprint re-arms rather than convicting
 
 	// #705: opt-in verify.visual outcome for this session's PR. Set once by
 	// the orchestrator's merge flow: "not_required" (no UI paths touched),
@@ -267,6 +379,13 @@ type Session struct {
 	ReviewPendingHeadSHA string     `json:"review_pending_head_sha,omitempty"` // head SHA the pending clock applies to
 	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
 	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
+	ReviewRetriggerCount int        `json:"review_retrigger_count,omitempty"`  // re-triggers posted for ReviewPendingHeadSHA; capped by review_retrigger.max_attempts
+	// ReviewGateObserved is sticky for ReviewPendingHeadSHA: once ANY reviewer
+	// signal is seen on that head it stays true until the head changes. A
+	// transient check-runs API error degrades one read to "unobserved", and
+	// without this memory that single blip would look like "the reviewer never
+	// showed up" and expire a gate that is genuinely working.
+	ReviewGateObserved bool `json:"review_gate_observed,omitempty"`
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits
@@ -280,12 +399,11 @@ type Session struct {
 	WorkerEndedAt *time.Time `json:"worker_ended_at,omitempty"`
 	PROpenedAt    *time.Time `json:"pr_opened_at,omitempty"`
 
-	// #513: per-segment attribution timeline. Every spawn / respawn /
-	// fallover appends a new entry; the previous entry's EndedAt is
-	// closed at the same moment. Records who actually produced the
-	// commits (provider/model/variant/effort) so the dashboard +
-	// commit trailer can show "first 12m on claude opus-4.8 xhigh,
-	// then 4m on codex gpt-5.5 medium after rate-limit fallover".
+	// #513/#1000: per-segment internal attribution timeline. Every spawn /
+	// respawn / fallover appends a new entry; the previous entry's EndedAt is
+	// closed at the same moment. Records which backend produced the work so
+	// durable state and Fleet Mission Control can show routing and fallover
+	// history without writing control-plane telemetry into product commits.
 	Attribution []BackendAttribution `json:"attribution,omitempty"`
 }
 
@@ -306,17 +424,25 @@ const (
 // rate-limit fallover or pipeline-phase machinery respawns it on a
 // different backend.
 type BackendAttribution struct {
-	Backend   string     `json:"backend"`              // shim name (claude, codex, freellm, opencode, …)
-	Provider  string     `json:"provider,omitempty"`   // anthropic, openai, groq, …
-	Model     string     `json:"model,omitempty"`      // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
-	Variant   string     `json:"variant,omitempty"`    // opus[1m], fast, sonnet, …
-	Effort    string     `json:"effort,omitempty"`     // xhigh, medium, low, …
-	TaskType  string     `json:"task_type,omitempty"`  // router classification: refactor, bugfix, test, vision, design, docs, infra
-	StartedAt time.Time  `json:"started_at"`           // when this segment became active
-	EndedAt   *time.Time `json:"ended_at,omitempty"`   // when the segment was closed; nil if still active
-	EndReason string     `json:"end_reason,omitempty"` // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"
-	Reason    string     `json:"reason,omitempty"`     // why this segment was started: "initial_spawn", "fallover", "in_place_respawn", "phase_transition"
+	Backend               string     `json:"backend"`                           // shim name (claude, codex, freellm, opencode, …)
+	Provider              string     `json:"provider,omitempty"`                // anthropic, openai, groq, …
+	Model                 string     `json:"model,omitempty"`                   // opus-4.8, gpt-5.5, llama-3.3-70b-versatile, …
+	Variant               string     `json:"variant,omitempty"`                 // opus[1m], fast, sonnet, …
+	Effort                string     `json:"effort,omitempty"`                  // xhigh, medium, low, …
+	TaskType              string     `json:"task_type,omitempty"`               // router classification: refactor, bugfix, test, vision, design, docs, infra
+	UsageUnreliable       bool       `json:"usage_unreliable,omitempty"`        // provider stream omitted plausible input/output usage for live budgets or terminal accounting
+	UsageUnreliableReason string     `json:"usage_unreliable_reason,omitempty"` // stable secret-free reason for the degradation
+	UsageUnreliableScope  string     `json:"usage_unreliable_scope,omitempty"`  // live_budget (terminal totals still usable) or accounting (session totals are a lower bound)
+	StartedAt             time.Time  `json:"started_at"`                        // when this segment became active
+	EndedAt               *time.Time `json:"ended_at,omitempty"`                // when the segment was closed; nil if still active
+	EndReason             string     `json:"end_reason,omitempty"`              // why the segment closed: "completed", "provider_limit", "fallover", "in_place_respawn", "killed"
+	Reason                string     `json:"reason,omitempty"`                  // why this segment was started: "initial_spawn", "fallover", "in_place_respawn", "phase_transition"
 }
+
+const (
+	UsageUnreliableScopeLiveBudget = "live_budget"
+	UsageUnreliableScopeAccounting = "accounting"
+)
 
 // SessionAttention explains why a session needs operator attention and the
 // safest next action Maestro can infer from persisted state.
@@ -338,15 +464,62 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	if sess == nil {
 		return SessionAttention{}
 	}
+	if reason := strings.TrimSpace(sess.WorkerLeaseAttention); reason != "" {
+		return SessionAttention{
+			Reason:         "Worker scratch ownership needs attention: " + reason + ".",
+			NextAction:     "Inspect the exact persisted worker lease and ownership manifest; do not delete by age, path prefix, or executable name.",
+			NeedsAttention: true,
+		}
+	}
+	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
+		return SessionAttention{Reason: "Issue is closed on GitHub; the session is terminal and retained only for audit."}
+	}
+	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
+		return SessionAttention{
+			Reason:     "Automatic retry is waiting for the issue's current dispatch guard to clear.",
+			NextAction: "No worker restart is allowed while the guard remains; Maestro will resume the same canonical session after it clears.",
+		}
+	}
 	if attention, ok := reviewFeedbackRetryAttention(sess, alive, now); ok {
 		return attention
 	}
-	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+	if strings.TrimSpace(sess.AdvisorTerminalReason) != "" && !sess.AdvisorBypassed && sess.Status == StatusFailed {
+		findings := strings.TrimSpace(sess.AdvisorUnresolvedFindings)
+		reason := fmt.Sprintf("Advisor gate failed closed before implementation (%s).", sess.AdvisorTerminalReason)
+		if findings != "" {
+			reason += "\n" + findings
+		}
 		return SessionAttention{
-			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s tokens observed).", formatSessionTokens(sess.TokensUsedAttempt)),
+			Reason:         reason,
+			NextAction:     "Review the exact Advisor findings and terminal reason, repair the plan or Advisor backend, then restart intentionally; implementation was not started.",
+			NeedsAttention: true,
+		}
+	}
+	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
+		observed := sess.TokenBudgetTokensAttempt
+		measure := strings.TrimSpace(sess.TokenBudgetMeasure)
+		if observed <= 0 {
+			observed = sess.TokensUsedAttempt
+		}
+		measureLabel := "tokens"
+		if measure != "" {
+			measureLabel = measure
+		}
+		return SessionAttention{
+			Reason:         fmt.Sprintf("Worker stopped after reaching its configured token budget (%s %s observed).", formatSessionTokens(observed), measureLabel),
 			NextAction:     "Review the partial work and raise or disable worker_max_tokens only if a larger run is intentional.",
 			NeedsAttention: true,
 		}
+	}
+	if sess.WorkerOutcome == WorkerOutcomeRepeatedUnexpectedExit {
+		return SessionAttention{
+			Reason:         "Worker disappeared again after its automatic unexpected-exit recovery; Maestro terminalized the session to stop a zombie respawn loop.",
+			NextAction:     "Inspect the retained log/worktree and restart intentionally only after correcting the repeated exit cause.",
+			NeedsAttention: true,
+		}
+	}
+	if attention, ok := OperatorGateAttention(sess); ok {
+		return attention
 	}
 
 	switch sess.Status {
@@ -437,6 +610,20 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 					NeedsAttention: true,
 				}
 			}
+			if sess.ProviderLimitReason == BackendBlockModelOverloaded {
+				route := backend
+				if sess.ProviderLimitProvider != "" {
+					route = sess.ProviderLimitProvider
+				}
+				if sess.ProviderLimitModel != "" {
+					route += "/" + sess.ProviderLimitModel
+				}
+				return SessionAttention{
+					Reason:         fmt.Sprintf("Provider/model route %s is temporarily overloaded; other models on the provider remain eligible.", route),
+					NextAction:     "Wait for the short route cooldown or use the next provider-local model; the per-issue retry budget was not consumed.",
+					NeedsAttention: true,
+				}
+			}
 			if sess.ProviderLimitReason == BackendBlockUsageLimit {
 				return SessionAttention{
 					Reason:         fmt.Sprintf("Backend %s has exhausted its account usage quota; no fallback backend is currently available or allowed.", backend),
@@ -494,6 +681,28 @@ func SessionAttentionForAt(sess *Session, alive *bool, now time.Time) SessionAtt
 	}
 }
 
+// OperatorGateAttention returns a stable, state-backed waiting verdict for an
+// explicit human/operator gate. It is independent of the runtime status because
+// an operator can apply a hold while a retry is already scheduled.
+func OperatorGateAttention(sess *Session) (SessionAttention, bool) {
+	if sess == nil || strings.TrimSpace(sess.OperatorGateName) == "" {
+		return SessionAttention{}, false
+	}
+	action := strings.TrimSpace(sess.OperatorGateRequiredAction)
+	if action == "" {
+		action = "Complete the operator decision, then remove the hold label or let the gated check pass."
+	}
+	pr := "the session"
+	if sess.PRNumber > 0 {
+		pr = fmt.Sprintf("PR #%d", sess.PRNumber)
+	}
+	return SessionAttention{
+		Reason:         fmt.Sprintf("%s is held by operator gate %q.", pr, sess.OperatorGateName),
+		NextAction:     action + " The retry budget was not consumed.",
+		NeedsAttention: true,
+	}, true
+}
+
 // SessionDisplayStatusFor returns the status token dashboards should display.
 func SessionDisplayStatusFor(sess *Session, alive *bool) string {
 	return SessionDisplayStatusForAt(sess, alive, time.Now().UTC())
@@ -504,11 +713,20 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 	if sess == nil {
 		return ""
 	}
+	if sess.Status == StatusDone && sess.IssueClosedAt != nil {
+		return string(StatusDone)
+	}
 	if sess.WorkerOutcome == string(DisplayTokenBudgetExceeded) {
 		return string(DisplayTokenBudgetExceeded)
 	}
+	if sess.WorkerOutcome == WorkerOutcomeRepeatedUnexpectedExit {
+		return string(DisplayRepeatedUnexpectedExit)
+	}
 	if sess.Status == StatusRunning && alive != nil && !*alive {
 		return string(sess.Status)
+	}
+	if sess.Status == StatusDead && sess.NextRetryAt != nil && strings.TrimSpace(sess.RetryHoldReason) != "" {
+		return string(DisplayWaitingForIssueGuard)
 	}
 	if display := reviewFeedbackRetryDisplayStatus(sess, now); display != "" {
 		return string(display)
@@ -521,6 +739,8 @@ func SessionDisplayStatusForAt(sess *Session, alive *bool, now time.Time) string
 			return string(DisplayBackendModelUnavailable)
 		case BackendBlockModelCooldown:
 			return string(DisplayBackendModelCooldown)
+		case BackendBlockModelOverloaded:
+			return string(DisplayBackendModelOverloaded)
 		case BackendBlockUsageLimit:
 			return string(DisplayBackendUsageLimit)
 		}
@@ -534,6 +754,21 @@ func formatSessionTokens(tokens int) string {
 		return "unknown"
 	}
 	return fmt.Sprintf("%d", tokens)
+}
+
+// PrepareWorkerForOperatorRestart clears automatic terminal latches from the
+// previous attempt and marks the queued retry as an explicit operator action.
+// The restart controller still owns Status/NextRetryAt/worktree mutation; this
+// helper only distinguishes intentional recovery from automatic respawn.
+func PrepareWorkerForOperatorRestart(sess *Session) {
+	if sess == nil {
+		return
+	}
+	sess.WorkerOutcome = ""
+	sess.LastNotifiedStatus = ""
+	sess.RetryHoldReason = ""
+	sess.UnexpectedExitRetries = 0
+	sess.RetryReason = RetryReasonOperatorRestart
 }
 
 // backendRateLimitedDisplayStatus reports whether a session represents a worker
@@ -669,6 +904,40 @@ type Mission struct {
 
 const DefaultSupervisorDecisionLimit = 20
 
+const (
+	RecommendationDispositionMaterialized = "materialized"
+	RecommendationDispositionDropped      = "dropped"
+
+	RecommendationDispositionApprovalRecorded = "approval_recorded"
+	RecommendationDispositionSafeAction       = "safe_action_applied"
+	RecommendationDispositionWorkerStarted    = "worker_started"
+	RecommendationDispositionTTLExpired       = "ttl_expired_unconsumed"
+	RecommendationDispositionSuperseded       = "superseded_by_new_decision"
+
+	SupervisorJournalInitial     = "initial"
+	SupervisorJournalRollup      = "rollup"
+	SupervisorJournalDisposition = "disposition"
+	SupervisorJournalSuppressed  = "suppressed"
+)
+
+// RecommendationDisposition is the terminal handling record for one durable
+// recommendation episode. A recommendation is either materialized into an
+// action/approval or dropped with an explicit reason; it never silently ages
+// forever in the decision ring.
+type RecommendationDisposition struct {
+	Status string    `json:"status"`
+	Reason string    `json:"reason"`
+	At     time.Time `json:"at"`
+}
+
+// RecommendationDropped reports whether this recommendation episode reached a
+// terminal dropped disposition and therefore must not be consumed by a later
+// actuator. Materialized recommendations remain visible and actionable through
+// their normal downstream receipt (for example an approval).
+func (d SupervisorDecision) RecommendationDropped() bool {
+	return d.Disposition != nil && d.Disposition.Status == RecommendationDispositionDropped
+}
+
 var (
 	ErrApprovalNotFound        = errors.New("approval not found")
 	ErrApprovalNotPending      = errors.New("approval is not pending")
@@ -676,6 +945,7 @@ var (
 	ErrApprovalSuperseded      = errors.New("approval is superseded")
 	ErrApprovalPayloadMismatch = errors.New("approval payload changed")
 	ErrStateConflict           = errors.New("state write conflict")
+	ErrNoStateChange           = errors.New("state update made no change")
 )
 
 // SupervisorTarget identifies the primary object a supervisor decision refers to.
@@ -717,14 +987,15 @@ type SupervisorIssueTarget struct {
 
 // SupervisorProjectState captures the read-only state snapshot behind a decision.
 type SupervisorProjectState struct {
-	Sessions       int `json:"sessions"`
-	Running        int `json:"running"`
-	PROpen         int `json:"pr_open"`
-	Queued         int `json:"queued"`
-	RetryExhausted int `json:"retry_exhausted"`
-	OpenIssues     int `json:"open_issues"`
-	OpenPRs        int `json:"open_prs"`
-	AvailableSlots int `json:"available_slots"`
+	Sessions       int   `json:"sessions"`
+	Running        int   `json:"running"`
+	PROpen         int   `json:"pr_open"`
+	Queued         int   `json:"queued"`
+	RetryExhausted int   `json:"retry_exhausted"`
+	OpenIssues     int   `json:"open_issues"`
+	OpenPRs        int   `json:"open_prs"`
+	OpenPRNumbers  []int `json:"open_pr_numbers"` // exact identities make later closed-issue filtering safe; nil denotes a legacy aggregate-only snapshot
+	AvailableSlots int   `json:"available_slots"`
 }
 
 const (
@@ -758,6 +1029,9 @@ const (
 	// surfaced as evidence. NEVER a silent dead-end (#565).
 	StuckReviewRepairExhausted = "review_repair_exhausted"
 	StuckSearchGuardrailTrip   = "search_guardrail_trip"
+	// StuckTokenBudgetExceeded keeps an issue-scoped budget stop visible without
+	// turning historical worker spend into a project-wide dispatch hold.
+	StuckTokenBudgetExceeded = "token_budget_exceeded"
 	// StuckSupervisorMeteredBackend is emitted when the supervisor LLM path is
 	// refused because supervisor.backend (or its model.default fallback) resolves
 	// to a metered (per-token) backend and supervisor.allow_metered_backend is not
@@ -960,8 +1234,22 @@ type SupervisorStuckState struct {
 
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
-	ID                string                   `json:"id"`
-	CreatedAt         time.Time                `json:"created_at"`
+	ID               string                     `json:"id"`
+	CreatedAt        time.Time                  `json:"created_at"`
+	RecommendationID string                     `json:"recommendation_id,omitempty"`
+	FirstSeenAt      time.Time                  `json:"first_seen_at,omitempty"`
+	LastSeenAt       time.Time                  `json:"last_seen_at,omitempty"`
+	SeenCount        int                        `json:"seen_count,omitempty"`
+	LastJournaledAt  time.Time                  `json:"last_journaled_at,omitempty"`
+	Disposition      *RecommendationDisposition `json:"disposition,omitempty"`
+	// Quiescent marks a dispatch-guard decision whose unchanged observations
+	// update the durable first/last/count metadata but emit no periodic journal
+	// roll-up. Entry and exit edges remain ordinary journaled decisions.
+	Quiescent bool `json:"quiescent,omitempty"`
+	// JournalEvent is transient output routing for the current RunOnce result.
+	// Durable suppression is carried by LastJournaledAt; this field must never
+	// be serialized into state or the SQLite mirror.
+	JournalEvent      string                   `json:"-"`
 	Project           string                   `json:"project"`
 	Repo              string                   `json:"repo,omitempty"`
 	Mode              string                   `json:"mode"`
@@ -1235,22 +1523,55 @@ type ApprovalAudit struct {
 	TargetStateHash string    `json:"target_state_hash,omitempty"`
 }
 
+// WorkerLeaseAttention is a durable, path-free ownership warning produced by
+// the worker scratch reconciler. Identity is either a validated lease ID or an
+// opaque fingerprint for an ambiguous entry; raw host paths and command lines
+// are deliberately excluded from persisted/UI state.
+type WorkerLeaseAttention struct {
+	Identity   string    `json:"identity"`
+	Slot       string    `json:"slot,omitempty"`
+	Reason     string    `json:"reason"`
+	NextAction string    `json:"next_action"`
+	DetectedAt time.Time `json:"detected_at"`
+}
+
 type State struct {
-	Sessions            map[string]*Session                 `json:"sessions"`
-	Missions            map[int]*Mission                    `json:"missions,omitempty"` // parent issue number → mission
-	SupervisorDecisions []SupervisorDecision                `json:"supervisor_decisions,omitempty"`
-	Approvals           []Approval                          `json:"approvals,omitempty"`
-	LessonProposals     []LessonProposal                    `json:"lesson_proposals,omitempty"`
-	OutcomeHealth       *outcome.HealthCheckResult          `json:"outcome_health,omitempty"`
-	BackendHealth       map[string]BackendHealth            `json:"backend_health,omitempty"`
-	ProviderModelHealth map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
-	BackendQuotaUsage   map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
-	ProjectStatusSync   map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
-	NextSlot            int                                 `json:"next_slot"`
-	LastMergeAt         time.Time                           `json:"last_merge_at,omitempty"`
+	Sessions            map[string]*Session         `json:"sessions"`
+	FreshDispatchClaims map[int]*FreshDispatchClaim `json:"fresh_dispatch_claims,omitempty"`
+	MergeControls       map[int]MergeControl        `json:"merge_controls,omitempty"`
+	Missions            map[int]*Mission            `json:"missions,omitempty"` // parent issue number → mission
+	SupervisorDecisions []SupervisorDecision        `json:"supervisor_decisions,omitempty"`
+	Approvals           []Approval                  `json:"approvals,omitempty"`
+	LessonProposals     []LessonProposal            `json:"lesson_proposals,omitempty"`
+	OutcomeHealth       *outcome.HealthCheckResult  `json:"outcome_health,omitempty"`
+	OutcomeRecovery     *outcome.RecoveryState      `json:"outcome_recovery,omitempty"`
+	// OutcomeGateStreaks tracks per-gate consecutive scheduled-failure runs with
+	// a failure fingerprint (gate name + reason class). OutcomeGateStreakCheckedAt
+	// is the CheckedAt of the last health result already folded into the streaks,
+	// so each scheduled run increments a streak exactly once.
+	OutcomeGateStreaks         []outcome.GateStreak                `json:"outcome_gate_streaks,omitempty"`
+	OutcomeGateStreakCheckedAt time.Time                           `json:"outcome_gate_streak_checked_at,omitempty"`
+	BackendHealth              map[string]BackendHealth            `json:"backend_health,omitempty"`
+	ProviderModelHealth        map[string]map[string]BackendHealth `json:"provider_model_health,omitempty"`
+	BackendQuotaUsage          map[string]*BackendQuotaUsage       `json:"backend_quota_usage,omitempty"`
+	ProjectStatusSync          map[int]ProjectStatusSync           `json:"project_status_sync,omitempty"`
+	NextSlot                   int                                 `json:"next_slot"`
+	LastMergeAt                time.Time                           `json:"last_merge_at,omitempty"`
+	// DispatchHold is the latest machine-readable reason fresh issue dispatch
+	// is suspended. IdleStall tracks consecutive no-worker cycles against the
+	// same hold so the orchestrator can emit one durable idle_stall alert after
+	// two observations instead of spamming every poll (#1023).
+	DispatchHold DispatchHold   `json:"dispatch_hold"`
+	IdleStall    IdleStallState `json:"idle_stall,omitempty"`
+
+	// WorkerLeaseAttention is the current startup/periodic reconciliation
+	// result for scratch ownership that cannot be changed automatically. The
+	// watermark makes concurrent state saves choose the newest complete pass.
+	WorkerLeaseAttention    []WorkerLeaseAttention `json:"worker_lease_attention,omitempty"`
+	WorkerLeaseReconciledAt time.Time              `json:"worker_lease_reconciled_at,omitempty"`
 
 	// RestartRequired is set by the running orchestrator when a config field that
-	// cannot be hot-applied (model.default, routing.*) changes during a reload. It is
+	// cannot be hot-applied (currently routing.*) changes during a reload. It is
 	// surfaced by `maestro status` and the Fleet API so an operator sees the pending
 	// restart without grepping the daemon journal. RestartRequiredReason explains why.
 	RestartRequired       bool   `json:"restart_required,omitempty"`
@@ -1277,9 +1598,12 @@ type State struct {
 	// workers but lets in-flight workers finish. It is set by `maestro
 	// drain` and cleared automatically when the orchestrator starts, so a
 	// drain never persists across a legitimate restart. SpawnDrainAt records
-	// when the drain was requested (UTC).
-	SpawnDrain   bool      `json:"spawn_drain,omitempty"`
-	SpawnDrainAt time.Time `json:"spawn_drain_at,omitempty"`
+	// when the drain was requested (UTC). ShutdownDrain distinguishes the
+	// daemon's in-process SIGTERM drain from a standalone operator drain: only
+	// the former makes a process loss restart-resumable (#967).
+	SpawnDrain    bool      `json:"spawn_drain,omitempty"`
+	SpawnDrainAt  time.Time `json:"spawn_drain_at,omitempty"`
+	ShutdownDrain bool      `json:"shutdown_drain,omitempty"`
 
 	// Paused is the first-class operator pause (#683): while it is set, the
 	// orchestrator skips issue selection entirely and spawns no new workers,
@@ -1483,6 +1807,7 @@ type ProjectStatusSync struct {
 func NewState() *State {
 	return &State{
 		Sessions:            make(map[string]*Session),
+		FreshDispatchClaims: make(map[int]*FreshDispatchClaim),
 		Missions:            make(map[int]*Mission),
 		ProjectStatusSync:   make(map[int]ProjectStatusSync),
 		BackendHealth:       make(map[string]BackendHealth),
@@ -1640,6 +1965,44 @@ func Save(stateDir string, s *State) error {
 	return nil
 }
 
+// Update applies fn to the latest state snapshot while holding the per-project
+// flock, then persists that exact mutation before releasing the lock. It is the
+// compare-and-swap boundary for operations that must validate current identity
+// immediately before changing durable ownership, such as watchdog recovery
+// lease claims. fn must not perform external side effects or re-enter Load/Save.
+func Update(stateDir string, fn func(*State) error) error {
+	if fn == nil {
+		return fmt.Errorf("update state: nil callback")
+	}
+	if err := os.MkdirAll(stateDir, 0755); err != nil {
+		return fmt.Errorf("create state dir: %w", err)
+	}
+	unlock, err := lockState(stateDir)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+
+	current, data, err := readStateFile(StatePath(stateDir))
+	if err != nil {
+		return err
+	}
+	current.rememberLoaded(data)
+	if err := fn(current); err != nil {
+		if errors.Is(err, ErrNoStateChange) {
+			return nil
+		}
+		return err
+	}
+	if err := saveLocked(stateDir, current); err != nil {
+		return err
+	}
+	if hook := currentSaveHook(); hook != nil {
+		hook(stateDir, current)
+	}
+	return nil
+}
+
 func saveLocked(stateDir string, s *State) error {
 	if s == nil {
 		s = NewState()
@@ -1735,6 +2098,12 @@ func (s *State) normalize() {
 	if s.Sessions == nil {
 		s.Sessions = make(map[string]*Session)
 	}
+	if s.FreshDispatchClaims == nil {
+		s.FreshDispatchClaims = make(map[int]*FreshDispatchClaim)
+	}
+	if s.MergeControls == nil {
+		s.MergeControls = make(map[int]MergeControl)
+	}
 	if s.Missions == nil {
 		s.Missions = make(map[int]*Mission)
 	}
@@ -1760,11 +2129,17 @@ func (s *State) normalize() {
 
 func (s *State) copyFrom(src *State) {
 	s.Sessions = src.Sessions
+	s.FreshDispatchClaims = src.FreshDispatchClaims
+	s.MergeControls = src.MergeControls
 	s.Missions = src.Missions
 	s.SupervisorDecisions = src.SupervisorDecisions
 	s.Approvals = src.Approvals
 	s.LessonProposals = src.LessonProposals
 	s.OutcomeHealth = src.OutcomeHealth
+	s.OutcomeGateStreaks = src.OutcomeGateStreaks
+	s.OutcomeGateStreakCheckedAt = src.OutcomeGateStreakCheckedAt
+	s.DispatchHold = src.DispatchHold
+	s.IdleStall = src.IdleStall
 	s.ProjectStatusSync = src.ProjectStatusSync
 	s.BackendHealth = src.BackendHealth
 	s.ProviderModelHealth = src.ProviderModelHealth
@@ -1774,11 +2149,23 @@ func (s *State) copyFrom(src *State) {
 	s.SpecGroomCursor = src.SpecGroomCursor
 	s.NextSlot = src.NextSlot
 	s.LastMergeAt = src.LastMergeAt
+	s.WorkerLeaseAttention = src.WorkerLeaseAttention
+	s.WorkerLeaseReconciledAt = src.WorkerLeaseReconciledAt
 	s.SpawnDrain = src.SpawnDrain
 	s.SpawnDrainAt = src.SpawnDrainAt
+	s.ShutdownDrain = src.ShutdownDrain
 	s.Paused = src.Paused
 	s.PausedAt = src.PausedAt
 	s.MaterialProgress = src.MaterialProgress
+	// Keep the caller's in-memory snapshot aligned with the merged file. Save
+	// calls copyFrom after a three-way merge, then rememberLoaded records the
+	// merged file hash. Omitting the heartbeat tuple here leaves a long-lived
+	// writer (notably the material-progress watchdog) holding an older pulse
+	// while believing it loaded the current file. Its next non-conflicting save
+	// can then regress LastRunOnceAt and resurrect an obsolete stuck verdict.
+	s.LastRunOnceAt = src.LastRunOnceAt
+	s.SupervisorStuck = src.SupervisorStuck
+	s.SupervisorStuckReason = src.SupervisorStuckReason
 }
 
 func cloneState(s *State) *State {
@@ -1806,6 +2193,8 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	if err := mergeSessions(merged, base, current, ours); err != nil {
 		return nil, err
 	}
+	merged.FreshDispatchClaims = mergeFreshDispatchClaims(current.FreshDispatchClaims, ours.FreshDispatchClaims)
+	merged.MergeControls = mergeMergeControls(current.MergeControls, ours.MergeControls)
 	if err := mergeMissions(merged, base, current, ours); err != nil {
 		return nil, err
 	}
@@ -1819,6 +2208,9 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 		return nil, err
 	}
 	merged.OutcomeHealth = mergeOutcomeHealth(base.OutcomeHealth, current.OutcomeHealth, ours.OutcomeHealth)
+	merged.OutcomeRecovery = mergeOutcomeRecovery(base.OutcomeRecovery, current.OutcomeRecovery, ours.OutcomeRecovery)
+	merged.OutcomeGateStreaks, merged.OutcomeGateStreakCheckedAt = mergeOutcomeGateStreaks(current, ours)
+	merged.DispatchHold, merged.IdleStall = mergeDispatchVisibility(current, ours)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
@@ -1827,10 +2219,59 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.BackendQuotaUsage = mergeBackendQuotaUsage(current.BackendQuotaUsage, ours.BackendQuotaUsage)
 	merged.NextSlot = mergeMonotonicInt(base.NextSlot, current.NextSlot, ours.NextSlot)
 	merged.LastMergeAt = mergeLatestTime(base.LastMergeAt, current.LastMergeAt, ours.LastMergeAt)
+	mergeWorkerLeaseAttention(merged, current, ours)
 	mergeSpawnDrain(merged, current, ours)
 	mergePaused(merged, current, ours)
+	mergeSupervisorHeartbeat(merged, current, ours)
 	mergeMaterialProgress(merged, current, ours)
 	return merged, nil
+}
+
+func mergeWorkerLeaseAttention(merged, current, ours *State) {
+	winner := current
+	if winner == nil || (ours != nil && ours.WorkerLeaseReconciledAt.After(winner.WorkerLeaseReconciledAt)) {
+		winner = ours
+	}
+	if winner == nil {
+		merged.WorkerLeaseAttention = nil
+		merged.WorkerLeaseReconciledAt = time.Time{}
+		return
+	}
+	merged.WorkerLeaseAttention = append([]WorkerLeaseAttention(nil), winner.WorkerLeaseAttention...)
+	merged.WorkerLeaseReconciledAt = winner.WorkerLeaseReconciledAt
+}
+
+// mergeSupervisorHeartbeat preserves the newest completed supervisor pulse
+// across ordinary three-way merges. The orchestrator and material-progress
+// evaluator write the same state concurrently; before this field-specific
+// merge, their otherwise-compatible writes silently kept current's old pulse
+// while accepting the new supervisor decision. Stuck state follows the pulse
+// that produced it. At an equal pulse, a watchdog's stuck=true wins so an
+// unrelated save cannot erase a real overdue verdict; a later RunOnce clears it
+// by advancing LastRunOnceAt.
+func mergeSupervisorHeartbeat(merged, current, ours *State) {
+	switch {
+	case ours.LastRunOnceAt.After(current.LastRunOnceAt):
+		merged.LastRunOnceAt = ours.LastRunOnceAt
+		merged.SupervisorStuck = ours.SupervisorStuck
+		merged.SupervisorStuckReason = ours.SupervisorStuckReason
+	case current.LastRunOnceAt.After(ours.LastRunOnceAt):
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		merged.SupervisorStuck = current.SupervisorStuck
+		merged.SupervisorStuckReason = current.SupervisorStuckReason
+	default:
+		merged.LastRunOnceAt = current.LastRunOnceAt
+		if current.SupervisorStuck || ours.SupervisorStuck {
+			merged.SupervisorStuck = true
+			merged.SupervisorStuckReason = current.SupervisorStuckReason
+			if merged.SupervisorStuckReason == "" {
+				merged.SupervisorStuckReason = ours.SupervisorStuckReason
+			}
+			return
+		}
+		merged.SupervisorStuck = false
+		merged.SupervisorStuckReason = ""
+	}
 }
 
 // mergeSpawnDrain resolves the drain flag (#541) latest-write-wins by
@@ -1842,10 +2283,12 @@ func mergeSpawnDrain(merged, current, ours *State) {
 	if ours.SpawnDrainAt.After(current.SpawnDrainAt) {
 		merged.SpawnDrain = ours.SpawnDrain
 		merged.SpawnDrainAt = ours.SpawnDrainAt
+		merged.ShutdownDrain = ours.ShutdownDrain
 		return
 	}
 	merged.SpawnDrain = current.SpawnDrain
 	merged.SpawnDrainAt = current.SpawnDrainAt
+	merged.ShutdownDrain = current.ShutdownDrain
 }
 
 // mergePaused resolves the pause flag (#683) latest-write-wins by PausedAt,
@@ -2138,7 +2581,96 @@ func cloneOutcomeHealth(value *outcome.HealthCheckResult) *outcome.HealthCheckRe
 		return nil
 	}
 	clone := *value
+	clone.Checks = append([]outcome.HealthCheckItem(nil), value.Checks...)
 	return &clone
+}
+
+func mergeOutcomeRecovery(base, current, ours *outcome.RecoveryState) *outcome.RecoveryState {
+	latest := current
+	if latest == nil || (ours != nil && ours.UpdatedAt.After(latest.UpdatedAt)) {
+		latest = ours
+	}
+	if latest == nil {
+		latest = base
+	}
+	return cloneOutcomeRecovery(latest)
+}
+
+func cloneOutcomeRecovery(value *outcome.RecoveryState) *outcome.RecoveryState {
+	if value == nil {
+		return nil
+	}
+	clone := *value
+	if value.ExitCode != nil {
+		code := *value.ExitCode
+		clone.ExitCode = &code
+	}
+	return &clone
+}
+
+// mergeOutcomeGateStreaks keeps the streak table whose folded-run watermark is
+// newest. The table and its watermark advance together on every scheduled fold,
+// so the newer watermark carries the authoritative counters and emission marks.
+func mergeOutcomeGateStreaks(current, ours *State) ([]outcome.GateStreak, time.Time) {
+	winner := current
+	if winner == nil || (ours != nil && ours.OutcomeGateStreakCheckedAt.After(winner.OutcomeGateStreakCheckedAt)) {
+		winner = ours
+	}
+	if winner == nil {
+		return nil, time.Time{}
+	}
+	return append([]outcome.GateStreak(nil), winner.OutcomeGateStreaks...), winner.OutcomeGateStreakCheckedAt
+}
+
+// RecordOutcomeGateStreaks folds one scheduled health check result into the
+// per-gate streak table and returns the streaks that reached the escalation
+// threshold with a pending notification or intake. It records each distinct
+// scheduled run at most once: a result whose CheckedAt is not newer than the
+// last folded run is ignored, so overlapping evaluators never double-count.
+func (s *State) RecordOutcomeGateStreaks(result outcome.HealthCheckResult, threshold int, runLink string, now time.Time) []outcome.GateStreakEvent {
+	if s == nil {
+		return nil
+	}
+	if !result.CheckedAt.IsZero() && !result.CheckedAt.After(s.OutcomeGateStreakCheckedAt) {
+		return nil
+	}
+	next, events := outcome.RecordGateStreaks(s.OutcomeGateStreaks, result, threshold, runLink, now)
+	s.OutcomeGateStreaks = next
+	if !result.CheckedAt.IsZero() {
+		s.OutcomeGateStreakCheckedAt = result.CheckedAt.UTC()
+	}
+	return events
+}
+
+// MarkGateStreakNotified records that the gate_fail_streak notification for a
+// fingerprint has been sent, deduping repeat same-fingerprint escalations.
+func (s *State) MarkGateStreakNotified(gate, fingerprint string, now time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.OutcomeGateStreaks {
+		if s.OutcomeGateStreaks[i].Gate == gate && s.OutcomeGateStreaks[i].Fingerprint == fingerprint {
+			s.OutcomeGateStreaks[i].NotifiedFingerprint = fingerprint
+			return
+		}
+	}
+}
+
+// MarkGateStreakIntaken records that the deduped repair issue for a fingerprint
+// has been filed, so a repeat same-fingerprint failure never re-files.
+func (s *State) MarkGateStreakIntaken(gate, fingerprint string, issue int, now time.Time) {
+	if s == nil {
+		return
+	}
+	for i := range s.OutcomeGateStreaks {
+		if s.OutcomeGateStreaks[i].Gate == gate && s.OutcomeGateStreaks[i].Fingerprint == fingerprint {
+			s.OutcomeGateStreaks[i].IntakeFingerprint = fingerprint
+			if issue > 0 {
+				s.OutcomeGateStreaks[i].IntakeIssue = issue
+			}
+			return
+		}
+	}
 }
 
 func unionKeys(maps ...map[string]*Session) []string {
@@ -2344,16 +2876,243 @@ func (s *State) RecordSupervisorDecision(decision SupervisorDecision, limit int)
 	}
 }
 
-// LatestSupervisorDecision returns the newest supervisor decision by creation time.
-func (s *State) LatestSupervisorDecision() *SupervisorDecision {
-	if len(s.SupervisorDecisions) == 0 {
+// PrepareSupervisorRecommendation stamps the stable idempotency key used by
+// the recommendation episode recorder. The key deliberately excludes volatile
+// per-cycle counters/project snapshots while including the recommendation's
+// action, target, policy, summary, and error class; a material change therefore
+// creates a transition edge while an unchanged cycle retains one identity.
+func PrepareSupervisorRecommendation(decision *SupervisorDecision) {
+	if decision == nil || strings.TrimSpace(decision.RecommendationID) != "" {
+		return
+	}
+	payload := struct {
+		Action     string            `json:"action"`
+		Target     *SupervisorTarget `json:"target,omitempty"`
+		PolicyRule string            `json:"policy_rule,omitempty"`
+		Summary    string            `json:"summary,omitempty"`
+		ErrorClass string            `json:"error_class,omitempty"`
+	}{
+		Action:     strings.TrimSpace(decision.RecommendedAction),
+		Target:     decision.Target,
+		PolicyRule: strings.TrimSpace(decision.PolicyRule),
+		Summary:    strings.TrimSpace(decision.Summary),
+		ErrorClass: strings.TrimSpace(decision.ErrorClass),
+	}
+	decision.RecommendationID = "supervisor:" + stableHash(payload)
+}
+
+// SupervisorRecommendationDropped reports whether the current latest episode
+// for this exact recommendation has already reached a dropped disposition.
+// Callers use it before actuation so an expired recommendation cannot execute
+// later merely because an external dependency recovered.
+func (s *State) SupervisorRecommendationDropped(decision SupervisorDecision) bool {
+	if s == nil {
+		return false
+	}
+	PrepareSupervisorRecommendation(&decision)
+	latest := s.LatestSupervisorDecision()
+	return latest != nil && sameSupervisorRecommendation(*latest, decision) &&
+		latest.RecommendationDropped()
+}
+
+// RecordSupervisorDecisionWithPolicy coalesces consecutive identical
+// recommendation observations into one durable episode. The first observation
+// is journaled, active unchanged episodes emit one roll-up per window, and an
+// unconsumed episode receives a dropped disposition at TTL. A different
+// recommendation closes the previous unconsumed episode as superseded and is
+// appended as a transition edge.
+func (s *State) RecordSupervisorDecisionWithPolicy(decision SupervisorDecision, limit int, unchangedWindow, ttl time.Duration, now time.Time) SupervisorDecision {
+	if s == nil {
+		return decision
+	}
+	if limit <= 0 {
+		limit = DefaultSupervisorDecisionLimit
+	}
+	if unchangedWindow <= 0 {
+		unchangedWindow = time.Hour
+	}
+	if ttl <= 0 {
+		ttl = 24 * time.Hour
+	}
+	now = normalizedTime(now)
+	PrepareSupervisorRecommendation(&decision)
+	expired := s.expireSupervisorRecommendations(now, ttl)
+
+	latestIndex := s.latestSupervisorDecisionIndex()
+	if latestIndex >= 0 && sameSupervisorRecommendation(s.SupervisorDecisions[latestIndex], decision) {
+		incomingDisposition := cloneRecommendationDisposition(decision.Disposition)
+		existing := s.SupervisorDecisions[latestIndex]
+		decision.ID = existing.ID
+		decision.CreatedAt = now
+		decision.FirstSeenAt = supervisorDecisionFirstSeen(existing)
+		decision.LastSeenAt = now
+		decision.SeenCount = existing.SeenCount
+		if decision.SeenCount <= 0 {
+			decision.SeenCount = 1
+		}
+		decision.SeenCount++
+		decision.LastJournaledAt = existing.LastJournaledAt
+		decision.Disposition = cloneRecommendationDisposition(existing.Disposition)
+		if decision.ApprovalID == "" {
+			decision.ApprovalID = existing.ApprovalID
+		}
+		decision.JournalEvent = SupervisorJournalSuppressed
+
+		if expired[existing.ID] {
+			decision.LastJournaledAt = now
+			decision.JournalEvent = SupervisorJournalDisposition
+		} else if decision.Disposition == nil {
+			if incomingDisposition != nil {
+				decision.Disposition = incomingDisposition
+				decision.LastJournaledAt = now
+				decision.JournalEvent = SupervisorJournalDisposition
+			}
+		}
+		if supervisorRecommendationCanRollUp(decision) &&
+			(decision.LastJournaledAt.IsZero() || now.Before(decision.LastJournaledAt) ||
+				!now.Before(decision.LastJournaledAt.Add(unchangedWindow))) {
+			decision.LastJournaledAt = now
+			decision.JournalEvent = SupervisorJournalRollup
+		}
+		s.SupervisorDecisions[latestIndex] = decision
+		return decision
+	}
+
+	if latestIndex >= 0 {
+		s.disposeSupervisorDecision(&s.SupervisorDecisions[latestIndex], RecommendationDispositionDropped, RecommendationDispositionSuperseded, now)
+	}
+	if decision.ID == "" {
+		decision.ID = "sup-" + now.Format("20060102T150405.000000000Z")
+	}
+	decision.CreatedAt = now
+	decision.FirstSeenAt = now
+	decision.LastSeenAt = now
+	decision.SeenCount = 1
+	decision.LastJournaledAt = now
+	decision.Disposition = cloneRecommendationDisposition(decision.Disposition)
+	decision.JournalEvent = SupervisorJournalInitial
+	s.SupervisorDecisions = append(s.SupervisorDecisions, decision)
+	if len(s.SupervisorDecisions) > limit {
+		s.SupervisorDecisions = append([]SupervisorDecision(nil), s.SupervisorDecisions[len(s.SupervisorDecisions)-limit:]...)
+	}
+	return decision
+}
+
+// UpdateSupervisorDecisionEpisode replaces the durable record for an episode
+// after its actuator has attached an approval, mutation result, or disposition.
+// It deliberately does not increment SeenCount: actuation finalizes the same
+// observation that RecordSupervisorDecisionWithPolicy already counted.
+func (s *State) UpdateSupervisorDecisionEpisode(decision SupervisorDecision) bool {
+	if s == nil || strings.TrimSpace(decision.ID) == "" {
+		return false
+	}
+	for i := range s.SupervisorDecisions {
+		if s.SupervisorDecisions[i].ID != decision.ID {
+			continue
+		}
+		decision.Disposition = cloneRecommendationDisposition(decision.Disposition)
+		s.SupervisorDecisions[i] = decision
+		return true
+	}
+	return false
+}
+
+// MarkSupervisorRecommendationMaterialized attaches a downstream consumption
+// receipt to an existing episode. The orchestrator uses this after it starts a
+// worker from a supervisor recommendation; approval and safe-mutation receipts
+// are attached directly by RunOnce.
+func (s *State) MarkSupervisorRecommendationMaterialized(decisionID, reason string, now time.Time) bool {
+	if s == nil || strings.TrimSpace(decisionID) == "" || strings.TrimSpace(reason) == "" {
+		return false
+	}
+	for i := range s.SupervisorDecisions {
+		decision := &s.SupervisorDecisions[i]
+		if decision.ID != decisionID || decision.Disposition != nil {
+			continue
+		}
+		decision.Disposition = &RecommendationDisposition{
+			Status: RecommendationDispositionMaterialized,
+			Reason: strings.TrimSpace(reason),
+			At:     normalizedTime(now),
+		}
+		return true
+	}
+	return false
+}
+
+func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration) map[string]bool {
+	expired := make(map[string]bool)
+	for i := range s.SupervisorDecisions {
+		decision := &s.SupervisorDecisions[i]
+		if decision.Disposition != nil {
+			continue
+		}
+		firstSeen := supervisorDecisionFirstSeen(*decision)
+		if firstSeen.IsZero() || now.Before(firstSeen.Add(ttl)) {
+			continue
+		}
+		s.disposeSupervisorDecision(decision, RecommendationDispositionDropped, RecommendationDispositionTTLExpired, now)
+		expired[decision.ID] = true
+	}
+	return expired
+}
+
+func (s *State) disposeSupervisorDecision(decision *SupervisorDecision, status, reason string, now time.Time) {
+	if decision == nil || decision.Disposition != nil {
+		return
+	}
+	decision.Disposition = &RecommendationDisposition{Status: status, Reason: reason, At: now.UTC()}
+}
+
+func supervisorRecommendationCanRollUp(decision SupervisorDecision) bool {
+	if decision.Quiescent || decision.RecommendationDropped() {
+		return false
+	}
+	return true
+}
+
+func sameSupervisorRecommendation(a, b SupervisorDecision) bool {
+	if strings.TrimSpace(a.RecommendationID) == "" || strings.TrimSpace(b.RecommendationID) == "" {
+		return false
+	}
+	return a.RecommendedAction == b.RecommendedAction &&
+		a.RecommendationID == b.RecommendationID &&
+		stableHash(a.Target) == stableHash(b.Target)
+}
+
+func supervisorDecisionFirstSeen(decision SupervisorDecision) time.Time {
+	if !decision.FirstSeenAt.IsZero() {
+		return decision.FirstSeenAt.UTC()
+	}
+	return decision.CreatedAt.UTC()
+}
+
+func cloneRecommendationDisposition(disposition *RecommendationDisposition) *RecommendationDisposition {
+	if disposition == nil {
 		return nil
+	}
+	clone := *disposition
+	return &clone
+}
+
+func (s *State) latestSupervisorDecisionIndex() int {
+	if s == nil || len(s.SupervisorDecisions) == 0 {
+		return -1
 	}
 	latest := 0
 	for i := 1; i < len(s.SupervisorDecisions); i++ {
 		if s.SupervisorDecisions[i].CreatedAt.After(s.SupervisorDecisions[latest].CreatedAt) {
 			latest = i
 		}
+	}
+	return latest
+}
+
+// LatestSupervisorDecision returns the newest supervisor decision by creation time.
+func (s *State) LatestSupervisorDecision() *SupervisorDecision {
+	latest := s.latestSupervisorDecisionIndex()
+	if latest < 0 {
+		return nil
 	}
 	return &s.SupervisorDecisions[latest]
 }
@@ -3008,6 +3767,112 @@ func (s *State) MarkCloseIssueApprovalsStaleForVerifiedIssue(issueNumber int, no
 	return count
 }
 
+// StaleIssueApprovalsForClosedIssue retires every still-actionable approval
+// whose side effect is scoped to an issue GitHub already reports closed.
+// Deployment approvals are intentionally excluded: deploying or verifying the
+// merged project revision is independent project/outcome work and remains
+// auditable/actionable after the issue lifecycle has ended.
+func (s *State) StaleIssueApprovalsForClosedIssue(issueNumber int, now time.Time, reason string) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	if strings.TrimSpace(reason) == "" {
+		reason = fmt.Sprintf("issue #%d is closed on GitHub — issue-scoped approval is moot", issueNumber)
+	}
+	var staled []Approval
+	var reissues []SupervisorDecision
+	initialApprovals := len(s.Approvals)
+	for i := 0; i < initialApprovals; i++ {
+		approval := &s.Approvals[i]
+		if approval.Action == ApprovalActionDeployProject || !s.approvalTargetsIssue(approval, issueNumber) {
+			continue
+		}
+		switch approval.Status {
+		case ApprovalStatusPending, ApprovalStatusApproved, ApprovalStatusAwaitingDispatch:
+			// A batch approval can authorize other still-open issues. Retire the
+			// old immutable payload, then reissue only the remaining targets as a
+			// fresh pending approval. Narrowing through a new gate keeps the closed
+			// issue moot without discarding unrelated operator-approved work.
+			if approval.Action == approvalActionCloseIssueBatch && approval.Target != nil {
+				remaining := make([]SupervisorIssueTarget, 0, len(approval.Target.Issues))
+				for _, target := range approval.Target.Issues {
+					if target.Issue != issueNumber {
+						remaining = append(remaining, target)
+					}
+				}
+				if len(remaining) > 0 {
+					target := cloneSupervisorTarget(approval.Target)
+					target.Issues = remaining
+					reissues = append(reissues, SupervisorDecision{
+						ID:                approval.DecisionID,
+						CreatedAt:         now,
+						Project:           approval.Project,
+						Repo:              approval.Repo,
+						Summary:           fmt.Sprintf("Close %d remaining verified merged issue(s); issue #%d was already closed externally.", len(remaining), issueNumber),
+						RecommendedAction: approval.Action,
+						Target:            target,
+						Risk:              approval.Risk,
+						Reasons:           append(append([]string(nil), approval.Evidence...), reason),
+						RequiresApproval:  true,
+					})
+				}
+			}
+			s.markApprovalStale(approval, now, reason)
+			staled = append(staled, *approval)
+		}
+	}
+	for _, decision := range reissues {
+		s.RecordPendingApprovalForDecision(decision, now)
+	}
+	return staled
+}
+
+// MootIssueApprovalMirrorCandidates returns every JSON-stale issue-scoped
+// approval for a closed issue. Unlike StaleIssueApprovalsForClosedIssue, this
+// includes approvals transitioned on an earlier cycle so a transient SQLite
+// mirror failure is retried until both stores converge.
+func (s *State) MootIssueApprovalMirrorCandidates(issueNumber int) []Approval {
+	if s == nil || issueNumber <= 0 {
+		return nil
+	}
+	var out []Approval
+	for i := range s.Approvals {
+		approval := &s.Approvals[i]
+		if approval.Action == ApprovalActionDeployProject || approval.Status != ApprovalStatusStale || !s.approvalTargetsIssue(approval, issueNumber) {
+			continue
+		}
+		out = append(out, *approval)
+	}
+	return out
+}
+
+func (s *State) approvalTargetsIssue(approval *Approval, issueNumber int) bool {
+	if approval == nil || approval.Target == nil || issueNumber <= 0 {
+		return false
+	}
+	target := approval.Target
+	if target.Issue == issueNumber {
+		return true
+	}
+	for _, candidate := range target.Issues {
+		if candidate.Issue == issueNumber {
+			return true
+		}
+	}
+	for slot, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNumber {
+			continue
+		}
+		if target.Session != "" && target.Session == slot {
+			return true
+		}
+		if target.Issue <= 0 && target.PR > 0 && target.PR == sess.PRNumber {
+			return true
+		}
+	}
+	return false
+}
+
 func closeIssueApprovalTargetsIssue(approval *Approval, issueNumber int) bool {
 	if approval == nil || approval.Target == nil || issueNumber <= 0 {
 		return false
@@ -3354,14 +4219,16 @@ func (s *State) ApprovalTargetStateHash(target *SupervisorTarget) string {
 			continue
 		}
 		snapshot.Sessions = append(snapshot.Sessions, approvalSessionSnapshot{
-			Slot:        name,
-			IssueNumber: sess.IssueNumber,
-			Status:      sess.Status,
-			Branch:      sess.Branch,
-			PRNumber:    sess.PRNumber,
-			FinishedAt:  sess.FinishedAt,
-			RetryCount:  sess.RetryCount,
-			NextRetryAt: sess.NextRetryAt,
+			Slot:             name,
+			IssueNumber:      sess.IssueNumber,
+			Status:           sess.Status,
+			Branch:           sess.Branch,
+			PRNumber:         sess.PRNumber,
+			StartedAt:        sess.StartedAt,
+			WorkerGeneration: sess.WorkerGeneration,
+			FinishedAt:       sess.FinishedAt,
+			RetryCount:       sess.RetryCount,
+			NextRetryAt:      sess.NextRetryAt,
 		})
 	}
 	return stableHash(snapshot)
@@ -3432,9 +4299,15 @@ type approvalSessionSnapshot struct {
 	Status      SessionStatus `json:"status"`
 	Branch      string        `json:"branch,omitempty"`
 	PRNumber    int           `json:"pr_number,omitempty"`
-	FinishedAt  *time.Time    `json:"finished_at,omitempty"`
-	RetryCount  int           `json:"retry_count,omitempty"`
-	NextRetryAt *time.Time    `json:"next_retry_at,omitempty"`
+	// StartedAt and WorkerGeneration identify the exact worker attempt. An
+	// in-place respawn can return every other projected field to its prior value
+	// while replacing the process an earlier worker-control approval addressed
+	// (#964). StartedAt also fences legacy sessions whose generation is zero.
+	StartedAt        time.Time  `json:"started_at"`
+	WorkerGeneration uint64     `json:"worker_generation,omitempty"`
+	FinishedAt       *time.Time `json:"finished_at,omitempty"`
+	RetryCount       int        `json:"retry_count,omitempty"`
+	NextRetryAt      *time.Time `json:"next_retry_at,omitempty"`
 }
 
 func approvalID(decision SupervisorDecision, createdAt time.Time) string {
@@ -3705,6 +4578,7 @@ const (
 	ActivityWaitingOnGates       ProjectActivity = "waiting_on_pr_gates"     // no live worker, PRs open, and no eligible work left — just waiting for gates
 	ActivityBlockedByApprovals   ProjectActivity = "blocked_by_approvals"    // dispatch is held pending an operator approval decision
 	ActivityBlockedByModelLimits ProjectActivity = "blocked_by_model_limits" // every eligible backend is blocked by a model/usage limit
+	ActivityNeedsAttention       ProjectActivity = "needs_attention"         // no live worker; canonical actionable work requires repair/reconciliation
 	ActivityPaused               ProjectActivity = "paused"                  // operator paused the project
 	ActivityQueueEmpty           ProjectActivity = "queue_empty"             // no eligible ready issues remain
 	ActivityIdle                 ProjectActivity = "idle"                    // idle for none of the more specific reasons above
@@ -3713,11 +4587,12 @@ const (
 // ActivityInput carries the non-session signals ClassifyActivity needs beyond
 // the session-derived Capacity snapshot.
 type ActivityInput struct {
-	Capacity         Capacity
-	EligibleIssues   int  // ready issues that could be dispatched now
-	PendingApprovals int  // spawn/merge approvals awaiting an operator decision
-	BackendsBlocked  bool // every eligible backend is blocked by a model/usage limit
-	Paused           bool // operator paused the project
+	Capacity            Capacity
+	EligibleIssues      int  // ready issues that could be dispatched now
+	PendingApprovals    int  // spawn/merge approvals awaiting an operator decision
+	ActionableAttention int  // canonical, non-self-resolving worker/session blockers
+	BackendsBlocked     bool // every eligible backend is blocked by a model/usage limit
+	Paused              bool // operator paused the project
 }
 
 // ClassifyActivity returns the ProjectActivity token and a concise
@@ -3738,14 +4613,22 @@ func ClassifyActivity(in ActivityInput) (ProjectActivity, string) {
 	if in.PendingApprovals > 0 {
 		return ActivityBlockedByApprovals, fmt.Sprintf("Blocked by approvals: %d decision(s) awaiting an operator.", in.PendingApprovals)
 	}
+	if in.ActionableAttention > 0 {
+		return ActivityNeedsAttention, fmt.Sprintf("Needs attention: %d actionable worker/session blocker(s) require repair or reconciliation.", in.ActionableAttention)
+	}
 	// Gate-bound: no live worker and no free slot while PRs are open. Only a
 	// problem when eligible work is waiting — that is the recurring #814
-	// intervention loop. With eligible work drained it is simply "waiting".
-	if c.PRGates > 0 && c.AvailableSlots == 0 {
-		if in.EligibleIssues > 0 {
+	// intervention loop. With eligible work drained it is simply "waiting",
+	// including separated-concurrency projects where PR gates intentionally do
+	// not consume otherwise-free implementation slots. Calling that state
+	// queue_empty hides the real gate/outcome work still in flight.
+	if c.PRGates > 0 {
+		if in.EligibleIssues > 0 && c.AvailableSlots == 0 {
 			return ActivityBlockedByGates, fmt.Sprintf("Blocked by PR gates: %d PR gate(s) hold all capacity while %d ready issue(s) wait; raise max_live_workers or max_parallel to keep implementing.", c.PRGates, in.EligibleIssues)
 		}
-		return ActivityWaitingOnGates, fmt.Sprintf("Waiting on PR gates: %d PR(s) open, no eligible work left to dispatch.", c.PRGates)
+		if in.EligibleIssues <= 0 {
+			return ActivityWaitingOnGates, fmt.Sprintf("Waiting on PR gates: %d PR(s) open, no eligible work left to dispatch.", c.PRGates)
+		}
 	}
 	if in.EligibleIssues <= 0 {
 		return ActivityQueueEmpty, "Queue empty: no eligible ready issues to dispatch."
@@ -3769,6 +4652,20 @@ func (s *State) SetSpawnDrain(at time.Time) {
 		return
 	}
 	s.SpawnDrain = true
+	s.ShutdownDrain = false
+	s.SpawnDrainAt = normalizedTime(at)
+}
+
+// SetShutdownDrain requests the daemon's in-process graceful shutdown drain.
+// Unlike a standalone `maestro drain`, a worker process lost during this window
+// is presumed interrupted by the daemon restart and may carry restart intent
+// across its running-to-dead transition (#967).
+func (s *State) SetShutdownDrain(at time.Time) {
+	if s == nil {
+		return
+	}
+	s.SpawnDrain = true
+	s.ShutdownDrain = true
 	s.SpawnDrainAt = normalizedTime(at)
 }
 
@@ -3779,12 +4676,19 @@ func (s *State) ClearSpawnDrain(at time.Time) {
 		return
 	}
 	s.SpawnDrain = false
+	s.ShutdownDrain = false
 	s.SpawnDrainAt = normalizedTime(at)
 }
 
 // DrainActive reports whether a graceful drain is currently requested.
 func (s *State) DrainActive() bool {
 	return s != nil && s.SpawnDrain
+}
+
+// ShutdownDrainActive reports whether the active drain belongs to an in-process
+// daemon shutdown rather than a standalone operator drain.
+func (s *State) ShutdownDrainActive() bool {
+	return s != nil && s.SpawnDrain && s.ShutdownDrain
 }
 
 // SetPaused marks the project paused (#683): the orchestrator skips issue
@@ -3876,7 +4780,7 @@ func SessionLiveAt(sess *Session, now time.Time) bool {
 	}
 
 	switch SessionDisplayStatus(SessionDisplayStatusForAt(sess, nil, now)) {
-	case DisplayReviewRetryBackoff, DisplayReviewRetryPending, DisplayReviewRetryRunning, DisplayReviewRetryRecheck:
+	case DisplayReviewRetryBackoff, DisplayReviewRetryPending, DisplayReviewRetryRunning, DisplayReviewRetryRecheck, DisplayWaitingForIssueGuard:
 		return true
 	}
 
@@ -3916,6 +4820,9 @@ func SessionAttentionActionableAt(sess *Session, now time.Time) bool {
 func sessionAttentionActionableAt(sess *Session, now time.Time, ttl time.Duration) bool {
 	if sess == nil {
 		return false
+	}
+	if strings.TrimSpace(sess.WorkerLeaseAttention) != "" {
+		return true
 	}
 	if now.IsZero() {
 		now = time.Now().UTC()
@@ -4093,6 +5000,9 @@ func SessionChangedAt(sess *Session) time.Time {
 	if sess.FinishedAt != nil && sess.FinishedAt.After(changedAt) {
 		changedAt = *sess.FinishedAt
 	}
+	if sess.IssueClosedAt != nil && sess.IssueClosedAt.After(changedAt) {
+		changedAt = *sess.IssueClosedAt
+	}
 	if !sess.LastOutputChangedAt.IsZero() && sess.LastOutputChangedAt.After(changedAt) {
 		changedAt = sess.LastOutputChangedAt
 	}
@@ -4125,29 +5035,31 @@ func (s *State) DonePRCount() int {
 	return count
 }
 
-// IssueInProgress returns true if the given issue is already being handled.
-// This includes dead sessions with a pending retry (NextRetryAt set) to prevent
-// duplicate worker spawns during backoff periods.
+// IssueInProgress returns true if the given issue already has a durable claim.
+// Claims include active sessions, scheduled retries, retained open-PR
+// maintenance work, and approved repair dispatch reservations.
 func (s *State) IssueInProgress(issueNum int) bool {
-	for _, sess := range s.Sessions {
-		if sess.IssueNumber != issueNum {
-			continue
-		}
-		if sess.Status == StatusRunning || sess.Status == StatusPROpen || sess.Status == StatusQueued || sess.Status == StatusCodeLanded {
-			return true
-		}
-		// Dead session with pending retry — still in progress
-		if sess.Status == StatusDead && sess.NextRetryAt != nil {
-			return true
-		}
-	}
-	return false
+	_, ok := s.IssueClaimFor(issueNum)
+	return ok
 }
 
-// IssueDone returns true if the given issue already has a completed session.
+// IssueDone returns true only when forge reconciliation has closed the issue
+// on a completed session. Historical StatusDone rows (duplicate_dispatch,
+// abandoned attempts, docs-only merges that left the GitHub issue open) must
+// NOT permanently starve dynamic-wave eligibility — that was the live path to
+// eligible=0 / live=0 while *-ready backlog still existed (#1103).
+//
+// The merge→close race is owned by sessionIssueClaim's terminal_reconcile
+// lease (done+PR, not yet ReleasedForRedispatch), not by this helper.
 func (s *State) IssueDone(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusDone {
+		if sess == nil || sess.IssueNumber != issueNum || sess.Status != StatusDone {
+			continue
+		}
+		if sess.ReleasedForRedispatch {
+			continue
+		}
+		if sess.IssueClosedAt != nil {
 			return true
 		}
 	}
@@ -4158,30 +5070,119 @@ func (s *State) IssueDone(issueNum int) bool {
 // without producing a PR (dead, failed, or retry_exhausted).
 //
 // Sessions marked as backend-blocked (RateLimitHit — provider capacity limit
-// or backend auth failure) are NOT counted as failed attempts: a transient
-// backend block must not consume the per-issue retry budget.
+// or backend auth failure) and deterministic token-budget stops are NOT counted
+// as failed attempts: neither condition proves the implementation itself failed,
+// and both must remain runnable after their independent hold/release policy.
 // See #432 / #458 / #466 / #693.
+//
+// Sessions Maestro itself retired while reconciling duplicate dispatches are
+// excluded for the same reason: that outcome records the control plane tidying
+// up after spawning two workers for one issue, not an attempt that failed.
+// Live 2026-07-23 (ok-player #627): a respawn-thrash incident produced two such
+// siblings, and with only one genuine failure the issue still reported 3/3
+// attempts and stopped being dispatched at all.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit {
+			sessionProvesFailedAttempt(sess) {
 			count++
 		}
 	}
 	return count
 }
 
+// ConsecutiveTokenBudgetKillsForIssue counts how many of the issue's most
+// recent PR-less sessions ended at the token budget, stopping at the first
+// session that ended any other way.
+//
+// A budget stop is deliberately excluded from FailedAttemptsForIssue — it is a
+// governor, not a work failure, so it must not burn the per-issue retry budget.
+// The gap that leaves: when the configured budget sits BELOW the floor a worker
+// needs just to load its initial context, every dispatch dies the same way and
+// nothing ever stops re-dispatching. Live 2026-07-24: ok-player #628 spawned 9
+// times in 4.5h, each killed after ~2 minutes at observed≈157k vs max=120k.
+// Callers use this streak to break the mill and surface the misconfiguration.
+func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
+	if s == nil {
+		return 0
+	}
+	type ended struct {
+		at      time.Time
+		budget  bool
+		counted bool
+	}
+	var history []ended
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNum || sess.PRNumber != 0 {
+			continue
+		}
+		if sess.Status != StatusDead && sess.Status != StatusFailed && sess.Status != StatusRetryExhausted {
+			continue
+		}
+		at := sess.StartedAt
+		if sess.FinishedAt != nil {
+			at = *sess.FinishedAt
+		}
+		history = append(history, ended{
+			at:      at,
+			budget:  sess.WorkerOutcome == string(DisplayTokenBudgetExceeded),
+			counted: true,
+		})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].at.After(history[j].at) })
+	streak := 0
+	for _, entry := range history {
+		if !entry.budget {
+			break
+		}
+		streak++
+	}
+	return streak
+}
+
 // IssueRetryExhausted returns true if any session for the given issue
 // has been marked as retry_exhausted.
 func (s *State) IssueRetryExhausted(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted {
+		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted &&
+			sessionProvesFailedAttempt(sess) {
 			return true
 		}
 	}
 	return false
+}
+
+// sessionProvesFailedAttempt reports whether a terminal session is evidence the
+// implementation itself failed, as opposed to a transient backend block, a
+// deterministic governor stop, or Maestro's own bookkeeping.
+//
+// Both retry gates must agree on this, and both are consulted: the queue paths
+// check IssueRetryExhausted BEFORE FailedAttemptsForIssue, so excluding an
+// outcome from the count alone leaves the issue blocked anyway the moment one
+// such session carries the retry_exhausted status. Live ok-player #627: two
+// duplicate-dispatch siblings were retired with that status, and the issue
+// stayed permanently undispatchable even after the count was corrected.
+// SessionProvesFailedAttempt is the exported form for callers outside this
+// package that act on retry exhaustion — spawning a repair worker, or raising a
+// Blocked stuck-state. They must agree with the two retry gates: a session
+// retired by Maestro's own duplicate-dispatch cleanup, stopped deterministically
+// at the token budget, or blocked by a rate limit carries the retry_exhausted
+// status without being evidence that the implementation failed.
+func SessionProvesFailedAttempt(sess *Session) bool {
+	return sessionProvesFailedAttempt(sess)
+}
+
+func sessionProvesFailedAttempt(sess *Session) bool {
+	if sess == nil || sess.RateLimitHit {
+		return false
+	}
+	switch sess.WorkerOutcome {
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+		return false
+	}
+	return true
 }
 
 // MarkIssueRetryExhausted transitions the most recent dead/failed session
@@ -4305,7 +5306,7 @@ func (s *State) IsMissionChild(issueNum int) bool {
 func (s *State) PruneOldSessions(maxAge time.Duration) int {
 	pruned := 0
 	for name, sess := range s.Sessions {
-		if !IsTerminal(sess.Status) {
+		if !IsTerminal(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" || strings.TrimSpace(sess.WorkerLeaseID) != "" {
 			continue
 		}
 		finished := sess.FinishedAt
@@ -4386,7 +5387,7 @@ func (s *State) CompactSessions(policy SessionRetentionPolicy, now time.Time) (S
 	}
 	eligible := make([]candidate, 0, len(s.Sessions))
 	for slot, sess := range s.Sessions {
-		if sess == nil || !IsRetentionEligible(sess.Status) {
+		if sess == nil || !IsRetentionEligible(sess.Status) || strings.TrimSpace(sess.ProcessLeaseUnit) != "" || strings.TrimSpace(sess.WorkerLeaseID) != "" {
 			continue
 		}
 		finished := sess.StartedAt

@@ -8,6 +8,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 )
@@ -68,7 +69,8 @@ supervisor:
 	}
 	fromYAML.SourcePath = ""
 	fromStore.SourcePath = ""
-	fromStore.SettingsSources = nil // provenance map is set by Load, absent from Parse
+	fromStore.SettingsSources = nil   // provenance map is set by Load, absent from Parse
+	fromStore.FleetOnlySettings = nil // daemon-only settings are set by Load, absent from Parse
 	if !reflect.DeepEqual(fromStore, fromYAML) {
 		t.Fatalf("store config differs from yaml\nstore=%#v\nyaml=%#v", fromStore.Model, fromYAML.Model)
 	}
@@ -143,6 +145,44 @@ func TestLoadKeepsImportedSourcePath(t *testing.T) {
 	}
 }
 
+func TestProjectsFingerprintAdvancesOnSharedBackendUpdate(t *testing.T) {
+	ctx := context.Background()
+	store := openTestStore(t)
+	if err := store.UpsertProject(ctx, "owner-demo", `
+repo: owner/demo
+model:
+  default: claude
+  backends:
+    claude:
+      cmd: claude --model opus --effort xhigh
+      effort: xhigh
+`); err != nil {
+		t.Fatalf("UpsertProject: %v", err)
+	}
+	before, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("ProjectsFingerprint before: %v", err)
+	}
+	time.Sleep(time.Millisecond)
+	if err := store.UpsertBackend(ctx, "claude", "cmd: claude --model opus --effort high\neffort: high\n"); err != nil {
+		t.Fatalf("UpsertBackend: %v", err)
+	}
+	after, err := store.ProjectsFingerprint(ctx)
+	if err != nil {
+		t.Fatalf("ProjectsFingerprint after: %v", err)
+	}
+	if !after["owner-demo"].After(before["owner-demo"]) {
+		t.Fatalf("fingerprint did not advance after backend-only update: before=%s after=%s", before["owner-demo"], after["owner-demo"])
+	}
+	cfg, err := store.Load(ctx, "owner-demo")
+	if err != nil {
+		t.Fatalf("Load: %v", err)
+	}
+	if got := cfg.Model.Backends["claude"].Effort; got != "high" {
+		t.Fatalf("loaded backend effort = %q, want high", got)
+	}
+}
+
 func TestExportDirRoundTrips(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
@@ -188,8 +228,8 @@ model:
 	}
 }
 
-// #841: the per-phase backend + effort fields (pipeline.{planner,implementer,
-// validator}.{backend,effort}) live in the project document, so the store must
+// #841/#928: the per-phase backend + effort fields (pipeline.{planner,advisor,
+// implementer,validator}.{backend,effort}) live in the project document, so the store must
 // round-trip them through import → export → parse without a schema change, and a
 // row that omits them must load with empty defaults.
 func TestExportDirRoundTripsPerPhaseBackendEffort(t *testing.T) {
@@ -210,6 +250,13 @@ pipeline:
     enabled: true
     backend: fable
     effort: xhigh
+  advisor:
+    enabled: true
+    backend: codex
+    effort: high
+    max_runtime_minutes: 20
+  advisor_review_rounds: 4
+  advisor_best_effort: true
   implementer:
     backend: codex
     effort: low
@@ -252,6 +299,9 @@ pipeline:
 		t.Fatalf("planner/validator effort not preserved: planner=%q validator=%q",
 			roundTrip.Pipeline.Planner.Effort, roundTrip.Pipeline.Validator.Effort)
 	}
+	if !roundTrip.Pipeline.Advisor.Enabled || roundTrip.Pipeline.Advisor.Backend != "codex" || roundTrip.Pipeline.Advisor.Effort != "high" || roundTrip.Pipeline.Advisor.MaxRuntimeMinutes != 20 || roundTrip.Pipeline.AdvisorReviewRounds != 4 || !roundTrip.Pipeline.AdvisorBestEffort {
+		t.Fatalf("advisor config not preserved: %#v", roundTrip.Pipeline)
+	}
 }
 
 // A project row that predates #841 (no pipeline effort/implementer fields) must
@@ -289,6 +339,9 @@ pipeline:
 	if cfg.Pipeline.Planner.Effort != "" || cfg.Pipeline.Validator.Effort != "" {
 		t.Fatalf("absent effort should default empty: planner=%q validator=%q",
 			cfg.Pipeline.Planner.Effort, cfg.Pipeline.Validator.Effort)
+	}
+	if cfg.Pipeline.Advisor.Enabled || cfg.Pipeline.Advisor.Backend != "" || cfg.Pipeline.AdvisorReviewRounds != 0 || cfg.Pipeline.AdvisorBestEffort {
+		t.Fatalf("absent advisor should default disabled: %#v", cfg.Pipeline)
 	}
 }
 

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -48,6 +50,87 @@ func TestHashOutput_UsesLast50LinesOnly(t *testing.T) {
 	want := hashOutput(last50)
 	if got != want {
 		t.Fatalf("hashOutput() should only depend on last 50 lines; got %q want %q", got, want)
+	}
+}
+
+func TestRespawnPreservingWorktreeRepairsExistingDirectoryWithInvalidGitMetadata(t *testing.T) {
+	root := t.TempDir()
+	repo := filepath.Join(root, "repo")
+	base := filepath.Join(root, "worktrees")
+	worktree := filepath.Join(base, "ok-player-277")
+	branch := "feat/ok-player-277-346"
+	for _, args := range [][]string{
+		{"init", "-b", "main", repo},
+		{"-C", repo, "config", "user.email", "test@example.com"},
+		{"-C", repo, "config", "user.name", "Test"},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(repo, "base.txt"), []byte("base\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"-C", repo, "add", "base.txt"},
+		{"-C", repo, "commit", "-m", "base"},
+		{"-C", repo, "branch", branch},
+	} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: /missing/admin/metadata\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worktree, "preserved.txt"), []byte("do not lose\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	branchesBefore, err := exec.Command("git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+	if err != nil {
+		t.Fatalf("list branches before recovery: %v: %s", err, branchesBefore)
+	}
+
+	cfg := &config.Config{LocalPath: repo, WorktreeBase: base}
+	sess := &state.Session{IssueNumber: 346, PRNumber: 397, Worktree: worktree, Branch: branch}
+	respawned := false
+	o := &Orchestrator{
+		cfg:               cfg,
+		restoreWorktreeFn: worker.RestoreMissingWorktree,
+		respawnInPlaceFn: func(_ *config.Config, slotName string, got *state.Session, _ string, _ github.Issue, _, _ string) error {
+			respawned = true
+			if slotName != "ok-player-277" {
+				t.Fatalf("slot = %q, want canonical ok-player-277", slotName)
+			}
+			if got.Worktree != worktree || got.Branch != branch || got.PRNumber != 397 {
+				t.Fatalf("canonical identity changed: worktree=%q branch=%q PR=%d", got.Worktree, got.Branch, got.PRNumber)
+			}
+			out, err := exec.Command("git", "-C", worktree, "rev-parse", "--show-toplevel").CombinedOutput()
+			if err != nil || filepath.Clean(strings.TrimSpace(string(out))) != filepath.Clean(worktree) {
+				t.Fatalf("restored worktree root = %q, %v; want %q", strings.TrimSpace(string(out)), err, worktree)
+			}
+			return nil
+		},
+	}
+	if err := o.respawnPreservingWorktreeWithConfig(cfg, "ok-player-277", sess, github.Issue{Number: 346}, "prompt", "sol"); err != nil {
+		t.Fatalf("respawn preserving worktree: %v", err)
+	}
+	if !respawned {
+		t.Fatal("canonical in-place respawn was not invoked")
+	}
+	branchesAfter, err := exec.Command("git", "-C", repo, "for-each-ref", "--format=%(refname)", "refs/heads").CombinedOutput()
+	if err != nil || string(branchesAfter) != string(branchesBefore) {
+		t.Fatalf("branches changed during recovery: before=%q after=%q err=%v", branchesBefore, branchesAfter, err)
+	}
+	backups, err := filepath.Glob(worktree + ".orphaned-*")
+	if err != nil || len(backups) != 1 {
+		t.Fatalf("orphan backups = %v, %v; want one", backups, err)
+	}
+	if got, err := os.ReadFile(filepath.Join(backups[0], "preserved.txt")); err != nil || string(got) != "do not lose\n" {
+		t.Fatalf("preserved orphan content = %q, %v", got, err)
 	}
 }
 
@@ -173,6 +256,7 @@ func TestSelectPrompt_CaseInsensitiveLabel(t *testing.T) {
 // to pr_open so that IssueInProgress returns true and no duplicate worker is spawned.
 func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *testing.T) {
 	s := state.NewState()
+	retryAt := time.Now().UTC().Add(-time.Minute)
 	s.Sessions["mae-5"] = &state.Session{
 		IssueNumber: 105,
 		IssueTitle:  "fix crash",
@@ -180,6 +264,7 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 		PID:         9999,
 		TmuxSession: "maestro-mae-5",
 		Branch:      "feat/mae-5-105-fix-crash",
+		NextRetryAt: &retryAt,
 	}
 
 	openPRs := []github.PR{
@@ -209,6 +294,9 @@ func TestReconcileRunningSessions_DeadWorkerWithOpenPR_TransitionsToPROpen(t *te
 	}
 	if sess.TmuxSession != "" {
 		t.Fatalf("tmux_session = %q, want empty", sess.TmuxSession)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil after authoritative PR-open reconciliation", sess.NextRetryAt)
 	}
 	if sess.FinishedAt == nil {
 		t.Fatal("finished_at should be set")
@@ -255,6 +343,67 @@ func TestReconcileRunningSessions_DeadWithPendingRetry_NotFlippedToPROpen(t *tes
 	}
 	if sess.NextRetryAt == nil {
 		t.Fatal("NextRetryAt must be preserved — the in-place respawn depends on it")
+	}
+}
+
+func TestCheckSessions_PROpenClearsStaleRetryMarker(t *testing.T) {
+	retryAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406,
+		IssueTitle:  "canonical Flatpak repair",
+		Status:      state.StatusPROpen,
+		NextRetryAt: &retryAt,
+		RetryCount:  2,
+		Branch:      "feat/ok-player-345-flatpak-beta-retry",
+		PRNumber:    388,
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(int) (bool, error) { return false, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["ok-player-302"]
+	if sess.Status != state.StatusPROpen {
+		t.Fatalf("status = %q, want %q", sess.Status, state.StatusPROpen)
+	}
+	if sess.NextRetryAt != nil {
+		t.Fatalf("next_retry_at = %v, want nil for pr_open canonical session", sess.NextRetryAt)
+	}
+	if sess.RetryCount != 2 {
+		t.Fatalf("retry_count = %d, want preserved history 2", sess.RetryCount)
+	}
+}
+
+func TestCheckSessions_DonePRReleasesTerminalClaimAfterIssueCloses(t *testing.T) {
+	finishedAt := time.Now().UTC().Add(-time.Minute)
+	s := state.NewState()
+	s.Sessions["ok-player-274"] = &state.Session{
+		IssueNumber: 365, Status: state.StatusDone, PRNumber: 370, FinishedAt: &finishedAt,
+	}
+	if _, ok := s.IssueClaimFor(365); !ok {
+		t.Fatal("done PR must hold a terminal reconciliation claim before issue closure")
+	}
+	o := &Orchestrator{
+		cfg:                 &config.Config{StateDir: t.TempDir()},
+		listOpenPRsFn:       func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:     func(issueNumber int) (bool, error) { return issueNumber == 365, nil },
+		pidAliveFn:          func(int) bool { return false },
+		tmuxSessionExistsFn: func(string) bool { return false },
+	}
+
+	o.checkSessions(s)
+
+	if !s.Sessions["ok-player-274"].ReleasedForRedispatch {
+		t.Fatal("closed issue must release its completed PR terminal claim")
+	}
+	if _, ok := s.IssueClaimFor(365); ok {
+		t.Fatal("closed issue retained terminal reconciliation claim")
 	}
 }
 
@@ -349,8 +498,6 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 	}
 
 	var gotTitle, gotBody, gotBase, gotHead string
-	var amendedWorktree, amendedBranch string
-	var amendedAttribution []state.BackendAttribution
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -361,12 +508,6 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 		createPRFn: func(title, body, base, head string) (int, error) {
 			gotTitle, gotBody, gotBase, gotHead = title, body, base, head
 			return 144, nil
-		},
-		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amendedWorktree = worktreePath
-			amendedBranch = branch
-			amendedAttribution = append([]state.BackendAttribution(nil), attribution...)
-			return nil
 		},
 	}
 
@@ -417,20 +558,14 @@ func TestReconcileRunningSessions_PushedBranchWithoutPR_AutoCreatesPR(t *testing
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, gotBody)
 		}
 	}
-	if amendedWorktree != "/tmp/mae-8" || amendedBranch != "feat/mae-8-108-add-branch-rescue" {
-		t.Fatalf("amend target = %q/%q", amendedWorktree, amendedBranch)
-	}
-	if len(amendedAttribution) != 2 {
-		t.Fatalf("amended attribution len = %d, want 2", len(amendedAttribution))
-	}
 	if !s.IssueInProgress(108) {
 		t.Fatal("IssueInProgress(108) must remain true after auto-created PR")
 	}
 }
 
-// The Maestro-Backend attribution trailer stays on commits only; PR bodies on
-// the (possibly public) target repo must not be rewritten to carry it (#799).
-func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *testing.T) {
+// Backend attribution is internal control-plane state. Reconciliation must
+// adopt the existing PR without changing its public commit or PR body (#1000).
+func TestReconcileRunningSessions_OpenPR_DoesNotAmendProductCommit(t *testing.T) {
 	s := state.NewState()
 	t0 := time.Date(2026, 6, 4, 12, 0, 0, 0, time.UTC)
 	s.Sessions["mae-9"] = &state.Session{
@@ -450,7 +585,6 @@ func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *t
 		}},
 	}
 
-	var amended bool
 	o := &Orchestrator{
 		pidAliveFn:          func(pid int) bool { return false },
 		tmuxSessionExistsFn: func(name string) bool { return false },
@@ -460,10 +594,6 @@ func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *t
 				HeadRefName: "feat/mae-9-109-existing-pr",
 				Body:        "Refs #109\n",
 			}}, nil
-		},
-		amendHeadFn: func(worktreePath, branch string, attribution []state.BackendAttribution, now time.Time) error {
-			amended = true
-			return nil
 		},
 	}
 
@@ -477,9 +607,6 @@ func TestReconcileRunningSessions_OpenPR_AmendsCommitOnly_LeavesPRBodyAlone(t *t
 	}
 	if sess.PRNumber != 145 {
 		t.Fatalf("pr_number = %d, want 145", sess.PRNumber)
-	}
-	if !amended {
-		t.Fatal("expected branch head amend hook")
 	}
 }
 
@@ -502,6 +629,35 @@ func TestAutoCreatedPRBody_NoOrchestrationInternals(t *testing.T) {
 		if strings.Contains(body, leak) {
 			t.Fatalf("PR body leaks orchestration internals (%q): %q", leak, body)
 		}
+	}
+}
+
+func TestCreatePR_NoAttributionPolicyRejectsForbiddenPublicText(t *testing.T) {
+	root := t.TempDir()
+	if err := os.WriteFile(filepath.Join(root, "AGENTS.md"), []byte("No AI attribution anywhere in git/GitHub artifacts.\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	called := false
+	o := &Orchestrator{
+		cfg: &config.Config{LocalPath: root},
+		createPRFn: func(title, body, base, head string) (int, error) {
+			called = true
+			return 974, nil
+		},
+	}
+	if _, err := o.createPR("policy regression", "Refs #974\n\nMaestro-Backend: sol openai gpt-5.6-sol\n", "main", "feat/policy"); err == nil {
+		t.Fatal("forbidden PR attribution was published")
+	}
+	if called {
+		t.Fatal("PR creation reached the public write after policy rejection")
+	}
+
+	if _, err := o.createPR("policy regression", "Refs #974\n", "main", "feat/policy"); err != nil {
+		t.Fatalf("clean PR text was rejected: %v", err)
+	}
+	if !called {
+		t.Fatal("clean PR text did not reach the public write")
 	}
 }
 
@@ -1263,6 +1419,10 @@ func newMergeTestOrchestrator(cfg *config.Config, prs []github.PR) (*Orchestrato
 		ghPRGreptileApprovedFn: func(prNumber int) (bool, bool, error) {
 			return true, false, nil // approved, not pending
 		},
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "merge candidate"), nil
+		},
+		ghPRLabelsFn: func(int) ([]string, error) { return nil, nil },
 		ghMergePRFn: func(prNumber int) error {
 			merged = append(merged, prNumber)
 			return nil
@@ -1304,6 +1464,9 @@ func TestAutoMergePRs_MissingOpenPRDoesNotBecomeDoneWhenOutcomePassRequiredFails
 		},
 	}
 	o, merged := newMergeTestOrchestrator(cfg, nil)
+	o.isPRMergedFn = func(prNumber int) (bool, error) {
+		return prNumber == 10, nil
+	}
 	s := makeTestState([]github.PR{{Number: 10, HeadRefName: "feat/a"}})
 	s.OutcomeHealth = &outcome.HealthCheckResult{
 		CheckedAt: time.Now().UTC(),
@@ -1946,6 +2109,106 @@ func TestAutoMergePRs_SequentialMergesOnlyFirst(t *testing.T) {
 	}
 	if (*merged)[0] != 10 {
 		t.Errorf("sequential should merge lowest PR number first; merged PR #%d, want #10", (*merged)[0])
+	}
+}
+
+func TestAutoMergePRs_SequentialSkipsOlderConflictAndMergesCleanPR(t *testing.T) {
+	prs := []github.PR{
+		{Number: 10, HeadRefName: "feat/conflicting"},
+		{Number: 20, HeadRefName: "feat/clean"},
+	}
+
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "sequential"}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghPRMergeStatusFn = func(prNumber int) (string, string, error) {
+		if prNumber == 10 {
+			return "CONFLICTING", "dirty", nil
+		}
+		return "MERGEABLE", "clean", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{20}) {
+		t.Fatalf("merged = %v, want clean PR #20; older conflicting PR must not consume the sequential merge slot", *merged)
+	}
+	if got := s.Sessions["slot-0"].Status; got != state.StatusPROpen {
+		t.Fatalf("conflicting canonical session status = %q, want pr_open for in-place repair", got)
+	}
+}
+
+func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "sequential",
+		ReviewGate:              "greptile",
+		AutoRetryReviewFeedback: true,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "P1 advisory finding on a head Greptile has approved", nil
+	}
+	s := makeTestState(prs)
+
+	o.autoMergePRs(s)
+
+	if !reflect.DeepEqual(*merged, []int{10}) {
+		t.Fatalf("merged = %v, want approved PR #10; successful gate is authoritative", *merged)
+	}
+	if got := s.Sessions["slot-0"].MaintenanceRetryCount; got != 0 {
+		t.Fatalf("maintenance retries = %d, want 0 after successful review gate", got)
+	}
+}
+
+func TestAutoMergePRs_GreptileThreeOfFiveEntersBoundedRepairWithFindings(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
+	cfg := &config.Config{
+		Repo:                    "owner/repo",
+		MergeStrategy:           "parallel",
+		ReviewGate:              "greptile",
+		ReviewGateStreams:       []string{"greptile"},
+		AutoRetryReviewFeedback: true,
+		MaxRetriesPerIssue:      3,
+		MaxRetryBackoffMs:       300000,
+	}
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	head := strings.Repeat("a", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Fingerprint: strings.Repeat("1", 16), Complete: true}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{
+			Passed: false,
+			Streams: []github.ReviewStreamVerdict{{
+				Name: "greptile", Score: 3, ScoreMax: 5, Verdict: "repair_required",
+				Findings: []github.ReviewComment{{Path: "internal/foo.go", Line: 42, Body: "P1: nil pointer panic", User: "greptile-apps[bot]"}},
+			}},
+		}, nil
+	}
+	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+		return "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic", nil
+	}
+	st := makeTestState(prs)
+	st.Sessions["slot-0"].Worktree = "/tmp/maestro-slot-0"
+
+	o.autoMergePRs(st)
+
+	if len(*merged) != 0 {
+		t.Fatalf("Greptile 3/5 must not merge: %v", *merged)
+	}
+	sess := st.Sessions["slot-0"]
+	if sess.Status != state.StatusDead || sess.MaintenanceRetryCount != 1 || sess.NextRetryAt == nil {
+		t.Fatalf("bounded review repair not scheduled: status=%q maintenance=%d next=%v", sess.Status, sess.MaintenanceRetryCount, sess.NextRetryAt)
+	}
+	if !strings.Contains(sess.PreviousAttemptFeedback, "internal/foo.go:42") {
+		t.Fatalf("repair context lost concrete finding: %q", sess.PreviousAttemptFeedback)
+	}
+	snapshot := mustLatestPRGateSnapshot(t, st, sess.IssueNumber, 10)
+	if snapshot.ReviewDecision != state.PRGateReviewBlocked || len(snapshot.ReviewStreams) != 1 || snapshot.ReviewStreams[0].Score != 3 {
+		t.Fatalf("Greptile 3/5 fact not persisted with blocked gate: %+v", snapshot)
 	}
 }
 
@@ -2683,9 +2946,9 @@ func TestAutoMergePRs_CIPendingAndMergeStateBlocked_DoesNotMerge(t *testing.T) {
 	}
 }
 
-// mergeable_state="unstable" — only non-required checks are failing, so
-// the PR is still safe to merge under the same #424 override.
-func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
+// mergeable_state="unstable" can coexist with failed check runs. It is not
+// authoritative green evidence and must never override the check rollup.
+func TestAutoMergePRs_CIPendingMergeStateUnstable_DoesNotMerge(t *testing.T) {
 	prs := []github.PR{{Number: 102, HeadRefName: "feat/unstable"}}
 
 	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", ReviewGate: "none"}
@@ -2717,8 +2980,8 @@ func TestAutoMergePRs_CIPendingMergeStateUnstable_Merges(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	if len(merged) != 1 || merged[0] != 102 {
-		t.Fatalf("merged = %v, want [102] (mergeable_state=unstable should still allow merge)", merged)
+	if len(merged) != 0 {
+		t.Fatalf("merged = %v, want [] (mergeable_state=unstable must not override pending/failed checks)", merged)
 	}
 }
 
@@ -2778,13 +3041,13 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		t.Errorf("merged PR #%d, want #20", merged[0])
 	}
 
-	// PR #10 should have been closed and session scheduled for retry
-	if len(closedPRs) != 1 || closedPRs[0] != 10 {
-		t.Errorf("closedPRs = %v, want [10]", closedPRs)
+	// PR #10 remains canonical while its same-session repair is scheduled.
+	if len(closedPRs) != 0 {
+		t.Errorf("closedPRs = %v, want none", closedPRs)
 	}
 	for _, sess := range s.Sessions {
-		if sess.PRNumber == 0 && sess.IssueNumber == 100 {
-			// This is the session for PR #10 (PR cleared after CI failure retry)
+		if sess.PRNumber == 10 && sess.IssueNumber == 100 {
+			// This is the session for PR #10 (identity retained for in-place retry).
 			if sess.Status != state.StatusDead {
 				t.Errorf("CI-failed session status = %q, want %q", sess.Status, state.StatusDead)
 			}
@@ -3004,6 +3267,95 @@ func TestCheckSessions_TokensBelowLimit_WorkerSurvives(t *testing.T) {
 	}
 	if len(*stopped) != 0 {
 		t.Fatalf("stopped = %v, want empty", *stopped)
+	}
+}
+
+func TestCheckSessions_CacheReadExcludedFromClaudeAndPiBudgets(t *testing.T) {
+	softThreshold := 0.8
+	tests := []struct {
+		name       string
+		backend    string
+		backendDef config.BackendDef
+		stream     string
+		writeJSONL bool
+	}{
+		{
+			name:       "claude",
+			backend:    "claude",
+			backendDef: config.BackendDef{Cmd: "claude", Provider: "anthropic", UsageStream: true},
+			// fin-26 shape: almost all observed provider tokens are cache
+			// replay on the second assistant turn. Inclusive telemetry is
+			// 200,506, while the uncached budget measure is only 77,030.
+			stream:     claudeResultFrame(10, 30, 76_990, 123_476, 0, "working"),
+			writeJSONL: true,
+		},
+		{
+			name:       "pi",
+			backend:    "pi",
+			backendDef: config.BackendDef{Cmd: "pi", Provider: "pi"},
+			stream:     `{"type":"turn_end","message":{"role":"assistant","provider":"anthropic","model":"claude-opus","usage":{"input":10,"output":30,"cacheRead":123476,"cacheWrite":76990,"totalTokens":200506,"cost":{"total":0}}}}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			cfg := &config.Config{
+				Repo:                     "owner/repo",
+				StateDir:                 dir,
+				WorkerMaxTokens:          160_000,
+				WorkerSoftTokenThreshold: &softThreshold,
+				MaxRuntimeMinutes:        999,
+				Model: config.ModelConfig{
+					Default:  tt.backend,
+					Backends: map[string]config.BackendDef{tt.backend: tt.backendDef},
+				},
+			}
+			tmuxOutput := tt.stream
+			if tt.writeJSONL {
+				tmuxOutput = "working"
+			}
+			o, stopped := newCheckSessionsOrchestrator(cfg, tmuxOutput)
+			checkpointed := 0
+			o.saveCheckpointFn = func(*state.Session) (string, error) {
+				checkpointed++
+				return "/tmp/CHECKPOINT.md", nil
+			}
+
+			logFile := filepath.Join(dir, "slot.log")
+			if tt.writeJSONL {
+				if err := os.WriteFile(worker.JSONLPathForLog(logFile), []byte(tt.stream), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := state.NewState()
+			s.Sessions["slot"] = &state.Session{
+				IssueNumber: 64,
+				Status:      state.StatusRunning,
+				PID:         1234,
+				TmuxSession: "maestro-slot",
+				Branch:      "feat/slot-64-budget",
+				Backend:     tt.backend,
+				LogFile:     logFile,
+				StartedAt:   time.Now().Add(-time.Minute),
+			}
+
+			o.checkSessions(s)
+
+			sess := s.Sessions["slot"]
+			if sess.Status != state.StatusRunning {
+				t.Fatalf("status = %q, want running; inclusive cache telemetry must not kill the worker", sess.Status)
+			}
+			if sess.TokensUsedAttempt != 200_506 || sess.TokensUsedTotal != 200_506 {
+				t.Fatalf("inclusive telemetry = %d/%d, want 200506/200506", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+			}
+			if sess.TokenBudgetTokensAttempt != 77_030 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+				t.Fatalf("budget observation = %d %q, want 77030 %q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+			}
+			if checkpointed != 0 || len(*stopped) != 0 {
+				t.Fatalf("cache replay triggered checkpoint/stop: checkpointed=%d stopped=%v", checkpointed, *stopped)
+			}
+		})
 	}
 }
 
@@ -3250,6 +3602,7 @@ func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) 
 		Backend:        "claude",
 		TokensObserved: 85_000,
 		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
 		MeasuredAt:     time.Now().UTC(),
 	}
 	data, err := json.Marshal(marker)
@@ -3290,8 +3643,61 @@ func TestReconcileRunningSessions_TokenBudgetMarkerPreemptsOpenPR(t *testing.T) 
 	if sess.PRNumber != 0 || sess.NextRetryAt != nil || sess.PID != 0 {
 		t.Fatalf("budget stop was reclassified as PR/retry/running: %+v", sess)
 	}
-	if sess.TokensUsedAttempt != 85_000 || sess.TokensUsedTotal != 85_000 {
-		t.Fatalf("tokens = %d/%d, want 85000/85000", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+	if sess.TokenBudgetTokensAttempt != 85_000 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("budget observation = %d %q, want 85000 %q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
+	if sess.TokensUsedAttempt != 0 || sess.TokensUsedTotal != 0 {
+		t.Fatalf("uncached marker polluted inclusive telemetry: attempt=%d total=%d", sess.TokensUsedAttempt, sess.TokensUsedTotal)
+	}
+}
+
+func TestCheckSessions_StaleTokenBudgetMarkerDoesNotTerminateReplacement(t *testing.T) {
+	dir := t.TempDir()
+	logFile := filepath.Join(dir, "sup-906.log")
+	startedAt := time.Now().UTC()
+	marker := worker.TokenBudgetMarker{
+		Outcome:        worker.TokenBudgetExceededOutcome,
+		Backend:        "claude",
+		TokensObserved: 85_000,
+		MaxTokens:      80_000,
+		Measure:        worker.TokenBudgetMeasureUncached,
+		MeasuredAt:     startedAt.Add(-time.Minute),
+	}
+	data, err := json.Marshal(marker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.TokenBudgetMarkerPathForLog(logFile), data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	o, stopped := newCheckSessionsOrchestrator(&config.Config{
+		Repo:              "owner/repo",
+		StateDir:          dir,
+		WorkerMaxTokens:   80_000,
+		MaxRuntimeMinutes: 999,
+	}, "replacement still working")
+	s := state.NewState()
+	s.Sessions["sup-906"] = &state.Session{
+		IssueNumber:      906,
+		Status:           state.StatusRunning,
+		PID:              1234,
+		TmuxSession:      "maestro-sup-906",
+		Branch:           "feat/sup-906",
+		LogFile:          logFile,
+		Backend:          "claude",
+		WorkerGeneration: 2,
+		StartedAt:        startedAt,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["sup-906"]
+	if sess.Status != state.StatusRunning || sess.WorkerOutcome != "" {
+		t.Fatalf("replacement = status %q outcome %q, want running with no terminal outcome", sess.Status, sess.WorkerOutcome)
+	}
+	if sess.TokenBudgetTokensAttempt != 0 || len(*stopped) != 0 {
+		t.Fatalf("stale marker affected replacement: budget=%d stopped=%v", sess.TokenBudgetTokensAttempt, *stopped)
 	}
 }
 
@@ -3981,6 +4387,46 @@ func TestRebaseConflicts_OpenPRBehindMainUpdatesUnderMaintenance(t *testing.T) {
 	}
 }
 
+func TestRebaseConflicts_SharedPRMutatesOnlyNewestContinuation(t *testing.T) {
+	updateCalled := 0
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			return prs, nil
+		},
+		ghPRMergeStatusFn: func(prNumber int) (string, string, error) {
+			return "MERGEABLE", "behind", nil
+		},
+		ghUpdateBranchFn: func(prNumber int) error {
+			updateCalled++
+			return nil
+		},
+	}
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC),
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.rebaseConflicts(s)
+
+	if updateCalled != 1 {
+		t.Fatalf("updateBranch called %d times, want exactly one canonical update", updateCalled)
+	}
+	if got := s.Sessions["ok-player-273"].Status; got != state.StatusPROpen {
+		t.Fatalf("historical session status = %q, want untouched pr_open", got)
+	}
+	if got := s.Sessions["ok-player-302"].Status; got != state.StatusQueued {
+		t.Fatalf("canonical continuation status = %q, want queued after update", got)
+	}
+}
+
 // #602 — When the merge fails with a non-"not up to date" error AND GitHub
 // reports MERGEABLE (so it's not actually a conflict), fall through to the
 // existing single-notification merge_failed path instead of mis-routing.
@@ -4629,11 +5075,11 @@ func TestStartNewWorkers_SkipsClosedIssueWithDoneSession(t *testing.T) {
 	}
 }
 
-func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
+func TestStartNewWorkers_RepairSpawnCannotBypassExcludedLabel(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude")
-	cfg.ExcludeLabels = []string{"blocked"}
+	cfg.ExcludeLabels = []string{"needs-maintenance-triage"}
 	cfg.Supervisor.ReviewRepair.MaxRetries = 1
-	issues := []github.Issue{makeIssue(669, "repair open PR", "blocked")}
+	issues := []github.Issue{makeIssue(669, "repair open PR", "needs-maintenance-triage")}
 
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
 	s := state.NewState()
@@ -4659,12 +5105,11 @@ func TestStartNewWorkers_RepairSpawnBypassesExcludedLabel(t *testing.T) {
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 669 {
-		t.Fatalf("started = %v, want [669] for supervisor-selected maintenance despite excluded label", *started)
+	if len(*started) != 0 {
+		t.Fatalf("started = %v, want no worker: current blocked label outranks delayed repair intent", *started)
 	}
-	track, ok := s.LookupReviewRepairTrack(1001, "deadbeef")
-	if !ok || track.Attempts != 1 {
-		t.Fatalf("review repair track = %+v, ok=%v; want one maintenance attempt", track, ok)
+	if track, ok := s.LookupReviewRepairTrack(1001, "deadbeef"); ok || track.Attempts != 0 {
+		t.Fatalf("review repair track = %+v, ok=%v; blocked dispatch must not consume an attempt", track, ok)
 	}
 }
 
@@ -4946,12 +5391,20 @@ func TestStartNewWorkers_WithoutPipelineFullLabelKeepsSingleSession(t *testing.T
 	}
 }
 
-func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testing.T) {
+func TestStartNewWorkers_SupervisorRepairSpawnRepairsReservedSessionInPlace(t *testing.T) {
 	cfg := cfgWithBackends("codex", "codex")
 	issues := []github.Issue{makeIssue(767, "repair stale PR")}
 	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 769)
 	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
 		return issueNumber == 767, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
 	}
 
 	s := state.NewState()
@@ -4961,6 +5414,8 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 		Status:      state.StatusPROpen,
 		PRNumber:    769,
 		Branch:      "codex/old-pr",
+		Worktree:    "/work/pan-12",
+		Backend:     "codex",
 	}
 	s.RecordSupervisorDecision(state.SupervisorDecision{
 		ID:                "sup-repair",
@@ -4973,8 +5428,131 @@ func TestStartNewWorkers_SupervisorRepairSpawnBypassesInProgressSession(t *testi
 
 	o.startNewWorkers(s, 1)
 
-	if len(*started) != 1 || (*started)[0] != 767 {
-		t.Fatalf("started = %v, want [767] for supervisor-selected repair", *started)
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want none for same-session repair", *started)
+	}
+	if respawned != "pan-12" {
+		t.Fatalf("respawned = %q, want reserved session pan-12", respawned)
+	}
+	if len(s.Sessions) != 1 || s.Sessions["pan-12"].Status != state.StatusRunning {
+		t.Fatalf("sessions = %+v, want only pan-12 running", s.Sessions)
+	}
+}
+
+func TestStartNewWorkers_ApprovedRepairIgnoresOlderDoneTerminalClaim(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.WorktreeBase = t.TempDir()
+	restoredWorktree := filepath.Join(cfg.WorktreeBase, "sup-360")
+	if err := os.MkdirAll(restoredWorktree, 0o755); err != nil {
+		t.Fatalf("mkdir restored worktree: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(restoredWorktree, ".git"), []byte("gitdir: test\n"), 0o644); err != nil {
+		t.Fatalf("write restored worktree metadata: %v", err)
+	}
+	issues := []github.Issue{makeIssue(887, "finish watchdog recovery")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	authorizeCurrentFailedRepairGate(o, 914)
+	o.hasOpenPRForIssueFn = func(issueNumber int) (bool, error) {
+		return issueNumber == 887, nil
+	}
+	respawned := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		respawned = slotName
+		sess.Status = state.StatusRunning
+		sess.PID = 5555
+		return nil
+	}
+
+	oldFinished := time.Date(2026, 7, 14, 18, 59, 0, 0, time.UTC)
+	s := state.NewState()
+	s.Sessions["sup-318"] = &state.Session{
+		IssueNumber: 887,
+		Status:      state.StatusDone,
+		PRNumber:    893,
+		StartedAt:   oldFinished.Add(-time.Hour),
+		FinishedAt:  &oldFinished,
+	}
+	s.Sessions["sup-360"] = &state.Session{
+		IssueNumber: 887,
+		IssueTitle:  "finish watchdog recovery",
+		Status:      state.StatusRetryExhausted,
+		PRNumber:    914,
+		Branch:      "feat/sup-360-887-watchdog-recovery",
+		Backend:     "codex",
+		// Cleanup/import can lose the attempt timestamp. Canonical PR identity,
+		// not an optional timestamp, orders an older completed PR claim.
+		StartedAt: time.Time{},
+	}
+	repair := repairApproval("repair-newer-pr", 887, 914, state.ApprovalStatusPending, oldFinished.Add(24*time.Hour))
+	repair.Target.Session = "sup-360"
+	s.Approvals = []state.Approval{repair}
+	if _, err := s.ApproveApproval("repair-newer-pr", oldFinished.Add(25*time.Hour), "operator", "approve exact repair"); err != nil {
+		t.Fatalf("approve repair: %v", err)
+	}
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want exact in-place repair", *started)
+	}
+	if respawned != "sup-360" {
+		t.Fatalf("respawned = %q, want sup-360", respawned)
+	}
+	if got := s.Sessions["sup-318"].Status; got != state.StatusDone {
+		t.Fatalf("older terminal session status = %q, want done", got)
+	}
+	if got := s.Sessions["sup-360"].Worktree; got != restoredWorktree {
+		t.Fatalf("restored worktree = %q, want %q", got, restoredWorktree)
+	}
+	if got := approvalStatus(t, s, "repair-newer-pr"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
+	}
+	if len(s.Sessions) != 2 {
+		t.Fatalf("sessions = %d, want no new session", len(s.Sessions))
+	}
+}
+
+func TestStartNewWorkers_SupervisorRepairSpawnHonorsCurrentModelLabelInPlace(t *testing.T) {
+	cfg := cfgWithBackends("codex", "codex", "sol")
+	issues := []github.Issue{makeIssue(345, "resume retained packaging work", "model:sol")}
+	o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return false, nil }
+	gotBackend := ""
+	o.respawnInPlaceFn = func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+		gotBackend = backend
+		sess.Status = state.StatusRunning
+		sess.Backend = backend
+		return nil
+	}
+
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345,
+		IssueTitle:  "resume retained packaging work",
+		Status:      state.StatusDead,
+		Worktree:    "/work/ok-player-273",
+		Branch:      "feat/ok-player-273-345",
+		Backend:     "codex",
+	}
+	s.RecordSupervisorDecision(state.SupervisorDecision{
+		ID:                "sup-repair-label",
+		CreatedAt:         time.Now().UTC(),
+		RecommendedAction: supervisor.ActionSpawnRepairWorker,
+		Risk:              supervisor.RiskMutating,
+		RequiresApproval:  false,
+		Target:            &state.SupervisorTarget{Issue: 345, Session: "ok-player-273"},
+	}, state.DefaultSupervisorDecisionLimit)
+
+	o.startNewWorkers(s, 1)
+
+	if len(*started) != 0 {
+		t.Fatalf("fresh starts = %v, want retained-session repair", *started)
+	}
+	if gotBackend != "sol" {
+		t.Fatalf("repair backend = %q, want current explicit label backend sol", gotBackend)
+	}
+	if got := s.Sessions["ok-player-273"].Backend; got != "sol" {
+		t.Fatalf("session backend = %q, want sol", got)
 	}
 }
 
@@ -5560,8 +6138,13 @@ func TestCheckSessions_FailedClosedIssue_TransitionsToDone(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(t *testing.T) {
+func TestCheckSessions_ClosedNoDeliveryIssueBecomesDoneWhenProjectOutcomeFails(t *testing.T) {
 	now := time.Now().UTC()
+	worktree := t.TempDir()
+	preserved := filepath.Join(worktree, "preserved.txt")
+	if err := os.WriteFile(preserved, []byte("completed work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
 	o := &Orchestrator{
 		cfg: &config.Config{
 			Repo:              "owner/repo",
@@ -5579,8 +6162,17 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 		isIssueClosedFn: func(issueNumber int) (bool, error) {
 			return true, nil
 		},
+		mergedPRForBranchFn: func(branch string) (int, error) {
+			return 0, nil
+		},
+		mergedPRForIssueFn: func(issueNumber int) (int, error) {
+			// A prior lifecycle of this issue shipped PR #77 before the issue was
+			// reopened. That historical issue-level link must not be attributed to
+			// this later no-delivery session.
+			return 77, nil
+		},
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
-			t.Fatalf("workerStopFn should not run before outcome verification passes")
+			t.Fatalf("terminal reconciliation must preserve the retained worktree; workerStopFn must not run")
 			return nil
 		},
 	}
@@ -5594,17 +6186,71 @@ func TestCheckSessions_ClosedIssueDoesNotBecomeDoneWhenOutcomePassRequiredFails(
 	}
 	s.Sessions["pan-10"] = &state.Session{
 		IssueNumber: 100,
-		IssueTitle:  "failed worker",
-		Status:      state.StatusFailed,
-		Branch:      "feat/pan-10-100-failed",
+		IssueTitle:  "dead worker",
+		Status:      state.StatusDead,
+		Branch:      "feat/pan-10-100-dead",
+		Worktree:    worktree,
 		FinishedAt:  &now,
 	}
 
 	o.checkSessions(s)
 
 	sess := s.Sessions["pan-10"]
-	if sess.Status != state.StatusFailed {
-		t.Fatalf("status = %q, want %q until live verification passes", sess.Status, state.StatusFailed)
+	if sess.Status != state.StatusDone {
+		t.Fatalf("status = %q, want %q: no merged revision is owned by this closed issue", sess.Status, state.StatusDone)
+	}
+	if sess.Branch != "feat/pan-10-100-dead" {
+		t.Fatalf("branch = %q, want retained branch unchanged", sess.Branch)
+	}
+	if sess.Worktree != worktree {
+		t.Fatalf("worktree = %q, want retained %q", sess.Worktree, worktree)
+	}
+	if _, err := os.Stat(preserved); err != nil {
+		t.Fatalf("retained work disappeared: %v", err)
+	}
+}
+
+func TestCheckSessions_ClosedMergedIssueBecomesDoneWhileProjectOutcomeFails(t *testing.T) {
+	now := time.Now().UTC()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			Repo:              "owner/repo",
+			MaxRuntimeMinutes: 120,
+			Outcome: outcome.Brief{
+				DesiredOutcome:      "Live app works",
+				VerifierCommand:     "check-live",
+				PassRequiredForDone: boolPtr(true),
+			},
+		},
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return true, nil },
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 77, nil },
+	}
+
+	s := state.NewState()
+	s.OutcomeHealth = &outcome.HealthCheckResult{
+		CheckedAt: now,
+		State:     outcome.HealthFailing,
+		Signal:    "verifier_command",
+		Summary:   "live verifier failed",
+	}
+	s.Sessions["pan-10"] = &state.Session{
+		IssueNumber:        100,
+		IssueTitle:         "merged worker",
+		Status:             state.StatusFailed,
+		LastClosedPRNumber: 77,
+		FinishedAt:         &now,
+	}
+
+	o.checkSessions(s)
+
+	sess := s.Sessions["pan-10"]
+	if sess.Status != state.StatusDone || sess.PRNumber != 77 || sess.IssueClosedAt == nil {
+		t.Fatalf("session = status %q PR #%d closed_at=%v, want terminal done with merged PR #77 retained", sess.Status, sess.PRNumber, sess.IssueClosedAt)
+	}
+	if s.OutcomeHealth == nil || s.OutcomeHealth.State != outcome.HealthFailing {
+		t.Fatalf("project outcome = %+v, want independently failing outcome retained", s.OutcomeHealth)
 	}
 }
 
@@ -6662,7 +7308,7 @@ func TestCheckSessions_NoRateLimit_NormalRetry(t *testing.T) {
 	}
 }
 
-func TestCheckSessions_RateLimitNoFallbackConfigured_UsesDefaultFallback(t *testing.T) {
+func TestCheckSessions_RateLimitNoFallbackConfigured_DoesNotUseBackendMapOrder(t *testing.T) {
 	cfg := cfgWithBackends("claude", "claude", "codex")
 	// No fallback_backends configured
 	cfg.MaxRuntimeMinutes = 999
@@ -6685,14 +7331,14 @@ func TestCheckSessions_RateLimitNoFallbackConfigured_UsesDefaultFallback(t *test
 	o.checkSessions(s)
 
 	sess2 := s.Sessions["mae-1"]
-	if sess2.Status != state.StatusRunning {
-		t.Fatalf("status = %q, want running after default fallback", sess2.Status)
+	if sess2.Status != state.StatusDead {
+		t.Fatalf("status = %q, want dead with no configured fallback", sess2.Status)
 	}
-	if sess2.Backend != "codex" {
-		t.Fatalf("backend = %q, want codex", sess2.Backend)
+	if sess2.Backend != "claude" {
+		t.Fatalf("backend = %q, want unchanged claude", sess2.Backend)
 	}
-	if len(*respawned) != 1 || (*respawned)[0] != "codex" {
-		t.Fatalf("respawned = %v, want [codex]", *respawned)
+	if len(*respawned) != 0 {
+		t.Fatalf("respawned = %v, want none", *respawned)
 	}
 	if sess2.RetryCount != 0 {
 		t.Fatalf("retry_count = %d, want 0", sess2.RetryCount)
@@ -7093,6 +7739,7 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	cfg := &config.Config{
 		Repo:               "owner/repo",
 		MaxParallel:        5,
+		MaxLiveWorkers:     1,
 		MaxRuntimeMinutes:  120,
 		MaxRetriesPerIssue: 3,
 		Model: config.ModelConfig{
@@ -7110,6 +7757,7 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	newCfg := &config.Config{
 		Repo:               "owner/repo",
 		MaxParallel:        10,
+		MaxLiveWorkers:     3,
 		MaxRuntimeMinutes:  60,
 		MaxRetriesPerIssue: 5,
 		Model: config.ModelConfig{
@@ -7125,11 +7773,167 @@ func TestReloadConfig_AppliesReloadableFields(t *testing.T) {
 	if o.cfg.MaxParallel != 10 {
 		t.Errorf("MaxParallel = %d, want 10", o.cfg.MaxParallel)
 	}
+	if o.cfg.MaxLiveWorkers != 3 {
+		t.Errorf("MaxLiveWorkers = %d, want 3", o.cfg.MaxLiveWorkers)
+	}
 	if o.cfg.MaxRuntimeMinutes != 60 {
 		t.Errorf("MaxRuntimeMinutes = %d, want 60", o.cfg.MaxRuntimeMinutes)
 	}
 	if o.cfg.MaxRetriesPerIssue != 5 {
 		t.Errorf("MaxRetriesPerIssue = %d, want 5", o.cfg.MaxRetriesPerIssue)
+	}
+}
+
+func TestDispatchCapacityConfigEqualIncludesEveryCapacityInput(t *testing.T) {
+	base := &config.Config{
+		MaxParallel:          4,
+		MaxLiveWorkers:       2,
+		MaxConcurrentByState: map[string]int{"running": 3},
+	}
+	tests := []struct {
+		name   string
+		mutate func(*config.Config)
+	}{
+		{name: "max_parallel", mutate: func(c *config.Config) { c.MaxParallel++ }},
+		{name: "max_live_workers", mutate: func(c *config.Config) { c.MaxLiveWorkers++ }},
+		{name: "max_concurrent_by_state", mutate: func(c *config.Config) {
+			c.MaxConcurrentByState = map[string]int{"running": 4}
+		}},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			changed := *base
+			changed.MaxConcurrentByState = map[string]int{"running": 3}
+			tt.mutate(&changed)
+			if dispatchCapacityConfigEqual(base, &changed) {
+				t.Fatalf("dispatch capacity configs compare equal after %s changed", tt.name)
+			}
+		})
+	}
+
+	nonCapacity := *base
+	nonCapacity.MaxRuntimeMinutes = 90
+	if !dispatchCapacityConfigEqual(base, &nonCapacity) {
+		t.Fatal("non-capacity config change affected capacity equality")
+	}
+	emptyMap := *base
+	emptyMap.MaxConcurrentByState = map[string]int{}
+	nilMap := emptyMap
+	nilMap.MaxConcurrentByState = nil
+	if !dispatchCapacityConfigEqual(&emptyMap, &nilMap) {
+		t.Fatal("nil and empty per-state limits should be capacity-equivalent")
+	}
+}
+
+func TestReloadConfig_MaxLiveWorkersIncreaseExpandsCapacity(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 3
+	cfg.MaxLiveWorkers = 1
+	o, started, _ := newStartWorkersOrchestrator(cfg, []github.Issue{
+		makeIssue(901, "first ready issue"),
+		makeIssue(902, "second ready issue"),
+		makeIssue(903, "third ready issue"),
+	})
+
+	s := state.NewState()
+	s.Sessions["existing"] = &state.Session{IssueNumber: 900, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 0 {
+		t.Fatalf("initial available slots = %d, want 0 at max_live_workers=1", got)
+	}
+
+	newCfg := *cfg
+	newCfg.MaxLiveWorkers = 3
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	slots := s.Capacity(capacityInput(o.cfg)).AvailableSlots
+	if slots != 2 {
+		t.Fatalf("available slots after reload = %d, want 2", slots)
+	}
+	o.startNewWorkers(s, slots)
+	if len(*started) != 2 {
+		t.Fatalf("started workers after reload = %v, want two new workers", *started)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).LiveWorkers; got != 3 {
+		t.Fatalf("live workers after dispatch = %d, want 3", got)
+	}
+}
+
+func TestReloadConfig_MaxLiveWorkersDecreaseStopsNewDispatch(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 3
+	cfg.MaxLiveWorkers = 3
+	o, started, _ := newStartWorkersOrchestrator(cfg, []github.Issue{
+		makeIssue(904, "ready after downshift"),
+		makeIssue(905, "another ready after downshift"),
+	})
+
+	s := state.NewState()
+	s.Sessions["one"] = &state.Session{IssueNumber: 901, Status: state.StatusRunning}
+	s.Sessions["two"] = &state.Session{IssueNumber: 902, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 1 {
+		t.Fatalf("initial available slots = %d, want 1 at max_live_workers=3", got)
+	}
+
+	newCfg := *cfg
+	newCfg.MaxLiveWorkers = 1
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	slots := s.Capacity(capacityInput(o.cfg)).AvailableSlots
+	if slots != 0 {
+		t.Fatalf("available slots after downshift = %d, want 0", slots)
+	}
+	o.startNewWorkers(s, 2)
+	if len(*started) != 0 {
+		t.Fatalf("started workers after downshift = %v, want none beyond lowered limit", *started)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).LiveWorkers; got != 2 {
+		t.Fatalf("live workers after blocked dispatch = %d, want existing workers only", got)
+	}
+}
+
+func TestReloadConfig_AppliesEveryDispatchCapacityField(t *testing.T) {
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.MaxParallel = 4
+	cfg.MaxLiveWorkers = 0
+	cfg.MaxConcurrentByState = map[string]int{"running": 1}
+	o := &Orchestrator{
+		cfg:      cfg,
+		repo:     cfg.Repo,
+		notifier: notify.NewWithToken("", "", "", ""),
+		router:   router.New(cfg),
+	}
+
+	s := state.NewState()
+	s.Sessions["existing"] = &state.Session{IssueNumber: 900, Status: state.StatusRunning}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 0 {
+		t.Fatalf("initial available slots = %d, want 0 at running limit 1", got)
+	}
+
+	// max_concurrent_by_state is the third input to the shared dispatch-capacity
+	// calculation. A reload comparison that enumerates only the two scalar limits
+	// leaves the orchestrator stale even though Fleet reads the new store config.
+	newCfg := *cfg
+	newCfg.MaxConcurrentByState = map[string]int{"running": 3}
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	if got := o.cfg.MaxConcurrentByState["running"]; got != 3 {
+		t.Fatalf("reloaded running limit = %d, want 3", got)
+	}
+	if got := s.Capacity(capacityInput(o.cfg)).AvailableSlots; got != 2 {
+		t.Fatalf("available slots after reload = %d, want 2", got)
+	}
+
+	// The orchestrator owns a private config snapshot. A caller mutating the
+	// reload object later must not silently change live dispatch capacity.
+	newCfg.MaxConcurrentByState["running"] = 9
+	if got := o.cfg.MaxConcurrentByState["running"]; got != 3 {
+		t.Fatalf("live running limit aliased reload input: got %d, want 3", got)
 	}
 }
 
@@ -7617,6 +8421,56 @@ func TestRespawnDueRetries_WithOpenPRRespawnsInPlace(t *testing.T) {
 	}
 	if s.Sessions["mae-12"].PreviousAttemptFeedback != "" {
 		t.Fatal("PreviousAttemptFeedback should be consumed before respawn")
+	}
+}
+
+func TestRespawnDueRetries_StalledProgressResumesExactWorktreeInPlace(t *testing.T) {
+	cfg := &config.Config{
+		Repo:              "owner/repo",
+		MaxRetryBackoffMs: 300000,
+		MaxRuntimeMinutes: 999,
+	}
+	respawnedFresh := false
+	respawnedInPlace := false
+	o := &Orchestrator{
+		cfg:        cfg,
+		notifier:   &notify.Notifier{},
+		promptBase: "test prompt",
+		getIssueFn: func(number int) (github.Issue, error) {
+			return makeIssue(number, "test issue"), nil
+		},
+		respawnWorkerFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedFresh = true
+			return nil
+		},
+		respawnInPlaceFn: func(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backend string) error {
+			respawnedInPlace = true
+			sess.Status = state.StatusRunning
+			sess.PID = 5555
+			return nil
+		},
+	}
+
+	pastTime := time.Now().UTC().Add(-time.Second)
+	s := state.NewState()
+	s.Sessions["mae-12"] = &state.Session{
+		IssueNumber: 112,
+		IssueTitle:  "test issue",
+		Status:      state.StatusDead,
+		RetryCount:  1,
+		NextRetryAt: &pastTime,
+		RetryReason: state.RetryReasonStalledProgress,
+		Branch:      "feat/mae-12-112-test",
+		Worktree:    "/tmp/maestro-mae-12",
+	}
+
+	o.respawnDueRetries(s, 1)
+
+	if !respawnedInPlace || respawnedFresh {
+		t.Fatalf("stalled-progress respawn: in_place=%t fresh=%t", respawnedInPlace, respawnedFresh)
+	}
+	if s.Sessions["mae-12"].Worktree != "/tmp/maestro-mae-12" {
+		t.Fatalf("stalled-progress retry changed worktree: %+v", s.Sessions["mae-12"])
 	}
 }
 
@@ -8226,6 +9080,7 @@ func TestDeferProjectBoardSweepDelaysOnlyBroadSweep(t *testing.T) {
 func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 	soon := time.Now().UTC().Add(30 * time.Second)
 	deployed := time.Now().UTC()
+	closed := time.Now().UTC().Add(-time.Minute)
 
 	tests := []struct {
 		name           string
@@ -8242,6 +9097,8 @@ func TestProjectStatusForSession_MirrorsRuntime(t *testing.T) {
 		{name: "code_landed -> deploying when deploy required", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10}, requiresDeploy: true, want: github.ProjectStatusDeploying, wantOK: true},
 		{name: "code_landed -> live_verification after deploy succeeds", sess: &state.Session{IssueNumber: 4, Status: state.StatusCodeLanded, PRNumber: 10, DeploymentFinishedAt: &deployed}, requiresDeploy: true, want: github.ProjectStatusLiveVerify, wantOK: true},
 		{name: "done -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone}, want: github.ProjectStatusDone, wantOK: true},
+		{name: "done+released open -> todo", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone, ReleasedForRedispatch: true}, want: github.ProjectStatusTodo, wantOK: true},
+		{name: "done+released closed -> done", sess: &state.Session{IssueNumber: 5, Status: state.StatusDone, ReleasedForRedispatch: true, IssueClosedAt: &closed}, want: github.ProjectStatusDone, wantOK: true},
 		{name: "retry_exhausted -> blocked", sess: &state.Session{IssueNumber: 6, Status: state.StatusRetryExhausted}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "conflict_failed -> blocked", sess: &state.Session{IssueNumber: 7, Status: state.StatusConflictFailed}, want: github.ProjectStatusBlocked, wantOK: true},
 		{name: "failed -> blocked", sess: &state.Session{IssueNumber: 8, Status: state.StatusFailed}, want: github.ProjectStatusBlocked, wantOK: true},
@@ -8331,7 +9188,7 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 	}, &merged, &closedPRs
 }
 
-func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_KeepsCanonicalPRAndSchedulesInPlaceRetry(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8346,9 +9203,9 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 		t.Fatalf("expected 0 merges, got %d", len(*merged))
 	}
 
-	// Should close the PR
-	if len(*closedPRs) != 1 || (*closedPRs)[0] != 10 {
-		t.Fatalf("closedPRs = %v, want [10]", *closedPRs)
+	// A failed check must not destroy canonical PR identity.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none for in-place retry", *closedPRs)
 	}
 
 	// Session should be dead with NextRetryAt scheduled
@@ -8362,8 +9219,8 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.RetryCount != 1 {
 		t.Fatalf("RetryCount = %d, want 1", sess.RetryCount)
 	}
-	if sess.PRNumber != 0 {
-		t.Fatalf("PRNumber = %d, want 0 (cleared after PR close)", sess.PRNumber)
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want 10 (same PR retained)", sess.PRNumber)
 	}
 	if sess.CIFailureOutput == "" {
 		t.Fatal("CIFailureOutput should be set")
@@ -8371,8 +9228,61 @@ func TestAutoMergePRs_CIFailure_ClosesPRAndSchedulesRetry(t *testing.T) {
 	if sess.FinishedAt == nil {
 		t.Fatal("FinishedAt should be set")
 	}
-	if sess.Worktree != "" {
-		t.Fatalf("Worktree = %q, want empty (cleaned up)", sess.Worktree)
+}
+
+func TestAutoMergePRs_SharedPRFailureMutatesOnlyNewestContinuation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	historical := s.Sessions["ok-player-273"]
+	if historical.Status != state.StatusPROpen || historical.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated by shared PR failure: %+v", historical)
+	}
+	canonical := s.Sessions["ok-player-302"]
+	if canonical.Status != state.StatusDead || canonical.NextRetryAt == nil || canonical.RetryCount != 1 {
+		t.Fatalf("canonical continuation = %+v, want one scheduled in-place retry", canonical)
+	}
+	if canonical.PRNumber != 388 || len(*closedPRs) != 0 {
+		t.Fatalf("canonical identity changed: pr=%d closed=%v", canonical.PRNumber, *closedPRs)
+	}
+}
+
+func TestAutoMergePRs_SharedPRLiveContinuationBlocksHistoricalGateMutation(t *testing.T) {
+	prs := []github.PR{{Number: 388, HeadRefName: "feat/shared-pr"}}
+	cfg := &config.Config{Repo: "owner/repo", MergeStrategy: "parallel", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000}
+	o, _, closedPRs := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{388: "failure"})
+	s := state.NewState()
+	s.Sessions["ok-player-273"] = &state.Session{
+		IssueNumber: 345, Status: state.StatusPROpen, PRNumber: 388, Branch: "feat/shared-pr",
+		StartedAt: time.Date(2026, 7, 17, 23, 6, 0, 0, time.UTC), RetryCount: 3,
+	}
+	s.Sessions["ok-player-302"] = &state.Session{
+		IssueNumber: 406, Status: state.StatusRunning, PRNumber: 388, Branch: "feat/shared-pr", PID: 12345,
+		StartedAt: time.Date(2026, 7, 18, 4, 57, 43, 0, time.UTC),
+	}
+
+	o.autoMergePRs(s)
+
+	if got := s.Sessions["ok-player-273"]; got.Status != state.StatusPROpen || got.LastNotifiedStatus != "" {
+		t.Fatalf("historical session mutated while canonical repair is live: %+v", got)
+	}
+	if got := s.Sessions["ok-player-302"]; got.Status != state.StatusRunning || got.RetryCount != 0 {
+		t.Fatalf("live canonical continuation mutated by merge flow: %+v", got)
+	}
+	if len(*closedPRs) != 0 {
+		t.Fatalf("shared PR closed while canonical repair is live: %v", *closedPRs)
 	}
 }
 
@@ -8449,9 +9359,9 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// Should close the PR and schedule retry
-	if len(*closedPRs) != 1 {
-		t.Fatalf("closedPRs = %v, want 1 PR closed (unlimited retries)", *closedPRs)
+	// Should preserve the PR and schedule an in-place retry.
+	if len(*closedPRs) != 0 {
+		t.Fatalf("closedPRs = %v, want none (unlimited in-place retries)", *closedPRs)
 	}
 	sess := s.Sessions["slot-0"]
 	if sess.Status != state.StatusDead {
@@ -8462,7 +9372,7 @@ func TestAutoMergePRs_CIFailure_UnlimitedRetries(t *testing.T) {
 	}
 }
 
-func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
+func TestAutoMergePRs_CIFailure_DoesNotDependOnClosePR(t *testing.T) {
 	prs := []github.PR{
 		{Number: 10, HeadRefName: "feat/a"},
 	}
@@ -8502,13 +9412,16 @@ func TestAutoMergePRs_CIFailure_ClosePRFails_NoRetry(t *testing.T) {
 
 	o.autoMergePRs(s)
 
-	// When closePR fails, session should stay in pr_open (no retry scheduled)
+	// closePR is deliberately absent; the in-place retry must still schedule.
 	sess := s.Sessions["slot-0"]
-	if sess.Status != state.StatusPROpen {
-		t.Fatalf("status = %q, want %q (closePR failed, no retry)", sess.Status, state.StatusPROpen)
+	if sess.Status != state.StatusDead {
+		t.Fatalf("status = %q, want %q (closePR is not part of retry)", sess.Status, state.StatusDead)
 	}
-	if sess.NextRetryAt != nil {
-		t.Fatal("NextRetryAt should be nil when closePR fails")
+	if sess.NextRetryAt == nil {
+		t.Fatal("NextRetryAt should be set without closing the PR")
+	}
+	if sess.PRNumber != 10 {
+		t.Fatalf("PRNumber = %d, want canonical PR 10 retained", sess.PRNumber)
 	}
 }
 
@@ -8788,6 +9701,7 @@ func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
 			respawnedInPlace = append(respawnedInPlace, slotName)
 			sess.Status = state.StatusRunning
 			sess.TokensUsedAttempt = 0
+			sess.TokenBudgetTokensAttempt = 0
 			return nil
 		},
 	}
@@ -8817,6 +9731,9 @@ func TestCheckSessions_SoftThreshold_CheckpointAndRespawn(t *testing.T) {
 	}
 	if len(respawnedInPlace) != 1 || respawnedInPlace[0] != "mae-1" {
 		t.Fatalf("respawnedInPlace = %v, want [mae-1]", respawnedInPlace)
+	}
+	if sess.WorkerOutcome != "" || sess.UnexpectedExitRetries != 0 {
+		t.Fatalf("healthy checkpoint was terminalized: outcome=%q unexpected_retries=%d", sess.WorkerOutcome, sess.UnexpectedExitRetries)
 	}
 	// Worker should NOT be stopped (respawnInPlace handles the stop internally)
 	if len(stopped) != 0 {
@@ -8863,6 +9780,7 @@ func TestCheckSessions_SoftThreshold_CheckpointRespawnKeepsTierOverride(t *testi
 			respawned++
 			sess.Status = state.StatusRunning
 			sess.TokensUsedAttempt = 0
+			sess.TokenBudgetTokensAttempt = 0
 			return nil
 		},
 	}
@@ -9315,13 +10233,9 @@ func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
 	}
 }
 
-// --- issue #455: restart-required signal for model.default / routing.* reloads ---
+// --- issue #909: live model-route selector reloads ---
 
-// TestReloadConfig_ModelDefaultChangeSetsRestartRequired verifies that changing
-// model.default during a reload does NOT hot-apply (the backend router is built at
-// startup) but instead raises a persistent restart-required signal that is mirrored
-// into the state file so `maestro status` / Fleet API can surface it.
-func TestReloadConfig_ModelDefaultChangeSetsRestartRequired(t *testing.T) {
+func TestReloadConfig_ModelDefaultChangeUpdatesLiveRouter(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Repo:     "owner/repo",
@@ -9351,40 +10265,56 @@ func TestReloadConfig_ModelDefaultChangeSetsRestartRequired(t *testing.T) {
 	defer ticker.Stop()
 	o.reloadConfig(newCfg, &ticker)
 
-	if !o.restartRequired {
-		t.Fatal("restartRequired not set after model.default change")
+	if o.restartRequired {
+		t.Fatalf("model route reload unexpectedly requires restart: %s", o.restartRequiredReason)
 	}
-	if !strings.Contains(o.restartRequiredReason, "model.default") {
-		t.Fatalf("restartRequiredReason = %q, want it to mention model.default", o.restartRequiredReason)
+	if o.cfg.Model.Default != "claude" {
+		t.Fatalf("model.default = %q, want hot-applied claude", o.cfg.Model.Default)
 	}
-	// model.default must NOT be hot-applied (restart-required, not live-applied)
-	if o.cfg.Model.Default != "codex" {
-		t.Fatalf("model.default = %q, want unchanged %q (restart required, not applied)", o.cfg.Model.Default, "codex")
-	}
-
-	// The signal must be persisted to the state file so a separate `maestro status`
-	// process observes it.
-	st, err := state.Load(dir)
-	if err != nil {
-		t.Fatalf("load state: %v", err)
-	}
-	if !st.RestartRequired {
-		t.Fatal("state.RestartRequired not persisted after model.default change")
-	}
-	if !strings.Contains(st.RestartRequiredReason, "model.default") {
-		t.Fatalf("state.RestartRequiredReason = %q, want it to mention model.default", st.RestartRequiredReason)
-	}
-
-	// A subsequent reload that still differs must keep the signal set (not a one-time log).
-	o.reloadConfig(newCfg, &ticker)
-	if !o.restartRequired {
-		t.Fatal("restartRequired cleared on a second reload while config still differs")
+	decision := o.router.ResolveBackendDecision(github.Issue{Number: 909, Title: "route reload"})
+	if decision.Backend != "claude" {
+		t.Fatalf("live router backend = %q, want claude after reload", decision.Backend)
 	}
 }
 
-// TestReloadConfig_RoutingChangeSetsRestartRequired verifies that routing.* changes
-// (previously a fully silent no-op) now raise the restart-required signal too.
-func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
+func TestReloadConfig_ProviderLanesUpdateLiveFallbackSelector(t *testing.T) {
+	cfg := &config.Config{Model: config.ModelConfig{
+		Default: "claude",
+		Backends: map[string]config.BackendDef{
+			"claude": {Cmd: "claude", Provider: "anthropic"},
+		},
+	}}
+	o := &Orchestrator{cfg: cfg, router: router.New(cfg)}
+	newCfg := *cfg
+	newCfg.Model = cfg.Model
+	newCfg.Model.Backends = map[string]config.BackendDef{
+		"claude": {Cmd: "claude", Provider: "anthropic"},
+		"sol":    {Cmd: "codex", Provider: "openai", Model: "gpt-5.6-sol", Effort: "high"},
+		"gpt55":  {Cmd: "codex", Provider: "openai", Model: "gpt-5.5", Effort: "high"},
+	}
+	newCfg.Model.ProviderLanes = []config.ProviderLane{
+		{Provider: "anthropic", Default: "claude"},
+		{Provider: "openai", Default: "sol", FallbackBackends: []string{"gpt55"}},
+	}
+
+	ticker := time.NewTicker(10 * time.Minute)
+	defer ticker.Stop()
+	o.reloadConfig(&newCfg, &ticker)
+
+	got := o.backendFallbackCandidates(nil, &state.Session{Backend: "claude"}, "")
+	if !reflect.DeepEqual(got, []string{"sol", "gpt55"}) {
+		t.Fatalf("live fallback selector = %v, want [sol gpt55]", got)
+	}
+	if got := o.cfg.Model.Backends["sol"]; got.Model != "gpt-5.6-sol" || got.Effort != "high" {
+		t.Fatalf("live SOL backend = %+v, want reloaded definition", got)
+	}
+	decision, ok, _ := o.resolveDispatchBackend(state.NewState(), github.Issue{Number: 909}, time.Now())
+	if !ok || decision.Backend != "claude" {
+		t.Fatalf("live dispatch decision = %+v, ok=%t", decision, ok)
+	}
+}
+
+func TestReloadConfig_RoutingChangeStillRequiresRestart(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
 		Repo:     "owner/repo",
@@ -9422,6 +10352,9 @@ func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
 	if !strings.Contains(o.restartRequiredReason, "routing") {
 		t.Fatalf("restartRequiredReason = %q, want it to mention routing", o.restartRequiredReason)
 	}
+	if o.cfg.Routing.RouterModel != "codex" {
+		t.Fatalf("routing.router_model = %q, want unchanged codex", o.cfg.Routing.RouterModel)
+	}
 	st, err := state.Load(dir)
 	if err != nil {
 		t.Fatalf("load state: %v", err)
@@ -9434,7 +10367,8 @@ func TestReloadConfig_RoutingChangeSetsRestartRequired(t *testing.T) {
 // TestClearStaleRestartRequired_ClearsOnFreshStart verifies that a restart_required
 // flag persisted by a previous process is reconciled away on a fresh daemon start
 // (issue #549). The banner must not survive the very restart it asked the operator to
-// perform. A genuine config change after start must still re-raise the signal.
+// perform. A genuine restart-required config change after start must still
+// re-raise the signal.
 func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 	dir := t.TempDir()
 	cfg := &config.Config{
@@ -9444,6 +10378,7 @@ func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 			Default:  "codex",
 			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
 		},
+		Routing: config.RoutingConfig{Mode: "manual", RouterModel: "codex"},
 	}
 
 	// Seed state.json with a stale restart-required flag left over from a previous
@@ -9483,30 +10418,23 @@ func TestClearStaleRestartRequired_ClearsOnFreshStart(t *testing.T) {
 		t.Fatalf("state.RestartRequiredReason = %q, want empty after fresh start", st.RestartRequiredReason)
 	}
 
-	// A real config change applied AFTER start must still surface the signal — the
-	// fix clears stale state, it must not break the live signal.
-	newCfg := &config.Config{
-		Repo:     "owner/repo",
-		StateDir: dir,
-		Model: config.ModelConfig{
-			Default:  "claude",
-			Backends: map[string]config.BackendDef{"codex": {Cmd: "codex"}, "claude": {Cmd: "claude"}},
-		},
-	}
+	newCfg := *cfg
+	newCfg.Routing = config.RoutingConfig{Mode: "manual", RouterModel: "claude"}
 	ticker := time.NewTicker(10 * time.Minute)
 	defer ticker.Stop()
-	o.reloadConfig(newCfg, &ticker)
+	o.reloadConfig(&newCfg, &ticker)
 
 	if !o.restartRequired {
-		t.Fatal("restartRequired not re-raised by a real config change after start")
+		t.Fatal("restartRequired not re-raised by a routing change after start")
 	}
 	st, err = state.Load(dir)
 	if err != nil {
 		t.Fatalf("reload state after change: %v", err)
 	}
-	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "model.default") {
-		t.Fatalf("state restart-required not re-persisted after real change: %+v", st)
+	if !st.RestartRequired || !strings.Contains(st.RestartRequiredReason, "routing") {
+		t.Fatalf("state restart-required not re-persisted after routing change: %+v", st)
 	}
+
 }
 
 // TestClearStaleRestartRequired_PreservesInProcessSignal verifies that if a real
@@ -9745,6 +10673,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, nil
 		},
@@ -9780,6 +10711,240 @@ func TestAutoMergePRs_NoPRRetryExhaustedAppliesBlockedLabel(t *testing.T) {
 	}
 }
 
+func TestAutoMergePRs_NoPRRetryExhaustedGenuinelyStuckIssueBlocksOnceAcrossSlots(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 836,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 1 {
+		t.Fatalf("blocked label calls = %d, want one aggregate issue action", labelCalls)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		if got := s.Sessions[slot].LastNotifiedStatus; got != noPRReconciledStatus {
+			t.Fatalf("%s LastNotifiedStatus = %q, want %q", slot, got, noPRReconciledStatus)
+		}
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedSlotsDoNotBlockSiblingOpenPR(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		ReviewGate: "none",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	addedLabels := make(map[int]string)
+	o := &Orchestrator{
+		cfg:      cfg,
+		notifier: &notify.Notifier{},
+		listOpenPRsFn: func() ([]github.PR, error) {
+			// Deliberately omit an issue reference: aggregate ownership must come
+			// from the sibling session's issue/PR/branch identity, not PR text.
+			return []github.PR{{Number: 850, HeadRefName: "slot-d"}}, nil
+		},
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		ghPRCIStatusFn:  func(int) (string, error) { return "pending", nil },
+		ghPRMergeStatusFn: func(int) (string, string, error) {
+			return "MERGEABLE", "blocked", nil
+		},
+		addIssueLabelFn: func(number int, label string) error {
+			addedLabels[number] = label
+			return nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+	s.Sessions["slot-d"] = &state.Session{
+		IssueNumber: 835,
+		Status:      state.StatusPROpen,
+		PRNumber:    850,
+		Branch:      "slot-d",
+	}
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	o.autoMergePRs(s)
+
+	if len(addedLabels) != 0 {
+		t.Fatalf("dead sibling slots applied labels behind open PR: %v", addedLabels)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusRetryExhausted {
+			t.Fatalf("%s status = %q, want retry_exhausted while sibling PR is in flight", slot, sess.Status)
+		}
+		if sess.LastNotifiedStatus == noPRReconciledStatus {
+			t.Fatalf("%s was falsely reconciled as a blocking no-PR outcome", slot)
+		}
+	}
+	if !strings.Contains(logs.String(), "issue #835 has open PR #850 in aggregate session state") ||
+		!strings.Contains(logs.String(), "without applying blocked") {
+		t.Fatalf("journal does not explain aggregate open-PR suppression:\n%s", logs.String())
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedClosedIssueSettlesAllStaleSlots(t *testing.T) {
+	now := time.Now().UTC()
+	cfg := &config.Config{
+		Repo: "owner/repo",
+		GitHubProjects: config.GitHubProjectsConfig{
+			Enabled:       true,
+			ProjectNumber: 1,
+		},
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	var projectStatuses []github.ProjectStatus
+	o := &Orchestrator{
+		cfg:                  cfg,
+		notifier:             &notify.Notifier{},
+		projectRateAllowed:   true,
+		projectRateCheckedAt: now,
+		listOpenPRsFn:        func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn:      func(issueNumber int) (bool, error) { return true, nil },
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+		syncProjectFn: func(issueNumber int, status github.ProjectStatus) bool {
+			projectStatuses = append(projectStatuses, status)
+			return true
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			t.Fatalf("merged-PR lookup must not run after authoritative issue closure")
+			return false, nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+
+	var logs strings.Builder
+	previousLogOutput := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previousLogOutput)
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 0 {
+		t.Fatalf("closed issue received %d blocked-label call(s), want 0", labelCalls)
+	}
+	if len(projectStatuses) != 0 {
+		t.Fatalf("closed issue received stale-slot project syncs %v, want none", projectStatuses)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.LastNotifiedStatus != noPRReconciledStatus {
+			t.Fatalf("%s = status %q closed_at=%v notified=%q, want reconciled done", slot, sess.Status, sess.IssueClosedAt, sess.LastNotifiedStatus)
+		}
+	}
+	if !strings.Contains(logs.String(), "already closed; reconciled 3 stale no-PR slot(s) to done") {
+		t.Fatalf("journal missing closed-issue reconciliation reason:\n%s", logs.String())
+	}
+
+	logBefore := logs.Len()
+	o.autoMergePRs(s)
+	if labelCalls != 0 || len(projectStatuses) != 0 || logs.Len() != logBefore {
+		t.Fatalf("second cycle was not quiet: labels=%d statuses=%v logs=%q", labelCalls, projectStatuses, logs.String()[logBefore:])
+	}
+}
+
+func TestAutoMergePRs_NoPRRetryExhaustedMergedSiblingSettlesAllStaleSlots(t *testing.T) {
+	cfg := &config.Config{
+		Repo:       "owner/repo",
+		Supervisor: config.SupervisorConfig{BlockedLabel: "blocked"},
+	}
+	labelCalls := 0
+	o := &Orchestrator{
+		cfg:             cfg,
+		notifier:        &notify.Notifier{},
+		listOpenPRsFn:   func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) { return false, nil },
+		isPRMergedFn:    func(prNumber int) (bool, error) { return prNumber == 850, nil },
+		addIssueLabelFn: func(number int, label string) error {
+			labelCalls++
+			return nil
+		},
+		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
+			t.Fatalf("same-issue session PR identity should establish aggregate merge state")
+			return false, nil
+		},
+	}
+	s := state.NewState()
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		s.Sessions[slot] = &state.Session{
+			IssueNumber: 835,
+			Status:      state.StatusRetryExhausted,
+			Branch:      slot,
+		}
+	}
+	// The canonical slot already settled after its non-closing `Refs #835` PR
+	// merged. The stale no-PR slots must use that durable PR identity rather
+	// than the legacy closing-keyword lookup.
+	s.Sessions["slot-d"] = &state.Session{
+		IssueNumber: 835,
+		Status:      state.StatusDone,
+		PRNumber:    850,
+		PRMerged:    true,
+		Branch:      "slot-d",
+	}
+
+	o.autoMergePRs(s)
+
+	if labelCalls != 0 {
+		t.Fatalf("merged sibling PR still allowed %d blocked-label call(s)", labelCalls)
+	}
+	for _, slot := range []string{"slot-a", "slot-b", "slot-c"} {
+		sess := s.Sessions[slot]
+		if sess.Status != state.StatusDone || sess.LastNotifiedStatus != noPRReconciledStatus {
+			t.Fatalf("%s = status %q notified=%q, want reconciled done", slot, sess.Status, sess.LastNotifiedStatus)
+		}
+	}
+
+	o.autoMergePRs(s)
+	if labelCalls != 0 {
+		t.Fatalf("second cycle re-applied blocked label after merged sibling reconciliation")
+	}
+}
+
 // #577: when a merged PR already closes the issue (closing-keyword link),
 // the reconciler should auto-close the issue if close_issue is allowed as a
 // safe action without an approval gate. The dynamic-wave queue then sees
@@ -9798,6 +10963,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedAutoClosesWhenMergedPRDetected(t *testin
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return issueNumber == 490, nil
 		},
@@ -9852,6 +11020,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedMergedPRSurfacesCloseCandidate(t *testin
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return true, nil
 		},
@@ -9900,6 +11071,9 @@ func TestAutoMergePRs_NoPRRetryExhaustedHasMergedPRErrorDefersReconcile(t *testi
 		cfg:           cfg,
 		notifier:      &notify.Notifier{},
 		listOpenPRsFn: func() ([]github.PR, error) { return nil, nil },
+		isIssueClosedFn: func(issueNumber int) (bool, error) {
+			return false, nil
+		},
 		hasMergedPRForIssueFn: func(issueNumber int) (bool, error) {
 			return false, fmt.Errorf("gh: transient API failure")
 		},
@@ -10414,10 +11588,14 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 		t.Fatalf("attempt1: total=%d wm=%d attempt=%d, want 773/773/773",
 			sess.TokensUsedTotal, sess.UsageTokensWatermark, sess.TokensUsedAttempt)
 	}
+	if sess.TokenBudgetTokensAttempt != 773 || sess.TokenBudgetTokensWatermark != 773 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Fatalf("attempt1 budget=%d watermark=%d measure=%q, want 773/773/%q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
 
 	// Simulate respawn: per-attempt counter resets to 0 (checkpoint/worker/phase
 	// reset it), but UsageTokensWatermark persists across respawns.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the SAME appended log (cumulative 773) before the new turn
 	// lands — must NOT re-add the prior attempt's tokens.
@@ -10440,6 +11618,9 @@ func TestUpdateTokensUsedFromOutput_PiBackendRetryNoDoubleCount(t *testing.T) {
 	}
 	if sess.TokensUsedAttempt != 1000 {
 		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
+	}
+	if sess.TokenBudgetTokensAttempt != 1000 {
+		t.Errorf("TokenBudgetTokensAttempt = %d, want 1000", sess.TokenBudgetTokensAttempt)
 	}
 	if sess.UsageTokensWatermark != 1773 {
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
@@ -10470,7 +11651,14 @@ func claudeTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Se
 		},
 	}
 	logFile := dir + "/" + slot + ".log"
-	sess := &state.Session{Backend: "claude", LogFile: logFile}
+	sess := &state.Session{
+		Backend: "claude",
+		LogFile: logFile,
+		Attribution: []state.BackendAttribution{{
+			Backend:   "claude",
+			StartedAt: time.Now().UTC(),
+		}},
+	}
 	return o, sess, dir + "/" + slot + ".jsonl"
 }
 
@@ -10495,6 +11683,9 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
 	if sess.UsageTokensWatermark != 20076 {
 		t.Errorf("UsageTokensWatermark = %d, want 20076", sess.UsageTokensWatermark)
 	}
+	if sess.TokenBudgetTokensAttempt != 4415 || sess.TokenBudgetTokensWatermark != 4415 || sess.TokenBudgetMeasure != worker.TokenBudgetMeasureUncached {
+		t.Errorf("budget usage=%d watermark=%d measure=%q, want 4415/4415/%q", sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, worker.TokenBudgetMeasureUncached)
+	}
 	if !approxCostEq(sess.CostUSDBackend, 0.0401785) {
 		t.Errorf("CostUSDBackend = %v, want 0.0401785", sess.CostUSDBackend)
 	}
@@ -10512,6 +11703,34 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendStampsUsage(t *testing.T) {
 	}
 	if !sess.HasSplitTokens() {
 		t.Error("HasSplitTokens() = false, want true")
+	}
+}
+
+// A translated upstream that completes successfully but emits zero usage is
+// explicit degraded observability, never zero-token progress. The worker stays
+// alive/terminal according to its own lifecycle; token budget enforcement does
+// not synthesize a kill from missing data.
+func TestUpdateTokensUsedFromOutput_ClaudeZeroUsageMarksAttributionWithoutProgress(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-946")
+	frames := `{"type":"system","subtype":"init","model":"proxy-model"}` + "\n" +
+		`{"type":"result","subtype":"success","result":"done","usage":{"input_tokens":0,"output_tokens":0}}` + "\n"
+	if err := os.WriteFile(jsonlPath, []byte(frames), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !o.updateTokensUsedFromOutput("sup-946", sess, "healthy rendered output") {
+		t.Fatal("expected the reliability marker to change durable state")
+	}
+	if sess.TokensUsedAttempt != 0 || sess.TokensUsedTotal != 0 || sess.UsageTokensWatermark != 0 {
+		t.Fatalf("zero usage advanced token progress: attempt=%d total=%d watermark=%d",
+			sess.TokensUsedAttempt, sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+	seg := sess.Attribution[len(sess.Attribution)-1]
+	if !seg.UsageUnreliable || seg.UsageUnreliableReason != "terminal_result_zero_input_or_output" || seg.UsageUnreliableScope != state.UsageUnreliableScopeAccounting {
+		t.Fatalf("attribution = %+v, want explicit usage-unreliable marker", seg)
+	}
+	if o.updateTokensUsedFromOutput("sup-946", sess, "healthy rendered output") {
+		t.Fatal("unchanged unreliable stream should not report another state change")
 	}
 }
 
@@ -10536,6 +11755,7 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 
 	// Respawn: per-attempt counter resets, watermark persists.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
 	if o.updateTokensUsedFromOutput("sup-737", sess, "") {
@@ -10559,11 +11779,56 @@ func TestUpdateTokensUsedFromOutput_ClaudeBackendRetryNoDoubleCount(t *testing.T
 	if sess.TokensUsedAttempt != 1000 {
 		t.Errorf("TokensUsedAttempt = %d, want 1000 (current attempt delta)", sess.TokensUsedAttempt)
 	}
+	if sess.TokenBudgetTokensAttempt != 1000 {
+		t.Errorf("TokenBudgetTokensAttempt = %d, want 1000", sess.TokenBudgetTokensAttempt)
+	}
 	if sess.UsageTokensWatermark != 1773 {
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
 	}
 	if !approxCostEq(sess.CostUSDBackend, 0.003) {
 		t.Errorf("CostUSDBackend = %v, want 0.003 (cumulative)", sess.CostUSDBackend)
+	}
+}
+
+func TestUpdateTokensUsedFromOutput_KimiFixtureStampsWatermarkAndSplitTokens(t *testing.T) {
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default: "moonshot-primary",
+				Backends: map[string]config.BackendDef{
+					"moonshot-primary": {Cmd: "kimi", Provider: "moonshot"},
+				},
+			},
+		},
+	}
+	logFile := filepath.Join(dir, "sup-kimi.log")
+	sess := &state.Session{Backend: "moonshot-primary", LogFile: logFile}
+	fixture, err := os.ReadFile(filepath.Join("..", "worker", "testdata", "kimi_stream.jsonl"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(worker.JSONLPathForLog(logFile), fixture, 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !o.updateTokensUsedFromOutput("sup-kimi", sess, "rendered Kimi output") {
+		t.Fatal("expected Kimi JSONL usage to update the session")
+	}
+	if sess.TokensUsedAttempt != 2650 || sess.TokensUsedTotal != 2650 || sess.UsageTokensWatermark != 2650 {
+		t.Fatalf("tokens attempt/total/watermark = %d/%d/%d, want 2650/2650/2650",
+			sess.TokensUsedAttempt, sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+	if sess.TokensInput != 2100 || sess.TokensOutput != 180 || sess.TokensCacheRead != 350 || sess.TokensCacheWrite != 20 {
+		t.Fatalf("split tokens = %d/%d/%d/%d, want 2100/180/350/20",
+			sess.TokensInput, sess.TokensOutput, sess.TokensCacheRead, sess.TokensCacheWrite)
+	}
+	if sess.Model != "kimi-k2.5" {
+		t.Fatalf("Model = %q, want kimi-k2.5", sess.Model)
+	}
+	if o.updateTokensUsedFromOutput("sup-kimi", sess, "same rendered output") {
+		t.Fatal("unchanged cumulative Kimi usage must not advance the watermark")
 	}
 }
 
@@ -10653,6 +11918,7 @@ func TestUpdateTokensUsedFromOutput_CodexBackendRetryNoDoubleCount(t *testing.T)
 
 	// Respawn: per-attempt counter resets, watermark persists.
 	sess.TokensUsedAttempt = 0
+	sess.TokenBudgetTokensAttempt = 0
 
 	// Re-parse the unchanged jsonl before the new run lands — must NOT re-add.
 	if o.updateTokensUsedFromOutput("sup-738", sess, "") {

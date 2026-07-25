@@ -3,8 +3,10 @@ package server
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"html"
 	"io"
@@ -25,12 +27,15 @@ import (
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/emergencystore"
 	"github.com/befeast/maestro/internal/mirrorstore"
+	"github.com/befeast/maestro/internal/notify"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/progress"
 	"github.com/befeast/maestro/internal/server/web"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/statestore"
+	"github.com/befeast/maestro/internal/tmpfshygiene"
 	"github.com/befeast/maestro/internal/webhook"
+	"github.com/befeast/maestro/internal/worker"
 	"gopkg.in/yaml.v3"
 )
 
@@ -58,12 +63,38 @@ type FleetProject struct {
 	// safe actions for this project. Tests inject a fake via SetActionGH.
 	actionGH actionGitHubClient
 
+	// approvalExecutor is the project-scoped, in-process execution path for
+	// safety approvals that cannot wait for the next supervisor cadence. The
+	// daemon wires it to the live project's approver.Executor and worker
+	// controller. It is deliberately narrow: today only stop_worker is routed
+	// through it by handleFleetApproval.
+	approvalExecutor ApprovalExecutor
+
+	// approvalMu serializes approval decisions and their immediate execution
+	// for this project. FleetProject values are copied in snapshots, so this is
+	// a pointer shared by every copy rather than an embedded mutex.
+	approvalMu *sync.Mutex
+
 	// board is the GitHub Project board refresher state used by the
 	// /api/v1/fleet snapshot to surface the operator-glance WIP rollup
 	// (#529). nil disables board surfacing for the project. Wired by
 	// cmd/maestro via SetBoardClient when github_projects is enabled.
 	board *boardState
 }
+
+// ApprovalExecutionResult is the terminal outcome returned by a project's
+// immediate safety-approval executor. The fleet handler owns the durable
+// approval transitions; the callback owns only the exact side effect and any
+// in-memory session mutation performed by the worker controller.
+type ApprovalExecutionResult struct {
+	Status  state.ApprovalStatus
+	Summary string
+}
+
+// ApprovalExecutor executes one immutable approved target against the state
+// snapshot that was durably transitioned to approved immediately beforehand.
+// Implementations must return a terminal approval status.
+type ApprovalExecutor func(st *state.State, approval state.Approval) ApprovalExecutionResult
 
 // SetActionGH wires the per-project GitHub client used by the safe-action
 // dispatcher. Call this on startup; nil leaves safe actions disabled for the
@@ -73,6 +104,15 @@ func (p *FleetProject) SetActionGH(gh actionGitHubClient) {
 		return
 	}
 	p.actionGH = gh
+}
+
+// SetApprovalExecutor wires the project-scoped immediate safety executor.
+// Call this during fleet construction before the project is served.
+func (p *FleetProject) SetApprovalExecutor(execute ApprovalExecutor) {
+	if p == nil {
+		return
+	}
+	p.approvalExecutor = execute
 }
 
 // Cfg exposes the loaded *config.Config so callers (cmd/maestro) that need
@@ -102,6 +142,7 @@ func NewFleetProject(name, configPath, dashboardURL string, cfg *config.Config) 
 		ConfigPath:   strings.TrimSpace(configPath),
 		DashboardURL: fleetProjectScopedPath(trimmedName),
 		cfg:          cfg,
+		approvalMu:   &sync.Mutex{},
 	}
 }
 
@@ -343,6 +384,13 @@ type FleetServer struct {
 	emergencySource   func() emergencystore.State
 	emergencyStore    EmergencySwitch
 	emergencyNotifier EmergencyNotifier
+
+	// tmpfsHygieneSource exposes the latest daemon-owned /tmp sweep summary.
+	// It is a callback rather than copied state so every API request sees the
+	// newest post-apply use_pct and tmpfs_pressure signal without rebuilding the
+	// FleetServer. Plain `serve --fleet` leaves it nil and omits the block.
+	tmpfsHygieneMu     sync.RWMutex
+	tmpfsHygieneSource func() (tmpfshygiene.Summary, bool)
 }
 
 // EmergencySwitch is the write side of the fleet-wide EMERGENCY STOP store the
@@ -359,6 +407,9 @@ type EmergencySwitch interface {
 // satisfies it. nil disables the alert (the switch still flips).
 type EmergencyNotifier interface {
 	Sendf(format string, args ...any)
+	// Alert fans a classified alert to the ntfy transport when configured
+	// (#1018); a no-op when ntfy is not set up.
+	Alert(class notify.AlertClass, key, title, body string) error
 }
 
 // FleetProjectStore is the write side of the daemon's config store that the
@@ -381,6 +432,32 @@ func (s *FleetServer) SetEmergencySource(src func() emergencystore.State) {
 	s.emergencyMu.Lock()
 	s.emergencySource = src
 	s.emergencyMu.Unlock()
+}
+
+// SetTmpfsHygieneSource wires the latest scheduled sweep result into
+// /api/v1/fleet. The summary's attention_code is tmpfs_pressure whenever the
+// post-sweep use_pct remains at or above 85.
+func (s *FleetServer) SetTmpfsHygieneSource(src func() (tmpfshygiene.Summary, bool)) {
+	if s == nil {
+		return
+	}
+	s.tmpfsHygieneMu.Lock()
+	s.tmpfsHygieneSource = src
+	s.tmpfsHygieneMu.Unlock()
+}
+
+func (s *FleetServer) tmpfsHygieneSnapshot() *tmpfshygiene.Summary {
+	s.tmpfsHygieneMu.RLock()
+	src := s.tmpfsHygieneSource
+	s.tmpfsHygieneMu.RUnlock()
+	if src == nil {
+		return nil
+	}
+	summary, ok := src()
+	if !ok {
+		return nil
+	}
+	return &summary
 }
 
 // SetEmergencyStore wires the write side used by POST /api/v1/fleet/emergency
@@ -970,6 +1047,12 @@ type fleetResponse struct {
 	// of none|llm_stopped|all_stopped — the acceptance criterion "fleet API
 	// reports emergency: llm_stopped".
 	Emergency fleetEmergency `json:"emergency"`
+
+	// TmpfsHygiene is the latest daemon-scheduled apply result. In pressure
+	// state it carries attention_code="tmpfs_pressure" and the post-sweep
+	// utilization, allowing API and Mission Control consumers to alert without
+	// treating host pressure as a synthetic worker session.
+	TmpfsHygiene *tmpfshygiene.Summary `json:"tmpfs_hygiene,omitempty"`
 }
 
 // fleetEmergency is the fleet-wide big-red-button state on the snapshot (#840).
@@ -1173,16 +1256,53 @@ type fleetOperatorBrief struct {
 }
 
 type fleetOperatorState struct {
-	Kind        string `json:"kind"`
-	Tone        string `json:"tone"`
-	Label       string `json:"label"`
-	Summary     string `json:"summary"`
-	NextAction  string `json:"next_action,omitempty"`
-	IssueNumber int    `json:"issue_number,omitempty"`
-	IssueURL    string `json:"issue_url,omitempty"`
-	PRNumber    int    `json:"pr_number,omitempty"`
-	PRURL       string `json:"pr_url,omitempty"`
-	Session     string `json:"session,omitempty"`
+	Kind           string            `json:"kind"`
+	Tone           string            `json:"tone"`
+	Label          string            `json:"label"`
+	Summary        string            `json:"summary"`
+	NextAction     string            `json:"next_action,omitempty"`
+	IssueNumber    int               `json:"issue_number,omitempty"`
+	IssueURL       string            `json:"issue_url,omitempty"`
+	PRNumber       int               `json:"pr_number,omitempty"`
+	PRURL          string            `json:"pr_url,omitempty"`
+	Session        string            `json:"session,omitempty"`
+	ApprovalID     string            `json:"approval_id,omitempty"`
+	ApprovalStatus string            `json:"approval_status,omitempty"`
+	PRGate         *fleetPRGateState `json:"pr_gate,omitempty"`
+}
+
+type fleetPRReviewStream struct {
+	Name          string `json:"name"`
+	Passed        bool   `json:"passed"`
+	Pending       bool   `json:"pending"`
+	Score         int    `json:"score,omitempty"`
+	ScoreMax      int    `json:"score_max,omitempty"`
+	Verdict       string `json:"verdict,omitempty"`
+	FindingsCount int    `json:"findings_count,omitempty"`
+	Summary       string `json:"summary"`
+}
+
+type fleetMergeActionState struct {
+	ApprovalID     string `json:"approval_id"`
+	Status         string `json:"status"`
+	Label          string `json:"label"`
+	Summary        string `json:"summary"`
+	NextAction     string `json:"next_action,omitempty"`
+	ActionRequired bool   `json:"action_required,omitempty"`
+	UpdatedAt      string `json:"updated_at,omitempty"`
+}
+
+type fleetPRGateState struct {
+	PRNumber      int                    `json:"pr_number"`
+	CI            string                 `json:"ci,omitempty"`
+	Review        string                 `json:"review,omitempty"`
+	ReviewSummary string                 `json:"review_summary,omitempty"`
+	ReviewStreams []fleetPRReviewStream  `json:"review_streams,omitempty"`
+	MergeAction   *fleetMergeActionState `json:"merge_action,omitempty"`
+	Merged        bool                   `json:"merged"`
+	MergedAt      string                 `json:"merged_at,omitempty"`
+	Summary       string                 `json:"summary"`
+	UpdatedAt     string                 `json:"updated_at,omitempty"`
 }
 
 type fleetSummary struct {
@@ -1273,6 +1393,17 @@ type fleetQueueSnapshot struct {
 	SkippedCandidates []state.SupervisorSkippedCandidate `json:"skipped_candidates,omitempty"`
 }
 
+// fleetDispatchHold is the public, command/output-free projection of the
+// orchestrator's durable dispatch visibility state. EvaluatedAt and the
+// idle-stall debounce stay internal; Fleet exposes only the issue #1023
+// contract.
+type fleetDispatchHold struct {
+	Active      bool   `json:"active"`
+	ReasonClass string `json:"reason_class,omitempty"`
+	Detail      string `json:"detail,omitempty"`
+	Since       string `json:"since,omitempty"`
+}
+
 // fleetManagementHome is the JSON projection of config.ManagementHomeConfig
 // surfaced on the Fleet API (#869). It carries the descriptive fields verbatim;
 // no file content is read and the vault path is not resolved.
@@ -1281,6 +1412,16 @@ type fleetManagementHome struct {
 	Path      string `json:"path,omitempty"`
 	Vault     string `json:"vault,omitempty"`
 	VaultPath string `json:"vault_path,omitempty"`
+}
+
+// fleetClosedIssueOutcome is request-local reconciliation context. It is not a
+// new API shape: the public worker row already exposes status=done and
+// issue_closed_at. Fleet uses this private index to retire stale supervisor/PR
+// projections while keeping a project-scoped outcome warning visible.
+type fleetClosedIssueOutcome struct {
+	IssueNumber int
+	PRNumber    int
+	ClosedAt    time.Time
 }
 
 type fleetProjectState struct {
@@ -1301,7 +1442,7 @@ type fleetProjectState struct {
 	DispatchSLASeconds int                  `json:"dispatch_sla_seconds,omitempty"`
 
 	// RestartRequired/RestartRequiredReason mirror the orchestrator's restart-required
-	// signal (set when model.default / routing.* changed but cannot be hot-applied).
+	// signal (set when routing.* changes but cannot be hot-applied).
 	RestartRequired       bool   `json:"restart_required,omitempty"`
 	RestartRequiredReason string `json:"restart_required_reason,omitempty"`
 
@@ -1354,20 +1495,25 @@ type fleetProjectState struct {
 	// issue #598). The SPA project card uses this to render a calm
 	// "auto-merging" line instead of an alarming attention CTA.
 	SelfResolving   int                   `json:"self_resolving,omitempty"`
+	PRStates        []fleetPRGateState    `json:"pr_states,omitempty"`
 	Active          []sessionInfo         `json:"active,omitempty"`
 	Attention       []sessionInfo         `json:"attention,omitempty"`
+	IssueClaims     []state.IssueClaim    `json:"issue_claims,omitempty"`
 	Approvals       []fleetApprovalState  `json:"approvals,omitempty"`
 	ApprovalSummary map[string]int        `json:"approval_summary,omitempty"`
 	Actions         []controlAction       `json:"actions,omitempty"`
 	CloseCandidates []fleetCloseCandidate `json:"close_candidates,omitempty"`
 	Supervisor      supervisorInfo        `json:"supervisor"`
 	QueueSnapshot   *fleetQueueSnapshot   `json:"queue_snapshot,omitempty"`
+	DispatchHold    fleetDispatchHold     `json:"dispatch_hold"`
 	Freshness       fleetProjectFreshness `json:"freshness"`
 	// ProjectBoard is the cached GitHub Project board snapshot (#529). nil
 	// when the project has no github_projects configuration, or while the
 	// background refresher has not yet produced its first result.
 	ProjectBoard *fleetProjectBoard `json:"project_board,omitempty"`
 	Error        string             `json:"error,omitempty"`
+
+	closedIssueOutcomes []fleetClosedIssueOutcome
 
 	// SupervisorPulse exposes the data the header verdict card uses to
 	// render a positive liveness signal (issue #531): the last-cycle
@@ -1420,21 +1566,30 @@ type fleetProjectState struct {
 }
 
 type fleetEffectiveConfig struct {
-	ProjectID      string                `json:"project_id,omitempty"`
-	ManagementHome *fleetManagementHome  `json:"management_home,omitempty"`
-	ModelPolicy    fleetModelPolicy      `json:"model_policy"`
-	MaxParallel    int                   `json:"max_parallel"`
-	ReviewGate     string                `json:"review_gate"`
-	Labels         fleetConfigLabels     `json:"labels"`
-	Retention      fleetConfigRetention  `json:"retention"`
-	CostCaps       fleetConfigCostCaps   `json:"cost_caps"`
-	SupervisorGate fleetConfigSupervisor `json:"supervisor_gate"`
-	ApprovalAction string                `json:"approval_action"`
+	ProjectID      string                 `json:"project_id,omitempty"`
+	ManagementHome *fleetManagementHome   `json:"management_home,omitempty"`
+	ModelPolicy    fleetModelPolicy       `json:"model_policy"`
+	Pipeline       fleetEffectivePipeline `json:"pipeline"`
+	WorkerRuntime  fleetWorkerRuntime     `json:"worker_runtime"`
+	MaxParallel    int                    `json:"max_parallel"`
+	ReviewGate     string                 `json:"review_gate"`
+	Labels         fleetConfigLabels      `json:"labels"`
+	Retention      fleetConfigRetention   `json:"retention"`
+	CostCaps       fleetConfigCostCaps    `json:"cost_caps"`
+	SupervisorGate fleetConfigSupervisor  `json:"supervisor_gate"`
+	ApprovalAction string                 `json:"approval_action"`
 	// Settings is the fleet-controllable cost/LLM knob layer (#839): each
 	// registered key with its effective value and the layer that supplied it
 	// (builtin/fleet/project). Mission Control uses Source to highlight
 	// non-default overrides. Source is builtin for file-loaded configs.
 	Settings []fleetSettingSource `json:"settings"`
+}
+
+type fleetWorkerRuntime struct {
+	Mode              string `json:"mode"`
+	Scope             string `json:"scope"`
+	MemoryMaxMB       int    `json:"memory_max_mb,omitempty"`
+	ScratchConfigured bool   `json:"scratch_configured"`
 }
 
 // fleetSettingSource is one cost/LLM knob's effective value and provenance.
@@ -1448,6 +1603,9 @@ type fleetSettingSource struct {
 type fleetModelPolicy struct {
 	Default          string                        `json:"default"`
 	FallbackBackends []string                      `json:"fallback_backends,omitempty"`
+	ProviderLanes    []config.ProviderLane         `json:"provider_lanes,omitempty"`
+	ResolvedRoute    []string                      `json:"resolved_route"`
+	SelectionReason  string                        `json:"selection_reason"`
 	Backends         []fleetEffectiveBackendConfig `json:"backends"`
 	Routing          fleetEffectiveRoutingConfig   `json:"routing"`
 }
@@ -1476,7 +1634,31 @@ type fleetEffectiveRoutingConfig struct {
 	RouterModelName string `json:"router_model_name,omitempty"`
 	// AllowMeteredBackend surfaces the router opt-in for a metered router_model
 	// (#838); false is the default guarded behavior.
-	AllowMeteredBackend bool `json:"allow_metered_backend,omitempty"`
+	AllowMeteredBackend bool                        `json:"allow_metered_backend,omitempty"`
+	Tiers               []fleetEffectiveRoutingTier `json:"tiers,omitempty"`
+}
+
+type fleetEffectiveRoutingTier struct {
+	Name    string `json:"name"`
+	Backend string `json:"backend,omitempty"`
+	Effort  string `json:"effort,omitempty"`
+	Model   string `json:"model,omitempty"`
+	Rank    int    `json:"rank,omitempty"`
+}
+
+type fleetEffectivePipeline struct {
+	Planner             fleetEffectivePipelineRole `json:"planner"`
+	Advisor             fleetEffectivePipelineRole `json:"advisor"`
+	Implementer         fleetEffectivePipelineRole `json:"implementer"`
+	Validator           fleetEffectivePipelineRole `json:"validator"`
+	AdvisorReviewRounds int                        `json:"advisor_review_rounds,omitempty"`
+	AdvisorBestEffort   bool                       `json:"advisor_best_effort,omitempty"`
+}
+
+type fleetEffectivePipelineRole struct {
+	Enabled bool   `json:"enabled,omitempty"`
+	Backend string `json:"backend,omitempty"`
+	Effort  string `json:"effort,omitempty"`
 }
 
 type fleetConfigLabels struct {
@@ -1645,8 +1827,10 @@ type fleetSignalProgress struct {
 type fleetProgressRecovery struct {
 	Action                string   `json:"action"`
 	Outcome               string   `json:"outcome,omitempty"`
+	Stage                 string   `json:"stage,omitempty"`
 	RecommendationID      string   `json:"recommendation_id,omitempty"`
 	Reason                string   `json:"reason,omitempty"`
+	LeaseGeneration       int      `json:"lease_generation,omitempty"`
 	Phase                 string   `json:"phase,omitempty"`
 	At                    string   `json:"at,omitempty"`
 	CompletedAt           string   `json:"completed_at,omitempty"`
@@ -1681,6 +1865,7 @@ type fleetApprovalState struct {
 	Risk              string                  `json:"risk,omitempty"`
 	Summary           string                  `json:"summary,omitempty"`
 	PastSLA           bool                    `json:"past_sla,omitempty"`
+	TargetTerminal    bool                    `json:"target_terminal,omitempty"`
 	// Delivery is the operator-safe deploy_project payload. The raw delivery
 	// command is deliberately absent from state.DeliveryPayload; the snapshot
 	// takes a sanitized clone so accidental credential-shaped text in previews
@@ -1692,33 +1877,61 @@ type fleetApprovalState struct {
 }
 
 type fleetWorkerState struct {
-	ProjectName    string `json:"project_name"`
-	ProjectRepo    string `json:"project_repo,omitempty"`
-	DashboardURL   string `json:"dashboard_url,omitempty"`
-	Slot           string `json:"slot"`
-	IssueNumber    int    `json:"issue_number"`
-	IssueTitle     string `json:"issue_title"`
-	IssueURL       string `json:"issue_url,omitempty"`
-	Status         string `json:"status"`
-	DisplayStatus  string `json:"display_status,omitempty"`
-	StatusReason   string `json:"status_reason,omitempty"`
-	NextAction     string `json:"next_action,omitempty"`
-	NeedsAttention bool   `json:"needs_attention,omitempty"`
-	Live           bool   `json:"live"`
-	Backend        string `json:"backend,omitempty"`
+	ProjectName               string `json:"project_name"`
+	ProjectRepo               string `json:"project_repo,omitempty"`
+	DashboardURL              string `json:"dashboard_url,omitempty"`
+	Slot                      string `json:"slot"`
+	IssueNumber               int    `json:"issue_number"`
+	IssueTitle                string `json:"issue_title"`
+	IssueURL                  string `json:"issue_url,omitempty"`
+	Status                    string `json:"status"`
+	DisplayStatus             string `json:"display_status,omitempty"`
+	StatusReason              string `json:"status_reason,omitempty"`
+	NextAction                string `json:"next_action,omitempty"`
+	NeedsAttention            bool   `json:"needs_attention,omitempty"`
+	Live                      bool   `json:"live"`
+	Backend                   string `json:"backend,omitempty"`
+	ProviderLimitBackend      string `json:"provider_limit_backend,omitempty"`
+	ProviderLimitReason       string `json:"provider_limit_reason,omitempty"`
+	ProviderLimitProvider     string `json:"provider_limit_provider,omitempty"`
+	ProviderLimitModel        string `json:"provider_limit_model,omitempty"`
+	ProviderLimitResetAt      string `json:"provider_limit_reset_at,omitempty"`
+	CredentialCandidates      int    `json:"credential_candidates,omitempty"`
+	CredentialCandidatesKnown bool   `json:"credential_candidates_known,omitempty"`
+	CredentialUsable          int    `json:"credential_usable,omitempty"`
+	CredentialUsableKnown     bool   `json:"credential_usable_known,omitempty"`
+	CredentialAggregateReason string `json:"credential_aggregate_reason,omitempty"`
 	// #730: model the backend self-reported for this run (Pi --mode json).
 	// Empty for backends that do not self-report a model.
-	Model string `json:"model,omitempty"`
+	Model                     string                `json:"model,omitempty"`
+	Phase                     string                `json:"phase,omitempty"`
+	PlanVersion               int                   `json:"plan_version,omitempty"`
+	AdvisorReviewRound        int                   `json:"advisor_review_round,omitempty"`
+	AdvisorMaxReviewRounds    int                   `json:"advisor_max_review_rounds,omitempty"`
+	AdvisorBackend            string                `json:"advisor_backend,omitempty"`
+	AdvisorModel              string                `json:"advisor_model,omitempty"`
+	AdvisorVerdict            string                `json:"advisor_verdict,omitempty"`
+	AdvisorUnresolvedFindings string                `json:"advisor_unresolved_findings,omitempty"`
+	AdvisorTerminalReason     string                `json:"advisor_terminal_reason,omitempty"`
+	AdvisorBestEffort         bool                  `json:"advisor_best_effort,omitempty"`
+	AdvisorBypassed           bool                  `json:"advisor_bypassed,omitempty"`
+	AdvisorReviews            []state.AdvisorReview `json:"advisor_reviews,omitempty"`
+	PRGate                    *fleetPRGateState     `json:"pr_gate,omitempty"`
 	// BackendSelection records why this backend was chosen (label, role, auto,
 	// default, router_error, phase, review_repair). Surfaced on the fleet drawer
 	// so operators can tell task-based routing from label-pinned defaults. (#427)
-	BackendSelection  *state.BackendSelection `json:"backend_selection,omitempty"`
-	PRNumber          int                     `json:"pr_number,omitempty"`
-	PRURL             string                  `json:"pr_url,omitempty"`
-	TokensUsedAttempt int                     `json:"tokens_used_attempt"`
-	TokensUsedTotal   int                     `json:"tokens_used_total"`
-	WorkerMaxTokens   int                     `json:"worker_max_tokens,omitempty"`
-	WorkerOutcome     string                  `json:"worker_outcome,omitempty"`
+	BackendSelection         *state.BackendSelection `json:"backend_selection,omitempty"`
+	PRNumber                 int                     `json:"pr_number,omitempty"`
+	PRMerged                 bool                    `json:"pr_merged,omitempty"`
+	PRURL                    string                  `json:"pr_url,omitempty"`
+	OperatorGateName         string                  `json:"operator_gate_name,omitempty"`
+	OperatorGateAction       string                  `json:"operator_gate_required_action,omitempty"`
+	TokensUsedAttempt        int                     `json:"tokens_used_attempt"`
+	TokensUsedTotal          int                     `json:"tokens_used_total"`
+	TokenBudgetTokensAttempt int                     `json:"token_budget_tokens_attempt,omitempty"`
+	WorkerMaxTokens          int                     `json:"worker_max_tokens,omitempty"`
+	TokenBudgetMeasure       string                  `json:"token_budget_measure,omitempty"`
+	WorkerOutcome            string                  `json:"worker_outcome,omitempty"`
 	// CostUSDEstimate is the $ estimate for TokensUsedTotal under the
 	// project's configured per-backend pricing (#619), OR the backend's
 	// self-reported cost when present (#730, Pi --mode json cost.total). 0
@@ -1742,7 +1955,9 @@ type fleetWorkerState struct {
 	PROpenRuntime          string `json:"pr_open_runtime,omitempty"`
 	PROpenRuntimeSeconds   int64  `json:"pr_open_runtime_seconds,omitempty"`
 	StartedAt              string `json:"started_at"`
+	WorkerGeneration       uint64 `json:"worker_generation,omitempty"`
 	FinishedAt             string `json:"finished_at,omitempty"`
+	IssueClosedAt          string `json:"issue_closed_at,omitempty"`
 	WorkerEndedAt          string `json:"worker_ended_at,omitempty"`
 	PROpenedAt             string `json:"pr_opened_at,omitempty"`
 	NextRetryAt            string `json:"next_retry_at,omitempty"`
@@ -1758,8 +1973,9 @@ type fleetWorkerState struct {
 	// (#513 / #534). The SPA renders the active segment inline on the card
 	// and the complete list with EndReason between segments inside the
 	// worker drawer.
-	Attribution []state.BackendAttribution `json:"attribution,omitempty"`
-	Actions     []controlAction            `json:"actions,omitempty"`
+	Attribution  []state.BackendAttribution `json:"attribution,omitempty"`
+	BackendDrift *backendDriftInfo          `json:"backend_drift,omitempty"`
+	Actions      []controlAction            `json:"actions,omitempty"`
 }
 
 type fleetWorkerDetailResponse struct {
@@ -1779,6 +1995,14 @@ type fleetLogTail struct {
 func (s *FleetServer) handleFleet(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+	if r.Header.Get(outcome.HealthProbeHeader) == outcome.HealthProbeHeaderValue {
+		// The outcome checker only needs the HTTP status. Building the full Fleet
+		// response loads and mirrors every project state, which can exceed health
+		// deadlines during startup/restart contention and falsely mark Maestro's
+		// self-check red. Authentication has already run in buildHandler.
+		writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 		return
 	}
 	writeJSON(w, http.StatusOK, s.snapshot())
@@ -1814,6 +2038,21 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	}
 	sess, ok := st.Sessions[slot]
 	if !ok {
+		if attention, found := workerLeaseAttentionForSlot(st.WorkerLeaseAttention, slot); found {
+			projectState := fleetProjectState{
+				Name: project.Name, Repo: project.cfg.Repo, DashboardURL: project.DashboardURL,
+				ReadOnly: project.cfg.Server.ReadOnly || s.readOnly,
+			}
+			writeJSON(w, http.StatusOK, fleetWorkerDetailResponse{
+				Worker: makeFleetWorkerState(projectState, workerLeaseAttentionSessionInfo(attention)),
+				Log: fleetLogTail{
+					Available: false,
+					Reason:    "Worker lease attention contains no process log or command line by design.",
+					UpdatedAt: time.Now().UTC().Format(time.RFC3339),
+				},
+			})
+			return
+		}
 		writeError(w, http.StatusNotFound, fmt.Sprintf("session %q not found", slot))
 		return
 	}
@@ -1825,10 +2064,13 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 		ReadOnly:     project.cfg.Server.ReadOnly || s.readOnly,
 	}
 	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
+	applyBackendDrift(project.cfg, &infos[0])
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
+	applyMergeControlProjection(project.cfg, st, &infos[0])
+	infos[0] = reconcileFleetWorkerPRGate(infos[0], st, project.cfg.Repo)
 	pricing := backendPricingMap(project.cfg)
 	infos[0].CostUSDEstimate = sessionCostUSD(sess, pricing)
-	infos[0].Actions = workerActionAffordances(projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
+	infos[0].Actions = workerActionAffordances(project.cfg, projectState.ReadOnly, "/api/v1/fleet/actions", infos[0])
 	worker := makeFleetWorkerState(projectState, infos[0])
 	lines := parsePositiveInt(r.URL.Query().Get("lines"), 260)
 	if lines > 1000 {
@@ -1938,6 +2180,18 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 			req.Issues = fleetCloseCandidateTargets(fleetCloseCandidates(fleetProjectState{Name: project.Name, Repo: cfg.Repo}, st))
 		}
 	}
+	if strings.TrimSpace(req.ActionID) == config.SupervisorActionRestartStaleBackendWorkers {
+		if !projectOK {
+			writeError(w, http.StatusBadRequest, "project is required for restart_stale_backend_workers")
+			return
+		}
+		res := s.dispatchBackendDriftRestartAction(req, cfg, audit, authenticatedActor)
+		if res.err != nil {
+			log.Printf("[fleet] backend drift restart for project %q failed: %v", req.Project, res.err)
+		}
+		writeJSON(w, res.status, res.body)
+		return
+	}
 
 	if res := dispatchSafeAction(req, cfg, gh, audit, authenticatedActor); res.handled {
 		if res.err != nil {
@@ -1969,6 +2223,106 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 		return
 	}
 	writeError(w, http.StatusBadRequest, fmt.Sprintf("unknown action_id %q", id))
+}
+
+type backendDriftRestartResponse struct {
+	OK       bool                        `json:"ok"`
+	ActionID string                      `json:"action_id"`
+	Enqueued []backendDriftRestartResult `json:"enqueued,omitempty"`
+	Skipped  []controlActionWorkerTarget `json:"skipped,omitempty"`
+	Status   string                      `json:"status"`
+}
+
+type backendDriftRestartResult struct {
+	Slot        string `json:"slot"`
+	IssueNumber int    `json:"issue_number,omitempty"`
+	ApprovalID  string `json:"approval_id"`
+	Status      string `json:"status"`
+}
+
+func (s *FleetServer) dispatchBackendDriftRestartAction(req controlActionRequest, cfg *config.Config, audit actionAuditRecorder, authenticatedActor string) safeActionResult {
+	if cfg == nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no project config bound to this server"}, err: errors.New("nil cfg")}
+	}
+	if strings.TrimSpace(cfg.StateDir) == "" {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "no state dir is available to record approvals"}, err: errors.New("empty state dir")}
+	}
+	st, err := state.Load(cfg.StateDir)
+	if err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("load state: %v", err)}, err: err}
+	}
+	targets, skipped := backendDriftRestartTargets(cfg, st)
+	if len(targets) == 0 && len(skipped) == 0 {
+		body := backendDriftRestartResponse{OK: true, ActionID: config.SupervisorActionRestartStaleBackendWorkers, Status: "no_stale_backend_workers"}
+		return safeActionResult{handled: true, status: http.StatusOK, body: body}
+	}
+	targetSummary := fmt.Sprintf("%d restartable, %d skipped", len(targets), len(skipped))
+	if err := auditOrAbort(audit, req, authenticatedActor, "enqueue:"+config.SupervisorActionRestartStaleBackendWorkers, cfg.Repo, targetSummary); err != nil {
+		return auditFailureResult("enqueue:"+config.SupervisorActionRestartStaleBackendWorkers, cfg.Repo, err)
+	}
+	now := time.Now().UTC()
+	results := make([]backendDriftRestartResult, 0, len(targets))
+	for _, target := range targets {
+		restartReq := req
+		restartReq.ActionID = config.SupervisorActionRestartWorker
+		restartReq.Slot = target.Slot
+		restartReq.IssueNumber = target.IssueNumber
+		restartReq.PRNumber = 0
+		decision := buildApprovalDecision(config.SupervisorActionRestartWorker, restartReq, cfg, authenticatedActor, now)
+		approval := st.RecordPendingApprovalForDecision(decision, now)
+		if approval == nil {
+			return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": "failed to record restart approval"}, err: errors.New("RecordPendingApprovalForDecision returned nil")}
+		}
+		results = append(results, backendDriftRestartResult{
+			Slot:        target.Slot,
+			IssueNumber: target.IssueNumber,
+			ApprovalID:  approval.ID,
+			Status:      string(approval.Status),
+		})
+	}
+	if err := state.Save(cfg.StateDir, st); err != nil {
+		return safeActionResult{handled: true, status: http.StatusInternalServerError, body: map[string]string{"error": fmt.Sprintf("save state: %v", err)}, err: err}
+	}
+	body := backendDriftRestartResponse{
+		OK:       true,
+		ActionID: config.SupervisorActionRestartStaleBackendWorkers,
+		Enqueued: results,
+		Skipped:  skipped,
+		Status:   "approvals_enqueued",
+	}
+	return safeActionResult{handled: true, status: http.StatusAccepted, body: body}
+}
+
+func backendDriftRestartTargets(cfg *config.Config, st *state.State) ([]controlActionWorkerTarget, []controlActionWorkerTarget) {
+	if cfg == nil || st == nil {
+		return nil, nil
+	}
+	infos := allSessionInfos(cfg, st)
+	targets := make([]controlActionWorkerTarget, 0)
+	skipped := make([]controlActionWorkerTarget, 0)
+	seen := map[string]bool{}
+	for _, info := range infos {
+		if info.BackendDrift == nil || !info.BackendDrift.Stale {
+			continue
+		}
+		target := controlActionWorkerTarget{
+			Slot:        info.Slot,
+			IssueNumber: info.IssueNumber,
+			PRNumber:    info.PRNumber,
+		}
+		if info.BackendDrift.Restartable {
+			if seen[info.Slot] {
+				continue
+			}
+			seen[info.Slot] = true
+			target.Reason = info.BackendDrift.Reason
+			targets = append(targets, target)
+			continue
+		}
+		target.Reason = firstNonEmpty(info.BackendDrift.RefusalReason, info.BackendDrift.Reason)
+		skipped = append(skipped, target)
+	}
+	return targets, skipped
 }
 
 // fleetEmergencyRequest is the body for the dashboard EMERGENCY STOP endpoint
@@ -2074,10 +2428,17 @@ func (s *FleetServer) handleFleetEmergency(w http.ResponseWriter, r *http.Reques
 	// sends exactly one alert — the daemon's watch loop only logs the per-flow
 	// journal confirmation.
 	if n := s.liveEmergencyNotifier(); n != nil {
+		var msg string
 		if st.Active() {
-			n.Sendf("%s", st.ActivationMessage())
+			msg = st.ActivationMessage()
 		} else {
-			n.Sendf("%s", emergencystore.ResumeMessage(emergencystore.State{Level: level}, st))
+			msg = emergencystore.ResumeMessage(emergencystore.State{Level: level}, st)
+		}
+		// Alert covers both transports: ntfy when configured, otherwise the
+		// base Telegram/OpenClaw send; dedup keeps a repeated identical
+		// emergency state from re-notifying (#1018).
+		if err := n.Alert(notify.AlertEmergency, "emergency", "maestro emergency", msg); err != nil {
+			log.Printf("[fleet] emergency alert failed: %v", err)
 		}
 	}
 	writeJSON(w, http.StatusOK, emergencyStateToWire(st))
@@ -2450,6 +2811,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.Webhooks = s.webhookStatsSnapshot()
 	resp.Mirror = s.mirrorStatsSnapshot()
 	resp.Emergency = s.emergencySnapshot()
+	resp.TmpfsHygiene = s.tmpfsHygieneSnapshot()
 	return resp
 }
 
@@ -2515,7 +2877,7 @@ func fleetSessionActuallyRunning(worker sessionInfo) bool {
 
 func fleetWorkerSelfProgressing(worker fleetWorkerState) bool {
 	switch worker.DisplayStatus {
-	case string(state.DisplayReviewRetryBackoff), string(state.DisplayReviewRetryPending), string(state.DisplayReviewRetryRunning), string(state.DisplayReviewRetryRecheck):
+	case string(state.DisplayReviewRetryBackoff), string(state.DisplayReviewRetryPending), string(state.DisplayReviewRetryRunning), string(state.DisplayReviewRetryRecheck), string(state.DisplayWaitingForIssueGuard):
 		return true
 	}
 	switch state.SessionStatus(worker.Status) {
@@ -2788,7 +3150,7 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 		summary.Active++
 	}
 	switch kind {
-	case "monitoring_pr":
+	case "monitoring_pr", "merge_in_progress":
 		summary.MonitoringPR++
 	case "pending_dispatch":
 		summary.DispatchPending++
@@ -2810,7 +3172,7 @@ func addFleetOperatorSummary(summary *fleetSummary, operator fleetOperatorState)
 
 func fleetOperatorStateIsActive(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "working", "monitoring_pr", "pending_dispatch":
+	case "working", "monitoring_pr", "pending_dispatch", "merge_in_progress", "code_landed":
 		return true
 	default:
 		return false
@@ -2823,12 +3185,13 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	}
 
 	if approval := oldestPastSLAPendingFleetApproval(approvals, now); approval != nil {
+		label, reason := fleetPendingApprovalBrief(projects, approval, "Approval past SLA")
 		return fleetOperatorBrief{
 			Tone:           "daemon-down",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval past SLA", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, reason, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
-			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			Reason:         truncateFleetOperatorText(reason, 150),
 			NextAction:     "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now.",
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
@@ -2840,12 +3203,13 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	}
 
 	if approval := highestPriorityPendingFleetApproval(approvals); approval != nil {
+		label, reason := fleetPendingApprovalBrief(projects, approval, "Approval pending")
 		return fleetOperatorBrief{
 			Tone:           "attention",
-			Sentence:       fleetActionRequiredSentence(approval.ProjectName, "Approval pending", approval.Summary, approval.IssueNumber, approval.PRNumber, approval.Session),
+			Sentence:       fleetActionRequiredSentence(approval.ProjectName, label, reason, approval.IssueNumber, approval.PRNumber, approval.Session),
 			Project:        approval.ProjectName,
 			Kind:           "approval_pending",
-			Reason:         truncateFleetOperatorText(approval.Summary, 150),
+			Reason:         truncateFleetOperatorText(reason, 150),
 			NextAction:     "Approve or reject the pending supervisor approval after checking the target state.",
 			ActionRequired: true,
 			IssueNumber:    approval.IssueNumber,
@@ -2885,6 +3249,27 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 		return brief
 	}
 
+	for i := range projects {
+		project := &projects[i]
+		switch strings.TrimSpace(project.OperatorState.Kind) {
+		case "merge_in_progress", "code_landed":
+			op := project.OperatorState
+			return fleetOperatorBrief{
+				Tone:        fleetActionTone(op.Tone),
+				Sentence:    fmt.Sprintf("Global brief: %s — %s", project.Name, op.Summary),
+				Project:     project.Name,
+				Kind:        op.Kind,
+				Reason:      op.Summary,
+				NextAction:  op.NextAction,
+				IssueNumber: op.IssueNumber,
+				IssueURL:    op.IssueURL,
+				PRNumber:    op.PRNumber,
+				PRURL:       op.PRURL,
+				Session:     op.Session,
+			}
+		}
+	}
+
 	working, monitoring, pending, attention := 0, 0, 0, 0
 	for _, project := range projects {
 		switch project.OperatorState.Kind {
@@ -2917,6 +3302,29 @@ func buildFleetOperatorBrief(projects []fleetProjectState, approvals []fleetAppr
 	return fleetOperatorBrief{Tone: "busy", Kind: "active", Sentence: "Global brief: " + strings.Join(parts, "; ") + "; no operator action is needed right now."}
 }
 
+func fleetPendingApprovalBrief(projects []fleetProjectState, approval *fleetApprovalState, fallbackLabel string) (string, string) {
+	if approval == nil || approval.Action != config.SupervisorActionMergePR {
+		if approval == nil {
+			return fallbackLabel, ""
+		}
+		return fallbackLabel, approval.Summary
+	}
+	label := "Merge requested"
+	reason := strings.TrimSpace(approval.Summary)
+	for i := range projects {
+		project := &projects[i]
+		if project.Name != approval.ProjectName {
+			continue
+		}
+		for _, gate := range project.PRStates {
+			if gate.PRNumber == approval.PRNumber && gate.MergeAction != nil && gate.MergeAction.ApprovalID == approval.ID {
+				return label, gate.Summary
+			}
+		}
+	}
+	return label, reason
+}
+
 // fleetNextActionCandidate is one possible "what needs me now" item before
 // priority/age sorting picks the canonical winner.
 type fleetNextActionCandidate struct {
@@ -2940,7 +3348,7 @@ func fleetNextActionPriorityForKind(kind string) (int, bool) {
 	switch strings.TrimSpace(kind) {
 	case "error", "dispatch_failure", "metered_backend", "stale_worker":
 		return 0, true
-	case "attention":
+	case "attention", "merge_action_required", "review_repair":
 		return 1, true
 	case "outcome_drift", "stale", "no_eligible_issues", "queue_blocked":
 		return 2, true
@@ -2961,6 +3369,11 @@ func fleetNextActionPriorityForKind(kind string) (int, bool) {
 // input returns the same picked_at.
 func fleetProjectOperatorUpdatedAt(project fleetProjectState) time.Time {
 	kind := strings.TrimSpace(project.OperatorState.Kind)
+	if project.OperatorState.PRGate != nil {
+		if t := parseFleetWorkerTime(project.OperatorState.PRGate.UpdatedAt); !t.IsZero() {
+			return t
+		}
+	}
 	switch kind {
 	case "attention", "stale_worker":
 		if len(project.Attention) > 0 {
@@ -3036,7 +3449,7 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal {
 			continue
 		}
 		priority := 1
@@ -3048,7 +3461,8 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 			priority = 0
 			reason = "Pending approval is past the " + fleetApprovalSLAText() + " SLA. Approve or reject it now."
 		}
-		if summary := strings.TrimSpace(approval.Summary); summary != "" {
+		_, approvalSummary := fleetPendingApprovalBrief(projects, approval, "Approval pending")
+		if summary := strings.TrimSpace(approvalSummary); summary != "" {
 			reason = summary + " " + reason
 		}
 		target := firstNonEmpty(approval.DashboardURL, fleetApprovalsFocusedPath(approval.ID))
@@ -3074,6 +3488,9 @@ func buildFleetNextAction(projects []fleetProjectState, approvals []fleetApprova
 			continue
 		}
 		reason := strings.TrimSpace(project.OperatorState.NextAction)
+		if kind == "merge_action_required" || kind == "review_repair" {
+			reason = strings.TrimSpace(project.OperatorState.Summary + " " + reason)
+		}
 		if reason == "" {
 			reason = strings.TrimSpace(project.OperatorState.Summary)
 		}
@@ -3222,6 +3639,19 @@ func fleetNextActionCTAForProject(kind string, op fleetOperatorState) string {
 			return fmt.Sprintf("Review issue #%d", op.IssueNumber)
 		}
 		return "Review attention"
+	case "merge_action_required":
+		if state.ApprovalStatus(op.ApprovalStatus) == state.ApprovalStatusPending && op.PRNumber > 0 {
+			return fmt.Sprintf("Approve PR #%d", op.PRNumber)
+		}
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Review merge for PR #%d", op.PRNumber)
+		}
+		return "Review merge request"
+	case "review_repair":
+		if op.PRNumber > 0 {
+			return fmt.Sprintf("Repair review findings on PR #%d", op.PRNumber)
+		}
+		return "Repair review findings"
 	case "auto_merging":
 		return ""
 	case "outcome_drift":
@@ -3280,7 +3710,7 @@ func fleetPendingDispatchPastSLA(project fleetProjectState, now time.Time) bool 
 }
 
 func approvalPastSLA(approval *fleetApprovalState, now time.Time) bool {
-	if approval == nil {
+	if approval == nil || approval.TargetTerminal {
 		return false
 	}
 	if approval.CreatedAgeSeconds > fleetApprovalSLASeconds {
@@ -3296,7 +3726,7 @@ func oldestPastSLAPendingFleetApproval(approvals []fleetApprovalState, now time.
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) || !approvalPastSLA(approval, now) {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal || fleetApprovalIsSuggestion(approval) || !approvalPastSLA(approval, now) {
 			continue
 		}
 		if selected == nil || fleetApprovalRecency(*approval).Before(fleetApprovalRecency(*selected)) {
@@ -3310,7 +3740,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 	var selected *fleetApprovalState
 	for i := range approvals {
 		approval := &approvals[i]
-		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || fleetApprovalIsSuggestion(approval) {
+		if state.ApprovalStatus(approval.Status) != state.ApprovalStatusPending || approval.TargetTerminal || fleetApprovalIsSuggestion(approval) {
 			continue
 		}
 		if selected == nil {
@@ -3328,7 +3758,7 @@ func highestPriorityPendingFleetApproval(approvals []fleetApprovalState) *fleetA
 
 func fleetOperatorKindNeedsAction(kind string) bool {
 	switch strings.TrimSpace(kind) {
-	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
+	case "error", "dispatch_failure", "metered_backend", "stale_worker", "attention", "merge_action_required", "review_repair", "stale", "outcome_drift", "no_eligible_issues", "queue_blocked":
 		return true
 	default:
 		return false
@@ -3396,6 +3826,8 @@ func fleetOperatorStatePriority(kind string) int {
 		return 2
 	case "attention":
 		return 3
+	case "merge_action_required", "review_repair":
+		return 3
 	case "outcome_drift":
 		return 4
 	case "stale":
@@ -3405,6 +3837,8 @@ func fleetOperatorStatePriority(kind string) int {
 	case "working":
 		return 7
 	case "monitoring_pr":
+		return 8
+	case "merge_in_progress", "code_landed":
 		return 8
 	case "auto_merging":
 		// #598: convergence-bound, calm — sort alongside monitoring_pr,
@@ -3643,6 +4077,18 @@ func fleetQueueSnapshotFromSupervisor(info supervisorInfo) *fleetQueueSnapshot {
 	return snapshot
 }
 
+func fleetDispatchHoldFromState(hold state.DispatchHold) fleetDispatchHold {
+	out := fleetDispatchHold{
+		Active:      hold.Active,
+		ReasonClass: strings.TrimSpace(hold.ReasonClass),
+		Detail:      strings.TrimSpace(hold.Detail),
+	}
+	if hold.Active && !hold.Since.IsZero() {
+		out.Since = hold.Since.UTC().Format(time.RFC3339)
+	}
+	return out
+}
+
 func latestProjectLogModTime(st *state.State) time.Time {
 	if st == nil {
 		return time.Time{}
@@ -3677,6 +4123,10 @@ func latestTime(left, right time.Time) time.Time {
 }
 
 func addFleetApprovalSummary(summary *fleetSummary, approval fleetApprovalState) {
+	if approval.TargetTerminal && state.ApprovalStatus(approval.Status) == state.ApprovalStatusPending {
+		summary.ApprovalsHistorical++
+		return
+	}
 	switch state.ApprovalStatus(approval.Status) {
 	case state.ApprovalStatusPending:
 		summary.Approvals++
@@ -3844,21 +4294,40 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
 
 	meteredBackend, meteredRefused := cfg.SupervisorMeteredRefusal()
+	modelRoute := cfg.Model.ResolvedRoute()
 
 	retention := cfg.SessionRetention
 	return fleetEffectiveConfig{
 		ProjectID:      strings.TrimSpace(cfg.ProjectID),
 		ManagementHome: fleetManagementHomeFromConfig(cfg.ManagementHome),
 		ModelPolicy: fleetModelPolicy{
-			Default:          strings.TrimSpace(cfg.Model.Default),
+			Default:          cfg.Model.EffectiveDefault(),
 			FallbackBackends: append([]string(nil), cfg.Model.FallbackBackends...),
+			ProviderLanes:    append([]config.ProviderLane(nil), modelRoute.Lanes...),
+			ResolvedRoute:    append([]string(nil), modelRoute.Backends...),
+			SelectionReason:  modelRoute.SelectionReason,
 			Backends:         backends,
 			Routing: fleetEffectiveRoutingConfig{
 				Mode:                strings.TrimSpace(cfg.Routing.Mode),
 				RouterModel:         strings.TrimSpace(cfg.Routing.RouterModel),
 				RouterModelName:     strings.TrimSpace(cfg.Routing.RouterModelName),
 				AllowMeteredBackend: cfg.Routing.AllowMeteredBackend,
+				Tiers:               buildFleetEffectiveRoutingTiers(cfg),
 			},
+		},
+		Pipeline: fleetEffectivePipeline{
+			Planner:             fleetEffectivePipelineRoleFrom(cfg.Pipeline.Planner),
+			Advisor:             fleetEffectivePipelineRoleFrom(cfg.Pipeline.Advisor),
+			Implementer:         fleetEffectivePipelineRoleFrom(cfg.Pipeline.Implementer),
+			Validator:           fleetEffectivePipelineRoleFrom(cfg.Pipeline.Validator),
+			AdvisorReviewRounds: cfg.Pipeline.EffectiveAdvisorReviewRounds(),
+			AdvisorBestEffort:   cfg.Pipeline.AdvisorBestEffort,
+		},
+		WorkerRuntime: fleetWorkerRuntime{
+			Mode:              cfg.WorkerRuntime.EffectiveMode(),
+			Scope:             cfg.WorkerRuntime.EffectiveScope(),
+			MemoryMaxMB:       cfg.WorkerRuntime.MemoryMaxMB,
+			ScratchConfigured: strings.TrimSpace(cfg.WorkerRuntime.ScratchRoot) != "",
 		},
 		MaxParallel: cfg.MaxParallel,
 		ReviewGate:  strings.TrimSpace(cfg.ReviewGate),
@@ -3908,6 +4377,43 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 	}
 }
 
+func buildFleetEffectiveRoutingTiers(cfg *config.Config) []fleetEffectiveRoutingTier {
+	if cfg == nil || len(cfg.Routing.Tiers) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(cfg.Routing.Tiers))
+	for name := range cfg.Routing.Tiers {
+		names = append(names, name)
+	}
+	sort.Slice(names, func(i, j int) bool {
+		li, lj := cfg.Routing.Tiers[names[i]], cfg.Routing.Tiers[names[j]]
+		if li.Rank != lj.Rank {
+			return li.Rank < lj.Rank
+		}
+		return names[i] < names[j]
+	})
+	out := make([]fleetEffectiveRoutingTier, 0, len(names))
+	for _, name := range names {
+		tier := cfg.Routing.Tiers[name]
+		out = append(out, fleetEffectiveRoutingTier{
+			Name:    name,
+			Backend: strings.TrimSpace(tier.Backend),
+			Effort:  strings.TrimSpace(tier.Effort),
+			Model:   strings.TrimSpace(tier.Model),
+			Rank:    tier.Rank,
+		})
+	}
+	return out
+}
+
+func fleetEffectivePipelineRoleFrom(role config.RoleConfig) fleetEffectivePipelineRole {
+	return fleetEffectivePipelineRole{
+		Enabled: role.Enabled,
+		Backend: strings.TrimSpace(role.Backend),
+		Effort:  strings.TrimSpace(role.Effort),
+	}
+}
+
 // buildFleetSettingSources reports each fleet-controllable knob's effective
 // value and the layer it came from (#839). Source is read from cfg.SettingsSources
 // (populated by configstore.Load); a file-loaded config has no provenance map,
@@ -3920,9 +4426,15 @@ func buildFleetSettingSources(cfg *config.Config) []fleetSettingSource {
 		if src == "" {
 			src = config.SettingSourceBuiltin
 		}
+		value := ""
+		if spec.FleetOnly {
+			value, _ = config.FleetSettingDisplayValue(spec, cfg.FleetOnlySettings)
+		} else {
+			value = spec.Value(cfg)
+		}
 		out = append(out, fleetSettingSource{
 			Key:       spec.Key,
-			Value:     spec.Value(cfg),
+			Value:     value,
 			Source:    src,
 			IsDefault: src == config.SettingSourceBuiltin,
 		})
@@ -3971,6 +4483,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.RestartRequiredReason = st.RestartRequiredReason
 	item.Paused = st.PauseActive()
 	item.PausedAt = st.PausedAt
+	item.closedIssueOutcomes = fleetClosedIssueOutcomes(st)
 	item.CloseCandidates = fleetCloseCandidates(item, st)
 	if len(item.CloseCandidates) > 0 {
 		item.Actions = append(item.Actions, closeIssueBatchControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, item.CloseCandidates))
@@ -4007,33 +4520,25 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	item.Sessions = len(projectState.All)
 	item.Supervisor = projectState.Supervisor
 	item.QueueSnapshot = fleetQueueSnapshotFromSupervisor(item.Supervisor)
+	if item.Supervisor.Latest != nil && fleetTargetWasClosed(item, item.Supervisor.Latest.Target, item.Supervisor.Latest.CreatedAt) {
+		// The decision remains in the audit timeline, but its issue-scoped queue
+		// projection is obsolete as soon as GitHub closure is reconciled.
+		item.QueueSnapshot = nil
+	}
+	item.DispatchHold = fleetDispatchHoldFromState(st.DispatchHold)
 	item.SupervisorPulse = buildFleetSupervisorPulse(cfg, st, now)
 	item.Epics, item.EpicSummary = fleetEpicProgressFromState(st)
+	item.IssueClaims = st.ActiveIssueClaims()
 	item.Approvals = makeFleetApprovalStates(item, st, now)
 	if len(item.Approvals) > 0 {
 		item.ApprovalSummary = make(map[string]int)
 		for _, approval := range item.Approvals {
+			if approval.TargetTerminal && state.ApprovalStatus(approval.Status) == state.ApprovalStatusPending {
+				continue
+			}
 			item.ApprovalSummary[approval.Status]++
 		}
 	}
-	// #814: classify why the project is (not) implementing so operators can tell
-	// an empty queue from a gate-bound-but-eligible pipeline. Signals are read
-	// from the same snapshot: eligible from the supervisor queue analysis,
-	// pending approvals from the approval summary, model limits from backend
-	// health.
-	eligibleIssues := 0
-	if item.QueueSnapshot != nil {
-		eligibleIssues = item.QueueSnapshot.Eligible
-	}
-	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
-		Capacity:         capacity,
-		EligibleIssues:   eligibleIssues,
-		PendingApprovals: item.ApprovalSummary["pending"],
-		BackendsBlocked:  allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
-		Paused:           item.Paused,
-	})
-	item.Activity = string(activity)
-	item.ActivityReason = activityReason
 	staleAudits := reconcileStaleSessions(cfg, st, now)
 	staleSlots := make(map[string]state.StaleSessionAudit, len(staleAudits))
 	for _, audit := range staleAudits {
@@ -4043,8 +4548,35 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		recordStaleSessionAudits(cfg.StateDir, project.Name, staleAudits)
 	}
 	workers := make([]fleetWorkerState, 0, len(projectState.All))
+	var backendRestartTargets []controlActionWorkerTarget
+	var backendRestartSkipped []controlActionWorkerTarget
 	for _, worker := range projectState.All {
-		worker.Actions = workerActionAffordances(item.ReadOnly, "/api/v1/fleet/actions", worker)
+		worker = reconcileFleetWorkerPRGate(worker, st, cfg.Repo)
+		if worker.PRGate != nil && fleetWorkerPRStateCurrent(worker) {
+			item.PRStates = appendFleetProjectPRState(item.PRStates, *worker.PRGate)
+		}
+		worker.Actions = workerActionAffordances(cfg, item.ReadOnly, "/api/v1/fleet/actions", worker)
+		if worker.BackendDrift != nil && worker.BackendDrift.Stale {
+			target := controlActionWorkerTarget{
+				Slot:        worker.Slot,
+				IssueNumber: worker.IssueNumber,
+				PRNumber:    worker.PRNumber,
+			}
+			if worker.BackendDrift.Restartable {
+				target.Reason = worker.BackendDrift.Reason
+				backendRestartTargets = append(backendRestartTargets, target)
+			} else {
+				target.Reason = firstNonEmpty(worker.BackendDrift.RefusalReason, worker.BackendDrift.Reason)
+				backendRestartSkipped = append(backendRestartSkipped, target)
+			}
+		}
+		if worker.NeedsAttention {
+			if canonical, ok := fleetSupersedingIssueSession(worker, projectState.All); ok {
+				worker.NeedsAttention = false
+				worker.StatusReason = fmt.Sprintf("superseded by canonical session %s (%s)", canonical.Slot, canonical.Status)
+				worker.NextAction = "No operator action required: follow the canonical session for this issue."
+			}
+		}
 		if audit, isStale := staleSlots[worker.Slot]; isStale {
 			worker.NeedsAttention = false
 			if reason := strings.TrimSpace(audit.Reason); reason != "" {
@@ -4055,7 +4587,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		if worker.NeedsAttention {
 			item.NeedsAttention++
 			item.Attention = append(item.Attention, worker)
-			if fleetSessionIsConvergenceBound(worker) {
+			if fleetSessionIsConvergenceBound(worker, item.Supervisor.Latest) {
 				item.SelfResolving++
 			}
 		}
@@ -4075,8 +4607,603 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 			item.Active = append(item.Active, worker)
 		}
 	}
+	for _, runtimeAttention := range st.WorkerLeaseAttention {
+		if sess := st.Sessions[strings.TrimSpace(runtimeAttention.Slot)]; sess != nil &&
+			strings.TrimSpace(sess.WorkerLeaseAttention) == strings.TrimSpace(runtimeAttention.Reason) {
+			continue
+		}
+		info := workerLeaseAttentionSessionInfo(runtimeAttention)
+		item.NeedsAttention++
+		item.Attention = append(item.Attention, info)
+		workers = append(workers, makeFleetWorkerState(item, info))
+	}
+	if len(backendRestartTargets) > 0 || len(backendRestartSkipped) > 0 {
+		item.Actions = append(item.Actions, backendDriftRestartControlAction(item.ReadOnly, "/api/v1/fleet/actions", item.Name, backendRestartTargets, backendRestartSkipped))
+	}
+	// #814/#996: classify only after canonical attention has been counted and
+	// stale/historical sessions have been suppressed. Otherwise a failed,
+	// retry-exhausted open PR has no live worker or PRGate capacity entry and
+	// falsely falls through to queue_empty while its in-place repair is pending.
+	eligibleIssues := 0
+	if item.QueueSnapshot != nil {
+		eligibleIssues = item.QueueSnapshot.Eligible
+	}
+	actionableAttention := item.NeedsAttention - item.SelfResolving
+	if actionableAttention < 0 {
+		actionableAttention = 0
+	}
+	activity, activityReason := state.ClassifyActivity(state.ActivityInput{
+		Capacity:            capacity,
+		EligibleIssues:      eligibleIssues,
+		PendingApprovals:    item.ApprovalSummary["pending"],
+		ActionableAttention: actionableAttention,
+		BackendsBlocked:     allBackendsBlocked(item.BackendHealth, configuredWorkerBackends(cfg)),
+		Paused:              item.Paused,
+	})
+	item.Activity = string(activity)
+	item.ActivityReason = activityReason
+	sortFleetProjectPRStates(item.PRStates)
 	item.OperatorState = buildFleetProjectOperatorState(item)
 	return item, workers
+}
+
+func workerLeaseAttentionSlot(attention state.WorkerLeaseAttention) string {
+	identity := strings.TrimSpace(attention.Identity)
+	if identity == "" {
+		identity = "unknown"
+	}
+	fingerprint := sha256.Sum256([]byte(identity + "\x00" + attention.Slot + "\x00" + attention.Reason))
+	return "worker-lease-attention-" + identity + "-" + hex.EncodeToString(fingerprint[:6])
+}
+
+func workerLeaseAttentionForSlot(attention []state.WorkerLeaseAttention, slot string) (state.WorkerLeaseAttention, bool) {
+	for _, item := range attention {
+		if workerLeaseAttentionSlot(item) == slot {
+			return item, true
+		}
+	}
+	return state.WorkerLeaseAttention{}, false
+}
+
+func workerLeaseAttentionSessionInfo(attention state.WorkerLeaseAttention) sessionInfo {
+	startedAt := attention.DetectedAt.UTC().Format(time.RFC3339)
+	return sessionInfo{
+		Slot:           workerLeaseAttentionSlot(attention),
+		IssueTitle:     "Worker scratch ownership",
+		Status:         "worker_lease_attention",
+		DisplayStatus:  "needs_attention",
+		StatusReason:   attention.Reason,
+		NextAction:     attention.NextAction,
+		NeedsAttention: true,
+		Live:           true,
+		StartedAt:      startedAt,
+	}
+}
+
+// reconcileFleetWorkerPRGate attaches the latest durable gate observation to
+// the Fleet-only session projection. A current failed rollup also replaces any
+// stale retry/session wording so the attention row and project operator_state
+// tell one conservative story: repair the existing PR and do not merge it.
+func reconcileFleetWorkerPRGate(worker sessionInfo, st *state.State, project string) sessionInfo {
+	if st == nil || worker.IssueNumber <= 0 || worker.PRNumber <= 0 {
+		return worker
+	}
+	var snapshot *state.PRGateSnapshot
+	if latest, ok := st.LatestPRGateSnapshot(project, worker.IssueNumber, worker.PRNumber); ok {
+		snapshot = &latest
+		worker.prGateSnapshot = snapshot
+	}
+	mergeApproval := latestFleetMergeApprovalForPR(st, worker.PRNumber)
+	if snapshot == nil && mergeApproval == nil && state.SessionStatus(worker.Status) != state.StatusCodeLanded {
+		return worker
+	}
+	worker.PRGate = makeFleetPRGateState(worker, snapshot, mergeApproval)
+	if worker.PRGate == nil {
+		return worker
+	}
+	if worker.PRGate.Merged {
+		if state.SessionStatus(worker.Status) != state.StatusDone {
+			worker.Status = string(state.StatusCodeLanded)
+			worker.DisplayStatus = ""
+			worker.Live = true
+		}
+		worker.StatusReason = fmt.Sprintf("PR #%d merged and code landed. %s", worker.PRNumber, worker.PRGate.Summary)
+		worker.NextAction = worker.PRGate.Summary + ". No merge or review-repair action is available; wait for any configured runtime or delivery verification."
+		worker.NeedsAttention = false
+		return worker
+	}
+	if action := worker.PRGate.MergeAction; action != nil {
+		worker.Status = string(state.StatusPROpen)
+		worker.DisplayStatus = fleetMergeActionDisplayStatus(action.Status)
+		worker.StatusReason = worker.PRGate.Summary
+		worker.NextAction = strings.TrimSpace(worker.PRGate.Summary + " " + action.NextAction)
+		worker.NeedsAttention = action.ActionRequired
+		worker.Live = true
+		return worker
+	}
+	if state.SessionStatus(worker.Status) == state.StatusRetryExhausted && fleetPRGateHasFailingChecks(snapshot) {
+		worker.StatusReason = fmt.Sprintf("PR #%d has failing checks on the current reconciled head and is awaiting in-place repair after retry exhaustion.", worker.PRNumber)
+		worker.NextAction = "Repair the existing PR in place and wait for every required check to pass; do not merge while any check is failing."
+		worker.NeedsAttention = true
+		return worker
+	}
+	if snapshot != nil {
+		switch snapshot.ReviewDecision {
+		case state.PRGateReviewBlocked:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate requires repair.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Address the concrete review findings through the bounded review-repair/retry flow, then wait for a new current-head verdict.")
+			worker.NeedsAttention = true
+		case state.PRGateReviewPending:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate is pending.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Wait for the current-head review result; Maestro will re-trigger or repair through the bounded flow if needed.")
+			worker.NeedsAttention = false
+		case state.PRGateReviewPassed:
+			worker.StatusReason = firstNonEmpty(worker.PRGate.ReviewSummary, fmt.Sprintf("PR #%d review gate passed.", worker.PRNumber))
+			worker.NextAction = strings.TrimSpace(worker.StatusReason + " Wait for CI/mergeability and the configured merge path.")
+			if !fleetPRGateHasFailingChecks(snapshot) {
+				worker.NeedsAttention = false
+			}
+		}
+	}
+	return worker
+}
+
+func latestFleetMergeApprovalForPR(st *state.State, prNumber int) *state.Approval {
+	if st == nil || prNumber <= 0 {
+		return nil
+	}
+	var selected *state.Approval
+	for i := range st.Approvals {
+		approval := &st.Approvals[i]
+		if approval.Action != config.SupervisorActionMergePR || approval.Target == nil || approval.Target.PR != prNumber {
+			continue
+		}
+		switch approval.Status {
+		case state.ApprovalStatusStale, state.ApprovalStatusSuperseded:
+			continue
+		}
+		if selected == nil || fleetApprovalTime(*approval).After(fleetApprovalTime(*selected)) ||
+			(fleetApprovalTime(*approval).Equal(fleetApprovalTime(*selected)) && approval.ID > selected.ID) {
+			selected = approval
+		}
+	}
+	return selected
+}
+
+func fleetApprovalTime(approval state.Approval) time.Time {
+	if !approval.UpdatedAt.IsZero() {
+		return approval.UpdatedAt.UTC()
+	}
+	return approval.CreatedAt.UTC()
+}
+
+func makeFleetPRGateState(worker sessionInfo, snapshot *state.PRGateSnapshot, mergeApproval *state.Approval) *fleetPRGateState {
+	if worker.PRNumber <= 0 {
+		return nil
+	}
+	gate := &fleetPRGateState{PRNumber: worker.PRNumber}
+	if snapshot != nil {
+		gate.CI = string(snapshot.CIEffectiveVerdict)
+		gate.Review = string(snapshot.ReviewDecision)
+		gate.UpdatedAt = formatFleetTime(snapshot.UpdatedAt)
+		if snapshot.MergeCommitSHA != "" && !snapshot.MergedAt.IsZero() {
+			gate.Merged = true
+			gate.MergedAt = formatFleetTime(snapshot.MergedAt)
+		}
+		for _, stream := range snapshot.ReviewStreams {
+			fact := fleetPRReviewStream{
+				Name:          stream.Name,
+				Passed:        stream.Passed,
+				Pending:       stream.Pending,
+				Score:         stream.Score,
+				ScoreMax:      stream.ScoreMax,
+				Verdict:       string(stream.Verdict),
+				FindingsCount: stream.FindingsCount,
+			}
+			fact.Summary = fleetPRReviewStreamSummary(fact)
+			gate.ReviewStreams = append(gate.ReviewStreams, fact)
+		}
+		gate.ReviewSummary = fleetPRReviewSummary(gate.ReviewStreams, snapshot.ReviewDecision)
+	}
+	if state.SessionStatus(worker.Status) == state.StatusCodeLanded {
+		gate.Merged = true
+	}
+	if gate.Merged {
+		if gate.ReviewSummary != "" {
+			gate.Summary = gate.ReviewSummary + " · PR merged"
+		} else {
+			gate.Summary = "PR merged"
+		}
+		return gate
+	}
+	if mergeApproval != nil {
+		gate.MergeAction = makeFleetMergeActionState(*mergeApproval, worker.PRNumber)
+		if gate.MergeAction.UpdatedAt != "" {
+			gate.UpdatedAt = gate.MergeAction.UpdatedAt
+		}
+		gate.Summary = gate.MergeAction.Summary
+		if gate.ReviewSummary != "" {
+			gate.Summary += " " + gate.ReviewSummary + "."
+		}
+		return gate
+	}
+	gate.Summary = gate.ReviewSummary
+	if gate.Summary == "" && gate.CI != "" && gate.CI != string(state.PRGateCIUnknown) {
+		gate.Summary = "CI " + gate.CI
+	}
+	return gate
+}
+
+func fleetPRReviewStreamSummary(stream fleetPRReviewStream) string {
+	name := strings.TrimSpace(stream.Name)
+	if strings.EqualFold(name, "greptile") {
+		name = "Greptile"
+	} else if name != "" {
+		name = strings.ToUpper(name[:1]) + name[1:]
+	} else {
+		name = "Review"
+	}
+	if stream.ScoreMax > 0 {
+		name += fmt.Sprintf(" %d/%d", stream.Score, stream.ScoreMax)
+	}
+	status := "passed"
+	switch {
+	case stream.Pending:
+		status = "pending"
+	case !stream.Passed:
+		status = "repair required"
+	case stream.ScoreMax == 0 && stream.Verdict == string(state.PRGateReviewVerdictOKToMerge):
+		status = "OK to merge"
+	}
+	return name + " · " + status
+}
+
+func fleetPRReviewSummary(streams []fleetPRReviewStream, decision state.PRGateReviewDecision) string {
+	if len(streams) > 0 {
+		parts := make([]string, 0, len(streams))
+		for _, stream := range streams {
+			parts = append(parts, stream.Summary)
+		}
+		return strings.Join(parts, " · ")
+	}
+	switch decision {
+	case state.PRGateReviewPassed:
+		return "Review gate · passed"
+	case state.PRGateReviewPending:
+		return "Review gate · pending"
+	case state.PRGateReviewBlocked:
+		return "Review gate · repair required"
+	case state.PRGateReviewDisabled:
+		return "Review gate · disabled"
+	default:
+		return ""
+	}
+}
+
+func makeFleetMergeActionState(approval state.Approval, prNumber int) *fleetMergeActionState {
+	status := approval.Status
+	item := &fleetMergeActionState{
+		ApprovalID: approval.ID,
+		Status:     string(status),
+		UpdatedAt:  formatFleetTime(fleetApprovalTime(approval)),
+	}
+	ref := fmt.Sprintf("PR #%d", prNumber)
+	id := approval.ID
+	switch status {
+	case state.ApprovalStatusPending:
+		item.Label = "Merge requested"
+		item.Summary = fmt.Sprintf("Merge requested for %s; approval %s is pending operator review.", ref, id)
+		item.NextAction = fmt.Sprintf("Approve or reject merge approval %s.", id)
+		item.ActionRequired = true
+	case state.ApprovalStatusApproved:
+		item.Label = "Merge approved"
+		item.Summary = fmt.Sprintf("Merge approved for %s under approval %s; execution has not started yet.", ref, id)
+		item.NextAction = "Await the merge executor; no second merge request is needed."
+	case state.ApprovalStatusAwaitingDispatch:
+		item.Label = "Merge awaiting execution"
+		item.Summary = fmt.Sprintf("Merge approval %s for %s is awaiting execution.", id, ref)
+		item.NextAction = "Await the merge executor; no second merge request is needed."
+	case state.ApprovalStatusExecuting:
+		item.Label = "Merge executing"
+		item.Summary = fmt.Sprintf("Merge approval %s is executing for %s.", id, ref)
+		item.NextAction = "Wait for GitHub terminal truth; do not submit another merge request."
+	case state.ApprovalStatusExecuted:
+		item.Label = "Merge executed"
+		item.Summary = fmt.Sprintf("Merge approval %s executed for %s; awaiting GitHub terminal reconciliation.", id, ref)
+		item.NextAction = "Wait for GitHub to report the PR as merged; no second merge request is needed."
+	case state.ApprovalStatusRejected:
+		item.Label = "Merge rejected"
+		item.Summary = fmt.Sprintf("Merge request %s for %s was rejected.", id, ref)
+		item.NextAction = "Review the rejection; request merge again only if merge is still intended."
+		item.ActionRequired = true
+	case state.ApprovalStatusExecutionFailed:
+		item.Label = "Merge execution failed"
+		item.Summary = fmt.Sprintf("Merge approval %s failed while executing for %s.", id, ref)
+		item.NextAction = "Inspect the merge failure, correct the blocker, then request merge again."
+		item.ActionRequired = true
+	case state.ApprovalStatusExecutionSkipped:
+		item.Label = "Merge deferred"
+		item.Summary = fmt.Sprintf("Merge approval %s for %s was deferred without merging.", id, ref)
+		item.NextAction = "Revalidate the current PR head and request a fresh merge when ready."
+		item.ActionRequired = true
+	default:
+		item.Label = "Merge requested"
+		item.Summary = fmt.Sprintf("Merge request %s for %s is in status %s.", id, ref, status)
+		item.NextAction = "Review the durable merge approval state."
+		item.ActionRequired = true
+	}
+	return item
+}
+
+func fleetMergeActionDisplayStatus(status string) string {
+	switch state.ApprovalStatus(status) {
+	case state.ApprovalStatusPending:
+		return "merge_requested"
+	case state.ApprovalStatusApproved:
+		return "merge_approved"
+	case state.ApprovalStatusAwaitingDispatch:
+		return "merge_awaiting_execution"
+	case state.ApprovalStatusExecuting:
+		return "merge_executing"
+	case state.ApprovalStatusExecuted:
+		return "merge_executed"
+	case state.ApprovalStatusRejected:
+		return "merge_rejected"
+	case state.ApprovalStatusExecutionFailed:
+		return "merge_execution_failed"
+	case state.ApprovalStatusExecutionSkipped:
+		return "merge_deferred"
+	default:
+		return "merge_requested"
+	}
+}
+
+func appendFleetProjectPRState(states []fleetPRGateState, candidate fleetPRGateState) []fleetPRGateState {
+	for i := range states {
+		if states[i].PRNumber != candidate.PRNumber {
+			continue
+		}
+		if fleetPRStateNewer(candidate, states[i]) {
+			states[i] = candidate
+		}
+		return states
+	}
+	return append(states, candidate)
+}
+
+func fleetWorkerPRStateCurrent(worker sessionInfo) bool {
+	switch state.SessionStatus(worker.Status) {
+	case state.StatusDone:
+		return worker.Live && worker.PRGate != nil && worker.PRGate.Merged
+	case state.StatusPROpen, state.StatusCodeLanded, state.StatusRetryExhausted,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusDead:
+		return true
+	default:
+		return worker.Live || worker.NeedsAttention
+	}
+}
+
+func sortFleetProjectPRStates(states []fleetPRGateState) {
+	sort.SliceStable(states, func(i, j int) bool {
+		li, lj := fleetPRStatePriority(states[i]), fleetPRStatePriority(states[j])
+		if li != lj {
+			return li < lj
+		}
+		ti, tj := parseFleetTime(states[i].UpdatedAt), parseFleetTime(states[j].UpdatedAt)
+		if !ti.Equal(tj) {
+			return ti.After(tj)
+		}
+		return states[i].PRNumber > states[j].PRNumber
+	})
+}
+
+func fleetPRStateNewer(candidate, current fleetPRGateState) bool {
+	if candidate.Merged != current.Merged {
+		return candidate.Merged
+	}
+	ct, pt := parseFleetTime(candidate.UpdatedAt), parseFleetTime(current.UpdatedAt)
+	if !ct.Equal(pt) {
+		return ct.After(pt)
+	}
+	return candidate.PRNumber >= current.PRNumber
+}
+
+func fleetPRStatePriority(gate fleetPRGateState) int {
+	// Terminal truth wins when several sessions describe the same PR (the
+	// deduplication above handles that case). Across distinct PRs, however, an
+	// open durable merge action or repair-required gate is the current operator
+	// concern and must not be hidden by an older completed PR.
+	if !gate.Merged && gate.MergeAction != nil {
+		return 0
+	}
+	if !gate.Merged && (state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure || state.PRGateReviewDecision(gate.Review) == state.PRGateReviewBlocked) {
+		return 1
+	}
+	if gate.Merged {
+		return 2
+	}
+	switch state.PRGateReviewDecision(gate.Review) {
+	case state.PRGateReviewPending:
+		return 3
+	case state.PRGateReviewPassed:
+		return 4
+	default:
+		return 5
+	}
+}
+
+func parseFleetTime(value string) time.Time {
+	parsed, _ := time.Parse(time.RFC3339, strings.TrimSpace(value))
+	return parsed
+}
+
+func fleetPRGateHasFailingChecks(snapshot *state.PRGateSnapshot) bool {
+	return snapshot != nil &&
+		(snapshot.CIRollupVerdict == state.PRGateCIFailure || snapshot.CIEffectiveVerdict == state.PRGateCIFailure)
+}
+
+func fleetPRGateChecksSucceeded(snapshot *state.PRGateSnapshot) bool {
+	return snapshot != nil && snapshot.CIRollupVerdict != state.PRGateCIFailure &&
+		snapshot.CIEffectiveVerdict == state.PRGateCISuccess
+}
+
+// fleetSupersedingIssueSession identifies terminal duplicate attempts that
+// should not dominate project operator_state while the same issue already has
+// one canonical live or PR-bearing session. This is display/reconciliation
+// truth only: it does not delete history or choose a different dispatcher
+// lease. The durable issue claim remains the authority that prevents another
+// worker from being created.
+func fleetSupersedingIssueSession(candidate sessionInfo, all []sessionInfo) (sessionInfo, bool) {
+	if candidate.IssueNumber <= 0 || !candidate.NeedsAttention {
+		return sessionInfo{}, false
+	}
+	// A PR is one lifecycle artifact even when a continuation issue and its
+	// historical source issue both retain session rows. Suppress a terminal
+	// attention row behind the deterministic current owner of that exact PR;
+	// otherwise an old retry_exhausted attempt can dominate operator_state while
+	// the newer continuation is the only session allowed to repair the PR.
+	if candidate.PRNumber > 0 {
+		owner := candidate
+		for _, peer := range all {
+			if peer.Slot == candidate.Slot || peer.PRNumber != candidate.PRNumber || !fleetSessionCanOwnOpenPR(peer) {
+				continue
+			}
+			if fleetPRSessionOwnerPrecedes(peer, owner) {
+				owner = peer
+			}
+		}
+		if owner.Slot != candidate.Slot {
+			return owner, true
+		}
+	}
+	// A terminal attempt with its own PR is not merely stale execution state:
+	// it may still require operator action or reconciliation for that distinct
+	// artifact. Only no-PR duplicate attempts may be hidden behind the issue's
+	// canonical live or PR-bearing session.
+	if candidate.PRNumber > 0 {
+		return sessionInfo{}, false
+	}
+	switch state.SessionStatus(candidate.Status) {
+	case state.StatusDead, state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+	default:
+		return sessionInfo{}, false
+	}
+	for _, peer := range all {
+		if peer.Slot == candidate.Slot || peer.IssueNumber != candidate.IssueNumber {
+			continue
+		}
+		if fleetSessionActuallyRunning(peer) {
+			return peer, true
+		}
+		switch state.SessionStatus(peer.Status) {
+		case state.StatusPROpen, state.StatusCodeLanded:
+			return peer, true
+		case state.StatusRetryExhausted:
+			// A retry-exhausted canonical session still owns its open PR and
+			// remains the only valid repair identity. A no-PR terminal sibling
+			// must not dominate operator_state or ask the operator to restart it.
+			if peer.PRNumber > 0 {
+				return peer, true
+			}
+		case state.StatusDone:
+			// A terminal peer is authoritative only when it owns the issue's
+			// delivered PR and has not been released back for redispatch. It
+			// supersedes this terminal attempt when any of:
+			//   - the attempt was explicitly reconciled as a duplicate dispatch;
+			//   - the attempt was (re)dispatched after the canonical PR merged
+			//     — a stale duplicate of already-delivered work; or
+			//   - the canonical session is simply a *later* session than this
+			//     attempt (#976). Two older failed attempts (A, B) must not
+			//     resurface as operator_state once a later session (C) delivered
+			//     the same still-open/blocked issue.
+			// Do not hide a genuine failed follow-up that started *after* an
+			// older completion for the issue: that ordering is left to the
+			// started-after-completion / released-for-redispatch guards, so a
+			// genuinely regressed later session surfaces instead of a predecessor.
+			if peer.PRNumber > 0 && !peer.ReleasedForRedispatch &&
+				(candidate.WorkerOutcome == state.WorkerOutcomeDuplicateDispatchReconciled ||
+					fleetSessionStartedAfterCanonicalCompletion(candidate, peer) ||
+					fleetSessionPrecededLaterAuthoritative(candidate, peer)) {
+				return peer, true
+			}
+		}
+	}
+	return sessionInfo{}, false
+}
+
+func fleetSessionCanOwnOpenPR(sess sessionInfo) bool {
+	if sess.PRNumber <= 0 {
+		return false
+	}
+	switch state.SessionStatus(sess.Status) {
+	case state.StatusRunning, state.StatusPROpen, state.StatusQueued, state.StatusDead,
+		state.StatusFailed, state.StatusConflictFailed, state.StatusRetryExhausted:
+		return true
+	default:
+		return false
+	}
+}
+
+func fleetPRSessionOwnerPrecedes(candidate, current sessionInfo) bool {
+	candidateLive := fleetSessionActuallyRunning(candidate)
+	currentLive := fleetSessionActuallyRunning(current)
+	if candidateLive != currentLive {
+		return candidateLive
+	}
+	candidateStarted, candidateErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(candidate.StartedAt))
+	currentStarted, currentErr := time.Parse(time.RFC3339Nano, strings.TrimSpace(current.StartedAt))
+	if candidateErr == nil && currentErr != nil {
+		return true
+	}
+	if candidateErr == nil && currentErr == nil {
+		if candidateStarted.After(currentStarted) {
+			return true
+		}
+		if currentStarted.After(candidateStarted) {
+			return false
+		}
+	}
+	if candidate.Status != current.Status {
+		return state.SessionStatus(candidate.Status) == state.StatusQueued
+	}
+	return candidate.Slot < current.Slot
+}
+
+func fleetSessionStartedAfterCanonicalCompletion(candidate, canonical sessionInfo) bool {
+	started, startErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
+	finished, finishErr := time.Parse(time.RFC3339, strings.TrimSpace(canonical.FinishedAt))
+	return startErr == nil && finishErr == nil && !started.Before(finished)
+}
+
+// fleetSessionPrecededLaterAuthoritative reports whether the terminal candidate
+// is an older predecessor of the authoritative session — i.e. the authoritative
+// session started strictly after the candidate. Both StartedAt values must
+// parse; an unknown ordering is never treated as "superseded" so a follow-up
+// whose timing cannot be established is preserved as actionable state rather
+// than hidden behind a peer (#976). This is the invariant that keeps two older
+// failed attempts from resurfacing once a later session became authoritative.
+func fleetSessionPrecededLaterAuthoritative(candidate, authoritative sessionInfo) bool {
+	predecessorStart, predErr := time.Parse(time.RFC3339, strings.TrimSpace(candidate.StartedAt))
+	authoritativeStart, authErr := time.Parse(time.RFC3339, strings.TrimSpace(authoritative.StartedAt))
+	if predErr != nil || authErr != nil {
+		return false
+	}
+	return authoritativeStart.After(predecessorStart)
+}
+
+func backendDriftRestartControlAction(readOnly bool, endpoint, target string, workers, skipped []controlActionWorkerTarget) controlAction {
+	a := newApprovalControlAction(config.SupervisorActionRestartStaleBackendWorkers, "Restart stale backend workers", "Preview and enqueue restart_worker approvals for PR-less workers running stale backend settings; open-PR workers are skipped.", "project", target, 0, 0, endpoint, readOnly)
+	a.Workers = append([]controlActionWorkerTarget(nil), workers...)
+	a.SkippedWorkers = append([]controlActionWorkerTarget(nil), skipped...)
+	if len(workers) == 0 {
+		a.Disabled = true
+		if readOnly {
+			a.DisabledReason = readOnlyDisabledReason()
+		} else {
+			a.DisabledReason = "All stale-backend workers have open PRs or are not restartable; use in-place repair or handoff."
+		}
+	}
+	return a
 }
 
 func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetCloseCandidate {
@@ -4086,7 +5213,7 @@ func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetClo
 	alreadyClosed := fleetIssuesCoveredByExecutedCloseApproval(st)
 	candidates := make([]fleetCloseCandidate, 0)
 	for slot, sess := range st.Sessions {
-		if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.Status != state.StatusDone {
+		if sess == nil || sess.IssueNumber <= 0 || sess.PRNumber <= 0 || sess.Status != state.StatusDone || sess.IssueClosedAt != nil {
 			continue
 		}
 		if alreadyClosed[sess.IssueNumber] {
@@ -4108,6 +5235,57 @@ func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetClo
 		return candidates[i].PRNumber < candidates[j].PRNumber
 	})
 	return candidates
+}
+
+func fleetClosedIssueOutcomes(st *state.State) []fleetClosedIssueOutcome {
+	if st == nil {
+		return nil
+	}
+	out := make([]fleetClosedIssueOutcome, 0)
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.Status != state.StatusDone || sess.IssueNumber <= 0 || sess.IssueClosedAt == nil {
+			continue
+		}
+		out = append(out, fleetClosedIssueOutcome{
+			IssueNumber: sess.IssueNumber,
+			PRNumber:    sess.PRNumber,
+			ClosedAt:    sess.IssueClosedAt.UTC(),
+		})
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if !out[i].ClosedAt.Equal(out[j].ClosedAt) {
+			return out[i].ClosedAt.After(out[j].ClosedAt)
+		}
+		if out[i].IssueNumber != out[j].IssueNumber {
+			return out[i].IssueNumber < out[j].IssueNumber
+		}
+		return out[i].PRNumber < out[j].PRNumber
+	})
+	return out
+}
+
+func fleetTargetWasClosed(project fleetProjectState, target *state.SupervisorTarget, observedAt time.Time) bool {
+	if target == nil {
+		return false
+	}
+	for _, closed := range project.closedIssueOutcomes {
+		matches := target.Issue > 0 && target.Issue == closed.IssueNumber
+		if !matches && target.Issue <= 0 && target.PR > 0 {
+			matches = target.PR == closed.PRNumber
+		}
+		if !matches {
+			continue
+		}
+		return observedAt.IsZero() || !closed.ClosedAt.Before(observedAt.UTC())
+	}
+	return false
+}
+
+func latestFleetClosedIssueOutcome(project fleetProjectState) (fleetClosedIssueOutcome, bool) {
+	if len(project.closedIssueOutcomes) == 0 {
+		return fleetClosedIssueOutcome{}, false
+	}
+	return project.closedIssueOutcomes[0], true
 }
 
 func fleetCloseCandidateTargets(candidates []fleetCloseCandidate) []state.SupervisorIssueTarget {
@@ -4152,34 +5330,21 @@ func fleetIssuesCoveredByExecutedCloseApproval(st *state.State) map[int]bool {
 	return covered
 }
 
-// configuredWorkerBackends returns the set of backends a fresh dispatch could
-// route a worker to: the default backend plus every enabled backend declared
-// in model.backends. Disabled backends are omitted — they are never
-// dispatchable, so they cannot serve as an available escape hatch when
-// deciding whether the project is fully blocked by model limits (#814).
+// configuredWorkerBackends returns the enabled backends in the exact effective
+// dispatch route. Unrelated backend definitions are not escape hatches because
+// the selector will never try them without an explicit label or policy pin.
 func configuredWorkerBackends(cfg *config.Config) []string {
 	if cfg == nil {
 		return nil
 	}
-	seen := make(map[string]bool)
 	var names []string
-	add := func(name string) {
+	for _, name := range cfg.Model.ResolvedRoute().Backends {
 		name = strings.TrimSpace(name)
-		if name == "" || seen[name] {
-			return
+		def, ok := cfg.Model.Backends[name]
+		if name == "" || !ok || !def.IsEnabled() {
+			continue
 		}
-		seen[name] = true
 		names = append(names, name)
-	}
-	// The default backend is auto-defined and dispatchable unless it is
-	// explicitly present-and-disabled in model.backends.
-	if def, ok := cfg.Model.Backends[cfg.Model.Default]; !ok || def.IsEnabled() {
-		add(cfg.Model.Default)
-	}
-	for name, def := range cfg.Model.Backends {
-		if def.IsEnabled() {
-			add(name)
-		}
 	}
 	return names
 }
@@ -4349,6 +5514,13 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			NextAction: "Fix the project state/config load error before Maestro can supervise it.",
 		}
 	}
+	// PR lifecycle precedence is explicit: terminal forge truth first, then the
+	// durable merge action, then open-PR gates. This projection runs after the
+	// worker rows have been reconciled from the durable gate snapshot, so a stale
+	// supervisor "not approved" finding cannot outrank a merge request or merge.
+	if lifecycle, ok := fleetProjectPRLifecycleOperatorState(project); ok {
+		return lifecycle
+	}
 	if state, ok := fleetDispatchFailureOperatorState(project); ok {
 		return state
 	}
@@ -4365,7 +5537,7 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		// attention is self-resolving the project reads calm ("auto-merging,
 		// no action needed") instead of alarming the fleet verdict with a
 		// passive `Action required — p1`.
-		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention)
+		actionable, autoMerging := partitionFleetAttentionByResolvability(project.Attention, project.Supervisor.Latest)
 		if len(actionable) == 0 && len(autoMerging) > 0 {
 			return fleetAutoMergingOperatorState(project, autoMerging[0])
 		}
@@ -4521,6 +5693,86 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 	}
 }
 
+func fleetProjectPRLifecycleOperatorState(project fleetProjectState) (fleetOperatorState, bool) {
+	if len(project.PRStates) == 0 {
+		return fleetOperatorState{}, false
+	}
+	gate := project.PRStates[0]
+	base := fleetOperatorState{
+		PRNumber: gate.PRNumber,
+		PRURL:    githubPRURL(project.Repo, gate.PRNumber),
+		PRGate:   &gate,
+	}
+	for _, worker := range append(append([]sessionInfo{}, project.Active...), project.Attention...) {
+		if worker.PRNumber != gate.PRNumber {
+			continue
+		}
+		base.Session = worker.Slot
+		base.IssueNumber = worker.IssueNumber
+		base.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+		break
+	}
+	if gate.Merged {
+		base.Kind = "code_landed"
+		base.Tone = "healthy"
+		base.Label = "Merged · code landed"
+		base.Summary = fmt.Sprintf("PR #%d merged and code landed. %s", gate.PRNumber, gate.Summary)
+		base.NextAction = "No merge or review-repair action is available; wait for any configured runtime or delivery verification."
+		return base, true
+	}
+	if action := gate.MergeAction; action != nil {
+		base.ApprovalID = action.ApprovalID
+		base.ApprovalStatus = action.Status
+		base.Label = action.Label
+		base.Summary = gate.Summary
+		base.NextAction = action.NextAction
+		if action.ActionRequired {
+			base.Kind = "merge_action_required"
+			base.Tone = "attention"
+		} else {
+			base.Kind = "merge_in_progress"
+			base.Tone = "busy"
+		}
+		return base, true
+	}
+	if state.PRGateCIVerdict(gate.CI) == state.PRGateCIFailure {
+		base.Kind = "attention"
+		base.Tone = "attention"
+		base.Label = "CI repair required"
+		base.Summary = fmt.Sprintf("PR #%d has failing checks", gate.PRNumber)
+		if gate.ReviewSummary != "" {
+			base.Summary += ". " + gate.ReviewSummary + "."
+		}
+		base.NextAction = "Repair the existing PR in place and wait for every required check to pass; do not merge while checks are failing."
+		return base, true
+	}
+	switch state.PRGateReviewDecision(gate.Review) {
+	case state.PRGateReviewBlocked:
+		base.Kind = "review_repair"
+		base.Tone = "attention"
+		base.Label = "Review repair required"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate requires repair.", gate.PRNumber))
+		base.NextAction = "Address the concrete review findings through the bounded review-repair/retry flow."
+		return base, true
+	case state.PRGateReviewPending:
+		base.Kind = "monitoring_pr"
+		base.Tone = "busy"
+		base.Label = "Review pending"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate is pending.", gate.PRNumber))
+		base.NextAction = "Wait for the current-head review result."
+		return base, true
+	case state.PRGateReviewPassed:
+		base.Kind = "monitoring_pr"
+		base.Tone = "busy"
+		base.Label = "Review passed"
+		base.Summary = firstNonEmpty(gate.ReviewSummary, fmt.Sprintf("PR #%d review gate passed.", gate.PRNumber))
+		base.NextAction = "Review passed; wait for CI/mergeability and the configured merge path."
+		return base, true
+	default:
+		return fleetOperatorState{}, false
+	}
+}
+
 // partitionFleetAttentionByResolvability splits attention sessions into
 // operator-actionable items and convergence-bound "self-resolving" items
 // (see issue #598). A self-resolving session is currently the
@@ -4528,9 +5780,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 // will auto-merge it as soon as the merge gate clears, so the fleet verdict
 // must not alarm with `Action required — p1`. Other shapes are returned in
 // the actionable slice; the order of both slices mirrors the input.
-func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, autoMerging []sessionInfo) {
+func partitionFleetAttentionByResolvability(workers []sessionInfo, latest *supervisorDecisionInfo) (actionable, autoMerging []sessionInfo) {
 	for _, w := range workers {
-		if fleetSessionIsConvergenceBound(w) {
+		if fleetSessionIsConvergenceBound(w, latest) {
 			autoMerging = append(autoMerging, w)
 			continue
 		}
@@ -4542,20 +5794,41 @@ func partitionFleetAttentionByResolvability(workers []sessionInfo) (actionable, 
 // fleetSessionIsConvergenceBound reports whether a session in the
 // attention list is "self-resolving" — convergence (the orchestrator's
 // auto-merge once gates clear) will resolve it without operator action.
-// Today this is the retry_exhausted-with-open-PR-and-no-failing-checks
-// shape from issue #598: a green PR whose retry budget has been used up
-// but whose merge will land naturally once the merge gate clears. A PR
-// known to have failed checks (CIFailureOutput / LastNotifiedStatus =
-// ci_failure) is NOT convergence-bound and stays actionable.
-func fleetSessionIsConvergenceBound(worker sessionInfo) bool {
+// Today this is the retry_exhausted-with-open-PR shape from issue #598, but
+// only when the durable PR-gate snapshot contains positive current-head
+// evidence that the effective CI gate succeeded. Absence of failure evidence
+// is not proof of green: session/retry and supervisor metadata can lag a freshly
+// failed check run, which previously produced the false "checks are green"
+// state from issue #955. Any contradictory failing attention state wins.
+func fleetSessionIsConvergenceBound(worker sessionInfo, latest *supervisorDecisionInfo) bool {
 	if state.SessionStatus(worker.Status) != state.StatusRetryExhausted {
 		return false
 	}
 	if worker.PRNumber <= 0 {
 		return false
 	}
-	if strings.EqualFold(strings.TrimSpace(worker.LastNotification), "ci_failure") {
+	if !fleetPRGateChecksSucceeded(worker.prGateSnapshot) {
 		return false
+	}
+	if latest == nil {
+		return true
+	}
+	for _, stuck := range latest.StuckStates {
+		if stuck.Target == nil || stuck.Target.PR != worker.PRNumber {
+			continue
+		}
+		switch strings.TrimSpace(stuck.Code) {
+		case "failing_checks", state.StuckPendingChecks, "draft_pr", "unmergeable_pr",
+			"greptile_not_approved", "greptile_pending", "review_gate_not_approved",
+			"review_gate_pending", state.StuckReviewRepairExhausted:
+			return false
+		case "retry_exhausted_open_pr":
+			for _, evidence := range stuck.Evidence {
+				if strings.Contains(strings.ToLower(evidence), "checks=failure") {
+					return false
+				}
+			}
+		}
 	}
 	return true
 }
@@ -4629,6 +5902,9 @@ func fleetDispatchFailureOperatorState(project fleetProjectState) (fleetOperator
 	if latest == nil {
 		return fleetOperatorState{}, false
 	}
+	if fleetTargetWasClosed(project, latest.Target, latest.CreatedAt) {
+		return fleetOperatorState{}, false
+	}
 	if strings.TrimSpace(latest.Status) != "failed" && strings.TrimSpace(latest.ErrorClass) == "" {
 		return fleetOperatorState{}, false
 	}
@@ -4677,12 +5953,20 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 	}
 	if latest := project.Supervisor.Latest; latest != nil {
 		if strings.TrimSpace(latest.RecommendedAction) == "check_outcome_health" {
+			summary := firstNonEmpty(latest.Summary, "Runtime outcome health needs verification.")
+			targetClosed := fleetTargetWasClosed(project, latest.Target, latest.CreatedAt)
+			if targetClosed {
+				summary = fleetOutcomeDriftSummary(project, summary)
+			}
 			operator := fleetOperatorState{
 				Kind:       "outcome_drift",
 				Tone:       "attention",
 				Label:      "Outcome drift",
-				Summary:    firstNonEmpty(latest.Summary, "Runtime outcome health needs verification."),
+				Summary:    summary,
 				NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
+			}
+			if targetClosed {
+				return operator, true
 			}
 			return applyFleetOperatorTarget(project, operator, latest.Target), true
 		}
@@ -4690,12 +5974,20 @@ func fleetOutcomeDriftOperatorState(project fleetProjectState) (fleetOperatorSta
 			if stuck.Code != state.StuckNoOutcomeProgress {
 				continue
 			}
+			summary := firstNonEmpty(stuck.Summary, "Runtime outcome health has not caught up with merged PRs.")
+			targetClosed := fleetTargetWasClosed(project, stuck.Target, latest.CreatedAt)
+			if targetClosed {
+				summary = fleetOutcomeDriftSummary(project, summary)
+			}
 			operator := fleetOperatorState{
 				Kind:       "outcome_drift",
 				Tone:       "attention",
 				Label:      "Outcome drift",
-				Summary:    firstNonEmpty(stuck.Summary, "Runtime outcome health has not caught up with merged PRs."),
+				Summary:    summary,
 				NextAction: firstNonEmpty(stuck.RecommendedAction, project.Outcome.NextAction),
+			}
+			if targetClosed {
+				return operator, true
 			}
 			return applyFleetOperatorTarget(project, operator, stuck.Target), true
 		}
@@ -4719,9 +6011,19 @@ func fleetOutcomeHealthState(project fleetProjectState, health string) fleetOper
 		Kind:       "outcome_drift",
 		Tone:       "attention",
 		Label:      "Outcome drift",
-		Summary:    fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal),
+		Summary:    fleetOutcomeDriftSummary(project, fmt.Sprintf("Runtime outcome health is %s for %s.", strings.ReplaceAll(firstNonEmpty(health, outcome.HealthUnknown), "_", " "), goal)),
 		NextAction: firstNonEmpty(project.Outcome.NextAction, "Run the configured runtime/deploy healthcheck before dispatching more issue work."),
 	}
+}
+
+func fleetOutcomeDriftSummary(project fleetProjectState, fallback string) string {
+	closed, ok := latestFleetClosedIssueOutcome(project)
+	if !ok {
+		return fallback
+	}
+	health := strings.ReplaceAll(firstNonEmpty(project.Outcome.HealthState, outcome.HealthUnknown), "_", " ")
+	goal := firstNonEmpty(project.Outcome.Goal, project.Outcome.DesiredOutcome, "the configured runtime outcome")
+	return fmt.Sprintf("Issue #%d is closed; project outcome remains unverified (runtime health is %s) for %s.", closed.IssueNumber, health, goal)
 }
 
 // fleetMeteredBackendOperatorState surfaces the #838 metered-backend refusal as
@@ -4750,6 +6052,9 @@ func fleetMeteredBackendOperatorState(project fleetProjectState) (fleetOperatorS
 func fleetOperatorStateFromSupervisor(project fleetProjectState) (fleetOperatorState, bool) {
 	latest := project.Supervisor.Latest
 	if latest == nil {
+		return fleetOperatorState{}, false
+	}
+	if fleetTargetWasClosed(project, latest.Target, latest.CreatedAt) {
 		return fleetOperatorState{}, false
 	}
 	action := strings.TrimSpace(latest.RecommendedAction)
@@ -4910,55 +6215,94 @@ func isFleetWorkerDefaultVisible(worker sessionInfo) bool {
 	return worker.NeedsAttention || worker.Live
 }
 
+func fleetTokenBudgetMeasureForBackend(backend string) string {
+	return worker.TokenBudgetMeasureForBackend(backend)
+}
+
 func makeFleetWorkerState(project fleetProjectState, worker sessionInfo) fleetWorkerState {
+	tokenBudgetMeasure := worker.TokenBudgetMeasure
+	if project.EffectiveConfig.CostCaps.WorkerMaxTokens > 0 && tokenBudgetMeasure == "" {
+		tokenBudgetMeasure = fleetTokenBudgetMeasureForBackend(worker.Backend)
+	}
 	return fleetWorkerState{
-		ProjectName:            project.Name,
-		ProjectRepo:            project.Repo,
-		DashboardURL:           project.DashboardURL,
-		Slot:                   worker.Slot,
-		IssueNumber:            worker.IssueNumber,
-		IssueTitle:             worker.IssueTitle,
-		IssueURL:               worker.IssueURL,
-		Status:                 worker.Status,
-		DisplayStatus:          worker.DisplayStatus,
-		StatusReason:           worker.StatusReason,
-		NextAction:             worker.NextAction,
-		NeedsAttention:         worker.NeedsAttention,
-		Live:                   worker.Live,
-		Backend:                worker.Backend,
-		Model:                  worker.Model,
-		BackendSelection:       worker.BackendSelection,
-		PRNumber:               worker.PRNumber,
-		PRURL:                  worker.PRURL,
-		TokensUsedAttempt:      worker.TokensUsedAttempt,
-		TokensUsedTotal:        worker.TokensUsedTotal,
-		WorkerMaxTokens:        project.EffectiveConfig.CostCaps.WorkerMaxTokens,
-		WorkerOutcome:          worker.WorkerOutcome,
-		CostUSDEstimate:        worker.CostUSDEstimate,
-		CostUSDBackend:         worker.CostUSDBackend,
-		Runtime:                worker.Runtime,
-		RuntimeSeconds:         worker.RuntimeSeconds,
-		WorkerRuntime:          worker.WorkerRuntime,
-		WorkerRuntimeSeconds:   worker.WorkerRuntimeSeconds,
-		WorkflowRuntime:        worker.WorkflowRuntime,
-		WorkflowRuntimeSeconds: worker.WorkflowRuntimeSeconds,
-		PROpenRuntime:          worker.PROpenRuntime,
-		PROpenRuntimeSeconds:   worker.PROpenRuntimeSeconds,
-		StartedAt:              worker.StartedAt,
-		FinishedAt:             worker.FinishedAt,
-		WorkerEndedAt:          worker.WorkerEndedAt,
-		PROpenedAt:             worker.PROpenedAt,
-		NextRetryAt:            worker.NextRetryAt,
-		PID:                    worker.PID,
-		Alive:                  worker.Alive,
-		Worktree:               worker.Worktree,
-		Branch:                 worker.Branch,
-		TmuxSession:            worker.TmuxSession,
-		HasLog:                 worker.HasLog,
-		RetryCount:             worker.RetryCount,
-		LastNotification:       worker.LastNotification,
-		Attribution:            worker.Attribution,
-		Actions:                worker.Actions,
+		ProjectName:               project.Name,
+		ProjectRepo:               project.Repo,
+		DashboardURL:              project.DashboardURL,
+		Slot:                      worker.Slot,
+		IssueNumber:               worker.IssueNumber,
+		IssueTitle:                worker.IssueTitle,
+		IssueURL:                  worker.IssueURL,
+		Status:                    worker.Status,
+		DisplayStatus:             worker.DisplayStatus,
+		StatusReason:              worker.StatusReason,
+		NextAction:                worker.NextAction,
+		NeedsAttention:            worker.NeedsAttention,
+		Live:                      worker.Live,
+		Backend:                   worker.Backend,
+		ProviderLimitBackend:      worker.ProviderLimitBackend,
+		ProviderLimitReason:       worker.ProviderLimitReason,
+		ProviderLimitProvider:     worker.ProviderLimitProvider,
+		ProviderLimitModel:        worker.ProviderLimitModel,
+		ProviderLimitResetAt:      worker.ProviderLimitResetAt,
+		CredentialCandidates:      worker.CredentialCandidates,
+		CredentialCandidatesKnown: worker.CredentialCandidatesKnown,
+		CredentialUsable:          worker.CredentialUsable,
+		CredentialUsableKnown:     worker.CredentialUsableKnown,
+		CredentialAggregateReason: worker.CredentialAggregateReason,
+		Model:                     worker.Model,
+		Phase:                     worker.Phase,
+		PlanVersion:               worker.PlanVersion,
+		AdvisorReviewRound:        worker.AdvisorReviewRound,
+		AdvisorMaxReviewRounds:    worker.AdvisorMaxReviewRounds,
+		AdvisorBackend:            worker.AdvisorBackend,
+		AdvisorModel:              worker.AdvisorModel,
+		AdvisorVerdict:            worker.AdvisorVerdict,
+		AdvisorUnresolvedFindings: worker.AdvisorUnresolvedFindings,
+		AdvisorTerminalReason:     worker.AdvisorTerminalReason,
+		AdvisorBestEffort:         worker.AdvisorBestEffort,
+		AdvisorBypassed:           worker.AdvisorBypassed,
+		AdvisorReviews:            append([]state.AdvisorReview(nil), worker.AdvisorReviews...),
+		PRGate:                    worker.PRGate,
+		BackendSelection:          worker.BackendSelection,
+		PRNumber:                  worker.PRNumber,
+		PRMerged:                  worker.PRMerged,
+		PRURL:                     worker.PRURL,
+		OperatorGateName:          worker.OperatorGateName,
+		OperatorGateAction:        worker.OperatorGateAction,
+		TokensUsedAttempt:         worker.TokensUsedAttempt,
+		TokensUsedTotal:           worker.TokensUsedTotal,
+		TokenBudgetTokensAttempt:  worker.TokenBudgetTokensAttempt,
+		WorkerMaxTokens:           project.EffectiveConfig.CostCaps.WorkerMaxTokens,
+		TokenBudgetMeasure:        tokenBudgetMeasure,
+		WorkerOutcome:             worker.WorkerOutcome,
+		CostUSDEstimate:           worker.CostUSDEstimate,
+		CostUSDBackend:            worker.CostUSDBackend,
+		Runtime:                   worker.Runtime,
+		RuntimeSeconds:            worker.RuntimeSeconds,
+		WorkerRuntime:             worker.WorkerRuntime,
+		WorkerRuntimeSeconds:      worker.WorkerRuntimeSeconds,
+		WorkflowRuntime:           worker.WorkflowRuntime,
+		WorkflowRuntimeSeconds:    worker.WorkflowRuntimeSeconds,
+		PROpenRuntime:             worker.PROpenRuntime,
+		PROpenRuntimeSeconds:      worker.PROpenRuntimeSeconds,
+		StartedAt:                 worker.StartedAt,
+		WorkerGeneration:          worker.WorkerGeneration,
+		FinishedAt:                worker.FinishedAt,
+		IssueClosedAt:             worker.IssueClosedAt,
+		WorkerEndedAt:             worker.WorkerEndedAt,
+		PROpenedAt:                worker.PROpenedAt,
+		NextRetryAt:               worker.NextRetryAt,
+		PID:                       worker.PID,
+		Alive:                     worker.Alive,
+		Worktree:                  worker.Worktree,
+		Branch:                    worker.Branch,
+		TmuxSession:               worker.TmuxSession,
+		HasLog:                    worker.HasLog,
+		RetryCount:                worker.RetryCount,
+		LastNotification:          worker.LastNotification,
+		Attribution:               worker.Attribution,
+		BackendDrift:              worker.BackendDrift,
+		Actions:                   worker.Actions,
 	}
 }
 
@@ -4981,6 +6325,17 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		}
 	}
 	issue, pr, session, sessionStatus := fleetApprovalTarget(st, approval.Target)
+	closedIssue := 0
+	if approval.Action == state.ApprovalActionDeployProject {
+		closedIssue = fleetClosedIssueForApproval(st, approval, issue, pr, session)
+		if closedIssue > 0 {
+			// Keep the durable approval payload untouched, but project it as
+			// project/deployment work rather than an action on a closed issue.
+			issue = 0
+			session = ""
+			sessionStatus = string(state.StatusDone)
+		}
+	}
 	createdAt := approval.CreatedAt.UTC()
 	updatedAt := approval.UpdatedAt.UTC()
 	if updatedAt.IsZero() {
@@ -5013,11 +6368,88 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		createdAt:         createdAt,
 		updatedAt:         updatedAt,
 	}
-	if approval.Status == state.ApprovalStatusPending {
+	if closedIssue > 0 {
+		if item.Target != nil {
+			target := *item.Target
+			target.Issue = 0
+			target.Session = ""
+			target.Issues = nil
+			item.Target = &target
+		}
+		if item.Delivery != nil {
+			item.Delivery.Issue = 0
+		}
+		item.Summary = fmt.Sprintf("Issue #%d is closed; deployment/outcome work for merged PR #%d remains project-scoped (approval status: %s).", closedIssue, pr, approval.Status)
+	}
+	if approval.Action == config.SupervisorActionMergePR && fleetPRMergedInState(st, project.Repo, issue, pr) {
+		item.TargetTerminal = true
+	}
+	if approval.Status == state.ApprovalStatusPending && !item.TargetTerminal {
 		item.PastSLA = approvalPastSLA(&item, now)
 	}
 	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
 	return item
+}
+
+func fleetClosedIssueForApproval(st *state.State, approval state.Approval, issue, pr int, session string) int {
+	if st == nil {
+		return 0
+	}
+	if session = strings.TrimSpace(session); session != "" {
+		if sess := st.Sessions[session]; sess != nil {
+			if sess.Status == state.StatusDone && sess.IssueClosedAt != nil &&
+				(issue <= 0 || issue == sess.IssueNumber) && (pr <= 0 || pr == sess.PRNumber) {
+				return sess.IssueNumber
+			}
+			// An exact live/fresh session is authoritative. Do not fall back to
+			// an older closed session for the same issue after a reopen.
+			return 0
+		}
+	}
+	if pr > 0 {
+		for _, sess := range st.Sessions {
+			if sess == nil || sess.Status != state.StatusDone || sess.IssueClosedAt == nil || sess.PRNumber != pr {
+				continue
+			}
+			if issue > 0 && sess.IssueNumber != issue {
+				continue
+			}
+			return sess.IssueNumber
+		}
+		// A PR identity is stronger than an issue-only historical marker. If
+		// this PR does not match the closed session, it belongs to later work.
+		return 0
+	}
+	createdAt := approval.CreatedAt.UTC()
+	for _, sess := range st.Sessions {
+		if sess == nil || sess.Status != state.StatusDone || sess.IssueClosedAt == nil {
+			continue
+		}
+		if issue > 0 && sess.IssueNumber == issue {
+			if !createdAt.IsZero() && sess.IssueClosedAt.Before(createdAt) {
+				continue
+			}
+			return sess.IssueNumber
+		}
+	}
+	return 0
+}
+
+func fleetPRMergedInState(st *state.State, project string, issueNumber, prNumber int) bool {
+	if st == nil || prNumber <= 0 {
+		return false
+	}
+	if issueNumber > 0 {
+		if snapshot, ok := st.LatestPRGateSnapshot(project, issueNumber, prNumber); ok && snapshot.MergeCommitSHA != "" && !snapshot.MergedAt.IsZero() {
+			return true
+		}
+	}
+	for _, sess := range st.Sessions {
+		if sess != nil && sess.PRNumber == prNumber && sess.Status == state.StatusCodeLanded {
+			return true
+		}
+	}
+	return false
 }
 
 // safeFleetDeliveryPayload returns an API-safe copy of the strict delivery
@@ -5416,7 +6848,10 @@ func fleetProgressActualRecoveryFrom(recovery *progress.Recovery, now time.Time)
 	r := &fleetProgressRecovery{
 		Action:           string(recovery.Action),
 		Outcome:          string(recovery.Outcome),
+		Stage:            string(recovery.Stage),
 		RecommendationID: strings.TrimSpace(recovery.RecommendationID),
+		Reason:           string(recovery.Reason),
+		LeaseGeneration:  recovery.LeaseGeneration,
 	}
 	if !recovery.AttemptedAt.IsZero() {
 		r.At = formatFleetTime(recovery.AttemptedAt)
@@ -5490,8 +6925,10 @@ func failedCount(summary map[string]int) int {
 // case (#564) and must contribute to the count. When the latest supervisor
 // decision reports ProjectState.OpenPRs (the GitHub truth, populated from
 // ListOpenPRs), the larger of the two values wins so a transient session
-// drift never under-counts the dashboard while a stale supervisor decision
-// cannot over-count it.
+// drift never under-counts the dashboard. New decisions also persist exact PR
+// numbers, allowing a later closed-issue reconciliation to remove only a PR
+// proven merged without subtracting unrelated or still-open work from an
+// aggregate.
 func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
 	count := len(projectState.PROpen)
 	if st != nil {
@@ -5518,8 +6955,38 @@ func fleetTruthfulOpenPRCount(projectState stateResponse, st *state.State) int {
 		}
 	}
 	if latest := projectState.SupervisorLatest; latest != nil {
-		if latest.ProjectState.OpenPRs > count {
-			count = latest.ProjectState.OpenPRs
+		reported := latest.ProjectState.OpenPRs
+		if latest.ProjectState.OpenPRNumbers != nil {
+			// Exact identities are required before filtering. A legacy aggregate
+			// alone cannot prove whether the closed session's PR was counted, and
+			// issue closure does not itself prove that the PR merged.
+			closedMergedPRs := make(map[int]struct{})
+			if st != nil {
+				for _, sess := range st.Sessions {
+					if sess == nil || sess.PRNumber <= 0 || !sess.PRMerged || sess.IssueClosedAt == nil || sess.IssueClosedAt.Before(latest.CreatedAt) {
+						continue
+					}
+					closedMergedPRs[sess.PRNumber] = struct{}{}
+				}
+			}
+			reported = 0
+			seen := make(map[int]struct{}, len(latest.ProjectState.OpenPRNumbers))
+			for _, pr := range latest.ProjectState.OpenPRNumbers {
+				if pr <= 0 {
+					continue
+				}
+				if _, duplicate := seen[pr]; duplicate {
+					continue
+				}
+				seen[pr] = struct{}{}
+				if _, closedAndMerged := closedMergedPRs[pr]; closedAndMerged {
+					continue
+				}
+				reported++
+			}
+		}
+		if reported > count {
+			count = reported
 		}
 	}
 	return count

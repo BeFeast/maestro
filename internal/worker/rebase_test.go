@@ -130,6 +130,102 @@ func TestNormalizedGitPaths_TrimsDeduplicatesAndUsesSlash(t *testing.T) {
 	}
 }
 
+func TestRebaseWorktree_NoAttributionPolicyFailsClosedBeforeForcePush(t *testing.T) {
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	worktree := filepath.Join(root, "worktree")
+	branch := "feat/no-attribution"
+
+	gitTest(t, root, "init", "--bare", origin)
+	gitTest(t, root, "clone", origin, seed)
+	gitTest(t, seed, "config", "user.email", "test@example.com")
+	gitTest(t, seed, "config", "user.name", "Test User")
+	writeTestFile(t, seed, "AGENTS.md", "No AI attribution anywhere in git/GitHub artifacts.\n")
+	writeTestFile(t, seed, "README.md", "base\n")
+	gitTest(t, seed, "add", "AGENTS.md", "README.md")
+	gitTest(t, seed, "commit", "-m", "initial")
+	gitTest(t, seed, "branch", "-M", "main")
+	gitTest(t, seed, "push", "-u", "origin", "main")
+	gitTest(t, seed, "checkout", "-b", branch)
+	writeTestFile(t, seed, "feature.txt", "implemented\n")
+	gitTest(t, seed, "add", "feature.txt")
+	gitTest(t, seed, "commit", "-m", "worker: implement feature")
+	gitTest(t, seed, "push", "-u", "origin", branch)
+
+	gitTest(t, root, "clone", origin, worktree)
+	gitTest(t, worktree, "config", "user.email", "test@example.com")
+	gitTest(t, worktree, "config", "user.name", "Test User")
+	gitTest(t, worktree, "checkout", branch)
+	remoteCleanHead := gitOutput(t, origin, "rev-parse", branch)
+
+	gitTest(t, worktree, "commit", "--amend", "-m", "worker: implement feature", "-m", "Maestro-Backend: sol openai gpt-5.6-sol")
+	if err := RebaseWorktree(worktree, branch, nil, nil); err == nil || !strings.Contains(err.Error(), "repository policy prohibits AI attribution") {
+		t.Fatalf("forbidden attribution force-push error = %v", err)
+	}
+	if got := gitOutput(t, origin, "rev-parse", branch); got != remoteCleanHead {
+		t.Fatalf("policy violation changed remote head: got %s want %s", got, remoteCleanHead)
+	}
+
+	// The worker strips the trailer. Finalization may force-push that clean head,
+	// but running it again must preserve the already accepted exact identity.
+	gitTest(t, worktree, "commit", "--amend", "-m", "worker: implement feature")
+	if err := RebaseWorktree(worktree, branch, nil, nil); err != nil {
+		t.Fatalf("clean force-push: %v", err)
+	}
+	acceptedHead := gitOutput(t, origin, "rev-parse", branch)
+	if msg := gitOutput(t, origin, "log", "-1", "--pretty=%B", branch); strings.Contains(msg, "Maestro-Backend:") {
+		t.Fatalf("clean force-push retained forbidden trailer:\n%s", msg)
+	}
+	if err := RebaseWorktree(worktree, branch, nil, nil); err != nil {
+		t.Fatalf("repeat clean finalization: %v", err)
+	}
+	if got := gitOutput(t, origin, "rev-parse", branch); got != acceptedHead {
+		t.Fatalf("repeat finalization invalidated exact head: got %s want %s", got, acceptedHead)
+	}
+}
+
+func TestRebaseWorktree_PreservesHistoricalAttributionTrailer(t *testing.T) {
+	root := t.TempDir()
+	origin := filepath.Join(root, "origin.git")
+	seed := filepath.Join(root, "seed")
+	worktree := filepath.Join(root, "worktree")
+	branch := "feat/historical-attribution"
+
+	gitTest(t, root, "init", "--bare", origin)
+	gitTest(t, root, "clone", origin, seed)
+	gitTest(t, seed, "config", "user.email", "test@example.com")
+	gitTest(t, seed, "config", "user.name", "Test User")
+	writeTestFile(t, seed, "README.md", "base\n")
+	gitTest(t, seed, "add", "README.md")
+	gitTest(t, seed, "commit", "-m", "initial")
+	gitTest(t, seed, "branch", "-M", "main")
+	gitTest(t, seed, "push", "-u", "origin", "main")
+	gitTest(t, seed, "checkout", "-b", branch)
+	writeTestFile(t, seed, "feature.txt", "implemented\n")
+	gitTest(t, seed, "add", "feature.txt")
+	gitTest(t, seed, "commit", "-m", "worker: implement feature", "-m", "Maestro-Backend: legacy provider model")
+	gitTest(t, seed, "push", "-u", "origin", branch)
+
+	gitTest(t, seed, "checkout", "main")
+	writeTestFile(t, seed, "README.md", "base advanced\n")
+	gitTest(t, seed, "commit", "-am", "advance main")
+	gitTest(t, seed, "push", "origin", "main")
+
+	gitTest(t, root, "clone", origin, worktree)
+	gitTest(t, worktree, "config", "user.email", "test@example.com")
+	gitTest(t, worktree, "config", "user.name", "Test User")
+	gitTest(t, worktree, "checkout", branch)
+
+	if err := RebaseWorktree(worktree, branch, nil, nil); err != nil {
+		t.Fatalf("rebase historical trailer: %v", err)
+	}
+	msg := gitOutput(t, origin, "log", "-1", "--pretty=%B", branch)
+	if !strings.Contains(msg, "Maestro-Backend: legacy provider model") {
+		t.Fatalf("historical attribution trailer was not preserved:\n%s", msg)
+	}
+}
+
 func gitTest(t *testing.T, dir string, args ...string) {
 	t.Helper()
 	cmd := exec.Command("git", args...)
@@ -138,6 +234,17 @@ func gitTest(t *testing.T, dir string, args ...string) {
 	if err != nil {
 		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
 	}
+}
+
+func gitOutput(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	cmd := exec.Command("git", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+	}
+	return strings.TrimSpace(string(out))
 }
 
 func writeTestFile(t *testing.T, dir, rel, content string) {

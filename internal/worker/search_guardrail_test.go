@@ -2,12 +2,16 @@ package worker
 
 import (
 	"bytes"
+	"context"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/state"
 )
@@ -31,11 +35,6 @@ func newSearchGuardrailHarness(t *testing.T) searchGuardrailHarness {
 		t.Fatalf("create fake bin: %v", err)
 	}
 
-	guardDir, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state"))
-	if err != nil {
-		t.Fatalf("ensureSearchGuardrailWrappers: %v", err)
-	}
-
 	fakeScript := `#!/bin/sh
 printf 'real:%s:%s\n' "$0" "$PWD"
 printf 'args:'
@@ -48,6 +47,12 @@ printf '\n'
 		if err := os.WriteFile(filepath.Join(fakeDir, name), []byte(fakeScript), 0755); err != nil {
 			t.Fatalf("write fake %s: %v", name, err)
 		}
+	}
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	guardDir, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state"))
+	if err != nil {
+		t.Fatalf("ensureSearchGuardrailWrappers: %v", err)
 	}
 
 	return searchGuardrailHarness{
@@ -201,6 +206,509 @@ func TestSearchGuardrailWrapperAllowsExplicitBroadSearch(t *testing.T) {
 	}
 }
 
+func TestSearchGuardrailWrapperPinsTrustedExecutable(t *testing.T) {
+	baseDir := t.TempDir()
+	firstBin := filepath.Join(baseDir, "first-bin")
+	secondBin := filepath.Join(baseDir, "second-bin")
+	for _, dir := range []string{firstBin, secondBin} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create fake bin: %v", err)
+		}
+	}
+	for _, name := range searchGuardedCommands {
+		if err := os.WriteFile(filepath.Join(firstBin, name), []byte("#!/bin/sh\nprintf 'first:"+name+"\\n'\n"), 0o755); err != nil {
+			t.Fatalf("write first %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(secondBin, name), []byte("#!/bin/sh\nprintf 'second:"+name+"\\n'\n"), 0o755); err != nil {
+			t.Fatalf("write second %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", firstBin+string(os.PathListSeparator)+secondBin)
+
+	guardDir, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state"))
+	if err != nil {
+		t.Fatalf("ensureSearchGuardrailWrappers: %v", err)
+	}
+
+	for _, name := range searchGuardedCommands {
+		cmd := exec.Command(filepath.Join(guardDir, name))
+		cmd.Dir = baseDir
+		cmd.Env = []string{
+			"MAESTRO_ALLOW_BROAD_SEARCH=1",
+			"MAESTRO_ORIGINAL_PATH=" + guardDir + ":::" + secondBin,
+			"PATH=" + guardDir + string(os.PathListSeparator) + secondBin,
+		}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run pinned %s: %v\n%s", name, err, output)
+		}
+		if got, want := string(output), "first:"+name+"\n"; got != want {
+			t.Fatalf("pinned %s output = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestEnsureSearchGuardrailWrappersSkipsInheritedGuardrail(t *testing.T) {
+	baseDir := t.TempDir()
+	inheritedGuardDir := filepath.Join(baseDir, "inherited", searchGuardrailDirName)
+	inheritedAlias := filepath.Join(baseDir, "inherited-alias")
+	trustedBin := filepath.Join(baseDir, "trusted-bin")
+	for _, dir := range []string{inheritedGuardDir, trustedBin} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create fake bin: %v", err)
+		}
+	}
+	if err := os.Symlink(inheritedGuardDir, inheritedAlias); err != nil {
+		t.Fatalf("create inherited guard alias: %v", err)
+	}
+	for _, name := range searchGuardedCommands {
+		if err := os.WriteFile(filepath.Join(inheritedGuardDir, name), []byte("#!/bin/sh\nprintf 'recursive:"+name+"\\n'\n"), 0o755); err != nil {
+			t.Fatalf("write inherited wrapper %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(trustedBin, name), []byte("#!/bin/sh\nprintf 'trusted:"+name+"\\n'\n"), 0o755); err != nil {
+			t.Fatalf("write trusted %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", inheritedAlias+string(os.PathListSeparator)+trustedBin)
+
+	guardDir, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state"))
+	if err != nil {
+		t.Fatalf("ensure wrappers behind inherited guardrail: %v", err)
+	}
+	hardlinkBin := filepath.Join(baseDir, "hardlink-bin")
+	if err := os.MkdirAll(hardlinkBin, 0o755); err != nil {
+		t.Fatalf("create hardlink bin: %v", err)
+	}
+	for _, name := range searchGuardedCommands {
+		if err := os.Link(filepath.Join(guardDir, name), filepath.Join(hardlinkBin, name)); err != nil {
+			t.Fatalf("hardlink installed %s wrapper: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", hardlinkBin+string(os.PathListSeparator)+trustedBin)
+	if _, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state")); err != nil {
+		t.Fatalf("refresh wrappers behind hardlinked wrappers: %v", err)
+	}
+	copiedBin := filepath.Join(baseDir, "copied-bin")
+	if err := os.MkdirAll(copiedBin, 0o755); err != nil {
+		t.Fatalf("create copied wrapper bin: %v", err)
+	}
+	for _, name := range searchGuardedCommands {
+		content, err := os.ReadFile(filepath.Join(hardlinkBin, name))
+		if err != nil {
+			t.Fatalf("read copied source %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(copiedBin, name), content, 0o755); err != nil {
+			t.Fatalf("copy installed %s wrapper: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", copiedBin+string(os.PathListSeparator)+trustedBin)
+	if _, err := ensureSearchGuardrailWrappers(filepath.Join(baseDir, "state")); err != nil {
+		t.Fatalf("refresh wrappers behind copied wrappers: %v", err)
+	}
+	for _, name := range searchGuardedCommands {
+		cmd := exec.Command(filepath.Join(guardDir, name))
+		cmd.Dir = baseDir
+		cmd.Env = []string{"MAESTRO_ALLOW_BROAD_SEARCH=1", "PATH=" + guardDir}
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("run %s: %v\n%s", name, err, output)
+		}
+		if got, want := string(output), "trusted:"+name+"\n"; got != want {
+			t.Fatalf("guarded %s output = %q, want %q", name, got, want)
+		}
+	}
+}
+
+func TestSearchGuardrailWrapperRefusesUnsafeTargetsWithoutOriginalPath(t *testing.T) {
+	guardDir := filepath.Join(t.TempDir(), searchGuardrailDirName)
+	if err := os.MkdirAll(guardDir, 0o755); err != nil {
+		t.Fatalf("create guard dir: %v", err)
+	}
+	insideTarget := filepath.Join(guardDir, "grep")
+	if err := os.WriteFile(insideTarget, []byte("#!/bin/sh\nexit 99\n"), 0o755); err != nil {
+		t.Fatalf("write inside target: %v", err)
+	}
+	insideAlias := filepath.Join(filepath.Dir(guardDir), "inside-alias")
+	if err := os.Symlink(insideTarget, insideAlias); err != nil {
+		t.Fatalf("create inside target alias: %v", err)
+	}
+	missingTarget := filepath.Join(filepath.Dir(guardDir), "private-bin", "grep")
+
+	tests := []struct {
+		name       string
+		wrapper    string
+		realTarget func(string) string
+		original   string
+		code       int
+		message    string
+	}{
+		{
+			name:       "inside guard directory with original path absent",
+			wrapper:    "inside-probe",
+			realTarget: func(string) string { return insideTarget },
+			code:       126,
+			message:    "refusing",
+		},
+		{
+			name:       "outside alias to guard directory target",
+			wrapper:    "alias-probe",
+			realTarget: func(string) string { return insideAlias },
+			code:       126,
+			message:    "refusing",
+		},
+		{
+			name:       "self with malformed original path",
+			wrapper:    "self-probe",
+			realTarget: func(wrapper string) string { return wrapper },
+			original:   guardDir + "::::",
+			code:       126,
+			message:    "refusing",
+		},
+		{
+			name:       "missing trusted target hides private path",
+			wrapper:    "missing-probe",
+			realTarget: func(string) string { return missingTarget },
+			code:       127,
+			message:    "unavailable",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			wrapper := filepath.Join(guardDir, tt.wrapper)
+			content := buildSearchGuardrailWrapperScript("grep", tt.realTarget(wrapper), guardDir)
+			if err := os.WriteFile(wrapper, []byte(content), searchGuardrailWrapperMode); err != nil {
+				t.Fatalf("write wrapper: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), time.Second)
+			defer cancel()
+			cmd := exec.CommandContext(ctx, wrapper)
+			cmd.Dir = t.TempDir()
+			cmd.Env = []string{"PATH=" + guardDir, "MAESTRO_ALLOW_BROAD_SEARCH=1"}
+			if tt.original != "" {
+				cmd.Env = append(cmd.Env, "MAESTRO_ORIGINAL_PATH="+tt.original)
+			}
+			output, err := cmd.CombinedOutput()
+			if ctx.Err() != nil {
+				t.Fatalf("unsafe wrapper recursed until timeout: %v", ctx.Err())
+			}
+			exitErr, ok := err.(*exec.ExitError)
+			if !ok || exitErr.ExitCode() != tt.code {
+				t.Fatalf("unsafe wrapper error = %v, output:\n%s", err, output)
+			}
+			if !strings.Contains(string(output), tt.message) || !strings.Contains(string(output), "grep") {
+				t.Fatalf("unsafe wrapper error lacks command and refusal stage: %s", output)
+			}
+			if strings.Contains(string(output), missingTarget) {
+				t.Fatalf("unsafe wrapper error exposed private target path: %s", output)
+			}
+		})
+	}
+}
+
+func TestEnsureSearchGuardrailWrappersAtomicallyReplacesInode(t *testing.T) {
+	baseDir := t.TempDir()
+	firstBin := filepath.Join(baseDir, "first-bin")
+	secondBin := filepath.Join(baseDir, "second-bin")
+	for _, dir := range []string{firstBin, secondBin} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create fake bin: %v", err)
+		}
+		for _, name := range searchGuardedCommands {
+			if err := os.WriteFile(filepath.Join(dir, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+				t.Fatalf("write fake %s: %v", name, err)
+			}
+		}
+	}
+	t.Setenv("PATH", firstBin)
+	stateDir := filepath.Join(baseDir, "state")
+	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
+	if err != nil {
+		t.Fatalf("first ensure: %v", err)
+	}
+	path := filepath.Join(guardDir, "grep")
+	oldInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat old wrapper: %v", err)
+	}
+	oldFile, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open old wrapper: %v", err)
+	}
+	defer oldFile.Close()
+
+	t.Setenv("PATH", secondBin)
+	if _, err := ensureSearchGuardrailWrappers(stateDir); err != nil {
+		t.Fatalf("refresh wrappers: %v", err)
+	}
+	newInfo, err := os.Stat(path)
+	if err != nil {
+		t.Fatalf("stat new wrapper: %v", err)
+	}
+	if os.SameFile(oldInfo, newInfo) {
+		t.Fatal("wrapper refresh reused the executing inode instead of atomically replacing it")
+	}
+	if newInfo.Mode().Perm() != searchGuardrailWrapperMode {
+		t.Fatalf("new wrapper mode = %o, want %o", newInfo.Mode().Perm(), searchGuardrailWrapperMode)
+	}
+	oldContent, err := io.ReadAll(oldFile)
+	if err != nil {
+		t.Fatalf("read old inode: %v", err)
+	}
+	newContent, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read new inode: %v", err)
+	}
+	if !strings.Contains(string(oldContent), firstBin) || !strings.Contains(string(oldContent), "exec \"$real_path\"") {
+		t.Fatalf("old inode was truncated or changed:\n%s", oldContent)
+	}
+	if !strings.Contains(string(newContent), secondBin) {
+		t.Fatalf("new wrapper did not capture refreshed target:\n%s", newContent)
+	}
+}
+
+func TestEnsureSearchGuardrailWrappersConcurrentPreparation(t *testing.T) {
+	baseDir := t.TempDir()
+	fakeBin := filepath.Join(baseDir, "fake-bin")
+	worktree := filepath.Join(baseDir, "worktree")
+	if err := os.MkdirAll(fakeBin, 0o755); err != nil {
+		t.Fatalf("create fake bin: %v", err)
+	}
+	if err := os.MkdirAll(worktree, 0o755); err != nil {
+		t.Fatalf("create worktree: %v", err)
+	}
+	for _, name := range searchGuardedCommands {
+		content := "#!/bin/sh\n/bin/sleep 0.005\nexit 0\n"
+		if err := os.WriteFile(filepath.Join(fakeBin, name), []byte(content), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+	stateDir := filepath.Join(baseDir, "state")
+	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
+	if err != nil {
+		t.Fatalf("initial ensure: %v", err)
+	}
+	initialWrappers := make(map[string]os.FileInfo, len(searchGuardedCommands))
+	for _, name := range searchGuardedCommands {
+		info, err := os.Stat(filepath.Join(guardDir, name))
+		if err != nil {
+			t.Fatalf("stat initial %s wrapper: %v", name, err)
+		}
+		initialWrappers[name] = info
+	}
+
+	start := make(chan struct{})
+	errs := make(chan error, 32)
+	var wg sync.WaitGroup
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 12; j++ {
+				if _, err := ensureSearchGuardrailWrappers(stateDir); err != nil {
+					errs <- fmt.Errorf("concurrent prepare: %w", err)
+					return
+				}
+			}
+		}()
+		wg.Add(1)
+		go func(index int) {
+			defer wg.Done()
+			<-start
+			for j := 0; j < 12; j++ {
+				name := searchGuardedCommands[(index+j)%len(searchGuardedCommands)]
+				cmd := exec.Command(filepath.Join(guardDir, name))
+				cmd.Dir = worktree
+				cmd.Env = []string{
+					"MAESTRO_ALLOW_BROAD_SEARCH=1",
+					"MAESTRO_ORIGINAL_PATH=" + guardDir,
+					"PATH=" + guardDir + string(os.PathListSeparator) + fakeBin + string(os.PathListSeparator) + "/usr/bin:/bin",
+				}
+				if output, err := cmd.CombinedOutput(); err != nil {
+					errs <- fmt.Errorf("guarded %s failed: %w (%s)", name, err, output)
+					return
+				}
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Error(err)
+	}
+	if t.Failed() {
+		return
+	}
+
+	entries, err := os.ReadDir(guardDir)
+	if err != nil {
+		t.Fatalf("read guard dir: %v", err)
+	}
+	if len(entries) != len(searchGuardedCommands) {
+		t.Fatalf("guard dir contains %d entries, want %d: %v", len(entries), len(searchGuardedCommands), entries)
+	}
+	for _, entry := range entries {
+		info, err := entry.Info()
+		if err != nil {
+			t.Fatalf("stat %s: %v", entry.Name(), err)
+		}
+		if !info.Mode().IsRegular() || info.Mode().Perm() != searchGuardrailWrapperMode {
+			t.Fatalf("wrapper %s mode = %v, want regular %o", entry.Name(), info.Mode(), searchGuardrailWrapperMode)
+		}
+		if initial := initialWrappers[entry.Name()]; initial == nil || !os.SameFile(initial, info) {
+			t.Fatalf("idempotent prepare replaced unchanged wrapper %s", entry.Name())
+		}
+	}
+}
+
+func TestSearchGuardrailXdgMimeRegressionDuringWrapperRefresh(t *testing.T) {
+	baseDir := t.TempDir()
+	fakeBin := filepath.Join(baseDir, "fake-bin")
+	worktree := filepath.Join(baseDir, "worktree")
+	for _, dir := range []string{fakeBin, worktree} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatalf("create test dir: %v", err)
+		}
+	}
+	for _, name := range []string{"rg", "find"} {
+		if err := os.WriteFile(filepath.Join(fakeBin, name), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+	}
+	grepScript := `#!/bin/sh
+if [ -n "${MAESTRO_TEST_GREP_MARKER:-}" ]; then
+  : > "$MAESTRO_TEST_GREP_MARKER"
+  while [ ! -e "$MAESTRO_TEST_GREP_RELEASE" ]; do
+    /bin/sleep 0.01
+  done
+fi
+exit 0
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "grep"), []byte(grepScript), 0o755); err != nil {
+		t.Fatalf("write fake grep: %v", err)
+	}
+	xdgMimeScript := `#!/bin/sh
+if [ "$1" != "query" ] || [ "$2" != "default" ] || [ "$3" != "video/mp4" ]; then
+  exit 64
+fi
+printf 'video/mp4\n' | grep -q video
+printf 'maestro-test.desktop\n'
+`
+	if err := os.WriteFile(filepath.Join(fakeBin, "xdg-mime"), []byte(xdgMimeScript), 0o755); err != nil {
+		t.Fatalf("write fake xdg-mime: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+"/usr/bin:/bin")
+	stateDir := filepath.Join(baseDir, "state")
+	guardDir, err := ensureSearchGuardrailWrappers(stateDir)
+	if err != nil {
+		t.Fatalf("initial ensure: %v", err)
+	}
+
+	marker := filepath.Join(baseDir, "grep-active")
+	release := filepath.Join(baseDir, "release-grep")
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "xdg-mime", "query", "default", "video/mp4")
+	cmd.Dir = worktree
+	cmd.Env = []string{
+		"MAESTRO_WORKTREE=" + worktree,
+		"MAESTRO_TEST_GREP_MARKER=" + marker,
+		"MAESTRO_TEST_GREP_RELEASE=" + release,
+		"MAESTRO_ORIGINAL_PATH=" + guardDir + "::::",
+		"PATH=" + guardDir + string(os.PathListSeparator) + fakeBin + string(os.PathListSeparator) + "/usr/bin:/bin",
+	}
+	var output bytes.Buffer
+	cmd.Stdout = &output
+	cmd.Stderr = &output
+	if err := cmd.Start(); err != nil {
+		t.Fatalf("start xdg-mime query default video/mp4: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = os.WriteFile(release, nil, 0o600)
+		if cmd.Process != nil {
+			_ = cmd.Process.Kill()
+		}
+	})
+	done := make(chan error, 1)
+	go func() { done <- cmd.Wait() }()
+
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if !os.IsNotExist(err) {
+			t.Fatalf("stat active grep marker: %v", err)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("xdg-mime never reached its guarded grep child; output:\n%s", output.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	if secondGuardDir, err := ensureSearchGuardrailWrappers(stateDir); err != nil {
+		t.Fatalf("prepare second worker while guarded grep is active: %v", err)
+	} else if secondGuardDir != guardDir {
+		t.Fatalf("second guard dir = %q, want %q", secondGuardDir, guardDir)
+	}
+	if err := os.WriteFile(release, nil, 0o600); err != nil {
+		t.Fatalf("release guarded grep: %v", err)
+	}
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("xdg-mime query failed after wrapper refresh: %v\n%s", err, output.String())
+		}
+	case <-ctx.Done():
+		t.Fatalf("xdg-mime query did not terminate: %v\n%s", ctx.Err(), output.String())
+	}
+	if got, want := output.String(), "maestro-test.desktop\n"; got != want {
+		t.Fatalf("xdg-mime output = %q, want %q", got, want)
+	}
+}
+
+func TestEnsureSearchGuardrailWrapperErrorsArePathSafe(t *testing.T) {
+	t.Run("resolution", func(t *testing.T) {
+		missingBin := t.TempDir()
+		stateDir := filepath.Join(t.TempDir(), "private-state")
+		t.Setenv("PATH", missingBin)
+		_, err := ensureSearchGuardrailWrappers(stateDir)
+		if err == nil {
+			t.Fatal("missing guarded commands unexpectedly succeeded")
+		}
+		message := err.Error()
+		if !strings.Contains(message, "rg") || !strings.Contains(message, "resolve trusted executable") {
+			t.Fatalf("resolution error lacks command/stage: %v", err)
+		}
+		if strings.Contains(message, missingBin) || strings.Contains(message, stateDir) {
+			t.Fatalf("resolution error exposed a private path: %v", err)
+		}
+	})
+
+	t.Run("installation", func(t *testing.T) {
+		stateDir := t.TempDir()
+		guardDir := filepath.Join(stateDir, searchGuardrailDirName)
+		redirect := t.TempDir()
+		if err := os.Symlink(redirect, guardDir); err != nil {
+			t.Fatalf("create guard-dir symlink: %v", err)
+		}
+		_, err := ensureSearchGuardrailWrappers(stateDir)
+		if err == nil {
+			t.Fatal("unsafe guard directory unexpectedly succeeded")
+		}
+		message := err.Error()
+		if !strings.Contains(message, "rg") || !strings.Contains(message, "install wrapper atomically") {
+			t.Fatalf("installation error lacks command/stage: %v", err)
+		}
+		if strings.Contains(message, stateDir) || strings.Contains(message, redirect) {
+			t.Fatalf("installation error exposed a private path: %v", err)
+		}
+	})
+}
+
 func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 	script := buildWorkerRunnerScript(
 		[]string{"codex", "exec", "-"},
@@ -227,6 +735,41 @@ func TestBuildWorkerRunnerScriptIncludesSearchGuardrails(t *testing.T) {
 	}
 }
 
+func TestResolveWorkerCommandPathPinsServiceExecutable(t *testing.T) {
+	serviceBin := t.TempDir()
+	workerBin := filepath.Join(serviceBin, "claude")
+	if err := os.WriteFile(workerBin, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake worker: %v", err)
+	}
+	t.Setenv("PATH", serviceBin)
+
+	args, err := resolveWorkerCommandPath([]string{"claude", "--model", "claude-fable-5"})
+	if err != nil {
+		t.Fatalf("resolveWorkerCommandPath: %v", err)
+	}
+	if args[0] != workerBin {
+		t.Fatalf("resolved executable = %q, want %q", args[0], workerBin)
+	}
+	if got := strings.Join(args[1:], " "); got != "--model claude-fable-5" {
+		t.Fatalf("arguments changed: %q", got)
+	}
+
+	// Once generated, a stale tmux PATH cannot change the pinned executable.
+	t.Setenv("PATH", "/usr/bin:/bin")
+	script := buildWorkerRunnerScript(args, "", "/tmp/worker.log", "/tmp/worktree", "/tmp/guard", "", "/usr/local/bin/maestro", nil)
+	if !strings.Contains(script, workerBin) {
+		t.Fatalf("runner does not pin service-resolved executable:\n%s", script)
+	}
+}
+
+func TestResolveWorkerCommandPathRejectsMissingServiceExecutable(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	_, err := resolveWorkerCommandPath([]string{"claude", "--model", "claude-fable-5"})
+	if err == nil || !strings.Contains(err.Error(), "maestro service PATH") {
+		t.Fatalf("error = %v, want service PATH resolution failure", err)
+	}
+}
+
 // #737: with a stream-split config the worker command is piped through
 // `maestro stream-split` (raw NDJSON -> slot.jsonl) before tee, keeping
 // slot.log human-readable while capturing usage on the side channel.
@@ -239,10 +782,17 @@ func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
 		"/tmp/state/search-guardrails",
 		"",
 		"/usr/local/bin/maestro",
-		&streamSplit{MaestroBin: "/usr/local/bin/maestro", Backend: "claude", JSONLPath: "/tmp/worker.jsonl"},
+		&streamSplit{
+			MaestroBin: "/usr/local/bin/maestro",
+			Backend:    "claude",
+			JSONLPath:  "/tmp/worker.jsonl",
+			MaxTokens:  80_000,
+			MarkerPath: "/tmp/worker.token-budget.json",
+			Generation: 7,
+		},
 	)
 
-	want := "2>&1 | /usr/local/bin/maestro stream-split --backend claude --jsonl /tmp/worker.jsonl | tee -a '/tmp/worker.log'"
+	want := "2>&1 | /usr/local/bin/maestro stream-split --backend claude --jsonl /tmp/worker.jsonl --max-tokens 80000 --budget-marker '/tmp/worker.token-budget.json' --worker-generation 7 | tee -a '/tmp/worker.log'"
 	if !strings.Contains(script, want) {
 		t.Fatalf("runner script missing stream-split pipeline %q\nscript:\n%s", want, script)
 	}
@@ -254,6 +804,11 @@ func TestBuildWorkerRunnerScriptStreamSplitPipeline(t *testing.T) {
 // built by concatenation so no contiguous credential-shaped literal exists in
 // the source (agent-lint).
 func TestWriteWorkerRunnerScriptUsesSingleSharedCredentialBoundary(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	tokenCanary := "CANARY-" + "auth-token-" + "d0n0t-persist-" + "0001"
 	keyCanary := "CANARY-" + "cliproxy-key-" + "d0n0t-persist-" + "0002"
 
@@ -620,6 +1175,11 @@ func TestResolveWorkerCredentialsFileRejectsSymlinkedPrivateDirectory(t *testing
 }
 
 func TestWriteWorkerRunnerScriptAtomicallyReplacesTargetSymlink(t *testing.T) {
+	fakeBin := t.TempDir()
+	if err := os.WriteFile(filepath.Join(fakeBin, "claude"), []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatalf("write fake claude: %v", err)
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	for _, key := range workerCredentialEnvKeys {
 		t.Setenv(key, "")
 	}

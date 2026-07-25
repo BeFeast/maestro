@@ -131,9 +131,10 @@ func TestDecideWithLLM_TokenBudgetExceeded_SkipsLLM(t *testing.T) {
 	if llm.calls != 0 {
 		t.Fatalf("LLM calls = %d, want 0 for deterministic token budget state", llm.calls)
 	}
-	if decision.RecommendedAction != ActionNone || decision.Target == nil || decision.Target.Session != "slot-budget" {
-		t.Fatalf("decision = %+v, want action=none targeting slot-budget", decision)
+	if decision.RecommendedAction != ActionNone || decision.Target != nil {
+		t.Fatalf("decision = %+v, want untargeted action=none when only historical budget history remains", decision)
 	}
+	requireStuckState(t, decision, state.StuckTokenBudgetExceeded)
 }
 
 // TestDecideWithLLM_SpawnCandidate_CallsLLM pins the counterpart AC: a mutating
@@ -156,31 +157,22 @@ func TestDecideWithLLM_SpawnCandidate_CallsLLM(t *testing.T) {
 	}
 }
 
-// TestDecideWithLLM_LabelIssueReadyWithMutations_CallsLLM pins the documented
-// choice for AC-3: a safe decision that still plans a GitHub mutation
-// (label_issue_ready with add_ready_label) keeps the LLM second opinion because
-// len(Mutations) > 0, even though its headline risk is safe.
-func TestDecideWithLLM_LabelIssueReadyWithMutations_CallsLLM(t *testing.T) {
+// TestDecideWithLLM_LabelIssueReadyWithMutations_SkipsLLM: risk=safe label
+// mutations must not block the control loop on a hung supervisor backend —
+// the guardrail already owns the decision.
+func TestDecideWithLLM_LabelIssueReadyWithMutations_SkipsLLM(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(308, "implement supervisor")}}
-	llm := &fakeLLM{output: `{
-  "summary": "Prepare issue #308 for the queue by adding the ready label.",
-  "recommended_action": "add_ready_label",
-  "target": {"issue": 308},
-  "risk": "safe",
-  "confidence": 0.82,
-  "reasons": ["issue #308 is next in queue"],
-  "requires_approval": true
-}`}
+	llm := idleLLM()
 
 	decision, err := testLLMEngine(cfg, reader, llm).Decide(state.NewState())
 	if err != nil {
 		t.Fatalf("Decide: %v", err)
 	}
-	if llm.calls != 1 {
-		t.Fatalf("LLM calls = %d, want 1 (safe decision with a planned GitHub mutation keeps the LLM)", llm.calls)
+	if llm.calls != 0 {
+		t.Fatalf("LLM calls = %d, want 0 (safe label mutations short-circuit)", llm.calls)
 	}
 	if decision.RecommendedAction != ActionLabelIssueReady {
 		t.Fatalf("action = %q, want %q", decision.RecommendedAction, ActionLabelIssueReady)
