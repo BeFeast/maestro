@@ -6038,10 +6038,13 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if sess.ReviewRetriggerAt != nil && now.Sub(*sess.ReviewRetriggerAt) < o.cfg.ReviewRetrigger.EffectiveCooldown() {
 		return
 	}
-	// Stop nagging a reviewer that is not answering. Past the cap the PR still
-	// waits (or clears through the missing-review policy), but it stops
-	// collecting a comment every cooldown window forever.
-	if maxAttempts := o.cfg.ReviewRetrigger.EffectiveMaxAttempts(); sess.ReviewRetriggerCount >= maxAttempts {
+	// Stop nagging a reviewer that is not answering, when the operator opted
+	// into a cap. Past it the PR still waits (or clears through the
+	// missing-review policy). Unlimited by default: the nudges are the only
+	// automatic recovery for a reviewer that comes back later, so silencing
+	// them without the missing-review escape hatch would wedge the PR for good.
+	maxAttempts := o.cfg.ReviewRetrigger.EffectiveMaxAttempts()
+	if maxAttempts > 0 && sess.ReviewRetriggerCount >= maxAttempts {
 		return
 	}
 	if err := o.commentPR(pr.Number, greptileRetriggerComment); err != nil {
@@ -6050,9 +6053,13 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	}
 	sess.ReviewRetriggerAt = &now
 	sess.ReviewRetriggerCount++
-	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%d, #691)",
+	cap := "unlimited"
+	if maxAttempts > 0 {
+		cap = strconv.Itoa(maxAttempts)
+	}
+	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%s, #691)",
 		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment,
-		sess.ReviewRetriggerCount, o.cfg.ReviewRetrigger.EffectiveMaxAttempts())
+		sess.ReviewRetriggerCount, cap)
 }
 
 // reviewClockHead picks the head SHA the review clock applies to: the one the

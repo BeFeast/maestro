@@ -292,3 +292,23 @@ func TestReviewRetrigger_CountsAttemptsPerHead(t *testing.T) {
 		t.Fatalf("count = %d, want 1 after the first re-trigger", sess.ReviewRetriggerCount)
 	}
 }
+
+// Workflow review catch: the cap must be OPT-IN. Capping by default removes the
+// only automatic recovery an untouched install has — the nudges that wake a
+// review service which comes back later — while the escape hatch that would
+// release the PR (missing_after_minutes) is itself off by default.
+func TestReviewRetrigger_UncappedByDefault(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a"}}
+	o, comments := newRetriggerTestOrchestrator(retriggerTestConfig(), prs, "abc123def456789")
+	s := makeTestState(prs)
+	sess := s.Sessions["slot-0"]
+	sess.ReviewPendingHeadSHA = "abc123def456789"
+	sess.ReviewPendingSince = backdated(6 * time.Hour)
+	sess.ReviewRetriggerCount = 12 // far beyond any cap an operator might pick
+
+	o.autoMergePRs(s)
+
+	if len(*comments) != 1 {
+		t.Fatalf("comments = %v, want the nudge to still fire — the cap must be opt-in", *comments)
+	}
+}

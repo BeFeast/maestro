@@ -1819,10 +1819,21 @@ func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
 	return time.Duration(c.CooldownMinutes) * time.Minute
 }
 
-// EffectiveMaxAttempts caps re-trigger comments per head. Default 3.
+// EffectiveMaxAttempts caps re-trigger comments per head; 0 means unlimited,
+// which is the default.
+//
+// The cap is deliberately opt-in. Capping by default would REMOVE the only
+// automatic recovery an untouched install has: before this knob existed, a
+// wedged gate kept being nudged every cooldown window, so a review service that
+// came back hours later was woken by the next nudge and the PR merged
+// hands-off. A default cap silences those nudges after N tries while the
+// escape hatch that would release the PR (missing_after_minutes) is itself
+// off by default — turning "eventually self-heals" into "wedged forever" for an
+// operator who changed nothing. An operator who sets a cap is accepting that
+// trade, and should set missing_after_minutes with it.
 func (c ReviewRetriggerConfig) EffectiveMaxAttempts() int {
 	if c.MaxAttempts <= 0 {
-		return 3
+		return 0
 	}
 	return c.MaxAttempts
 }
