@@ -238,6 +238,15 @@ type AdvisorReview struct {
 	ReviewedAt     time.Time `json:"reviewed_at"`
 }
 
+// UsageStreamCursor is one parser's read position into the worker's
+// append-only usage side channel. Every usage parser re-reads the whole file
+// and returns a cumulative total, so the cursor records how much of that
+// total has already been folded into the session's counters (#1120).
+type UsageStreamCursor struct {
+	TotalTokens  int `json:"total_tokens,omitempty"`  // cumulative provider total already counted into TokensUsedTotal
+	BudgetTokens int `json:"budget_tokens,omitempty"` // cumulative budget measure already counted into TokenBudgetTokensAttempt
+}
+
 type Session struct {
 	IssueNumber int    `json:"issue_number"`
 	IssueTitle  string `json:"issue_title"`
@@ -279,9 +288,20 @@ type Session struct {
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                      string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
-	CostUSDBackend             float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
+	Model                string  `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
+	CostUSDBackend       float64 `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
+	UsageTokensWatermark int     `json:"usage_tokens_watermark,omitempty"` // #730/#737/#1120: mirror of the usage-stream read position that last advanced; UsageStreamCursors is authoritative, this stays readable in state dumps and seeds the cursor of a session upgraded mid-attempt
+
+	// #1120: per-parser read positions into the worker's append-only usage
+	// side channel (<slot>.log for the text/Pi parsers, <slot>.jsonl for the
+	// structured ones). A respawn recomputes those exact paths, so the
+	// positions must survive a new attempt or the next poll re-adds the
+	// previous attempt's whole cumulative total to TokensUsedTotal. They are
+	// keyed per parser because a fallover leaves one file holding two
+	// backends' frames and each parser sums only its own: one shared position
+	// would silently swallow whichever backend's total is the smaller number.
+	UsageStreamCursors map[string]UsageStreamCursor `json:"usage_stream_cursors,omitempty"`
+
 	LongRunning                bool       `json:"long_running,omitempty"`
 	RebaseAttempted            bool       `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail             bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
@@ -297,7 +317,7 @@ type Session struct {
 	TokensUsedAttempt          int        `json:"tokens_used_attempt,omitempty"`           // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal            int        `json:"tokens_used_total,omitempty"`             // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
 	TokenBudgetTokensAttempt   int        `json:"token_budget_tokens_attempt,omitempty"`   // current-attempt usage under TokenBudgetMeasure; kept separate from inclusive cost telemetry
-	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // high-water mark for the current attempt's cumulative budget measure
+	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // #1120: high-water mark of the absolute, already-attempt-scoped budget observations (generic text total, live-monitor marker); reset per attempt, unlike the UsageStreamCursors read positions
 	TokenBudgetMeasure         string     `json:"token_budget_measure,omitempty"`          // explicit live-ceiling measure, e.g. uncached_tokens
 	TokenBudgetMaxTokens       int        `json:"token_budget_max_tokens,omitempty"`       // worker_max_tokens ceiling in effect when the budget stop was recorded (#1124); lets a raised budget retire a stale kill streak
 	WorkerOutcome              string     `json:"worker_outcome,omitempty"`                // deterministic terminal worker outcome, e.g. token_budget_exceeded

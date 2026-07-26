@@ -298,8 +298,17 @@ func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.
 	if sess.FinishedAt != nil || sess.WorkerEndedAt != nil || sess.Model != "" || sess.CostUSDBackend != 0 {
 		t.Fatalf("stale projection retained: finished=%v ended=%v model=%q cost=%v", sess.FinishedAt, sess.WorkerEndedAt, sess.Model, sess.CostUSDBackend)
 	}
-	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.TokenBudgetTokensAttempt != 0 || sess.TokenBudgetTokensWatermark != 0 || sess.TokenBudgetMeasure != "" || sess.WorkerOutcome != "" {
-		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d budget=%d budget_watermark=%d measure=%q outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, sess.WorkerOutcome)
+	if sess.TokensUsedAttempt != 0 || sess.TokenBudgetTokensAttempt != 0 || sess.TokenBudgetTokensWatermark != 0 || sess.TokenBudgetMeasure != "" || sess.WorkerOutcome != "" {
+		t.Fatalf("attempt counters not reset: attempt=%d budget=%d budget_watermark=%d measure=%q outcome=%q", sess.TokensUsedAttempt, sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, sess.WorkerOutcome)
+	}
+	// #1120: UsageTokensWatermark is a read position in the append-only usage
+	// side channel, not a per-attempt counter — the replacement process keeps
+	// appending to the same <slot>.jsonl, so clearing it here made the next
+	// orchestrator poll re-add the previous attempt's cumulative total.
+	// TokenBudgetTokensWatermark asserted above is the opposite case: it holds
+	// absolute per-attempt observations and must reset with the attempt.
+	if sess.UsageTokensWatermark != 1_730_413 {
+		t.Fatalf("usage read position cleared: %d, want 1730413 preserved", sess.UsageTokensWatermark)
 	}
 	if sess.TokensUsedTotal != 1_730_413 || sess.Worktree != "/tmp/kept-worktree" || sess.Branch != "feat/kept-branch" || sess.PRNumber != 335 {
 		t.Fatalf("cumulative/session identity changed: total=%d worktree=%q branch=%q PR=%d", sess.TokensUsedTotal, sess.Worktree, sess.Branch, sess.PRNumber)
