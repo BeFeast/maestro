@@ -227,6 +227,10 @@ outcome:
   runtime_target: https://app.example.com
   deployment_status_command: /path/to/repo/scripts/status.sh
   healthcheck_url: https://app.example.com/healthz
+  # Budget for one health check (URL or command). Defaults to 15s; raise it for
+  # a deploy verification or smoke test that legitimately runs longer. A
+  # timed-out check kills the whole command process group.
+  healthcheck_timeout_seconds: 15
   source_repo_path: /path/to/local/clone
   runtime_host: production host or platform
   # Opt-in bounded hands-off recovery for a failing health signal. The
