@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -302,6 +304,75 @@ func TestCheckerStructuredHealthRejectsFreeFormFields(t *testing.T) {
 	persisted := result.Summary + result.Detail
 	if strings.Contains(persisted, "top-secret") || strings.Contains(persisted, "token=secret") || strings.Contains(persisted, "secret-status") {
 		t.Fatalf("free-form structured output entered durable result: %q", persisted)
+	}
+}
+
+func TestBriefEffectiveHealthcheckTimeout(t *testing.T) {
+	if got := (Brief{}).EffectiveHealthcheckTimeout(); got != defaultCheckTimeout {
+		t.Fatalf("default healthcheck timeout = %s, want %s", got, defaultCheckTimeout)
+	}
+	if got := (Brief{HealthcheckTimeoutSeconds: 60}).EffectiveHealthcheckTimeout(); got != 60*time.Second {
+		t.Fatalf("configured healthcheck timeout = %s, want 1m0s", got)
+	}
+	if err := (Brief{HealthcheckTimeoutSeconds: -1}).Validate(); err == nil || !strings.Contains(err.Error(), "healthcheck_timeout_seconds") {
+		t.Fatalf("negative healthcheck_timeout_seconds error = %v", err)
+	}
+}
+
+func TestCheckerAppliesConfiguredHealthcheckTimeoutBudget(t *testing.T) {
+	cases := []struct {
+		name    string
+		seconds int
+		want    time.Duration
+	}{
+		{name: "default", seconds: 0, want: defaultCheckTimeout},
+		{name: "configured", seconds: 60, want: 60 * time.Second},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var budget time.Duration
+			result := Checker{
+				RunCommand: func(ctx context.Context, command, dir string) ([]byte, int, error) {
+					deadline, ok := ctx.Deadline()
+					if !ok {
+						t.Fatal("healthcheck command ran without a deadline")
+					}
+					budget = time.Until(deadline)
+					return nil, 0, nil
+				},
+			}.Check(context.Background(), Brief{
+				DesiredOutcome:            "App is live",
+				HealthcheckCommand:        "status.sh",
+				HealthcheckTimeoutSeconds: tc.seconds,
+			})
+			if result.State != HealthHealthy {
+				t.Fatalf("State = %q, want %q", result.State, HealthHealthy)
+			}
+			// The deadline is set just before the command runs, so the observed
+			// budget is the configured one minus scheduling slack.
+			if budget > tc.want || budget < tc.want-2*time.Second {
+				t.Fatalf("healthcheck budget = %s, want ~%s", budget, tc.want)
+			}
+		})
+	}
+}
+
+func TestCheckerHealthcheckTimeoutKillsDescendantProcessGroup(t *testing.T) {
+	marker := filepath.Join(t.TempDir(), "descendant-survived")
+	result := Checker{}.Check(context.Background(), Brief{
+		DesiredOutcome:            "App is live",
+		HealthcheckCommand:        fmt.Sprintf("(sleep 2; touch %q) & wait", marker),
+		HealthcheckTimeoutSeconds: 1,
+	})
+	if result.State != HealthFailing || !strings.Contains(result.Summary, "timed out after 1s") {
+		t.Fatalf("result = %+v, want a 1s timeout failure", result)
+	}
+
+	time.Sleep(2200 * time.Millisecond)
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("healthcheck descendant survived the timeout and produced its marker")
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("stat marker: %v", err)
 	}
 }
 

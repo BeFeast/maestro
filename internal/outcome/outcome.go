@@ -47,21 +47,27 @@ const (
 // Brief is the project operating brief Maestro uses to judge progress by the
 // runtime outcome instead of by raw issue throughput.
 type Brief struct {
-	DesiredOutcome          string   `yaml:"desired_outcome" json:"desired_outcome,omitempty"`
-	RuntimeTarget           string   `yaml:"runtime_target" json:"runtime_target,omitempty"`
-	RuntimeURL              string   `yaml:"runtime_url" json:"runtime_url,omitempty"`
-	DeploymentStatusCommand string   `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
-	DeployStatusCommand     string   `yaml:"deploy_status_command" json:"-"`
-	HealthcheckCommand      string   `yaml:"healthcheck_command" json:"healthcheck_command,omitempty"`
-	VerifierCommand         string   `yaml:"verifier_command" json:"verifier_command,omitempty"`
-	HealthcheckURL          string   `yaml:"healthcheck_url" json:"healthcheck_url,omitempty"`
-	SourceRepoPath          string   `yaml:"source_repo_path" json:"source_repo_path,omitempty"`
-	RuntimeHost             string   `yaml:"runtime_host" json:"runtime_host,omitempty"`
-	RequiredRoutes          []string `yaml:"required_routes" json:"required_routes,omitempty"`
-	RequiresDeploy          bool     `yaml:"requires_deploy" json:"requires_deploy,omitempty"`
-	PassRequiredForDone     *bool    `yaml:"pass_required_for_done" json:"-"`
-	FailRequiresVisibleWork *bool    `yaml:"fail_requires_visible_work" json:"-"`
-	NonGoals                []string `yaml:"non_goals" json:"non_goals,omitempty"`
+	DesiredOutcome          string `yaml:"desired_outcome" json:"desired_outcome,omitempty"`
+	RuntimeTarget           string `yaml:"runtime_target" json:"runtime_target,omitempty"`
+	RuntimeURL              string `yaml:"runtime_url" json:"runtime_url,omitempty"`
+	DeploymentStatusCommand string `yaml:"deployment_status_command" json:"deployment_status_command,omitempty"`
+	DeployStatusCommand     string `yaml:"deploy_status_command" json:"-"`
+	HealthcheckCommand      string `yaml:"healthcheck_command" json:"healthcheck_command,omitempty"`
+	VerifierCommand         string `yaml:"verifier_command" json:"verifier_command,omitempty"`
+	HealthcheckURL          string `yaml:"healthcheck_url" json:"healthcheck_url,omitempty"`
+	// HealthcheckTimeoutSeconds bounds a single outcome health check, whether
+	// it runs healthcheck_url, healthcheck_command, or
+	// deployment_status_command. Zero uses the default (15s). A deploy
+	// verification or smoke test that legitimately runs longer needs this
+	// instead of reporting a permanent timeout (#1122).
+	HealthcheckTimeoutSeconds int      `yaml:"healthcheck_timeout_seconds" json:"healthcheck_timeout_seconds,omitempty"`
+	SourceRepoPath            string   `yaml:"source_repo_path" json:"source_repo_path,omitempty"`
+	RuntimeHost               string   `yaml:"runtime_host" json:"runtime_host,omitempty"`
+	RequiredRoutes            []string `yaml:"required_routes" json:"required_routes,omitempty"`
+	RequiresDeploy            bool     `yaml:"requires_deploy" json:"requires_deploy,omitempty"`
+	PassRequiredForDone       *bool    `yaml:"pass_required_for_done" json:"-"`
+	FailRequiresVisibleWork   *bool    `yaml:"fail_requires_visible_work" json:"-"`
+	NonGoals                  []string `yaml:"non_goals" json:"non_goals,omitempty"`
 	// RecoveryCommand is omitted from API JSON: Fleet exposes only its bounded
 	// execution receipt, never command text or output.
 	RecoveryCommand         string `yaml:"recovery_command" json:"-"`
@@ -213,6 +219,9 @@ func (b Brief) Validate() error {
 	if b.RecoveryMaxFutileAttempts < 0 {
 		return fmt.Errorf("outcome recovery_max_futile_attempts must be >= 0")
 	}
+	if b.HealthcheckTimeoutSeconds < 0 {
+		return fmt.Errorf("outcome healthcheck_timeout_seconds must be >= 0")
+	}
 	switch b.RecoveryMode {
 	case RecoveryModeDisabled:
 		return nil
@@ -256,6 +265,16 @@ func (b Brief) EffectiveRecoveryTimeout() time.Duration {
 		return time.Duration(b.RecoveryTimeoutSeconds) * time.Second
 	}
 	return defaultRecoveryTimeout
+}
+
+// EffectiveHealthcheckTimeout bounds one outcome health check. Zero config
+// keeps the historical 15s budget, so a project that configures nothing is
+// unaffected (#1122).
+func (b Brief) EffectiveHealthcheckTimeout() time.Duration {
+	if b.HealthcheckTimeoutSeconds > 0 {
+		return time.Duration(b.HealthcheckTimeoutSeconds) * time.Second
+	}
+	return defaultCheckTimeout
 }
 
 // EffectiveRecoveryMaxFutileAttempts returns the consecutive post-attempt
