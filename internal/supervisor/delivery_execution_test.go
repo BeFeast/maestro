@@ -62,7 +62,7 @@ func TestRunOnceDeliveryUsesConfiguredApprovalsDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	reader := newDeliveryExecutionReader(t, cfg, repoDir, sha, now)
-	if _, err := RunOnce(cfg, reader, WithApprovalsDBPath(customDB)); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader, WithApprovalsDBPath(customDB)); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
@@ -149,7 +149,7 @@ func TestRunOnceImportsStoreAuthoritativeDeliveryBeforeApprovedScan(t *testing.T
 	}
 
 	reader := newDeliveryExecutionReader(t, cfg, repoDir, sha, now)
-	if _, err := RunOnce(cfg, reader, WithApprovalsDBPath(customDB)); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader, WithApprovalsDBPath(customDB)); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	loaded, err := state.Load(cfg.StateDir)

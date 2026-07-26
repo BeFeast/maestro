@@ -994,8 +994,13 @@ func superviseCmd(args []string) {
 		cfg.Supervisor.DryRun = true
 	}
 	gh := github.New(cfg.Repo)
+	// The cycle is context-aware (#1119): a cancelled ctx stops it at the next
+	// phase boundary. SIGINT/SIGTERM cancel it for the looping command below;
+	// --once inherits the same ctx and cancels it on return.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(cfg, gh, supervisor.WithApprovalsDBPath(*approvalsDB))
+		decision, err := supervisor.RunOnce(ctx, cfg, gh, supervisor.WithApprovalsDBPath(*approvalsDB))
 		if err != nil {
 			return err
 		}
@@ -1008,15 +1013,13 @@ func superviseCmd(args []string) {
 	// initialized (and, for a persistent command, launched) before this network/
 	// LLM-dependent cycle so a blocked first RunOnce cannot pause it (#887).
 	if *once {
-		if err := runInitialSuperviseCycle(context.Background(), cfg, true, *dryRun, runOnce,
+		if err := runInitialSuperviseCycle(ctx, cfg, true, *dryRun, runOnce,
 			supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
 			log.Fatalf("supervise: %v", err)
 		}
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	if err := runInitialSuperviseCycle(ctx, cfg, false, *dryRun, runOnce,
 		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
 		cancel()
@@ -1040,7 +1043,10 @@ func superviseCmd(args []string) {
 	// been bumped in 3*interval. The warning persists into state
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
-	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
+	// nil kick channel: this loop calls RunOnce inline, so there is no separable
+	// cycle to cancel and the watchdog stays warn-only. The daemon's per-flow
+	// loops wire a real one (#1119).
+	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval, nil)
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {

@@ -312,10 +312,25 @@ func WithApprovalsDBPath(path string) RunOption {
 
 // RunOnce records one supervisor decision in Maestro state and applies any safe
 // queue mutations selected by the decision.
-func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.SupervisorDecision, error) {
+//
+// ctx bounds the cycle (#1119). It is checked at each phase boundary — before
+// the state load, before Decide, and before the mutating phase — so a cancelled
+// cycle stops advancing instead of running to completion; the caller (the
+// daemon supervise loop) can therefore abandon a wedged cycle and recover.
+// Cancellation is deliberately NOT honored inside the mutating phase: once
+// approvals/labels/comments start landing, aborting halfway would leave GitHub
+// mutated with the matching state unsaved. The reads themselves are bounded by
+// the gh subprocess deadline in internal/github, so a phase cannot outlive it.
+func RunOnce(ctx context.Context, cfg *config.Config, reader Reader, opts ...RunOption) (state.SupervisorDecision, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var ro runOptions
 	for _, opt := range opts {
 		opt(&ro)
+	}
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
 	}
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -341,6 +356,9 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	// the same approvals on every cycle. We move the call there.
 	recordOutcomeHealth(cfg, st)
 
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
+	}
 	engine := NewEngine(cfg, reader)
 	engine.SetEmergencyLLMHalt(ro.emergencyLLMHalt)
 	decision, err := engine.Decide(st)
@@ -369,6 +387,9 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	}
 	state.PrepareSupervisorRecommendation(&decision)
 	decision.Quiescent = supervisorDecisionQuiescent(decision)
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
+	}
 	if !cfg.Supervisor.DryRun {
 		// Execute any approvals that were transitioned to status=approved
 		// outside this loop (CLI approve already executes inline; this
