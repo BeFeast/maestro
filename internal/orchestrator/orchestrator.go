@@ -1528,6 +1528,11 @@ const (
 	usageStreamCodex    = "codex"
 	usageStreamKimi     = "kimi"
 	usageStreamOpencode = "opencode"
+
+	// The two files usage parsers read. pi consumes the rendered <slot>.log;
+	// the structured parsers consume the <slot>.jsonl side channel (#1140).
+	usageStreamGroupLog   = "log"
+	usageStreamGroupJSONL = "jsonl"
 )
 
 // usageStreamCursor returns this parser's read position into the worker's
@@ -1566,8 +1571,18 @@ func setUsageStreamCursor(sess *state.Session, stream string, cursor state.Usage
 	sess.UsageTokensWatermark = cursor.TotalTokens
 }
 
-// usageStreamRead returns the read position for stream, first rewinding every
-// cursor when cumulative proves the file behind them restarted.
+// usageStreamGroup names the file a parser reads. The pi parser consumes the
+// rendered <slot>.log; every structured parser consumes the <slot>.jsonl side
+// channel. Two files, so a restart of one must not rewind readers of the other.
+func usageStreamGroup(stream string) string {
+	if stream == usageStreamPi {
+		return usageStreamGroupLog
+	}
+	return usageStreamGroupJSONL
+}
+
+// usageStreamRead returns the read position for stream, first rewinding the
+// cursors that share its file when cumulative proves that file restarted.
 //
 // Each parser is cumulative over an append-only file, so its own total can
 // only shrink when that file was replaced: an in-place respawn rotates
@@ -1576,9 +1591,12 @@ func setUsageStreamCursor(sess *state.Session, stream string, cursor state.Usage
 // file. Nothing rotates the <slot>.jsonl side channel today —
 // rotateWorkerAttemptLog moves <slot>.log and <slot>.log.jsonl, which is not
 // the path JSONLPathForLog derives — so for the structured parsers this is a
-// guard against an out-of-band replacement rather than a routine event. The
-// rewind clears every stream because the file all of them read is the one that
-// went away.
+// guard against an out-of-band replacement rather than a routine event.
+//
+// The rewind is scoped to the restarted file. Clearing every cursor instead
+// meant an in-place respawn, which rotates only <slot>.log, also wiped the
+// structured cursors; the next frame from a .jsonl parser then re-read an
+// un-rotated file from zero and counted it a second time (#1140).
 //
 // A cumulative of zero is never a restart: a terminal frame with missing usage
 // reports zero, and rewinding on it would let the next real frame be counted
@@ -1588,8 +1606,24 @@ func usageStreamRead(sess *state.Session, stream string, cumulative int) state.U
 	if sess == nil || cumulative <= 0 || cumulative >= cursor.TotalTokens {
 		return cursor
 	}
-	sess.UsageStreamCursors = make(map[string]state.UsageStreamCursor, 2)
-	sess.UsageTokensWatermark = 0
+	// Keep the cursors reading the OTHER file; only this file restarted.
+	group := usageStreamGroup(stream)
+	kept := make(map[string]state.UsageStreamCursor, len(sess.UsageStreamCursors))
+	highest := 0
+	for name, c := range sess.UsageStreamCursors {
+		if usageStreamGroup(name) == group {
+			continue
+		}
+		kept[name] = c
+		if c.TotalTokens > highest {
+			highest = c.TotalTokens
+		}
+	}
+	sess.UsageStreamCursors = kept
+	// UsageTokensWatermark mirrors the most advanced surviving cursor. Zeroing
+	// it unconditionally would hand a stale legacy seed to whichever parser
+	// asks next, which is the same double-count by another route.
+	sess.UsageTokensWatermark = highest
 	return state.UsageStreamCursor{}
 }
 
