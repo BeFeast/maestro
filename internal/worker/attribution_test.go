@@ -189,15 +189,27 @@ func TestRecordBackendAttribution_UnknownBackend_NoMetadata(t *testing.T) {
 
 // #1120: a fallover respawn recomputes the same <slot>.log path, the
 // stream-splitter reopens <slot>.jsonl with O_APPEND, and nothing truncates
-// either file. The usage watermarks are therefore read positions into a stream
+// either file. The usage cursors are therefore read positions into a stream
 // the replacement process keeps extending — clearing them made the next
 // orchestrator poll add the previous attempt's cumulative total to
 // TokensUsedTotal a second time, doubling the session total per retry.
-func TestBeginSessionAttemptKeepsUsageWatermarksAcrossFallover(t *testing.T) {
+//
+// TokenBudgetTokensWatermark is the opposite case and must still reset: it is
+// the high-water mark of absolute, already-attempt-scoped budget observations,
+// and a backend without usage_stream has no stream splitter, no live token
+// monitor and no durable marker — TokenBudgetTokensAttempt is then the only
+// thing enforcing worker_max_tokens, so an inherited ceiling silently raises
+// the budget for every replacement worker.
+//
+// This exercises the real cross-backend fallover call: internal/worker's
+// Respawn runs beginSessionAttempt(cfg, sess, backendName, "fallover",
+// "fallover", now) with the next backend in the chain.
+func TestBeginSessionAttemptFalloverKeepsStreamCursorsAndResetsBudgetCeiling(t *testing.T) {
 	sess := &state.Session{
 		Backend:                    "claude",
 		Status:                     state.StatusDead,
 		UsageTokensWatermark:       26064,
+		UsageStreamCursors:         map[string]state.UsageStreamCursor{"claude": {TotalTokens: 26064, BudgetTokens: 21000}},
 		TokensUsedAttempt:          26064,
 		TokensUsedTotal:            26064,
 		TokenBudgetTokensWatermark: 9000,
@@ -206,9 +218,18 @@ func TestBeginSessionAttemptKeepsUsageWatermarksAcrossFallover(t *testing.T) {
 
 	beginSessionAttempt(attribCfgWithBackends(), sess, "sol", "fallover", "fallover", time.Now().UTC())
 
-	if sess.UsageTokensWatermark != 26064 || sess.TokenBudgetTokensWatermark != 9000 {
-		t.Fatalf("watermarks = %d/%d, want 26064/9000 preserved (the jsonl was not rotated)",
-			sess.UsageTokensWatermark, sess.TokenBudgetTokensWatermark)
+	if sess.Backend != "sol" {
+		t.Fatalf("Backend = %q, want sol (the fallover target)", sess.Backend)
+	}
+	if sess.UsageTokensWatermark != 26064 {
+		t.Fatalf("UsageTokensWatermark = %d, want 26064 preserved (the jsonl was not rotated)", sess.UsageTokensWatermark)
+	}
+	claude, ok := sess.UsageStreamCursors["claude"]
+	if !ok || claude.TotalTokens != 26064 || claude.BudgetTokens != 21000 {
+		t.Fatalf("claude stream cursor = %+v (present=%v), want {TotalTokens:26064 BudgetTokens:21000} preserved", claude, ok)
+	}
+	if sess.TokenBudgetTokensWatermark != 0 {
+		t.Fatalf("TokenBudgetTokensWatermark = %d, want 0: an absolute per-attempt ceiling must not be inherited by the replacement worker", sess.TokenBudgetTokensWatermark)
 	}
 	if sess.TokensUsedAttempt != 0 || sess.TokenBudgetTokensAttempt != 0 {
 		t.Fatalf("attempt counters = %d/%d, want 0/0 for the new attempt",
