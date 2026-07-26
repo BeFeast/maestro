@@ -101,6 +101,48 @@ The script then:
    ("Self-deploy failed") in `/api/v1/fleet`, so an undeployed-but-merged host
    is loud rather than buried in journald (#711).
 
+### Build scratch location (#1129)
+
+The deploy's build root — the detached git worktree, Go's `$WORK` scratch tree,
+and the ~25 MB output binary — is **disk-backed**, not the RAM-backed `/tmp`.
+`/tmp` on the fleet host is a 16 GB tmpfs on a 24 GB swapless box, and a
+self-deploy fires by itself on every merge to `main`, so building there spiked
+RAM on every merge.
+
+- The build root is `mktemp -d "$BUILD_TMPDIR/maestro-self-deploy.XXXXXX"` with
+  `BUILD_TMPDIR` defaulting to `/var/tmp`.
+- `TMPDIR` is honoured as an operator lever, **except** when it is unusable
+  (empty, `/`, not a writable directory) or points at `/tmp` or below — those
+  fall back to `/var/tmp`. The transient deploy unit inherits only `PATH`, so an
+  ambient `TMPDIR` there would be an accident, not an intent.
+- The `go build` invocation additionally pins `TMPDIR=$BUILD_ROOT/tmp` and
+  `GOTMPDIR=$BUILD_ROOT/tmp`. Moving the build root alone is not enough: `-o`
+  only places the finished binary, while every intermediate archive and the
+  linker's `exe/a.out` go to Go's `$WORK` tree, which resolves against
+  `$GOTMPDIR`/`$TMPDIR` and otherwise defaults back to `/tmp`. Verify with
+  `go build -x …`, which prints `WORK=<dir>`.
+- **Leftovers are reaped by the deploy itself.** `cleanup_build` runs from an
+  EXIT trap, which a SIGKILL (the `RuntimeMaxSec` backstop below) does not
+  honour. Under the old `/tmp` root, a killed deploy's leftover disappeared at
+  the next reboot; `/var/tmp` is persistent, and Maestro's tmpfs sweeper cannot
+  help — `internal/tmpfshygiene` refuses any root that is not tmpfs and
+  permanently protects anything containing `.git`, which a git worktree always
+  has. So every deploy, right after taking the single-flight lock, removes
+  `maestro-self-deploy.*` directories older than 6 h from `$BUILD_TMPDIR`,
+  `/var/tmp`, and `/tmp` (the last collects pre-#1129 leftovers), then runs
+  `git worktree prune` to drop the dangling registrations. Six hours cannot race
+  a live deploy: one is bounded by `timeout_minutes` and the `RuntimeMaxSec`
+  backstop at twice that.
+
+To reclaim leftovers by hand:
+
+```bash
+find /var/tmp /tmp -maxdepth 1 -type d -name 'maestro-self-deploy.*' -mmin +360
+# then, after checking what matched:
+find /var/tmp /tmp -maxdepth 1 -type d -name 'maestro-self-deploy.*' -mmin +360 -exec rm -rf {} +
+git -C <repo-dir> worktree prune
+```
+
 ### Stale-trigger watchdog (#807)
 
 The one case the result file cannot cover is the detached deploy unit dying
@@ -423,6 +465,7 @@ maestro version
 | Finding `rolled_back … health check timed out` | New binary started but never reported the stamped version | Check `journalctl --user -u maestro.service`; the regression is in the merged code |
 | Finding `rolled_back … behavioral smoke gate failed: <check>` | New binary booted and reported the right version but failed the `maestro selfcheck` invariant `<check>` (config/backend/prompt/state) (#842) | Run `maestro selfcheck` to reproduce; inspect `journalctl --user -u 'maestro-self-deploy-*' \| grep gate:`; the regression is behavioral, in the merged code |
 | No finding, no restart | Trigger failed (script missing, systemd-run unavailable) | Orchestrator log shows `self-deploy trigger failed …`; a ⚠️ notification is sent |
+| `/tmp` (tmpfs) grows by ~26 MB per merge, or `maestro-self-deploy.*` dirs pile up | Deploy script is pre-#1129: it built in `/tmp` and left SIGKILLed build roots behind | Update the script; it now builds under `/var/tmp` (Go `$WORK` included) and reaps stale build roots each deploy (#1129) |
 | Deploy log `error obtaining VCS status: exit status 128` | `go build` in the detached worktree tripped git's dubious-ownership guard | Fixed in #807 — the build now passes `-buildvcs=false`; if you see this, the deploy script is pre-#807 (update it) |
 | Finding `self-deploy: no result … — the deploy unit died` | Trigger recorded but the transient unit never wrote a result (SIGKILLed at `RuntimeMaxSec`, or crashed pre-EXIT-trap) (#807) | Inspect `journalctl -u 'maestro-self-deploy-*'`; verify `maestro version` + units by hand; a later merge retries automatically |
 | Log `self-deploy debounced for PR #… < … window` | A deploy was triggered within `min_interval_minutes` of the previous one — expected on a burst of merges (#722) | None; the in-flight/previous deploy covers the merged code. Lower `min_interval_minutes` for faster successive deploys |
