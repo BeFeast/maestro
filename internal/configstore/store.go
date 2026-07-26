@@ -401,7 +401,7 @@ func (s *Store) Load(ctx context.Context, name string) (*config.Config, error) {
 }
 
 func (s *Store) LoadAll(ctx context.Context) ([]*config.Config, error) {
-	names, err := s.projectNames(ctx)
+	names, err := s.ProjectNames(ctx)
 	if err != nil {
 		return nil, err
 	}
@@ -423,7 +423,7 @@ func (s *Store) ExportDir(ctx context.Context, dir string) error {
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("create export dir %s: %w", dir, err)
 	}
-	names, err := s.projectNames(ctx)
+	names, err := s.ProjectNames(ctx)
 	if err != nil {
 		return err
 	}
@@ -962,7 +962,12 @@ func (s *Store) loadBackends(ctx context.Context) (map[string]*yaml.Node, error)
 	return out, rows.Err()
 }
 
-func (s *Store) projectNames(ctx context.Context) ([]string, error) {
+// ProjectNames returns the project keys of the store without loading or
+// validating any config document. `config-store list` needs exactly that: a row
+// whose YAML no longer parses must still be discoverable, because that is the
+// case where LoadAll fails and the operator has no other way to learn the
+// --config-store-project value (#1123).
+func (s *Store) ProjectNames(ctx context.Context) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT name FROM project ORDER BY name`)
 	if err != nil {
 		return nil, err
