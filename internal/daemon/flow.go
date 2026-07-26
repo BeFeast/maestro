@@ -439,6 +439,11 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// leaves the closure reading a permanently-normal cache, i.e. inert.
 	orch.SetEmergencyHalt(d.emergencySpawnHalt)
 	orch.SetFleetSpawnCeiling(d.fleetSpawnCeilingReached)
+	// Host-resource precondition (#1128): /tmp is a RAM-backed tmpfs, so
+	// dispatching into a nearly-full one turns a space problem into a host
+	// memory outage. Daemon.tmpfsSpawnHold is a self-clearing throughput pause
+	// re-evaluated every poll, not a gate and not an approval.
+	orch.SetSpawnResourceHold(d.tmpfsSpawnHold)
 	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
 		return d.reserveFleetSpawn(orchCfg.StateDir)
 	})

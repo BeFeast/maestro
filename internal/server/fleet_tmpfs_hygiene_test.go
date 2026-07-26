@@ -56,3 +56,46 @@ func TestFleetAPIOmitsTmpfsHygieneWhenNotDaemonWired(t *testing.T) {
 		t.Fatalf("plain fleet unexpectedly exposed tmpfs_hygiene: %s", rec.Body.String())
 	}
 }
+
+// The capacity sample is published even when no sweep summary exists, because
+// the sweeper is a verified no-op on this host (#1125, #1128).
+func TestFleetAPISurfacesTmpfsPressureWithoutASweepSummary(t *testing.T) {
+	srv := NewFleet(nil, "127.0.0.1", 0, true)
+	srv.SetTmpfsPressureSource(func() (tmpfshygiene.PressureSnapshot, bool) {
+		return tmpfshygiene.PressureSnapshot{
+			Timestamp:          time.Date(2026, 7, 25, 18, 0, 0, 0, time.UTC),
+			Root:               "/tmp",
+			Tmpfs:              true,
+			TotalBytes:         16 << 30,
+			AvailableBytes:     2 << 30,
+			UsePct:             88,
+			PressureFloorBytes: 8 << 30,
+			SpawnFloorBytes:    4 << 30,
+			Pressure:           true,
+			SpawnHold:          true,
+			HeldSpawns:         3,
+		}, true
+	})
+
+	rec := httptest.NewRecorder()
+	srv.handleFleet(rec, httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, body=%s", rec.Code, rec.Body.String())
+	}
+	var body struct {
+		TmpfsHygiene  *tmpfshygiene.Summary          `json:"tmpfs_hygiene"`
+		TmpfsPressure *tmpfshygiene.PressureSnapshot `json:"tmpfs_pressure"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatal(err)
+	}
+	if body.TmpfsHygiene != nil {
+		t.Fatalf("tmpfs_hygiene = %+v, want it absent when no sweep has run", body.TmpfsHygiene)
+	}
+	if body.TmpfsPressure == nil || !body.TmpfsPressure.SpawnHold || body.TmpfsPressure.HeldSpawns != 3 {
+		t.Fatalf("tmpfs_pressure = %+v, want the hold and its held-spawn count", body.TmpfsPressure)
+	}
+	if body.TmpfsPressure.PressureFloorBytes != 8<<30 {
+		t.Fatalf("tmpfs_pressure floor = %d, want an absolute byte budget", body.TmpfsPressure.PressureFloorBytes)
+	}
+}
