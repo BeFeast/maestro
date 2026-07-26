@@ -70,7 +70,12 @@ func TestTmpfsHygieneLoopAppliesFakeTreeAndPublishesPressure(t *testing.T) {
 	deadline := time.Now().Add(time.Second)
 	for {
 		if summary, ok := d.tmpfsHygieneSummary(); ok {
-			if summary.AttentionCode != "tmpfs_pressure" || summary.DeletedEntries != 1 {
+			// Only the attention code is stable here. tmpfsHygieneSummary
+			// returns the LATEST tick, and by the time this poll runs the
+			// sweep may already be several ticks past the one that deleted
+			// the entry, so DeletedEntries is asserted on the first emitted
+			// metric below instead of on whichever tick happens to be current.
+			if summary.AttentionCode != "tmpfs_pressure" {
 				t.Fatalf("summary = %+v", summary)
 			}
 			break
@@ -93,7 +98,7 @@ func TestTmpfsHygieneLoopAppliesFakeTreeAndPublishesPressure(t *testing.T) {
 	if err := json.NewDecoder(&metrics).Decode(&emitted); err != nil {
 		t.Fatalf("scheduled metric is not JSONL: %v\n%s", err, metrics.String())
 	}
-	if emitted.AttentionCode != "tmpfs_pressure" {
+	if emitted.AttentionCode != "tmpfs_pressure" || emitted.DeletedEntries != 1 {
 		t.Fatalf("emitted summary = %+v", emitted)
 	}
 }
