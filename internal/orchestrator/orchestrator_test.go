@@ -12223,6 +12223,65 @@ func TestUpdateClaudeUsageFromJSONL_ReplacedStreamCountsNewAttemptInFull(t *test
 // #1120: the budget read position indexes the same side channel, so it rewinds
 // with it. A budget position left at the previous stream's total would report
 // the replacement worker as having burned nothing.
+// A rotation of <slot>.log must not rewind the cursors reading <slot>.jsonl.
+// worker.rotateWorkerAttemptLog moves <slot>.log on an in-place respawn and
+// leaves the side channel appended to, so wiping every cursor made the next
+// structured frame re-read an un-rotated file from zero and count it twice
+// (#1140).
+func TestUsageStreamRead_LogRestartKeepsJSONLCursors(t *testing.T) {
+	sess := &state.Session{
+		UsageStreamCursors: map[string]state.UsageStreamCursor{
+			usageStreamPi:     {TotalTokens: 500, BudgetTokens: 500},
+			usageStreamClaude: {TotalTokens: 773, BudgetTokens: 773},
+		},
+		UsageTokensWatermark: 773,
+	}
+
+	// pi's own cumulative dropped: <slot>.log was rotated.
+	if got := usageStreamRead(sess, usageStreamPi, 20); got.TotalTokens != 0 {
+		t.Fatalf("restarted pi cursor = %+v, want a zero read position", got)
+	}
+	if _, ok := sess.UsageStreamCursors[usageStreamPi]; ok {
+		t.Fatal("pi cursor survived a rotation of the file it reads")
+	}
+	claude, ok := sess.UsageStreamCursors[usageStreamClaude]
+	if !ok || claude.TotalTokens != 773 {
+		t.Fatalf("claude cursor = %+v ok=%v; the .jsonl side channel did not rotate", claude, ok)
+	}
+	if sess.UsageTokensWatermark != 773 {
+		t.Fatalf("legacy watermark = %d, want the most advanced surviving cursor (773)", sess.UsageTokensWatermark)
+	}
+}
+
+// The mirror case: a replaced .jsonl rewinds every structured parser, because
+// they all read that one file, and leaves pi alone.
+func TestUsageStreamRead_JSONLRestartKeepsPiCursorAndClearsStructured(t *testing.T) {
+	sess := &state.Session{
+		UsageStreamCursors: map[string]state.UsageStreamCursor{
+			usageStreamPi:     {TotalTokens: 500, BudgetTokens: 500},
+			usageStreamClaude: {TotalTokens: 773, BudgetTokens: 773},
+			usageStreamCodex:  {TotalTokens: 640, BudgetTokens: 640},
+		},
+		UsageTokensWatermark: 773,
+	}
+
+	if got := usageStreamRead(sess, usageStreamClaude, 100); got.TotalTokens != 0 {
+		t.Fatalf("restarted claude cursor = %+v, want a zero read position", got)
+	}
+	for _, stream := range []string{usageStreamClaude, usageStreamCodex} {
+		if _, ok := sess.UsageStreamCursors[stream]; ok {
+			t.Fatalf("%s cursor survived a replacement of the .jsonl it reads", stream)
+		}
+	}
+	pi, ok := sess.UsageStreamCursors[usageStreamPi]
+	if !ok || pi.TotalTokens != 500 {
+		t.Fatalf("pi cursor = %+v ok=%v; <slot>.log did not change", pi, ok)
+	}
+	if sess.UsageTokensWatermark != 500 {
+		t.Fatalf("legacy watermark = %d, want the surviving pi cursor (500)", sess.UsageTokensWatermark)
+	}
+}
+
 func TestUpdateCodexUsageFromJSONL_ReplacedStreamRewindsBudgetReadPosition(t *testing.T) {
 	o, sess, jsonlPath := codexTestOrchestrator(t, "sup-1120-replaced-codex")
 
