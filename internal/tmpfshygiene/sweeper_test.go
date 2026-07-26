@@ -673,15 +673,17 @@ func TestSweepLeavesNonGeneratedNativeLibLookalikes(t *testing.T) {
 	assertMissing(t, leaked)
 }
 
-// Codex review catch (P1): EACCES does not prove the process belongs to
-// another user — Linux denies the same read for a same-UID process that
-// cleared PR_SET_DUMPABLE. Downgrading that to a routine skip let the sweep
-// delete a tree such a process was sitting in.
-func TestSweepFailsClosedOnSameUIDPermissionDenial(t *testing.T) {
+// EACCES does not prove the process belongs to another user — Linux denies the
+// same read for a same-UID process that cleared PR_SET_DUMPABLE. Such a process
+// still protects what it demonstrably references, but only that: charging its
+// denial to every candidate is what made the sweeper a permanent no-op on the
+// fleet host (#1125).
+func TestSweepScopesSameUIDDenialToTheProcessThatDenied(t *testing.T) {
 	if os.Geteuid() == 0 {
 		t.Skip("permission denials cannot be simulated as root")
 	}
 	root, proc, now := fakeRoots(t)
+	held := oldDir(t, root, "tmp.held", now, 3*time.Hour, "held")
 	stale := oldDir(t, root, "tmp.stale", now, 3*time.Hour, "stale")
 
 	processDir := filepath.Join(proc, "655")
@@ -693,7 +695,10 @@ func TestSweepFailsClosedOnSameUIDPermissionDenial(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
-	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("dumpable-off\x00"), 0o644); err != nil {
+	// Its fd table is unreadable, but its world-readable command line still ties
+	// it to one candidate.
+	cmdline := []byte("dumpable-off\x00--state=" + filepath.Join(held, "state.json") + "\x00")
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), cmdline, 0o644); err != nil {
 		t.Fatal(err)
 	}
 
@@ -701,13 +706,103 @@ func TestSweepFailsClosedOnSameUIDPermissionDenial(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if summary.ProcScanErrors == 0 {
-		t.Fatalf("summary = %+v, want a scan error for a same-UID denial", summary)
+	if summary.ProcScanErrors == 0 || summary.ProcUnresolvedProcesses == 0 {
+		t.Fatalf("summary = %+v, want the same-UID denial reported", summary)
 	}
-	if summary.DeletedEntries != 0 {
-		t.Fatalf("summary = %+v, want no deletion while the scan is incomplete", summary)
+	if summary.ProtectHits["proc_scan_error"] != 1 {
+		t.Fatalf("protect hits = %#v, want only the referenced candidate unresolvable", summary.ProtectHits)
 	}
-	assertExists(t, stale)
+	if summary.DeletedEntries != 1 {
+		t.Fatalf("summary = %+v, want the unreferenced candidate swept", summary)
+	}
+	assertExists(t, held)
+	assertMissing(t, stale)
+}
+
+// Regression for #1125: with a /proc scan that fails for a subset of pids, the
+// failing pids must not change the verdict for candidates they never touched,
+// and a candidate a live worker really holds must still be protected.
+func TestSweepKeepsPerCandidateVerdictsWhenSomeProcessesFailToScan(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission denials cannot be simulated as root")
+	}
+	root, proc, now := fakeRoots(t)
+	live := oldDir(t, root, "tmp.live", now, 3*time.Hour, "live")
+	garbage := oldDir(t, root, "tmp.garbage", now, 3*time.Hour, "garbage")
+
+	// A healthy worker sitting in tmp.live: fully resolvable, so tmp.live is
+	// protected on the evidence itself.
+	worker := filepath.Join(proc, "700")
+	if err := os.MkdirAll(filepath.Join(worker, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(live, filepath.Join(worker, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worker, "cmdline"), []byte("claude\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two same-UID session daemons that deny every read, like `systemd --user`
+	// and `(sd-pam)` on the fleet host. They reference no candidate.
+	for _, pid := range []string{"701", "702"} {
+		processDir := filepath.Join(proc, pid)
+		if err := os.MkdirAll(processDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fdDir := filepath.Join(processDir, "fd")
+		if err := os.MkdirAll(fdDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
+		if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("session-daemon\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 1, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProcUnresolvedProcesses != 2 || summary.ProcScanErrors == 0 {
+		t.Fatalf("summary = %+v, want both denying processes counted", summary)
+	}
+	if summary.ProtectHits["proc_scan_error"] != 0 {
+		t.Fatalf("protect hits = %#v, want no candidate charged with an unrelated denial", summary.ProtectHits)
+	}
+	if summary.ProtectHits["process_cwd"] != 1 || summary.ProtectedEntries != 1 {
+		t.Fatalf("summary = %+v, want only the worker-held candidate protected", summary)
+	}
+	if summary.ReclaimableBytes != int64(len("garbage")) || summary.SweepIneffective {
+		t.Fatalf("summary = %+v, want the abandoned candidate reported as reclaimable", summary)
+	}
+	assertExists(t, live)
+	assertExists(t, garbage)
+}
+
+// #1125: a sweep that protects everything it matched and reclaims nothing is
+// the shape of a broken reaper, not of a clean /tmp, so it must not read as a
+// quiet successful tick.
+func TestSweepFlagsFullyProtectedZeroReclaimSweep(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	young := oldDir(t, root, "tmp.young", now, 10*time.Minute, "new")
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.SweepIneffective || summary.AttentionCode != "tmpfs_sweep_ineffective" {
+		t.Fatalf("summary = %+v, want the no-op sweep flagged", summary)
+	}
+
+	setTreeAge(t, young, now.Add(-3*time.Hour))
+	summary, err = Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.SweepIneffective || summary.AttentionCode != "" {
+		t.Fatalf("summary = %+v, want a productive sweep left unflagged", summary)
+	}
 }
 
 // The 2026-07-25 event: 8.5GB used of a ~15GiB RAM-backed /tmp. That is only

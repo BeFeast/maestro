@@ -84,9 +84,22 @@ symlinks. Deletion uses no-follow, file-descriptor-relative operations rooted
 at the already-open tmpfs directory, so neither a symlink nor a concurrent
 symlink swap can redirect removal outside `/tmp`.
 
-`proc_scan_errors` records process entries that disappeared or could not be
-read during collection. A non-root daemon only removes entries owned by its own
-uid; a root-run installation can inspect and sweep all owners.
+`proc_scan_errors` records `/proc` reads that failed during collection and
+`proc_unresolved_processes` counts the processes behind them — typically
+`systemd --user`, `(sd-pam)` and `ssh-agent`, which run under the daemon's own
+uid with `PR_SET_DUMPABLE` cleared and are therefore present on every tick. A
+failed read protects only the candidates that one process demonstrably
+references (`protect_hits.proc_scan_error`); it is never a verdict on unrelated
+candidates. Charging it to the whole sweep made the sweeper a permanent no-op
+with `protected_entries == matched_entries` and `reclaimable_bytes: 0` (#1125).
+A non-root daemon only removes entries owned by its own uid; a root-run
+installation can inspect and sweep all owners.
+
+A sweep that protects every candidate it matched and reclaims nothing reports
+`sweep_ineffective: true`, attention code `tmpfs_sweep_ineffective` when nothing
+more urgent is pending, and a `SUSPICIOUS` daemon log line. Treat it as a broken
+reaper until proven otherwise: in the metric it is indistinguishable from a
+clean `/tmp`.
 
 ## Scheduling and Fleet pressure
 
@@ -173,6 +186,8 @@ Deployment/runtime verification remains an operator step after the code lands:
 5. Investigate persistent `scan_error`, `mount_boundary`, or high
    `proc_scan_errors` counts before broadening policy. Do not add a catch-all
    pattern or a blanket `/tmp` removal.
+6. Treat any `sweep_ineffective: true` record as a defect report, not as a
+   quiet tick.
 
 Changing tmpfs size, worktree GC, distributed runner cleanup, and producer-side
 ok-player fixes are intentionally outside this runbook.
