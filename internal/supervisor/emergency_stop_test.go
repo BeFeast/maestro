@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"testing"
 
 	"github.com/befeast/maestro/internal/config"
@@ -78,7 +79,7 @@ func TestRunOnce_WithEmergencyLLMHalt(t *testing.T) {
 	// RunOnce builds its own engine + backend client; with the halt set it must
 	// not shell out. A real backend call would fail (no backend configured), so a
 	// clean deterministic decision is itself evidence the LLM path was skipped.
-	decision, err := RunOnce(cfg, reader, WithEmergencyLLMHalt(true))
+	decision, err := RunOnce(context.Background(), cfg, reader, WithEmergencyLLMHalt(true))
 	if err != nil {
 		t.Fatalf("RunOnce with emergency halt: %v", err)
 	}

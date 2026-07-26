@@ -94,6 +94,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	d.flows[flow.key] = flow
 	d.mu.Unlock()
 
+	// Per-flow watchdog → supervise kick channel (#1119). Buffered by one so a
+	// watchdog tick never blocks on a loop that has not drained the previous
+	// kick; the send side is non-blocking anyway.
+	kickCh := make(chan struct{}, 1)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -112,7 +117,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		// its decision/cycle logs on it so two same-basename repos are
 		// distinguishable in the journal, matching the watchdog (#764). It reads
 		// the flow's CURRENT config through the holder each cycle (#768).
-		d.superviseLoop(fctx, flow.name, flow.holder.Load, d.opts)
+		d.superviseLoop(fctx, flow.name, flow.holder.Load, d.opts, kickCh)
 	}()
 	// Reload pump (#768): consume the store watcher and fan a config-store edit
 	// out to the holder (supervisor + dashboard) and the orchestrator. Tracked
@@ -137,7 +142,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		go func() {
 			defer wg.Done()
 			defer recoverFlow(flow, "watchdog")
-			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
+			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval, kickCh)
 		}()
 	}
 	// #887: the material-progress evaluator owns a separate per-project clock.

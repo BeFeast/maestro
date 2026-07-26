@@ -80,7 +80,7 @@ func (f *fakeWatchStore) ProjectsFingerprint(ctx context.Context) (map[string]ti
 	return out, nil
 }
 
-func newWatchDaemon(store ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options)) *Daemon {
+func newWatchDaemon(store ConfigLoader, run func(context.Context, *config.Config, Options, <-chan *config.Config), supervise func(context.Context, string, func() *config.Config, Options, <-chan struct{})) *Daemon {
 	d := New(store, Options{Host: "127.0.0.1", Port: 0, WatchStore: true, WatchStoreInterval: 25 * time.Millisecond})
 	if run != nil {
 		d.runLoop = run
@@ -88,7 +88,7 @@ func newWatchDaemon(store ConfigLoader, run func(context.Context, *config.Config
 	if supervise != nil {
 		d.superviseLoop = supervise
 	}
-	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration) {}
+	d.watchdogLoop = func(ctx context.Context, name, stateDir string, interval time.Duration, kickCh chan<- struct{}) {}
 	return d
 }
 
@@ -210,7 +210,9 @@ func TestWatchStoreWiresReloadChannel(t *testing.T) {
 		}
 		<-ctx.Done()
 	}
-	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) { <-ctx.Done() }
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{}) {
+		<-ctx.Done()
+	}
 	d := newWatchDaemon(store, run, sup)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -270,7 +272,7 @@ func TestWatchStoreMaxLiveWorkersOnlyReconfiguresRunningOrchestrator(t *testing.
 			}
 		}
 	}
-	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{}) {
 		<-ctx.Done()
 	}
 	d := newWatchDaemon(store, run, sup)
@@ -427,7 +429,7 @@ func TestWatchStoreLiveReloadReachesSupervisorAndDashboard(t *testing.T) {
 	run := func(ctx context.Context, c *config.Config, opts Options, reloadCh <-chan *config.Config) {
 		<-ctx.Done()
 	}
-	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options) {
+	sup := func(ctx context.Context, name string, getCfg func() *config.Config, opts Options, kickCh <-chan struct{}) {
 		tick := time.NewTicker(3 * time.Millisecond)
 		defer tick.Stop()
 		for {
