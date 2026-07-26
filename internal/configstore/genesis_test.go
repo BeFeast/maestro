@@ -396,9 +396,9 @@ func TestPlanProjectIsZeroWrite(t *testing.T) {
 	if !reflect.DeepEqual(before, after) {
 		t.Fatalf("plan changed the store fingerprint: %v -> %v", before, after)
 	}
-	names, err := store.projectNames(ctx)
+	names, err := store.ProjectNames(ctx)
 	if err != nil {
-		t.Fatalf("projectNames: %v", err)
+		t.Fatalf("ProjectNames: %v", err)
 	}
 	if len(names) != 0 {
 		t.Fatalf("plan created rows: %v", names)
@@ -423,9 +423,9 @@ func TestApplyProjectIdempotent(t *testing.T) {
 	if first.Effect != EffectCreate || !first.Wrote {
 		t.Fatalf("first apply = %+v, want create+wrote", first)
 	}
-	names, err := store.projectNames(ctx)
+	names, err := store.ProjectNames(ctx)
 	if err != nil {
-		t.Fatalf("projectNames: %v", err)
+		t.Fatalf("ProjectNames: %v", err)
 	}
 	if len(names) != 1 || names[0] != "befeast-maestro" {
 		t.Fatalf("after first apply names = %v, want [befeast-maestro]", names)
@@ -445,7 +445,7 @@ func TestApplyProjectIdempotent(t *testing.T) {
 	if second.Effect != EffectNoOp || second.Wrote {
 		t.Fatalf("second apply = %+v, want no-op+!wrote", second)
 	}
-	names, _ = store.projectNames(ctx)
+	names, _ = store.ProjectNames(ctx)
 	if len(names) != 1 {
 		t.Fatalf("second apply changed row count: %v", names)
 	}
@@ -495,7 +495,7 @@ func TestApplyProjectConfirmGate(t *testing.T) {
 		t.Fatal("wrong --confirm should be refused")
 	}
 	// Nothing was written by the refused applies.
-	if names, _ := store.projectNames(ctx); len(names) != 0 {
+	if names, _ := store.ProjectNames(ctx); len(names) != 0 {
 		t.Fatalf("refused apply wrote a row: %v", names)
 	}
 }
@@ -518,7 +518,7 @@ func TestApplyProjectFingerprintGate(t *testing.T) {
 	if !strings.Contains(err.Error(), "changed since plan") {
 		t.Fatalf("error = %v, want to mention change since plan", err)
 	}
-	if names, _ := store.projectNames(ctx); len(names) != 0 {
+	if names, _ := store.ProjectNames(ctx); len(names) != 0 {
 		t.Fatalf("refused apply wrote a row: %v", names)
 	}
 }
@@ -620,7 +620,7 @@ func TestApplyProjectConcurrentSameIdentityCreatesAtMostOneRow(t *testing.T) {
 		t.Fatalf("concurrent applies succeeded %d times, want exactly one", successes)
 	}
 
-	names, err := storeA.projectNames(ctx)
+	names, err := storeA.ProjectNames(ctx)
 	if err != nil {
 		t.Fatalf("list final projects: %v", err)
 	}
@@ -702,7 +702,7 @@ func TestApplyProjectIdentityConflictOtherName(t *testing.T) {
 		t.Fatalf("conflict report = %+v, want to name the other row", report)
 	}
 	// No new row was created for befeast-maestro.
-	if names, _ := store.projectNames(ctx); len(names) != 1 {
+	if names, _ := store.ProjectNames(ctx); len(names) != 1 {
 		t.Fatalf("conflict created an extra row: %v", names)
 	}
 }
