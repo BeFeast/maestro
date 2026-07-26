@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"strings"
@@ -237,7 +238,7 @@ func TestRunOnceDependencyUnblockAppliesSafeLabelMutations(t *testing.T) {
 		closedIssues: map[int]bool{147: true},
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -286,7 +287,7 @@ supervisor:
 		closedIssues: map[int]bool{150: true},
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -641,7 +642,7 @@ func TestRunOnce_DependencyUnblockExecutesMutations(t *testing.T) {
 		closedIssues: map[int]bool{147: true},
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -659,7 +660,7 @@ func TestRunOnce_DependencyUnblockExecutesMutations(t *testing.T) {
 	}
 
 	// Second cycle must be a no-op (idempotency).
-	if _, err := RunOnce(cfg, reader); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader); err != nil {
 		t.Fatalf("RunOnce(2): %v", err)
 	}
 	if len(reader.removedLabels) != 1 || len(reader.addedLabels) != 1 || len(reader.comments) != 1 {

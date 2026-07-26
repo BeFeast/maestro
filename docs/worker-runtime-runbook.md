@@ -38,6 +38,30 @@ The system scope requires passwordless access to the exact `systemd-run` and
 Validate that boundary before enabling a canary; a failure is spawn-fatal and
 does not fall back silently to an unowned worker.
 
+## Supervisor backend children
+
+`worker_runtime` only reaches processes that hold a worker lease. The supervisor's
+model backend probes are started directly by the daemon and never enter a lease,
+so they need their own containment. `BuildSupervisorCmd` therefore assigns an
+explicit child environment whose `TMPDIR`, `TMP`, and `TEMP` all point at a
+disk-backed directory:
+
+```yaml
+supervisor:
+  temp_dir: /var/tmp/maestro-supervisor
+```
+
+- The key is optional. When unset, Maestro uses `/var/tmp/maestro-supervisor-<uid>`
+  and creates it `0700` on first use.
+- Like `worker_runtime.scratch_root`, a configured path must be absolute and must
+  not live under global `/tmp`; production `/tmp` is the RAM-backed filesystem this
+  setting exists to keep backend children out of.
+- This replaces the host-local `maestro.service` `Environment=TMPDIR=` drop-in.
+  The drop-in worked only because the probes are direct children of the daemon,
+  it was invisible to anyone reading the repo, and it was lost on a host rebuild.
+- `PrivateTmp=` is not an alternative: `/tmp/tmux-<uid>` carries the worker tmux
+  server, whose survival across a daemon restart is a hard contract.
+
 ## Canary and rollback
 
 1. Enable `isolated` for one low-risk project and leave the rest on `legacy`.

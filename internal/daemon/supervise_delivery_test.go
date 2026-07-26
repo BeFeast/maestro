@@ -83,7 +83,7 @@ func TestRunSuperviseThreadsConfiguredApprovalsDB(t *testing.T) {
 		latest:   []github.PRMergeInfo{{SHA: sha, MergedAt: now}},
 		checkout: approver.NewLocalFixtureCheckoutPreparer(cfg.Repo, origin),
 	}
-	runSupervise(t.Context(), "daemon-delivery", func() *config.Config { return cfg }, reader, 0, customDB, nil)
+	runSupervise(t.Context(), "daemon-delivery", func() *config.Config { return cfg }, reader, 0, customDB, nil, nil)
 
 	loaded, err := state.Load(cfg.StateDir)
 	if err != nil {

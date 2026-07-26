@@ -27,10 +27,10 @@ func TestStartFlowMaterialProgressIndependentFromSupervisorFailure(t *testing.T)
 		<-ctx.Done()
 	}
 	var supervisorReturned int64
-	d.superviseLoop = func(context.Context, string, func() *config.Config, Options) {
+	d.superviseLoop = func(context.Context, string, func() *config.Config, Options, <-chan struct{}) {
 		atomic.StoreInt64(&supervisorReturned, 1) // models an unrecoverable first-cycle failure
 	}
-	d.watchdogLoop = func(context.Context, string, string, time.Duration) {}
+	d.watchdogLoop = func(context.Context, string, string, time.Duration, chan<- struct{}) {}
 
 	flow := d.startFlow(context.Background(), "", server.NewFleetProjectWithGitHub(cfg))
 	defer d.stopFlow(flow.key)

@@ -258,12 +258,41 @@ var ghAPIRunner = func(args ...string) ([]byte, error) {
 	return ghCommand(args...).CombinedOutput()
 }
 
-// ghCommand builds an exec.Command for `gh <args...>` with GitHub App auth
+// ghTimeout is the maximum wall time allowed for a single gh subprocess call.
+// It is the package-wide bound: ghCommand applies it to every plain `gh` call
+// site, and the GraphQL Projects calls in github_projects.go pass it to their
+// own contexts. A var rather than a const only so tests can shrink it;
+// production never reassigns it.
+var ghTimeout = 30 * time.Second
+
+// ghExecutable is the gh binary, resolved through PATH exactly like the bare
+// exec.Command call it replaced. A var only so a test can point the bounded
+// wiring at a stub instead of the real CLI.
+var ghExecutable = "gh"
+
+// ghCommand builds a bounded exec.Cmd for `gh <args...>` with GitHub App auth
 // injected when configured. All direct `gh` call sites in this package use it
-// instead of exec.Command so installation-token auth is uniform (#823).
+// instead of exec.Command so installation-token auth is uniform (#823) and so
+// no single gh invocation can hang a supervise cycle forever (#1119): this was
+// a plain exec.Command with no deadline behind 20 call sites — the entire read
+// surface the supervisor cycle depends on — so a gh that never returned wedged
+// RunOnce with nothing above it able to abort the subprocess.
+//
+// The deadline context deliberately outlives this function: exec.CommandContext
+// requires its context to stay live until Wait returns, so cancel cannot be
+// deferred here. It is invoked from Cancel when the deadline fires; when the
+// process exits first the context is released by its own timer at the deadline,
+// so the retained resource is one armed timer for at most ghTimeout. Note the
+// clock starts when the command is built, not when it is started — every call
+// site in this package builds and runs in a single expression.
 func ghCommand(args ...string) *exec.Cmd {
-	cmd := exec.Command("gh", args...)
-	ghApplyAuth(cmd)
+	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
+	cmd := ghCommandContext(ctx, args...)
+	kill := cmd.Cancel
+	cmd.Cancel = func() error {
+		defer cancel()
+		return kill()
+	}
 	return cmd
 }
 
@@ -271,7 +300,29 @@ func ghCommand(args ...string) *exec.Cmd {
 // GraphQL Projects calls in github_projects.go so they authenticate with the
 // installation token when App auth is active (#823).
 func ghCommandContext(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "gh", args...)
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	cmd := exec.CommandContext(ctx, ghExecutable, args...)
+	// Kill the whole process group, not just gh itself (#1119). gh spawns
+	// helpers (credential, pager, hooks) and a surviving child that inherited
+	// the output pipe keeps Wait blocked long after the leader is gone — the
+	// same hang the deadline exists to prevent. Mirrors the delivery-freshness
+	// fence in trustedGHCommandContext.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	// Bound the post-kill wait too: Wait blocks until the output pipes close,
+	// so a stray descriptor holder must not turn a deadline into a hang.
+	cmd.WaitDelay = 2 * time.Second
 	ghApplyAuth(cmd)
 	return cmd
 }

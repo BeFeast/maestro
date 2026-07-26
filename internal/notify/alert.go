@@ -24,6 +24,11 @@ const (
 	AlertDeliveryAdvance AlertClass = "delivery_advance"
 	// AlertEmergency: notify_red-grade — emergency stop / supervisor degraded.
 	AlertEmergency AlertClass = "emergency"
+	// AlertTmpfsPressure: free space on the host tmpfs root fell below the
+	// absolute free-byte floor. Priority 5 / CRITICAL — that tmpfs is RAM-backed,
+	// so running it out is a host memory outage for every live worker. Until
+	// #1128 the signal terminated at a dashboard pill nobody was watching.
+	AlertTmpfsPressure AlertClass = "tmpfs_pressure"
 )
 
 // AlertRoute is the transport-shaping metadata a class maps to.
@@ -44,6 +49,7 @@ var alertRoutes = map[AlertClass]AlertRoute{
 	AlertFloorBreach:              {Priority: 5, Tags: []string{"rotating_light", "sos", "warning"}},
 	AlertDeliveryAdvance:          {Priority: 3, Tags: []string{"white_check_mark", "rocket"}},
 	AlertEmergency:                {Priority: 5, Tags: []string{"rotating_light", "sos"}},
+	AlertTmpfsPressure:            {Priority: 5, Tags: []string{"rotating_light", "floppy_disk", "warning"}},
 }
 
 // defaultRoute is used for an unknown class so an unmapped alert still sends at
