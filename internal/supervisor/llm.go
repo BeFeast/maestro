@@ -294,6 +294,8 @@ func completeSupervisorBackend(name string, def config.BackendDef, cfg *config.C
 	backendCfg := worker.BackendConfig{
 		Cmd: def.Cmd, ExtraArgs: def.ExtraArgs, PromptMode: def.PromptMode, Provider: def.Provider,
 		Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort,
+		// #1127: keep this probe's temp files off the RAM-backed host /tmp.
+		TempDir: cfg.Supervisor.EffectiveTempDir(),
 	}
 	cmd, stdinFile, err := worker.BuildSupervisorCmd(name, backendCfg, promptPath, worktree)
 	if err != nil {
