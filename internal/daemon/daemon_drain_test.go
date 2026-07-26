@@ -230,7 +230,7 @@ func TestTwelveFlowShutdownKeepsHealthDuringDrainAndDetachesHungFlow(t *testing.
 	oldPoll, oldFlowTimeout, oldCheckpointFn := drainPollInterval, shutdownFlowTimeout, checkpointFn
 	drainPollInterval = 5 * time.Millisecond
 	shutdownFlowTimeout = 5 * time.Second
-	checkpointFn = func(*state.Session) (string, error) { return "", nil }
+	checkpointFn = func(context.Context, *state.Session) (string, error) { return "", nil }
 	defer func() {
 		drainPollInterval = oldPoll
 		shutdownFlowTimeout = oldFlowTimeout
@@ -273,8 +273,10 @@ func TestTwelveFlowShutdownKeepsHealthDuringDrainAndDetachesHungFlow(t *testing.
 		}
 		<-ctx.Done()
 	}
-	d.superviseLoop = func(ctx context.Context, _ string, _ func() *config.Config, _ Options) { <-ctx.Done() }
-	d.watchdogLoop = func(context.Context, string, string, time.Duration) {}
+	d.superviseLoop = func(ctx context.Context, _ string, _ func() *config.Config, _ Options, _ <-chan struct{}) {
+		<-ctx.Done()
+	}
+	d.watchdogLoop = func(context.Context, string, string, time.Duration, chan<- struct{}) {}
 	d.materialProgressLoop = func(context.Context, string, func() *config.Config) {}
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -348,8 +350,10 @@ func TestTwelveFlowShutdownKeepsHealthDuringDrainAndDetachesHungFlow(t *testing.
 	// bounded handoff; health recovery does not wait for an external second signal.
 	replacement := New(fakeLoader{cfgs: cfgs}, Options{Host: "127.0.0.1", Port: port})
 	replacement.runLoop = func(ctx context.Context, _ *config.Config, _ Options, _ <-chan *config.Config) { <-ctx.Done() }
-	replacement.superviseLoop = func(ctx context.Context, _ string, _ func() *config.Config, _ Options) { <-ctx.Done() }
-	replacement.watchdogLoop = func(context.Context, string, string, time.Duration) {}
+	replacement.superviseLoop = func(ctx context.Context, _ string, _ func() *config.Config, _ Options, _ <-chan struct{}) {
+		<-ctx.Done()
+	}
+	replacement.watchdogLoop = func(context.Context, string, string, time.Duration, chan<- struct{}) {}
 	replacement.materialProgressLoop = func(context.Context, string, func() *config.Config) {}
 	replacementCtx, stopReplacement := context.WithCancel(context.Background())
 	replacementDone := make(chan error, 1)

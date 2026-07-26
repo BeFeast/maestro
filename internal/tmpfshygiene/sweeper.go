@@ -115,6 +115,9 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	}
 	summary.Tmpfs = usage.Tmpfs
 	summary.UsePct = usage.UsePct
+	summary.TotalBytes = usage.TotalBytes
+	summary.AvailableBytes = usage.AvailableBytes
+	summary.PressureFloorBytes = opts.PressureFloorBytes
 	if !usage.Tmpfs {
 		return fail(fmt.Errorf("refusing tmpfs hygiene: %s is not tmpfs", opts.Root))
 	}
@@ -364,7 +367,12 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	}
 	summary.Tmpfs = finalUsage.Tmpfs
 	summary.UsePct = finalUsage.UsePct
-	summary.Pressure = finalUsage.UsePct >= PressureThresholdPct
+	summary.TotalBytes = finalUsage.TotalBytes
+	summary.AvailableBytes = finalUsage.AvailableBytes
+	// Pressure is an absolute free-byte budget, not a share of the mount
+	// (#1128). A percentage of a RAM-backed tmpfs says nothing about how close
+	// the host is to running out of memory.
+	summary.Pressure = BelowFloor(finalUsage.AvailableBytes, finalUsage.TotalBytes, opts.PressureFloorBytes)
 	if summary.Pressure {
 		summary.AttentionCode = "tmpfs_pressure"
 	}
@@ -380,6 +388,9 @@ func normalizeOptions(opts Options) Options {
 		opts.ProcRoot = "/proc"
 	}
 	opts.ProcRoot = filepath.Clean(opts.ProcRoot)
+	if opts.PressureFloorBytes == 0 {
+		opts.PressureFloorBytes = DefaultPressureFreeBytes
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}

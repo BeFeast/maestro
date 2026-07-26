@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -218,7 +219,7 @@ func TestRunOnce_SafeIdleDecision_RecordedWithoutBackendCall(t *testing.T) {
 		t.Fatalf("seed state: %v", err)
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}

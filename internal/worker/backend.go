@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -66,7 +67,11 @@ type BackendConfig struct {
 	// requires an enforceable live-usage mode; BuildWorkerCmd fails closed for
 	// backend/output combinations that only reveal usage after process exit.
 	TokenBudget int
-	MCP         config.MCPConfig
+	// TempDir is the disk-backed directory BuildSupervisorCmd points a supervisor
+	// backend child's TMPDIR/TMP/TEMP at (#1127). Empty selects
+	// config.DefaultSupervisorTempDir().
+	TempDir string
+	MCP     config.MCPConfig
 }
 
 // Backend builds the exec.Cmd for a specific model CLI.
@@ -839,6 +844,59 @@ func validateLiveTokenBudget(backendName string, cfg BackendConfig) error {
 // the backend name, provider field, and cmd binary (#684) so custom-named
 // backends keep stdin prompt delivery.
 func BuildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (cmd *exec.Cmd, stdinFile string, err error) {
+	cmd, stdinFile, err = buildSupervisorCmd(backendName, cfg, promptFile, worktree)
+	if err != nil {
+		return nil, "", err
+	}
+	if err := applySupervisorTempEnv(cmd, cfg); err != nil {
+		return nil, "", err
+	}
+	return cmd, stdinFile, nil
+}
+
+// supervisorTempDir resolves the temp directory for a supervisor backend child.
+// The built-in default applies when the caller did not thread one through, so a
+// missed wiring cannot silently put a probe back on the RAM-backed /tmp.
+func supervisorTempDir(cfg BackendConfig) string {
+	if dir := strings.TrimSpace(cfg.TempDir); dir != "" {
+		return filepath.Clean(dir)
+	}
+	return config.DefaultSupervisorTempDir()
+}
+
+// applySupervisorTempEnv gives a supervisor backend child an explicit
+// environment whose TMPDIR/TMP/TEMP point at a disk-backed directory (#1127).
+// These probes are direct children of the daemon and never enter a worker
+// lease, so worker_runtime isolation cannot reach them by construction: with no
+// Env assigned they inherit maestro.service's environment and write to the host
+// /tmp, which on the fleet host is a RAM-backed tmpfs. The Bun-built opencode
+// CLI alone extracts a ~5.6MB native library there on every invocation and
+// never removes it (see internal/tmpfshygiene). TMP/TEMP travel with TMPDIR for
+// parity with the isolated worker lease, which sets all three.
+func applySupervisorTempEnv(cmd *exec.Cmd, cfg BackendConfig) error {
+	dir := supervisorTempDir(cfg)
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return fmt.Errorf("prepare supervisor temp dir %s: %w", dir, err)
+	}
+	inherited := cmd.Env
+	if inherited == nil {
+		inherited = os.Environ()
+	}
+	env := make([]string, 0, len(inherited)+3)
+	for _, kv := range inherited {
+		switch strings.SplitN(kv, "=", 2)[0] {
+		case "TMPDIR", "TMP", "TEMP":
+			continue
+		}
+		env = append(env, kv)
+	}
+	cmd.Env = append(env, "TMPDIR="+dir, "TMP="+dir, "TEMP="+dir)
+	return nil
+}
+
+// buildSupervisorCmd builds the per-kind argv. Callers go through
+// BuildSupervisorCmd, which owns the child environment for every kind.
+func buildSupervisorCmd(backendName string, cfg BackendConfig, promptFile, worktree string) (*exec.Cmd, string, error) {
 	switch resolveBackendKind(backendName, cfg) {
 	case "claude":
 		claudeCmd := cfg.Cmd

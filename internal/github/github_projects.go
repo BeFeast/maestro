@@ -8,11 +8,7 @@ import (
 	"net/url"
 	"os/exec"
 	"strings"
-	"time"
 )
-
-// ghTimeout is the maximum time allowed for a single gh subprocess call.
-const ghTimeout = 30 * time.Second
 
 // ProjectStatus represents the status to set on a GitHub Project item.
 // Kept for backward compatibility — callers map these to real column names.

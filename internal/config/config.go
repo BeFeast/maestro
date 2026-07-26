@@ -962,6 +962,13 @@ type SupervisorConfig struct {
 	// force a full-context second opinion on every cycle regardless of token cost.
 	AlwaysConsultLLM bool `yaml:"always_consult_llm" json:"always_consult_llm,omitempty"`
 
+	// TempDir repoints TMPDIR/TMP/TEMP for the supervisor's backend children
+	// (#1127). These probes are started directly by the daemon and never enter a
+	// worker lease, so worker_runtime isolation cannot reach them; without an
+	// explicit environment they inherit the daemon's, which on the fleet host
+	// means the RAM-backed /tmp. Empty selects DefaultSupervisorTempDir().
+	TempDir string `yaml:"temp_dir" json:"temp_dir,omitempty"`
+
 	// AllowMeteredBackend opts this project's supervisor LLM loop into running on
 	// a metered (per-token) backend (#838). Default false: when supervisor.backend
 	// (or the model.default fallback the supervisor uses) resolves to a backend
@@ -2571,6 +2578,9 @@ func parse(data []byte) (*Config, error) {
 	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {
 		return nil, err
 	}
+	if err := validateSupervisorTempDir(cfg.Supervisor); err != nil {
+		return nil, err
+	}
 	if err := validateRemoteRunner(cfg); err != nil {
 		return nil, err
 	}
@@ -2651,6 +2661,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
 	cfg.WorkerRuntime.ScratchRoot = expandHome(cfg.WorkerRuntime.ScratchRoot)
+	cfg.Supervisor.TempDir = expandHome(cfg.Supervisor.TempDir)
 	cfg.Outcome = cfg.Outcome.Normalized()
 	if cfg.Outcome.Configured() {
 		cfg.Outcome.SourceRepoPath = expandHome(cfg.Outcome.SourceRepoPath)
