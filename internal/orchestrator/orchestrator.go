@@ -171,6 +171,12 @@ type Orchestrator struct {
 	fleetSpawnCeilingFn func() bool
 	fleetSpawnReserveFn func() (commit func(slot string), release func(), ok bool)
 
+	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
+	// whether the host is too short on tmpfs space to accept another worker, and
+	// why. nil = no precondition. It is a throughput pause only — see
+	// SetSpawnResourceHold.
+	spawnResourceHoldFn func() (hold bool, reason string)
+
 	// Restart-required signal. Some config fields (currently routing.*) cannot be
 	// hot-applied because their runtime components are built once at startup. When
 	// such a field changes during a config reload we do not apply it; instead we raise this
@@ -289,6 +295,18 @@ func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
 // nil disables the gate for legacy single-project callers and tests.
 func (o *Orchestrator) SetFleetSpawnCeiling(fn func() bool) {
 	o.fleetSpawnCeilingFn = fn
+}
+
+// SetSpawnResourceHold wires the host-resource spawn precondition (#1128). fn
+// is consulted at the top of startNewWorkers; when it reports a hold the
+// orchestrator lists nothing and spawns nothing for this cycle.
+//
+// It is deliberately a throughput pause and not a gate: no state is written, no
+// approval is requested, no ActionNone decision is produced, and no issue's
+// retry budget is touched. The next poll re-evaluates fn, so dispatch resumes
+// on its own as soon as the host recovers. Passing nil clears the precondition.
+func (o *Orchestrator) SetSpawnResourceHold(fn func() (bool, string)) {
+	o.spawnResourceHoldFn = fn
 }
 
 // SetFleetSpawnReserve wires the daemon's atomic one-worker reservation. The
@@ -10148,6 +10166,17 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	if o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
 		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
 		return
+	}
+	// Host-resource precondition (#1128): the host tmpfs is RAM-backed, so
+	// spawning into a nearly-full one is how a space problem becomes an
+	// out-of-memory outage. This sits before issue listing so a held cycle also
+	// costs no GitHub quota. It is a pause, not a freeze: nothing is persisted,
+	// no retry budget is spent, and the next poll re-checks and resumes.
+	if o.spawnResourceHoldFn != nil {
+		if hold, reason := o.spawnResourceHoldFn(); hold {
+			log.Printf("[orch] spawn held on host resources: %s (local_running=%d) — retrying next cycle", reason, s.RunningSessionCount())
+			return
+		}
 	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the

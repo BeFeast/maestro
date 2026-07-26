@@ -201,6 +201,18 @@ type Options struct {
 	// TmpfsHygieneInterval is the daemon-owned protect-aware /tmp apply cadence.
 	// Non-positive values are clamped to DefaultTmpfsHygieneInterval.
 	TmpfsHygieneInterval time.Duration
+	// TmpfsPressureInterval is the cadence of the sweep-independent /tmp
+	// capacity sample (#1128). Non-positive values are clamped to
+	// DefaultTmpfsPressureInterval.
+	TmpfsPressureInterval time.Duration
+	// TmpfsPressureFloorBytes is the absolute free-byte budget below which the
+	// daemon pages the operator. Zero takes
+	// tmpfshygiene.DefaultPressureFreeBytes; negative disables the alert.
+	TmpfsPressureFloorBytes int64
+	// TmpfsSpawnFloorBytes is the absolute free-byte budget below which new
+	// worker dispatch pauses. Zero takes tmpfshygiene.DefaultSpawnFreeBytes;
+	// negative disables the pause.
+	TmpfsSpawnFloorBytes int64
 
 	// PromptPath is an optional worker prompt base file applied to every flow.
 	PromptPath string
@@ -357,6 +369,10 @@ type Daemon struct {
 	// summary. It is independent of per-project flow state.
 	tmpfsHygiene *tmpfsHygieneRuntime
 
+	// tmpfsPressure owns the sweep-independent /tmp capacity sample backing the
+	// CRITICAL pressure alert and the spawn precondition (#1128).
+	tmpfsPressure *tmpfsPressureRuntime
+
 	// runLoop, superviseLoop, watchdogLoop, and materialProgressLoop build the
 	// per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -434,6 +450,9 @@ func New(store ConfigLoader, opts Options) *Daemon {
 	if opts.TmpfsHygieneInterval <= 0 {
 		opts.TmpfsHygieneInterval = DefaultTmpfsHygieneInterval
 	}
+	if opts.TmpfsPressureInterval <= 0 {
+		opts.TmpfsPressureInterval = DefaultTmpfsPressureInterval
+	}
 	if opts.WatchStore && opts.WatchStoreInterval <= 0 {
 		log.Printf("[daemon] watch-store-interval %s is not positive; clamping to default %s", opts.WatchStoreInterval, DefaultWatchStoreInterval)
 		opts.WatchStoreInterval = DefaultWatchStoreInterval
@@ -448,6 +467,10 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		spawnLimiter: newFleetSpawnLimiter(store),
 	}
 	d.tmpfsHygiene = newTmpfsHygieneRuntime(d)
+	// #1128: the capacity sample shares the hygiene root but not its schedule.
+	// The alert and the spawn precondition must not depend on a sweep that can
+	// legitimately refuse to run or reclaim nothing.
+	d.tmpfsPressure = newTmpfsPressureRuntime(d.tmpfsHygiene.options.Root, opts.TmpfsPressureFloorBytes, opts.TmpfsSpawnFloorBytes)
 	if opts.WatchStore {
 		// Only the richer store (Load + ProjectsFingerprint) can drive hot
 		// add/remove/reload. Degrade loudly rather than silently if an embedder
@@ -551,6 +574,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
 	fleet.SetTmpfsHygieneSource(d.tmpfsHygieneSummary)
+	fleet.SetTmpfsPressureSource(d.tmpfsPressureSnapshot)
 	// Back the dashboard project-CRUD endpoint (#761) with the SAME config store
 	// the daemon reads, when the store supports the write API. A UI add/remove
 	// then writes the store and the --watch-store diff-loop reconciles it into a
@@ -750,6 +774,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 			<-hygieneDone
 		}
 	}
+	// #1128: CRITICAL tmpfs pressure watch. It samples free bytes on its own
+	// short cadence instead of riding the 10m sweep, so the operator is paged and
+	// dispatch pauses even on a host where the sweeper reclaims nothing.
+	var stopTmpfsPressure func()
+	if d.tmpfsPressure != nil {
+		pctx, pressureCancel := context.WithCancel(ctx)
+		pressureDone := make(chan struct{})
+		go func() {
+			defer close(pressureDone)
+			d.watchTmpfsPressureLoop(pctx, d.opts.TmpfsPressureInterval)
+		}()
+		log.Printf("[daemon] tmpfs pressure watch enabled — sample every %s (CRITICAL below the free-byte floor)", d.opts.TmpfsPressureInterval)
+		stopTmpfsPressure = func() {
+			pressureCancel()
+			<-pressureDone
+		}
+	}
 	drainWatch := func() {
 		if stopWatch != nil {
 			stopWatch()
@@ -762,6 +803,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		if stopTmpfsHygiene != nil {
 			stopTmpfsHygiene()
+		}
+		if stopTmpfsPressure != nil {
+			stopTmpfsPressure()
 		}
 	}
 
