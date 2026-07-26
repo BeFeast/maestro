@@ -230,7 +230,7 @@ func TestTwelveFlowShutdownKeepsHealthDuringDrainAndDetachesHungFlow(t *testing.
 	oldPoll, oldFlowTimeout, oldCheckpointFn := drainPollInterval, shutdownFlowTimeout, checkpointFn
 	drainPollInterval = 5 * time.Millisecond
 	shutdownFlowTimeout = 5 * time.Second
-	checkpointFn = func(*state.Session) (string, error) { return "", nil }
+	checkpointFn = func(context.Context, *state.Session) (string, error) { return "", nil }
 	defer func() {
 		drainPollInterval = oldPoll
 		shutdownFlowTimeout = oldFlowTimeout

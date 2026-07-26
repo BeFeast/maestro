@@ -299,6 +299,7 @@ type Session struct {
 	TokenBudgetTokensAttempt   int        `json:"token_budget_tokens_attempt,omitempty"`   // current-attempt usage under TokenBudgetMeasure; kept separate from inclusive cost telemetry
 	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // high-water mark for the current attempt's cumulative budget measure
 	TokenBudgetMeasure         string     `json:"token_budget_measure,omitempty"`          // explicit live-ceiling measure, e.g. uncached_tokens
+	TokenBudgetMaxTokens       int        `json:"token_budget_max_tokens,omitempty"`       // worker_max_tokens ceiling in effect when the budget stop was recorded (#1124); lets a raised budget retire a stale kill streak
 	WorkerOutcome              string     `json:"worker_outcome,omitempty"`                // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
@@ -5104,14 +5105,22 @@ func (s *State) FailedAttemptsForIssue(issueNum int) int {
 // nothing ever stops re-dispatching. Live 2026-07-24: ok-player #628 spawned 9
 // times in 4.5h, each killed after ~2 minutes at observed≈157k vs max=120k.
 // Callers use this streak to break the mill and surface the misconfiguration.
-func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
+//
+// currentMaxTokens is the worker_max_tokens ceiling configured right now (0 when
+// none is configured, which counts every stop as before). Stops recorded under a
+// LOWER ceiling are stale evidence — the wall they hit no longer exists — so the
+// walk stops there and the streak clears. Without that the hold had no
+// self-clearing path: the only thing that reset the streak was a new non-budget
+// session, and creating one required the dispatch the hold itself blocked, so
+// raising the budget — the remedy the alert asks for — changed nothing (#1124).
+func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum, currentMaxTokens int) int {
 	if s == nil {
 		return 0
 	}
 	type ended struct {
 		at      time.Time
 		budget  bool
-		counted bool
+		ceiling int
 	}
 	var history []ended
 	for _, sess := range s.Sessions {
@@ -5128,7 +5137,7 @@ func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
 		history = append(history, ended{
 			at:      at,
 			budget:  sess.WorkerOutcome == string(DisplayTokenBudgetExceeded),
-			counted: true,
+			ceiling: tokenBudgetKillCeiling(sess),
 		})
 	}
 	sort.Slice(history, func(i, j int) bool { return history[i].at.After(history[j].at) })
@@ -5137,9 +5146,34 @@ func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum int) int {
 		if !entry.budget {
 			break
 		}
+		if currentMaxTokens > 0 && entry.ceiling > 0 && entry.ceiling < currentMaxTokens {
+			break
+		}
 		streak++
 	}
 	return streak
+}
+
+// tokenBudgetKillCeiling reports the worker_max_tokens ceiling a budget stop was
+// recorded under, or 0 when it cannot be established at all.
+//
+// Sessions stopped before #1124 carry no explicit ceiling, so their observed
+// budget usage stands in for it: the stop only fires once usage has reached the
+// ceiling, so observed >= ceiling, and an observation below the current budget
+// still proves the stop happened under a lower one. That fallback is what
+// releases the issues frozen when #1124 was filed (ok-folio #280, ok-player
+// #628) — their whole history predates the field.
+func tokenBudgetKillCeiling(sess *Session) int {
+	if sess == nil {
+		return 0
+	}
+	if sess.TokenBudgetMaxTokens > 0 {
+		return sess.TokenBudgetMaxTokens
+	}
+	if sess.TokenBudgetTokensAttempt > 0 {
+		return sess.TokenBudgetTokensAttempt
+	}
+	return sess.TokensUsedAttempt
 }
 
 // IssueRetryExhausted returns true if any session for the given issue

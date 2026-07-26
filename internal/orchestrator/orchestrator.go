@@ -1541,13 +1541,21 @@ func (o *Orchestrator) notifyTokenBudgetMill(issueNumber, kills int) {
 	if project != "" {
 		title += ": " + project
 	}
-	body := fmt.Sprintf(
-		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch is held until the budget is raised.",
-		issueNumber, kills, o.cfg.WorkerMaxTokens,
-	)
+	body := tokenBudgetMillAlertBody(issueNumber, kills, o.cfg.WorkerMaxTokens)
 	if err := o.notifier.Alert(notify.AlertFutileRecovery, fmt.Sprintf("%s:token_budget_wall:%d", project, issueNumber), title, body); err != nil {
 		log.Printf("[orch] token-budget-wall notification failed for issue #%d: %v", issueNumber, err)
 	}
+}
+
+// tokenBudgetMillAlertBody names the one action that actually releases the hold.
+// The pre-#1124 text asked the operator to raise the budget while the streak
+// ignored the budget entirely, so the stated remedy was silently ineffective;
+// the escape route has to be both true and specific.
+func tokenBudgetMillAlertBody(issueNumber, kills, maxTokens int) string {
+	return fmt.Sprintf(
+		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch stays held until worker_max_tokens is raised above %d — the hold then clears itself on the next dispatch cycle, because stops recorded under a lower ceiling stop counting (#1124). Re-adding a ready label does not release it.",
+		issueNumber, kills, maxTokens, maxTokens,
+	)
 }
 
 func tokenBudgetObservation(sess *state.Session) (int, string) {
@@ -1570,6 +1578,11 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 	}
 	o.updateTokensUsedFromWorkerLog(slotName, sess)
 	applyTokenBudgetObservation(sess, marker)
+	// Stamp the ceiling this stop actually hit so a later budget raise can
+	// retire the kill streak instead of holding the issue forever (#1124).
+	if marker.MaxTokens > 0 {
+		sess.TokenBudgetMaxTokens = marker.MaxTokens
+	}
 	budgetObserved, budgetMeasure := tokenBudgetObservation(sess)
 	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
 	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
@@ -10297,7 +10310,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// the operator raises worker_max_tokens (or fixes the measure) instead
 		// of watching the fleet re-spawn into the same wall.
 		if !repairSpawn {
-			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number)
+			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number, o.cfg.WorkerMaxTokens)
 			if o.tokenBudgetMillHold(issue.Number, kills) {
 				log.Printf("[orch] skipping issue #%d: %d consecutive token-budget stops — worker_max_tokens=%d is likely below the viable floor for this issue",
 					issue.Number, kills, o.cfg.WorkerMaxTokens)

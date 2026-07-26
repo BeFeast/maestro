@@ -115,20 +115,32 @@ var shutdownCheckpointBudget = 60 * time.Second
 var restartCheckpointRetries = 5
 
 // checkpointFn writes the best-effort CHECKPOINT.md context blob for one
-// in-flight session and returns its path. It defaults to worker.SaveCheckpoint,
-// which shells out to git; a var so tests can inject a fast or deliberately
-// wedged stub. It is called through saveCheckpointWithin so a git invocation
-// contending with a live worker's index.lock cannot hang the shutdown pass past
-// the drain deadline (#966).
-var checkpointFn = worker.SaveCheckpoint
+// in-flight session and returns its path. It defaults to
+// worker.SaveCheckpointContext, which shells out to git under the caller's
+// context; a var so tests can inject a fast or deliberately wedged stub. It is
+// called through saveCheckpointWithin so a git invocation contending with a live
+// worker's index.lock cannot hang the shutdown pass past the drain deadline
+// (#966) and cannot survive it as a subprocess (#1121).
+var checkpointFn = worker.SaveCheckpointContext
 
-// saveCheckpointWithin runs checkpointFn but abandons it if it does not return
-// within budget. Checkpoint capture shells out to git against worktrees that are
-// still owned by surviving workers, so it must not be allowed to defeat the same
-// global shutdown deadline as a wedged flow callback (#966). The marker is
-// persisted before this helper runs; the abandoned goroutine is harmless and is
-// reaped when the process exits. A non-positive budget skips the optional capture
-// entirely (timedOut=true).
+// checkpointCancelGrace bounds how long saveCheckpointWithin waits, after
+// cancelling a timed-out capture, for that capture to actually release its git
+// process group. The kill is a SIGKILL to the group, so this is normally
+// microseconds; the bound only exists so a capture that ignores cancellation
+// cannot re-introduce the unbounded hold this helper exists to prevent. A var so
+// tests can exercise both outcomes deterministically.
+var checkpointCancelGrace = 2 * time.Second
+
+// saveCheckpointWithin runs checkpointFn under a context it cancels if the
+// capture does not return within budget. Checkpoint capture shells out to git
+// against worktrees that are still owned by surviving workers, so it must not be
+// allowed to defeat the same global shutdown deadline as a wedged flow callback
+// (#966). Cancelling — rather than merely abandoning the waiting goroutine — is
+// what reclaims the git child: maestro.service runs KillMode=mixed, so a git
+// left behind stays in the unit cgroup and holds the unit in deactivating until
+// TimeoutStopSec, which is exactly the failure #966 set out to remove (#1121).
+// The marker is persisted before this helper runs. A non-positive budget skips
+// the optional capture entirely (timedOut=true).
 func saveCheckpointWithin(sess *state.Session, budget time.Duration) (path string, err error, timedOut bool) {
 	if budget <= 0 {
 		return "", nil, true
@@ -137,16 +149,29 @@ func saveCheckpointWithin(sess *state.Session, budget time.Duration) (path strin
 		path string
 		err  error
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	ch := make(chan result, 1)
-	go func() { p, e := checkpointFn(sess); ch <- result{p, e} }()
+	go func() { p, e := checkpointFn(ctx, sess); ch <- result{p, e} }()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r.path, r.err, false
 	case <-timer.C:
-		return "", nil, true
 	}
+	// Budget spent: kill the capture's git process group and join it, so the
+	// subprocess is gone before shutdown continues instead of racing the
+	// daemon's own force-exit.
+	cancel()
+	grace := time.NewTimer(checkpointCancelGrace)
+	defer grace.Stop()
+	select {
+	case <-ch:
+	case <-grace.C:
+		log.Printf("[daemon] restart-checkpoint: cancelled checkpoint capture for issue #%d did not release within %s; continuing shutdown", sess.IssueNumber, checkpointCancelGrace)
+	}
+	return "", nil, true
 }
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is

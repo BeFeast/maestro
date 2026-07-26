@@ -34,10 +34,9 @@ var errCheckOutputTooLarge = errors.New("outcome check output exceeded safe limi
 // Checker executes configured read-only outcome signals and returns a compact
 // result that can be persisted in Maestro state.
 type Checker struct {
-	HTTPClient     *http.Client
-	CommandTimeout time.Duration
-	Now            func() time.Time
-	RunCommand     func(ctx context.Context, command, dir string) ([]byte, int, error)
+	HTTPClient *http.Client
+	Now        func() time.Time
+	RunCommand func(ctx context.Context, command, dir string) ([]byte, int, error)
 }
 
 func (c Checker) Check(ctx context.Context, brief Brief) HealthCheckResult {
@@ -57,12 +56,16 @@ func (c Checker) Check(ctx context.Context, brief Brief) HealthCheckResult {
 		result.Summary = "No outcome health signal is configured."
 		return result
 	}
+	// The budget comes from the brief itself: every production call site builds
+	// a zero-value Checker, so a field on the struct could never be configured
+	// per project (#1122).
+	timeout := brief.EffectiveHealthcheckTimeout()
 	if strings.TrimSpace(brief.HealthcheckURL) != "" {
-		result = c.checkURL(ctx, brief.HealthcheckURL)
+		result = c.checkURL(ctx, brief.HealthcheckURL, timeout)
 	} else if strings.TrimSpace(brief.HealthcheckCommand) != "" {
-		result = c.checkCommand(ctx, brief.HealthcheckCommand, brief.SourceRepoPath, "healthcheck_command")
+		result = c.checkCommand(ctx, brief.HealthcheckCommand, brief.SourceRepoPath, "healthcheck_command", timeout)
 	} else {
-		result = c.checkCommand(ctx, brief.DeploymentStatusCommand, brief.SourceRepoPath, "deployment_status_command")
+		result = c.checkCommand(ctx, brief.DeploymentStatusCommand, brief.SourceRepoPath, "deployment_status_command", timeout)
 	}
 	if result.CheckedAt.IsZero() {
 		result.CheckedAt = start
@@ -74,9 +77,9 @@ func (c Checker) Check(ctx context.Context, brief Brief) HealthCheckResult {
 	return result
 }
 
-func (c Checker) checkURL(ctx context.Context, rawURL string) HealthCheckResult {
+func (c Checker) checkURL(ctx context.Context, rawURL string, timeout time.Duration) HealthCheckResult {
 	start := c.now()
-	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)
@@ -108,9 +111,9 @@ func (c Checker) checkURL(ctx context.Context, rawURL string) HealthCheckResult 
 	return c.result(start, "healthcheck_url", state, fmt.Sprintf("GET %s returned %s", rawURL, resp.Status), detail, 0)
 }
 
-func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) HealthCheckResult {
+func (c Checker) checkCommand(ctx context.Context, command, dir, signal string, timeout time.Duration) HealthCheckResult {
 	start := c.now()
-	ctx, cancel := context.WithTimeout(ctx, c.timeout())
+	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
 	output, exitCode, err := c.runCommand(ctx, command, dir)
@@ -132,7 +135,7 @@ func (c Checker) checkCommand(ctx context.Context, command, dir, signal string) 
 		if errors.Is(err, errCheckOutputTooLarge) {
 			summary = fmt.Sprintf("%s output exceeded the %d-byte safety limit", signal, maxCheckOutputBytes)
 		} else if ctx.Err() == context.DeadlineExceeded {
-			summary = fmt.Sprintf("%s timed out after %s", signal, c.timeout().String())
+			summary = fmt.Sprintf("%s timed out after %s", signal, timeout.String())
 		} else if exitCode >= 0 {
 			summary = fmt.Sprintf("%s failed with exit code %d", signal, exitCode)
 		}
@@ -165,6 +168,22 @@ func (c Checker) runCommand(ctx context.Context, command, dir string) ([]byte, i
 	if strings.TrimSpace(dir) != "" {
 		cmd.Dir = dir
 	}
+	// A read-only probe must not outlive its budget. Give the shell and every
+	// descendant one process group, then make the deadline kill that whole
+	// group instead of only signalling `sh` and leaving a backgrounded child
+	// running until the next check (#1122).
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
 	capture := &boundedOutputBuffer{limit: maxCheckOutputBytes}
 	cmd.Stdout = capture
 	cmd.Stderr = capture
@@ -190,13 +209,6 @@ func (c Checker) result(start time.Time, signal, state, summary, detail string, 
 		ExitCode:       exitCode,
 		DurationMillis: int64(c.now().Sub(start) / time.Millisecond),
 	}
-}
-
-func (c Checker) timeout() time.Duration {
-	if c.CommandTimeout > 0 {
-		return c.CommandTimeout
-	}
-	return defaultCheckTimeout
 }
 
 func (c Checker) now() time.Time {
