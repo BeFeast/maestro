@@ -76,12 +76,23 @@ type Summary struct {
 	Categories         map[string]CategoryStats `json:"categories"`
 	ProtectHits        map[string]int           `json:"protect_hits"`
 	ProcScanErrors     int                      `json:"proc_scan_errors,omitempty"`
+	// ProcUnresolvedProcesses counts processes whose held paths the scan could
+	// only read in part — typically a same-uid EACCES from a process that
+	// cleared PR_SET_DUMPABLE, such as `systemd --user` or `ssh-agent`. Each one
+	// protects the candidates it demonstrably references and nothing else, so
+	// this stays a diagnostic instead of a fleet-wide veto (#1125).
+	ProcUnresolvedProcesses int `json:"proc_unresolved_processes,omitempty"`
 	// ProcPermissionSkips counts /proc entries the sweeper could not inspect
 	// because they belong to other users (EACCES). These are expected on any
 	// multi-user host and never blanket-protect candidates; they are surfaced
 	// for observability only.
-	ProcPermissionSkips int    `json:"proc_permission_skips,omitempty"`
-	Error               string `json:"error,omitempty"`
+	ProcPermissionSkips int `json:"proc_permission_skips,omitempty"`
+	// SweepIneffective marks a sweep that protected every candidate it matched
+	// and found nothing reclaimable. That reads as "there was nothing to clean"
+	// while it usually means protection stopped discriminating, which is how the
+	// blanket /proc veto stayed invisible until /tmp filled RAM (#1125).
+	SweepIneffective bool   `json:"sweep_ineffective,omitempty"`
+	Error            string `json:"error,omitempty"`
 }
 
 // PressureSnapshot is one capacity reading of the tmpfs root, taken
