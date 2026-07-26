@@ -171,6 +171,12 @@ type Orchestrator struct {
 	fleetSpawnCeilingFn func() bool
 	fleetSpawnReserveFn func() (commit func(slot string), release func(), ok bool)
 
+	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
+	// whether the host is too short on tmpfs space to accept another worker, and
+	// why. nil = no precondition. It is a throughput pause only — see
+	// SetSpawnResourceHold.
+	spawnResourceHoldFn func() (hold bool, reason string)
+
 	// Restart-required signal. Some config fields (currently routing.*) cannot be
 	// hot-applied because their runtime components are built once at startup. When
 	// such a field changes during a config reload we do not apply it; instead we raise this
@@ -289,6 +295,18 @@ func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
 // nil disables the gate for legacy single-project callers and tests.
 func (o *Orchestrator) SetFleetSpawnCeiling(fn func() bool) {
 	o.fleetSpawnCeilingFn = fn
+}
+
+// SetSpawnResourceHold wires the host-resource spawn precondition (#1128). fn
+// is consulted at the top of startNewWorkers; when it reports a hold the
+// orchestrator lists nothing and spawns nothing for this cycle.
+//
+// It is deliberately a throughput pause and not a gate: no state is written, no
+// approval is requested, no ActionNone decision is produced, and no issue's
+// retry budget is touched. The next poll re-evaluates fn, so dispatch resumes
+// on its own as soon as the host recovers. Passing nil clears the precondition.
+func (o *Orchestrator) SetSpawnResourceHold(fn func() (bool, string)) {
+	o.spawnResourceHoldFn = fn
 }
 
 // SetFleetSpawnReserve wires the daemon's atomic one-worker reservation. The
@@ -1523,13 +1541,21 @@ func (o *Orchestrator) notifyTokenBudgetMill(issueNumber, kills int) {
 	if project != "" {
 		title += ": " + project
 	}
-	body := fmt.Sprintf(
-		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch is held until the budget is raised.",
-		issueNumber, kills, o.cfg.WorkerMaxTokens,
-	)
+	body := tokenBudgetMillAlertBody(issueNumber, kills, o.cfg.WorkerMaxTokens)
 	if err := o.notifier.Alert(notify.AlertFutileRecovery, fmt.Sprintf("%s:token_budget_wall:%d", project, issueNumber), title, body); err != nil {
 		log.Printf("[orch] token-budget-wall notification failed for issue #%d: %v", issueNumber, err)
 	}
+}
+
+// tokenBudgetMillAlertBody names the one action that actually releases the hold.
+// The pre-#1124 text asked the operator to raise the budget while the streak
+// ignored the budget entirely, so the stated remedy was silently ineffective;
+// the escape route has to be both true and specific.
+func tokenBudgetMillAlertBody(issueNumber, kills, maxTokens int) string {
+	return fmt.Sprintf(
+		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch stays held until worker_max_tokens is raised above %d — the hold then clears itself on the next dispatch cycle, because stops recorded under a lower ceiling stop counting (#1124). Re-adding a ready label does not release it.",
+		issueNumber, kills, maxTokens, maxTokens,
+	)
 }
 
 func tokenBudgetObservation(sess *state.Session) (int, string) {
@@ -1552,6 +1578,11 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 	}
 	o.updateTokensUsedFromWorkerLog(slotName, sess)
 	applyTokenBudgetObservation(sess, marker)
+	// Stamp the ceiling this stop actually hit so a later budget raise can
+	// retire the kill streak instead of holding the issue forever (#1124).
+	if marker.MaxTokens > 0 {
+		sess.TokenBudgetMaxTokens = marker.MaxTokens
+	}
 	budgetObserved, budgetMeasure := tokenBudgetObservation(sess)
 	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
 	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
@@ -10136,6 +10167,17 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
 		return
 	}
+	// Host-resource precondition (#1128): the host tmpfs is RAM-backed, so
+	// spawning into a nearly-full one is how a space problem becomes an
+	// out-of-memory outage. This sits before issue listing so a held cycle also
+	// costs no GitHub quota. It is a pause, not a freeze: nothing is persisted,
+	// no retry budget is spent, and the next poll re-checks and resumes.
+	if o.spawnResourceHoldFn != nil {
+		if hold, reason := o.spawnResourceHoldFn(); hold {
+			log.Printf("[orch] spawn held on host resources: %s (local_running=%d) — retrying next cycle", reason, s.RunningSessionCount())
+			return
+		}
+	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`
@@ -10268,7 +10310,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// the operator raises worker_max_tokens (or fixes the measure) instead
 		// of watching the fleet re-spawn into the same wall.
 		if !repairSpawn {
-			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number)
+			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number, o.cfg.WorkerMaxTokens)
 			if o.tokenBudgetMillHold(issue.Number, kills) {
 				log.Printf("[orch] skipping issue #%d: %d consecutive token-budget stops — worker_max_tokens=%d is likely below the viable floor for this issue",
 					issue.Number, kills, o.cfg.WorkerMaxTokens)

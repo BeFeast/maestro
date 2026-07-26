@@ -557,7 +557,12 @@ func fakeOptions(root, proc string, now time.Time, mode string, usePct int, tmpf
 		Mode:     mode,
 		Now:      func() time.Time { return now },
 		InspectMount: func(string) (MountUsage, error) {
-			return MountUsage{Tmpfs: tmpfs, UsePct: usePct, TotalBytes: 100, UsedBytes: int64(usePct)}, nil
+			// Model the real mount: a 16GiB RAM-backed /tmp. The pressure verdict
+			// is measured in absolute free bytes (#1128), so the fixture has to
+			// express a plausible capacity rather than a 100-byte stub.
+			const total = int64(16) << 30
+			used := total * int64(usePct) / 100
+			return MountUsage{Tmpfs: tmpfs, UsePct: usePct, TotalBytes: total, UsedBytes: used, AvailableBytes: total - used}, nil
 		},
 		EffectiveUID: os.Geteuid,
 		processID:    func() int { return -1 },
@@ -703,4 +708,42 @@ func TestSweepFailsClosedOnSameUIDPermissionDenial(t *testing.T) {
 		t.Fatalf("summary = %+v, want no deletion while the scan is incomplete", summary)
 	}
 	assertExists(t, stale)
+}
+
+// The 2026-07-25 event: 8.5GB used of a ~15GiB RAM-backed /tmp. That is only
+// 55% of the mount, so the old "85% utilization" rule stayed silent while 8.5GB
+// of a 24GiB host's RAM was already gone. Pressure is decided on the remaining
+// absolute bytes (#1128).
+func TestSweepPressureUsesFreeByteBudgetNotUtilizationPct(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+
+	tight := fakeOptions(root, proc, now, ModeApply, 55, true)
+	tight.InspectMount = func(string) (MountUsage, error) {
+		const total = int64(15) << 30
+		const used = int64(8_500_000_000)
+		return MountUsage{Tmpfs: true, UsePct: 55, TotalBytes: total, UsedBytes: used, AvailableBytes: total - used}, nil
+	}
+	summary, err := Sweep(context.Background(), tight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Pressure || summary.AttentionCode != "tmpfs_pressure" {
+		t.Fatalf("summary at %d%% use with %d free bytes = %+v, want pressure", summary.UsePct, summary.AvailableBytes, summary)
+	}
+
+	// And the mirror image: a high utilization ratio on a mount that still has
+	// tens of gigabytes free is not an emergency and must not page anyone.
+	roomy := fakeOptions(root, proc, now, ModeApply, 92, true)
+	roomy.InspectMount = func(string) (MountUsage, error) {
+		const total = int64(400) << 30
+		const available = int64(32) << 30
+		return MountUsage{Tmpfs: true, UsePct: 92, TotalBytes: total, UsedBytes: total - available, AvailableBytes: available}, nil
+	}
+	summary, err = Sweep(context.Background(), roomy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Pressure || summary.AttentionCode != "" {
+		t.Fatalf("summary at %d%% use with %d free bytes = %+v, want no pressure", summary.UsePct, summary.AvailableBytes, summary)
+	}
 }

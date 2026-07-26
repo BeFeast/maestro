@@ -391,6 +391,12 @@ type FleetServer struct {
 	// FleetServer. Plain `serve --fleet` leaves it nil and omits the block.
 	tmpfsHygieneMu     sync.RWMutex
 	tmpfsHygieneSource func() (tmpfshygiene.Summary, bool)
+
+	// tmpfsPressureSource exposes the daemon's sweep-independent /tmp capacity
+	// sample (#1128), including how many spawns the free-byte precondition has
+	// paused. Nil (plain `serve --fleet`) omits the block.
+	tmpfsPressureMu     sync.RWMutex
+	tmpfsPressureSource func() (tmpfshygiene.PressureSnapshot, bool)
 }
 
 // EmergencySwitch is the write side of the fleet-wide EMERGENCY STOP store the
@@ -458,6 +464,32 @@ func (s *FleetServer) tmpfsHygieneSnapshot() *tmpfshygiene.Summary {
 		return nil
 	}
 	return &summary
+}
+
+// SetTmpfsPressureSource wires the daemon's sweep-independent /tmp capacity
+// sample into /api/v1/fleet (#1128). Unlike the hygiene summary this exists
+// even when no sweep has run, and it carries the held-spawn counter.
+func (s *FleetServer) SetTmpfsPressureSource(src func() (tmpfshygiene.PressureSnapshot, bool)) {
+	if s == nil {
+		return
+	}
+	s.tmpfsPressureMu.Lock()
+	s.tmpfsPressureSource = src
+	s.tmpfsPressureMu.Unlock()
+}
+
+func (s *FleetServer) tmpfsPressureSnapshot() *tmpfshygiene.PressureSnapshot {
+	s.tmpfsPressureMu.RLock()
+	src := s.tmpfsPressureSource
+	s.tmpfsPressureMu.RUnlock()
+	if src == nil {
+		return nil
+	}
+	snapshot, ok := src()
+	if !ok {
+		return nil
+	}
+	return &snapshot
 }
 
 // SetEmergencyStore wires the write side used by POST /api/v1/fleet/emergency
@@ -1053,6 +1085,11 @@ type fleetResponse struct {
 	// utilization, allowing API and Mission Control consumers to alert without
 	// treating host pressure as a synthetic worker session.
 	TmpfsHygiene *tmpfshygiene.Summary `json:"tmpfs_hygiene,omitempty"`
+
+	// TmpfsPressure is the sweep-independent /tmp capacity sample (#1128): the
+	// absolute free-byte budget, both floors, whether dispatch is currently
+	// paused, and how many spawns that pause has held.
+	TmpfsPressure *tmpfshygiene.PressureSnapshot `json:"tmpfs_pressure,omitempty"`
 }
 
 // fleetEmergency is the fleet-wide big-red-button state on the snapshot (#840).
@@ -2812,6 +2849,7 @@ func (s *FleetServer) snapshot() fleetResponse {
 	resp.Mirror = s.mirrorStatsSnapshot()
 	resp.Emergency = s.emergencySnapshot()
 	resp.TmpfsHygiene = s.tmpfsHygieneSnapshot()
+	resp.TmpfsPressure = s.tmpfsPressureSnapshot()
 	return resp
 }
 

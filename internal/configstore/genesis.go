@@ -699,7 +699,7 @@ func (s *Store) projectNameByID(ctx context.Context, id, exclude string) (string
 	if id == "" {
 		return "", nil
 	}
-	names, err := s.projectNames(ctx)
+	names, err := s.ProjectNames(ctx)
 	if err != nil {
 		return "", err
 	}

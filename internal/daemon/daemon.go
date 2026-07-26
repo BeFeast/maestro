@@ -115,20 +115,32 @@ var shutdownCheckpointBudget = 60 * time.Second
 var restartCheckpointRetries = 5
 
 // checkpointFn writes the best-effort CHECKPOINT.md context blob for one
-// in-flight session and returns its path. It defaults to worker.SaveCheckpoint,
-// which shells out to git; a var so tests can inject a fast or deliberately
-// wedged stub. It is called through saveCheckpointWithin so a git invocation
-// contending with a live worker's index.lock cannot hang the shutdown pass past
-// the drain deadline (#966).
-var checkpointFn = worker.SaveCheckpoint
+// in-flight session and returns its path. It defaults to
+// worker.SaveCheckpointContext, which shells out to git under the caller's
+// context; a var so tests can inject a fast or deliberately wedged stub. It is
+// called through saveCheckpointWithin so a git invocation contending with a live
+// worker's index.lock cannot hang the shutdown pass past the drain deadline
+// (#966) and cannot survive it as a subprocess (#1121).
+var checkpointFn = worker.SaveCheckpointContext
 
-// saveCheckpointWithin runs checkpointFn but abandons it if it does not return
-// within budget. Checkpoint capture shells out to git against worktrees that are
-// still owned by surviving workers, so it must not be allowed to defeat the same
-// global shutdown deadline as a wedged flow callback (#966). The marker is
-// persisted before this helper runs; the abandoned goroutine is harmless and is
-// reaped when the process exits. A non-positive budget skips the optional capture
-// entirely (timedOut=true).
+// checkpointCancelGrace bounds how long saveCheckpointWithin waits, after
+// cancelling a timed-out capture, for that capture to actually release its git
+// process group. The kill is a SIGKILL to the group, so this is normally
+// microseconds; the bound only exists so a capture that ignores cancellation
+// cannot re-introduce the unbounded hold this helper exists to prevent. A var so
+// tests can exercise both outcomes deterministically.
+var checkpointCancelGrace = 2 * time.Second
+
+// saveCheckpointWithin runs checkpointFn under a context it cancels if the
+// capture does not return within budget. Checkpoint capture shells out to git
+// against worktrees that are still owned by surviving workers, so it must not be
+// allowed to defeat the same global shutdown deadline as a wedged flow callback
+// (#966). Cancelling — rather than merely abandoning the waiting goroutine — is
+// what reclaims the git child: maestro.service runs KillMode=mixed, so a git
+// left behind stays in the unit cgroup and holds the unit in deactivating until
+// TimeoutStopSec, which is exactly the failure #966 set out to remove (#1121).
+// The marker is persisted before this helper runs. A non-positive budget skips
+// the optional capture entirely (timedOut=true).
 func saveCheckpointWithin(sess *state.Session, budget time.Duration) (path string, err error, timedOut bool) {
 	if budget <= 0 {
 		return "", nil, true
@@ -137,16 +149,29 @@ func saveCheckpointWithin(sess *state.Session, budget time.Duration) (path strin
 		path string
 		err  error
 	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	ch := make(chan result, 1)
-	go func() { p, e := checkpointFn(sess); ch <- result{p, e} }()
+	go func() { p, e := checkpointFn(ctx, sess); ch <- result{p, e} }()
 	timer := time.NewTimer(budget)
 	defer timer.Stop()
 	select {
 	case r := <-ch:
 		return r.path, r.err, false
 	case <-timer.C:
-		return "", nil, true
 	}
+	// Budget spent: kill the capture's git process group and join it, so the
+	// subprocess is gone before shutdown continues instead of racing the
+	// daemon's own force-exit.
+	cancel()
+	grace := time.NewTimer(checkpointCancelGrace)
+	defer grace.Stop()
+	select {
+	case <-ch:
+	case <-grace.C:
+		log.Printf("[daemon] restart-checkpoint: cancelled checkpoint capture for issue #%d did not release within %s; continuing shutdown", sess.IssueNumber, checkpointCancelGrace)
+	}
+	return "", nil, true
 }
 
 // ConfigLoader yields the set of project configs the daemon supervises. It is
@@ -176,6 +201,18 @@ type Options struct {
 	// TmpfsHygieneInterval is the daemon-owned protect-aware /tmp apply cadence.
 	// Non-positive values are clamped to DefaultTmpfsHygieneInterval.
 	TmpfsHygieneInterval time.Duration
+	// TmpfsPressureInterval is the cadence of the sweep-independent /tmp
+	// capacity sample (#1128). Non-positive values are clamped to
+	// DefaultTmpfsPressureInterval.
+	TmpfsPressureInterval time.Duration
+	// TmpfsPressureFloorBytes is the absolute free-byte budget below which the
+	// daemon pages the operator. Zero takes
+	// tmpfshygiene.DefaultPressureFreeBytes; negative disables the alert.
+	TmpfsPressureFloorBytes int64
+	// TmpfsSpawnFloorBytes is the absolute free-byte budget below which new
+	// worker dispatch pauses. Zero takes tmpfshygiene.DefaultSpawnFreeBytes;
+	// negative disables the pause.
+	TmpfsSpawnFloorBytes int64
 
 	// PromptPath is an optional worker prompt base file applied to every flow.
 	PromptPath string
@@ -332,6 +369,10 @@ type Daemon struct {
 	// summary. It is independent of per-project flow state.
 	tmpfsHygiene *tmpfsHygieneRuntime
 
+	// tmpfsPressure owns the sweep-independent /tmp capacity sample backing the
+	// CRITICAL pressure alert and the spawn precondition (#1128).
+	tmpfsPressure *tmpfsPressureRuntime
+
 	// runLoop, superviseLoop, watchdogLoop, and materialProgressLoop build the
 	// per-project loops.
 	// They default to the production orchestrator + supervisor wiring; tests
@@ -413,6 +454,9 @@ func New(store ConfigLoader, opts Options) *Daemon {
 	if opts.TmpfsHygieneInterval <= 0 {
 		opts.TmpfsHygieneInterval = DefaultTmpfsHygieneInterval
 	}
+	if opts.TmpfsPressureInterval <= 0 {
+		opts.TmpfsPressureInterval = DefaultTmpfsPressureInterval
+	}
 	if opts.WatchStore && opts.WatchStoreInterval <= 0 {
 		log.Printf("[daemon] watch-store-interval %s is not positive; clamping to default %s", opts.WatchStoreInterval, DefaultWatchStoreInterval)
 		opts.WatchStoreInterval = DefaultWatchStoreInterval
@@ -427,6 +471,10 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		spawnLimiter: newFleetSpawnLimiter(store),
 	}
 	d.tmpfsHygiene = newTmpfsHygieneRuntime(d)
+	// #1128: the capacity sample shares the hygiene root but not its schedule.
+	// The alert and the spawn precondition must not depend on a sweep that can
+	// legitimately refuse to run or reclaim nothing.
+	d.tmpfsPressure = newTmpfsPressureRuntime(d.tmpfsHygiene.options.Root, opts.TmpfsPressureFloorBytes, opts.TmpfsSpawnFloorBytes)
 	if opts.WatchStore {
 		// Only the richer store (Load + ProjectsFingerprint) can drive hot
 		// add/remove/reload. Degrade loudly rather than silently if an embedder
@@ -530,6 +578,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// server.New instances the legacy run/serve paths spun up (#516).
 	fleet := server.NewFleet(projects, d.opts.Host, d.opts.Port, d.opts.ReadOnly)
 	fleet.SetTmpfsHygieneSource(d.tmpfsHygieneSummary)
+	fleet.SetTmpfsPressureSource(d.tmpfsPressureSnapshot)
 	// Back the dashboard project-CRUD endpoint (#761) with the SAME config store
 	// the daemon reads, when the store supports the write API. A UI add/remove
 	// then writes the store and the --watch-store diff-loop reconciles it into a
@@ -729,6 +778,23 @@ func (d *Daemon) Run(ctx context.Context) error {
 			<-hygieneDone
 		}
 	}
+	// #1128: CRITICAL tmpfs pressure watch. It samples free bytes on its own
+	// short cadence instead of riding the 10m sweep, so the operator is paged and
+	// dispatch pauses even on a host where the sweeper reclaims nothing.
+	var stopTmpfsPressure func()
+	if d.tmpfsPressure != nil {
+		pctx, pressureCancel := context.WithCancel(ctx)
+		pressureDone := make(chan struct{})
+		go func() {
+			defer close(pressureDone)
+			d.watchTmpfsPressureLoop(pctx, d.opts.TmpfsPressureInterval)
+		}()
+		log.Printf("[daemon] tmpfs pressure watch enabled — sample every %s (CRITICAL below the free-byte floor)", d.opts.TmpfsPressureInterval)
+		stopTmpfsPressure = func() {
+			pressureCancel()
+			<-pressureDone
+		}
+	}
 	drainWatch := func() {
 		if stopWatch != nil {
 			stopWatch()
@@ -741,6 +807,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 		if stopTmpfsHygiene != nil {
 			stopTmpfsHygiene()
+		}
+		if stopTmpfsPressure != nil {
+			stopTmpfsPressure()
 		}
 	}
 
