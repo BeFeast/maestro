@@ -111,7 +111,15 @@ DEADLINE=$((START_TS + TIMEOUT_SECONDS))
 # to recover even after the main deadline is spent.
 ROLLBACK_RESTART_TIMEOUT=600
 
-BUILD_ROOT=$(mktemp -d /tmp/maestro-self-deploy.XXXXXX)
+# #1129: the build root holds a full detached git worktree plus the ~25 MB
+# binary. The old template hardcoded /tmp, which on the fleet host is a
+# RAM-backed tmpfs, so every merge built the whole source tree and binary in
+# RAM; the explicit /tmp template also made mktemp ignore $TMPDIR, so no
+# environment-level lever could move it. Default to disk-backed /var/tmp and
+# honor TMPDIR when the operator points it somewhere else.
+BUILD_TMPDIR=${TMPDIR:-/var/tmp}
+BUILD_TMPDIR=${BUILD_TMPDIR%/}
+BUILD_ROOT=$(mktemp -d "$BUILD_TMPDIR/maestro-self-deploy.XXXXXX")
 BUILD_DIR="$BUILD_ROOT/src"
 INSTALLED=0
 HAVE_PREV=0

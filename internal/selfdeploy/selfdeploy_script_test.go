@@ -155,6 +155,96 @@ func TestSelfDeployScriptSmokeGateWiring(t *testing.T) {
 	}
 }
 
+// buildVarRE matches every top-level `BUILD_*=` assignment in the deploy script
+// (the build-root selection block), so the test can evaluate the real shell code
+// instead of asserting on a string.
+var buildVarRE = regexp.MustCompile(`(?m)^BUILD_[A-Z_]*=.*$`)
+
+// evalBuildRoot evaluates the script's BUILD_* assignment block in a real bash
+// subshell with `mktemp` stubbed out to echo the template it was handed (so the
+// test observes the chosen path without creating anything outside its TempDir),
+// and returns the resulting BUILD_ROOT.
+func evalBuildRoot(t *testing.T, script, tmpdir string) string {
+	t.Helper()
+	bash, err := exec.LookPath("bash")
+	if err != nil {
+		t.Skip("bash not in PATH")
+	}
+	assigns := buildVarRE.FindAllString(script, -1)
+	if len(assigns) == 0 {
+		t.Fatal("could not find any BUILD_* assignment in self-deploy.sh")
+	}
+	block := strings.Join(assigns, "\n")
+	if !strings.Contains(block, "mktemp") {
+		t.Fatalf("the BUILD_* block no longer calls mktemp:\n%s", block)
+	}
+
+	stub := filepath.Join(t.TempDir(), "bin", "mktemp")
+	writeFile(t, stub, "#!/bin/sh\nfor a in \"$@\"; do last=$a; done\nprintf '%s\\n' \"$last\"\n")
+	if err := os.Chmod(stub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cmd := exec.Command(bash, "-c", "set -eu\n"+block+"\nprintf '%s\\n' \"$BUILD_ROOT\"")
+	// An empty TMPDIR is the "operator set nothing usable" case; ${TMPDIR:-...}
+	// must fall back for it exactly as it does for an unset one.
+	cmd.Env = append(os.Environ(),
+		"PATH="+filepath.Dir(stub)+string(os.PathListSeparator)+os.Getenv("PATH"),
+		"TMPDIR="+tmpdir,
+	)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("evaluating the BUILD_* block failed: %v\n%s\nblock:\n%s", err, out, block)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// #1129 regression guard: the deploy build root must NOT live in /tmp. It holds
+// a full detached git worktree plus the ~25 MB binary, and /tmp on the fleet
+// host is a RAM-backed tmpfs on a swapless box — so a self-deploy, which fires
+// by itself on every merge to main, built the whole tree in RAM. The old
+// template also hardcoded /tmp, which makes mktemp ignore $TMPDIR, leaving the
+// operator without an environment-level lever either. Both halves are asserted
+// by evaluating the script's own build-root selection in bash.
+func TestSelfDeployScriptBuildRootIsDiskBacked(t *testing.T) {
+	data, err := os.ReadFile(selfDeployScriptPath(t))
+	if err != nil {
+		t.Fatalf("read script: %v", err)
+	}
+	script := string(data)
+
+	// Default (no TMPDIR): must land on a disk-backed absolute path, never /tmp.
+	def := evalBuildRoot(t, script, "")
+	if !filepath.IsAbs(def) {
+		t.Fatalf("default build root is not an absolute path: %q", def)
+	}
+	if base := filepath.Dir(def); base == "/tmp" || strings.HasPrefix(base, "/tmp/") {
+		t.Errorf("default build root is in the RAM-backed tmpfs: %q", def)
+	}
+
+	// TMPDIR must actually be honored, so the build root can be moved without
+	// editing the script.
+	want := t.TempDir()
+	if got := evalBuildRoot(t, script, want); filepath.Dir(got) != want {
+		t.Errorf("TMPDIR=%s ignored: build root resolved to %q", want, got)
+	}
+
+	// The rest of the deploy path must still hang off BUILD_ROOT: the git
+	// worktree, the build output, the install source, and the cleanup that
+	// reclaims it. A build root the script no longer builds into or cleans up
+	// would trade a tmpfs spike for a disk leak.
+	for _, want := range []string{
+		`BUILD_DIR="$BUILD_ROOT/src"`,       // the git worktree lives under it
+		`-o "$BUILD_ROOT/maestro"`,          // the build writes into it
+		`"$BUILD_ROOT/maestro" "$BIN.next"`, // the install stages from it
+		`rm -rf "$BUILD_ROOT"`,              // cleanup_build reclaims it
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("self-deploy.sh no longer wires the build root through %q", want)
+		}
+	}
+}
+
 func writeFile(t *testing.T, path, content string) {
 	t.Helper()
 	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
