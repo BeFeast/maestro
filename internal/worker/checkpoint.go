@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
@@ -12,6 +13,7 @@ import (
 	"regexp"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
@@ -279,9 +281,43 @@ func rotateWorkerAttemptLog(logFile string) error {
 	return nil
 }
 
+// checkpointGitCommand builds one cancellable git invocation for checkpoint
+// capture. Capture runs against worktrees that surviving workers still own, so
+// blocking on index.lock is normal rather than pathological, and shutdown must
+// be able to terminate the child instead of only abandoning the goroutine that
+// waits on it (#1121). The child leads its own process group and cancellation
+// kills the group, not just the leader, so a git that has itself forked (pager,
+// credential helper, hook) cannot outlive the drain deadline: maestro.service
+// runs with KillMode=mixed, so any survivor keeps the unit deactivating in the
+// unit cgroup until the TimeoutStopSec backstop.
+func checkpointGitCommand(ctx context.Context, args ...string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
+	return cmd
+}
+
 // SaveCheckpoint captures the worker's progress and writes a CHECKPOINT.md
-// file to the worktree. Returns the path to the checkpoint file.
+// file to the worktree. Returns the path to the checkpoint file. Callers that
+// are on a deadline (shutdown) must use SaveCheckpointContext instead.
 func SaveCheckpoint(sess *state.Session) (string, error) {
+	return SaveCheckpointContext(context.Background(), sess)
+}
+
+// SaveCheckpointContext is SaveCheckpoint with every git invocation bound to
+// ctx. Cancelling ctx kills each in-flight git process group and makes the
+// capture return, so a bounded shutdown can reclaim it (#1121).
+func SaveCheckpointContext(ctx context.Context, sess *state.Session) (string, error) {
 	if sess.Worktree == "" {
 		return "", fmt.Errorf("session has no worktree")
 	}
@@ -293,7 +329,7 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 	sections = append(sections, fmt.Sprintf("Tokens used (total): %d", sess.TokensUsedTotal))
 
 	// Capture branch commits (relative to origin/main)
-	if out, err := exec.Command("git", "-C", sess.Worktree,
+	if out, err := checkpointGitCommand(ctx, "-C", sess.Worktree,
 		"log", "--oneline", "origin/main..HEAD").CombinedOutput(); err == nil {
 		commits := strings.TrimSpace(string(out))
 		if commits != "" {
@@ -302,7 +338,7 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 	}
 
 	// Capture diff stat for uncommitted changes
-	if out, err := exec.Command("git", "-C", sess.Worktree,
+	if out, err := checkpointGitCommand(ctx, "-C", sess.Worktree,
 		"diff", "--stat").CombinedOutput(); err == nil {
 		diff := strings.TrimSpace(string(out))
 		if diff != "" {
@@ -311,7 +347,7 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 	}
 
 	// Capture staged changes stat
-	if out, err := exec.Command("git", "-C", sess.Worktree,
+	if out, err := checkpointGitCommand(ctx, "-C", sess.Worktree,
 		"diff", "--cached", "--stat").CombinedOutput(); err == nil {
 		staged := strings.TrimSpace(string(out))
 		if staged != "" {
@@ -324,6 +360,14 @@ func SaveCheckpoint(sess *state.Session) (string, error) {
 		if tail, err := readTailLines(sess.LogFile, 30); err == nil && tail != "" {
 			sections = append(sections, "\n## Last worker output\n```\n"+tail+"\n```")
 		}
+	}
+
+	// A cancelled capture has only the header and whatever ran before the
+	// deadline; writing that into a live worker's worktree would leave a
+	// misleading artefact behind for no benefit, since the shutdown caller
+	// discards the result anyway.
+	if err := ctx.Err(); err != nil {
+		return "", fmt.Errorf("checkpoint capture cancelled: %w", err)
 	}
 
 	content := strings.Join(sections, "\n")
