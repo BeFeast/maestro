@@ -281,7 +281,7 @@ type Session struct {
 	// configured per-backend pricing estimate.
 	Model                      string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
 	CostUSDBackend             float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
+	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737/#1120: read position in the backend's append-only usage side channel; survives a respawn that keeps appending to the same log/jsonl and is rewound only when the parsed cumulative total goes backwards (rotated or replaced stream), so TokensUsedTotal counts every token exactly once
 	LongRunning                bool       `json:"long_running,omitempty"`
 	RebaseAttempted            bool       `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail             bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus

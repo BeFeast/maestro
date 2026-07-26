@@ -298,8 +298,15 @@ func TestBeginSessionAttemptClearsPriorProjectionAndPreservesHistory(t *testing.
 	if sess.FinishedAt != nil || sess.WorkerEndedAt != nil || sess.Model != "" || sess.CostUSDBackend != 0 {
 		t.Fatalf("stale projection retained: finished=%v ended=%v model=%q cost=%v", sess.FinishedAt, sess.WorkerEndedAt, sess.Model, sess.CostUSDBackend)
 	}
-	if sess.TokensUsedAttempt != 0 || sess.UsageTokensWatermark != 0 || sess.TokenBudgetTokensAttempt != 0 || sess.TokenBudgetTokensWatermark != 0 || sess.TokenBudgetMeasure != "" || sess.WorkerOutcome != "" {
-		t.Fatalf("attempt counters not reset: attempt=%d watermark=%d budget=%d budget_watermark=%d measure=%q outcome=%q", sess.TokensUsedAttempt, sess.UsageTokensWatermark, sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark, sess.TokenBudgetMeasure, sess.WorkerOutcome)
+	if sess.TokensUsedAttempt != 0 || sess.TokenBudgetTokensAttempt != 0 || sess.TokenBudgetMeasure != "" || sess.WorkerOutcome != "" {
+		t.Fatalf("attempt counters not reset: attempt=%d budget=%d measure=%q outcome=%q", sess.TokensUsedAttempt, sess.TokenBudgetTokensAttempt, sess.TokenBudgetMeasure, sess.WorkerOutcome)
+	}
+	// #1120: the watermarks are read positions in the append-only usage side
+	// channel, not per-attempt counters. The orchestrator rewinds them when the
+	// parsed stream actually starts over; clearing them here made the next poll
+	// re-add the previous attempt's cumulative total.
+	if sess.UsageTokensWatermark != 1_730_413 || sess.TokenBudgetTokensWatermark != 120_000 {
+		t.Fatalf("usage watermarks cleared: usage=%d budget=%d, want 1730413/120000 preserved", sess.UsageTokensWatermark, sess.TokenBudgetTokensWatermark)
 	}
 	if sess.TokensUsedTotal != 1_730_413 || sess.Worktree != "/tmp/kept-worktree" || sess.Branch != "feat/kept-branch" || sess.PRNumber != 335 {
 		t.Fatalf("cumulative/session identity changed: total=%d worktree=%q branch=%q PR=%d", sess.TokensUsedTotal, sess.Worktree, sess.Branch, sess.PRNumber)

@@ -1458,6 +1458,29 @@ func updateTokenBudgetUsage(sess *state.Session, cumulative int, measure string)
 	return changed
 }
 
+// resetUsageWatermarksIfStreamRestarted rewinds the read positions into the
+// backend's usage side channel when that stream demonstrably started over.
+// Every parser is cumulative over an append-only file, so the total can only
+// go backwards when the file behind it changed: an in-place respawn rotates
+// slot.log/slot.jsonl, a phase transition switches to a new log path, and a
+// fallover hands the same slot.jsonl to a different backend whose parser sees
+// only its own frames. #1120: this is the only place the watermarks may be
+// cleared — beginSessionAttempt deliberately no longer clears them per
+// attempt, because a plain fallover respawn keeps appending to the same file
+// and a blind reset re-counted the previous attempt's tokens into
+// TokensUsedTotal.
+//
+// A cumulative of zero is never a restart: a terminal frame with missing usage
+// reports zero, and rewinding on it would let the next real frame be added a
+// second time.
+func resetUsageWatermarksIfStreamRestarted(sess *state.Session, cumulative int) {
+	if sess == nil || cumulative <= 0 || cumulative >= sess.UsageTokensWatermark {
+		return
+	}
+	sess.UsageTokensWatermark = 0
+	sess.TokenBudgetTokensWatermark = 0
+}
+
 func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetMarker) {
 	if sess == nil {
 		return
@@ -1650,6 +1673,7 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 	if !ok {
 		return false
 	}
+	resetUsageWatermarksIfStreamRestarted(sess, usage.TotalTokens)
 	changed := false
 	// #730: Pi re-parses the full appended slot log on each call, so
 	// usage.TotalTokens is the cumulative run total across every attempt.
@@ -1657,7 +1681,8 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 	// TokensUsedAttempt resets to 0 — comparing against TokensUsedAttempt
 	// would re-add the prior attempts' tokens. Use a separate monotonic
 	// watermark (UsageTokensWatermark) that persists across respawns so only
-	// the new attempt's tokens are counted.
+	// the new attempt's tokens are counted (#1120: beginSessionAttempt no
+	// longer clears it, which is what makes that claim true).
 	if usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark
 		sess.UsageTokensWatermark = usage.TotalTokens
@@ -1708,12 +1733,14 @@ func (o *Orchestrator) workerJSONLFile(slotName string, sess *state.Session) str
 // updateClaudeUsageFromJSONL parses the claude stream-json side-channel
 // (slot.jsonl) and stamps model/tokens/cost_usd onto the session (#737).
 // Like the Pi path it re-parses the full appended jsonl on each call, so
-// ParseClaudeUsage returns the cumulative run total across every attempt;
-// the monotonic UsageTokensWatermark persists across respawns so only the
-// new attempt's tokens are added (no double-count on retry/respawn). Cost
-// prefers the backend-reported total_cost_usd. A successful terminal frame
-// with missing/zero usage marks the active attribution usage-unreliable and
-// logs once; zero never advances token counters or budget progress.
+// ParseClaudeUsage returns the cumulative run total across every attempt.
+// #1120: a fallover respawn keeps appending to that same file, so the
+// UsageTokensWatermark is a read position that survives the new attempt and
+// only the unseen tail is added; resetUsageWatermarksIfStreamRestarted rewinds
+// it when the stream itself started over. Cost prefers the backend-reported
+// total_cost_usd. A successful terminal frame with missing/zero usage marks
+// the active attribution usage-unreliable and logs once; zero never advances
+// token counters or budget progress.
 func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1726,6 +1753,9 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		return false
 	}
 	usage, ok := worker.ParseClaudeUsage(string(data))
+	if ok {
+		resetUsageWatermarksIfStreamRestarted(sess, usage.TotalTokens)
+	}
 	changed := false
 	if usage.UsageUnreliable && state.MarkActiveAttributionUsageUnreliable(sess, usage.UsageUnreliableReason, usage.UsageUnreliableScope) {
 		log.Printf("[orch] %s claude usage-unreliable: scope=%s reason=%s; preserving observed counters and treating zero tokens as unavailable, not progress",
@@ -1773,11 +1803,13 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 // (slot.jsonl) and stamps tokens onto the session (#738). codex emits one
 // terminal turn.completed usage event per `codex exec` invocation; the
 // splitter appends each attempt's frames to the same slot.jsonl, so
-// ParseCodexUsage sums them to the cumulative run total. The monotonic
-// UsageTokensWatermark persists across respawns so a forced retry never
-// double-counts (mirrors the claude/Pi paths). codex reports no USD, so cost
-// stays virtual: CostUSDBackend is left at 0 and sessionCostEstimate supplies
-// the dollar figure from the configured pricing block. codex --json carries no
+// ParseCodexUsage sums them to the cumulative run total. #1120: the
+// UsageTokensWatermark is a read position into that append-only file and
+// survives a respawn, so a forced retry adds only the unseen tail; a stream
+// that started over is rewound by resetUsageWatermarksIfStreamRestarted
+// (mirrors the claude/Pi paths). codex reports no USD, so cost stays virtual:
+// CostUSDBackend is left at 0 and sessionCostEstimate supplies the dollar
+// figure from the configured pricing block. codex --json carries no
 // model name, so sess.Model is left as configured. Returns true when tokens
 // changed; false (tokens stay 0) when the jsonl is absent — the documented
 // degradation when the stream-splitter was unavailable.
@@ -1796,6 +1828,7 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	if !ok {
 		return false
 	}
+	resetUsageWatermarksIfStreamRestarted(sess, usage.TotalTokens)
 	changed := false
 	if usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark
@@ -1816,10 +1849,12 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 
 // updateKimiUsageFromJSONL parses Kimi's first-class stream-json side channel
 // and stamps split tokens onto the session. ParseKimiUsage returns cumulative
-// usage across the append-only file, so UsageTokensWatermark keeps retries and
-// respawns from double-counting. Native Kimi usage normally has no USD field;
-// when absent, Fleet cost observability applies the backend's configured split
-// pricing to these counters.
+// usage across the append-only file, so the UsageTokensWatermark read position
+// survives a respawn and keeps retries from double-counting (#1120); a stream
+// that started over is rewound by resetUsageWatermarksIfStreamRestarted.
+// Native Kimi usage normally has no USD field; when absent, Fleet cost
+// observability applies the backend's configured split pricing to these
+// counters.
 func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1833,6 +1868,7 @@ func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Ses
 	if !ok {
 		return false
 	}
+	resetUsageWatermarksIfStreamRestarted(sess, usage.TotalTokens)
 	changed := false
 	if usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark
@@ -1865,11 +1901,13 @@ func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Ses
 // (slot.jsonl) and stamps tokens/cost onto the session. opencode emits one
 // terminal step_finish event per `opencode run` invocation; the stream-splitter
 // appends each attempt's frames to the same slot.jsonl, so
-// ParseOpenCodeUsage sums them to the cumulative run total. The monotonic
-// UsageTokensWatermark persists across respawns so a forced retry never
-// double-counts (mirrors the claude/codex/Pi paths). opencode carries no model
-// name in the event stream, so sess.Model is left as configured. Returns true
-// when anything changed; false (tokens stay 0) when the jsonl is absent — the
+// ParseOpenCodeUsage sums them to the cumulative run total. #1120: the
+// UsageTokensWatermark is a read position into that append-only file and
+// survives a respawn, so a forced retry adds only the unseen tail; a stream
+// that started over is rewound by resetUsageWatermarksIfStreamRestarted
+// (mirrors the claude/codex/Pi paths). opencode carries no model name in the
+// event stream, so sess.Model is left as configured. Returns true when
+// anything changed; false (tokens stay 0) when the jsonl is absent — the
 // documented degradation when the stream-splitter was unavailable.
 func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
@@ -1884,6 +1922,7 @@ func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state
 	if !ok {
 		return false
 	}
+	resetUsageWatermarksIfStreamRestarted(sess, usage.TotalTokens)
 	changed := false
 	if usage.TotalTokens > sess.UsageTokensWatermark {
 		delta := usage.TotalTokens - sess.UsageTokensWatermark

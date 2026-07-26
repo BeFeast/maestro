@@ -186,3 +186,35 @@ func TestRecordBackendAttribution_UnknownBackend_NoMetadata(t *testing.T) {
 		t.Fatalf("unknown backend should have empty metadata, got %+v", seg)
 	}
 }
+
+// #1120: a fallover respawn recomputes the same <slot>.log path, the
+// stream-splitter reopens <slot>.jsonl with O_APPEND, and nothing truncates
+// either file. The usage watermarks are therefore read positions into a stream
+// the replacement process keeps extending — clearing them made the next
+// orchestrator poll add the previous attempt's cumulative total to
+// TokensUsedTotal a second time, doubling the session total per retry.
+func TestBeginSessionAttemptKeepsUsageWatermarksAcrossFallover(t *testing.T) {
+	sess := &state.Session{
+		Backend:                    "claude",
+		Status:                     state.StatusDead,
+		UsageTokensWatermark:       26064,
+		TokensUsedAttempt:          26064,
+		TokensUsedTotal:            26064,
+		TokenBudgetTokensWatermark: 9000,
+		TokenBudgetTokensAttempt:   9000,
+	}
+
+	beginSessionAttempt(attribCfgWithBackends(), sess, "sol", "fallover", "fallover", time.Now().UTC())
+
+	if sess.UsageTokensWatermark != 26064 || sess.TokenBudgetTokensWatermark != 9000 {
+		t.Fatalf("watermarks = %d/%d, want 26064/9000 preserved (the jsonl was not rotated)",
+			sess.UsageTokensWatermark, sess.TokenBudgetTokensWatermark)
+	}
+	if sess.TokensUsedAttempt != 0 || sess.TokenBudgetTokensAttempt != 0 {
+		t.Fatalf("attempt counters = %d/%d, want 0/0 for the new attempt",
+			sess.TokensUsedAttempt, sess.TokenBudgetTokensAttempt)
+	}
+	if sess.TokensUsedTotal != 26064 {
+		t.Fatalf("TokensUsedTotal = %d, want 26064 unchanged by starting an attempt", sess.TokensUsedTotal)
+	}
+}

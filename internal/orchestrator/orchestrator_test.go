@@ -11946,3 +11946,284 @@ func TestUpdateTokensUsedFromOutput_CodexBackendRetryNoDoubleCount(t *testing.T)
 		t.Errorf("UsageTokensWatermark = %d, want 1773", sess.UsageTokensWatermark)
 	}
 }
+
+// beginRespawnedAttempt starts a new worker attempt on an existing session
+// through the production reset path. worker.AdoptLiveRuntime is the exported
+// entry point into beginSessionAttempt — the single function every respawn
+// (fallover, in-place, phase transition) calls to open a new attempt — so the
+// usage tests below stay bound to what the worker package really resets
+// instead of a hand-rolled copy of it.
+func beginRespawnedAttempt(t *testing.T, sess *state.Session) {
+	t.Helper()
+	worker.AdoptLiveRuntime(nil, sess, 4242, "maestro-test-1120", time.Now().UTC())
+}
+
+// kimiUsageFrame builds one Kimi StatusUpdate frame carrying a token_usage
+// block, matching the shape of internal/worker/testdata/kimi_stream.jsonl.
+func kimiUsageFrame(messageID string, in, out int) string {
+	return fmt.Sprintf(`{"timestamp":1,"message":{"type":"StatusUpdate","payload":{"token_usage":{"input_other":%d,"output":%d,"input_cache_read":0,"input_cache_creation":0},"message_id":%q,"model":"kimi-k2.5"}}}`+"\n",
+		in, out, messageID)
+}
+
+// kimiTestOrchestrator wires a session to a Kimi backend whose slot.jsonl lives
+// at <dir>/<slot>.jsonl. Kimi always streams JSON, so no usage_stream opt-in.
+func kimiTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Session, string) {
+	t.Helper()
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default:  "moonshot-primary",
+				Backends: map[string]config.BackendDef{"moonshot-primary": {Cmd: "kimi", Provider: "moonshot"}},
+			},
+		},
+	}
+	logFile := filepath.Join(dir, slot+".log")
+	sess := &state.Session{Backend: "moonshot-primary", LogFile: logFile}
+	return o, sess, worker.JSONLPathForLog(logFile)
+}
+
+// opencodeStepFinishFrame builds one terminal opencode --format json
+// step_finish event with the given tokens + cost.
+func opencodeStepFinishFrame(in, out int, cost float64) string {
+	return fmt.Sprintf(`{"type":"step_finish","part":{"type":"step-finish","tokens":{"input":%d,"output":%d,"reasoning":0,"cache":{"read":0,"write":0}},"cost":%g}}`+"\n",
+		in, out, cost)
+}
+
+// opencodeTestOrchestrator wires a session to an opencode backend whose
+// slot.jsonl lives at <dir>/<slot>.jsonl.
+func opencodeTestOrchestrator(t *testing.T, slot string) (*Orchestrator, *state.Session, string) {
+	t.Helper()
+	dir := t.TempDir()
+	o := &Orchestrator{
+		cfg: &config.Config{
+			StateDir: dir,
+			Model: config.ModelConfig{
+				Default:  "opencode",
+				Backends: map[string]config.BackendDef{"opencode": {Cmd: "opencode", UsageStream: true}},
+			},
+		},
+	}
+	logFile := filepath.Join(dir, slot+".log")
+	sess := &state.Session{Backend: "opencode", LogFile: logFile}
+	return o, sess, worker.JSONLPathForLog(logFile)
+}
+
+// #1120: a fallover respawn recomputes the same slot.log path and the
+// stream-splitter reopens slot.jsonl with O_APPEND, so the previous attempt's
+// frames are still there when the replacement process starts. Polling usage
+// before that process has emitted anything must leave TokensUsedTotal alone,
+// and its first real frames must then be counted exactly once.
+func TestUpdateClaudeUsageFromJSONL_RespawnDoesNotRecountPreviousAttempt(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-1120-claude")
+
+	run1 := claudeResultFrame(770, 3, 0, 0, 0.001, "a") // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateClaudeUsageFromJSONL("sup-1120-claude", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("attempt 1: TokensUsedTotal = %d, want 773", sess.TokensUsedTotal)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	o.updateClaudeUsageFromJSONL("sup-1120-claude", sess)
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("respawn recount: TokensUsedTotal = %d, want 773 (no new worker output)", sess.TokensUsedTotal)
+	}
+	if sess.TokensUsedAttempt != 0 {
+		t.Fatalf("respawn recount: TokensUsedAttempt = %d, want 0 (no new worker output)", sess.TokensUsedAttempt)
+	}
+
+	run2 := claudeResultFrame(900, 100, 0, 0, 0.002, "b") // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateClaudeUsageFromJSONL("sup-1120-claude", sess) {
+		t.Fatal("attempt 2: expected the new frames to stamp usage")
+	}
+	if sess.TokensUsedTotal != 1773 || sess.TokensUsedAttempt != 1000 {
+		t.Fatalf("attempt 2: total=%d attempt=%d, want 1773/1000 (new usage counted once)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+}
+
+// #1120, codex path: same append-only slot.jsonl, same respawn recount.
+func TestUpdateCodexUsageFromJSONL_RespawnDoesNotRecountPreviousAttempt(t *testing.T) {
+	o, sess, jsonlPath := codexTestOrchestrator(t, "sup-1120-codex")
+
+	run1 := codexTurnFrame(770, 0, 3) // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateCodexUsageFromJSONL("sup-1120-codex", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("attempt 1: TokensUsedTotal = %d, want 773", sess.TokensUsedTotal)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	o.updateCodexUsageFromJSONL("sup-1120-codex", sess)
+	if sess.TokensUsedTotal != 773 || sess.TokensUsedAttempt != 0 {
+		t.Fatalf("respawn recount: total=%d attempt=%d, want 773/0 (no new worker output)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+	if sess.TokenBudgetTokensAttempt != 0 {
+		t.Fatalf("respawn recount: TokenBudgetTokensAttempt = %d, want 0 — a budget attempt that starts full kills the replacement early", sess.TokenBudgetTokensAttempt)
+	}
+
+	run2 := codexTurnFrame(900, 0, 100) // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateCodexUsageFromJSONL("sup-1120-codex", sess) {
+		t.Fatal("attempt 2: expected the new frames to stamp usage")
+	}
+	if sess.TokensUsedTotal != 1773 || sess.TokensUsedAttempt != 1000 || sess.TokenBudgetTokensAttempt != 1000 {
+		t.Fatalf("attempt 2: total=%d attempt=%d budget=%d, want 1773/1000/1000",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt, sess.TokenBudgetTokensAttempt)
+	}
+}
+
+// #1120, kimi path: same append-only slot.jsonl, same respawn recount. This is
+// the path PR #1095 flagged; the bug is identical on the other three.
+func TestUpdateKimiUsageFromJSONL_RespawnDoesNotRecountPreviousAttempt(t *testing.T) {
+	o, sess, jsonlPath := kimiTestOrchestrator(t, "sup-1120-kimi")
+
+	run1 := kimiUsageFrame("msg_1", 700, 73) // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateKimiUsageFromJSONL("sup-1120-kimi", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("attempt 1: TokensUsedTotal = %d, want 773", sess.TokensUsedTotal)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	o.updateKimiUsageFromJSONL("sup-1120-kimi", sess)
+	if sess.TokensUsedTotal != 773 || sess.TokensUsedAttempt != 0 {
+		t.Fatalf("respawn recount: total=%d attempt=%d, want 773/0 (no new worker output)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+
+	run2 := kimiUsageFrame("msg_2", 900, 100) // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateKimiUsageFromJSONL("sup-1120-kimi", sess) {
+		t.Fatal("attempt 2: expected the new frames to stamp usage")
+	}
+	if sess.TokensUsedTotal != 1773 || sess.TokensUsedAttempt != 1000 {
+		t.Fatalf("attempt 2: total=%d attempt=%d, want 1773/1000 (new usage counted once)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+}
+
+// #1120, opencode path: same append-only slot.jsonl, same respawn recount.
+func TestUpdateOpenCodeUsageFromJSONL_RespawnDoesNotRecountPreviousAttempt(t *testing.T) {
+	o, sess, jsonlPath := opencodeTestOrchestrator(t, "sup-1120-opencode")
+
+	run1 := opencodeStepFinishFrame(770, 3, 0.001) // total 773
+	if err := os.WriteFile(jsonlPath, []byte(run1), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateOpenCodeUsageFromJSONL("sup-1120-opencode", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokensUsedTotal != 773 {
+		t.Fatalf("attempt 1: TokensUsedTotal = %d, want 773", sess.TokensUsedTotal)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	o.updateOpenCodeUsageFromJSONL("sup-1120-opencode", sess)
+	if sess.TokensUsedTotal != 773 || sess.TokensUsedAttempt != 0 {
+		t.Fatalf("respawn recount: total=%d attempt=%d, want 773/0 (no new worker output)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+
+	run2 := opencodeStepFinishFrame(900, 100, 0.002) // total 1000
+	if err := os.WriteFile(jsonlPath, []byte(run1+run2), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateOpenCodeUsageFromJSONL("sup-1120-opencode", sess) {
+		t.Fatal("attempt 2: expected the new frames to stamp usage")
+	}
+	if sess.TokensUsedTotal != 1773 || sess.TokensUsedAttempt != 1000 {
+		t.Fatalf("attempt 2: total=%d attempt=%d, want 1773/1000 (new usage counted once)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt)
+	}
+}
+
+// #1120: an in-place respawn rotates slot.log/slot.jsonl and a phase
+// transition switches to a new log path, so the replacement stream really does
+// start from zero. The cumulative parse going backwards is the only honest
+// signal of that, and it must rewind the watermark — otherwise the new
+// attempt's tokens are swallowed until they pass the old attempt's total.
+func TestUpdateClaudeUsageFromJSONL_RotatedStreamCountsNewAttemptInFull(t *testing.T) {
+	o, sess, jsonlPath := claudeTestOrchestrator(t, "sup-1120-rotate")
+
+	if err := os.WriteFile(jsonlPath, []byte(claudeResultFrame(770, 3, 0, 0, 0.001, "a")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateClaudeUsageFromJSONL("sup-1120-rotate", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokensUsedTotal != 773 || sess.UsageTokensWatermark != 773 {
+		t.Fatalf("attempt 1: total=%d watermark=%d, want 773/773", sess.TokensUsedTotal, sess.UsageTokensWatermark)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	// rotateWorkerAttemptLog moved the previous attempt aside; the replacement
+	// process writes a fresh, smaller stream to the same path.
+	if err := os.WriteFile(jsonlPath, []byte(claudeResultFrame(400, 100, 0, 0, 0.0005, "b")), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateClaudeUsageFromJSONL("sup-1120-rotate", sess) {
+		t.Fatal("attempt 2: expected the rotated stream to stamp usage")
+	}
+	if sess.TokensUsedTotal != 1273 || sess.TokensUsedAttempt != 500 || sess.UsageTokensWatermark != 500 {
+		t.Fatalf("attempt 2: total=%d attempt=%d watermark=%d, want 1273/500/500 (rotated stream counted in full)",
+			sess.TokensUsedTotal, sess.TokensUsedAttempt, sess.UsageTokensWatermark)
+	}
+}
+
+// #1120: the token-budget watermark indexes the same rotated stream, so it has
+// to rewind with it. A budget watermark left at the previous attempt's total
+// would report the replacement worker as having burned nothing.
+func TestUpdateCodexUsageFromJSONL_RotatedStreamRewindsBudgetWatermark(t *testing.T) {
+	o, sess, jsonlPath := codexTestOrchestrator(t, "sup-1120-rotate-codex")
+
+	if err := os.WriteFile(jsonlPath, []byte(codexTurnFrame(770, 0, 3)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateCodexUsageFromJSONL("sup-1120-rotate-codex", sess) {
+		t.Fatal("attempt 1: expected the jsonl side channel to stamp usage")
+	}
+	if sess.TokenBudgetTokensWatermark != 773 {
+		t.Fatalf("attempt 1: TokenBudgetTokensWatermark = %d, want 773", sess.TokenBudgetTokensWatermark)
+	}
+
+	beginRespawnedAttempt(t, sess)
+
+	if err := os.WriteFile(jsonlPath, []byte(codexTurnFrame(400, 0, 100)), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if !o.updateCodexUsageFromJSONL("sup-1120-rotate-codex", sess) {
+		t.Fatal("attempt 2: expected the rotated stream to stamp usage")
+	}
+	if sess.TokenBudgetTokensAttempt != 500 || sess.TokenBudgetTokensWatermark != 500 {
+		t.Fatalf("attempt 2: budget attempt=%d watermark=%d, want 500/500 (rotated stream counted in full)",
+			sess.TokenBudgetTokensAttempt, sess.TokenBudgetTokensWatermark)
+	}
+}

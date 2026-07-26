@@ -26,9 +26,16 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.Backend = backendName
 	sess.Model = ""
 	sess.CostUSDBackend = 0
-	sess.UsageTokensWatermark = 0
+	// #1120: the per-attempt counters restart at zero, but the usage/budget
+	// watermarks must not. They are read positions in the backend's
+	// append-only side channel (slot.log / slot.jsonl), and a fallover respawn
+	// keeps writing to the same files — clearing them here made the next
+	// orchestrator poll re-add the previous attempt's whole cumulative total
+	// to TokensUsedTotal. When the stream really does start over (an in-place
+	// respawn rotates the log, a phase transition switches to a new path, or
+	// the replacement backend's parser sees only its own frames) the parsed
+	// cumulative goes backwards and the orchestrator rewinds them there.
 	sess.TokensUsedAttempt = 0
-	sess.TokenBudgetTokensWatermark = 0
 	sess.TokenBudgetTokensAttempt = 0
 	sess.TokenBudgetMeasure = ""
 	sess.WorkerOutcome = ""
