@@ -2866,7 +2866,7 @@ func killCmd(args []string) {
 			log.Fatalf("save state: %v", err)
 		}
 
-		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 		n.Sendf("maestro: manually killed worker %s (issue #%d: %s)", slotName, sess.IssueNumber, sess.IssueTitle)
 
 		fmt.Printf("Killed session %s (issue #%d: %s)\n", slotName, sess.IssueNumber, sess.IssueTitle)

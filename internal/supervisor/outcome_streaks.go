@@ -133,7 +133,7 @@ func defaultGateFailStreakNotify(cfg *config.Config, event outcome.GateStreakEve
 	if cfg == nil {
 		return nil
 	}
-	notifier := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+	notifier := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 	return notifier.Send(gateFailStreakMessage(event))
 }
 

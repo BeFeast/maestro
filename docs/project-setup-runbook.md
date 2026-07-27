@@ -267,7 +267,7 @@ delivery:
 # Telegram notifications (optional, via OpenClaw gateway)
 telegram:
   target: "YOUR_TELEGRAM_CHAT_ID"
-  bot_token: "YOUR_BOT_TOKEN"
+  bot_token_env: OK_GOBOT_TELEGRAM_TOKEN  # env var name; the token itself never enters config (#1143)
   openclaw_url: "http://localhost:18789"
 ```
 
