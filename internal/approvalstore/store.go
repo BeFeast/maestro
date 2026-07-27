@@ -24,8 +24,8 @@
 // and every claim predicate are therefore scoped by state_dir (the JSON state
 // directory, which is 1:1 with a project — repo can be shared by two configs,
 // the project name can be aliased, but the state dir is unique). Without that
-// scope the second project's INSERT OR IGNORE would be dropped and an
-// approve/reject would consume or block the first project's claim.
+// scope the second project's write would collide with the first project's row
+// and an approve/reject would consume or block the wrong project's claim.
 package approvalstore
 
 import (
@@ -36,6 +36,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -64,8 +65,8 @@ CREATE TABLE IF NOT EXISTS approvals (
 	approval_json TEXT NOT NULL,
 	-- Scope the row identity by state_dir: ids are content-addressed on
 	-- (action, target) only, so two projects can mint the same id. Without
-	-- (state_dir, id) the second project's INSERT OR IGNORE is dropped and a
-	-- claim consumes the wrong project's approval.
+	-- (state_dir, id) the second project's write collides with the first
+	-- project's row and a claim consumes the wrong project's approval.
 	PRIMARY KEY (state_dir, id)
 );`
 
@@ -371,9 +372,10 @@ func canonicalStateDir(path string) (string, error) {
 // were scoped by state_dir. The original table used `id TEXT PRIMARY KEY`, so
 // CREATE TABLE IF NOT EXISTS above is a no-op against it and the composite
 // PRIMARY KEY (state_dir, id) is never installed. In that unscoped table two
-// projects that mint the same content-addressed id collide: the second
-// project's INSERT OR IGNORE is dropped and a scoped claim cannot find — or is
-// blocked by — the wrong project's row. This detects the legacy primary key
+// projects that mint the same content-addressed id collide: the write path
+// resolves the conflict on (state_dir, id), which an unscoped `id PRIMARY KEY`
+// table does not have, so the statement ERRORS at runtime instead of writing —
+// and a scoped claim cannot find, or is blocked by, the wrong project's row. This detects the legacy primary key
 // and rebuilds the table in place (rename → recreate → copy → drop), so the
 // fix reaches already-created databases, not only fresh ones. No-op once the
 // table already carries the composite key.
@@ -467,12 +469,19 @@ func intersectColumns(have, want []string) []string {
 	return out
 }
 
-// Put seeds an approval into the store WITHOUT overwriting an existing row
-// (INSERT OR IGNORE). Returning inserted=false means a row for this id was
-// already present — crucially, a concurrent claim that already advanced the
-// status MUST NOT be reset back to pending, so Put never updates an existing
-// row. When the row is newly inserted, the approval's existing audit entries
-// are mirrored into approval_audit so the table is a faithful trail.
+// Put seeds an approval into the store. A row that already exists under
+// (state_dir, id) is either REPLACED by a strictly newer mint or explicitly
+// kept — never dropped silently (#1142). Ids are content-addressed on
+// (action, target), so the same id legitimately recurs once the earlier
+// instance of that decision is gone from the JSON state; the old
+// `INSERT OR IGNORE` swallowed the write and the row kept the first
+// instance's status forever while JSON moved on.
+//
+// Returning inserted=false means the pre-existing row was kept: a re-seed of
+// the SAME mint (equal CreatedAt) must not reset a status that a concurrent
+// claim already advanced. Returning true means the row now holds this
+// approval — a fresh insert or an accepted re-mint — and the approval's audit
+// entries are mirrored into approval_audit so the table is a faithful trail.
 //
 // Put is the write-through seed used during the JSON→SQLite transition: the
 // JSON state remains the mint source; Put copies a pending approval into
@@ -498,10 +507,11 @@ func (s *Store) Put(ctx context.Context, a *state.Approval, b RowBinding) (inser
 	if a.Action == state.ApprovalActionDeployProject {
 		persisted = state.CanonicalDeliveryApprovalForWrite(a)
 	}
-	ins, err := putApprovalTx(ctx, tx, persisted, b)
+	outcome, err := putApprovalTx(ctx, tx, persisted, b)
 	if err != nil {
 		return false, err
 	}
+	ins := outcome != approvalPutKept
 	if ins {
 		for i := range persisted.Audit {
 			if err := insertAuditTx(ctx, tx, persisted.ID, b, persisted.Audit[i]); err != nil {
@@ -644,10 +654,11 @@ WHERE state_dir = ? AND action = ? AND id <> ?`,
 	}
 
 	candidate = *state.CanonicalDeliveryApprovalForWrite(&candidate)
-	inserted, err = putApprovalTx(ctx, tx, &candidate, b)
+	outcome, err := putApprovalTx(ctx, tx, &candidate, b)
 	if err != nil {
 		return false, err
 	}
+	inserted = outcome != approvalPutKept
 	if inserted {
 		for i := range candidate.Audit {
 			if err := insertAuditTx(ctx, tx, candidate.ID, b, candidate.Audit[i]); err != nil {
@@ -1242,35 +1253,133 @@ func (s *Store) MarkStale(ctx context.Context, stateDir, id string, now time.Tim
 
 // --- tx helpers -------------------------------------------------------------
 
-func putApprovalTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBinding) (bool, error) {
+// approvalPutOutcome says what putApprovalTx did with the row. It exists so
+// the drop case is a named, logged branch instead of an invisible side effect
+// of a conflict clause (#1142).
+type approvalPutOutcome int
+
+const (
+	// approvalPutInserted: no row existed for (state_dir, id).
+	approvalPutInserted approvalPutOutcome = iota
+	// approvalPutReminted: a strictly newer mint replaced the stored row.
+	approvalPutReminted
+	// approvalPutKept: the stored row was deliberately preserved because the
+	// incoming record is a re-seed of the same (or an older) mint.
+	approvalPutKept
+)
+
+// putApprovalTx writes an approval row, resolving a (state_dir, id) collision
+// by mint time rather than by dropping the write.
+//
+// Ids are content-addressed on (action, target) and the row identity is scoped
+// by state_dir (see the package comment: two DIFFERENT projects mint the SAME
+// id, and the state_dir scope is what keeps their rows independent). Nothing
+// here widens that scope — every statement stays keyed on (state_dir, id), so
+// cross-project isolation is unchanged.
+//
+// Within one project the same id recurs when an earlier instance of the same
+// decision has left the JSON state and the decision is minted again. CreatedAt
+// separates the two cases, and it is the only signal that does so safely:
+//
+//   - incoming CreatedAt strictly after the stored one → a genuinely new mint;
+//     replace the row (ON CONFLICT DO UPDATE). Without this the row keeps the
+//     first instance's status forever — the drift this fixes.
+//   - otherwise → a re-seed of the mint the row already holds (Put is called
+//     on every claim from the same JSON record). Keep the row: resetting it
+//     would re-open a claim that already advanced past pending.
+//
+// Statuses are deliberately NOT the predicate: `approved` and
+// `awaiting_dispatch` are legitimately open, so a status-based rule would
+// either reset a live claim or leave exactly the stale-approved rows this
+// fixes. CreatedAt is compared as time.Time, never as SQL text: RFC3339Nano
+// trims trailing zeros, so string ordering is wrong.
+func putApprovalTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBinding) (approvalPutOutcome, error) {
 	persisted := a
 	if a.Action == state.ApprovalActionDeployProject {
 		persisted = state.CanonicalDeliveryApprovalForWrite(a)
 	}
 	blob, err := json.Marshal(persisted)
 	if err != nil {
-		return false, fmt.Errorf("marshal approval %s: %w", a.ID, err)
+		return approvalPutKept, fmt.Errorf("marshal approval %s: %w", a.ID, err)
 	}
 	recordHash := ""
 	if persisted.Action == state.ApprovalActionDeployProject {
 		recordHash, err = computeDeliveryRecordHash(persisted, b)
 		if err != nil {
-			return false, err
+			return approvalPutKept, err
 		}
 	}
-	res, err := tx.ExecContext(ctx, `
-INSERT OR IGNORE INTO approvals(id, decision_id, project, repo, state_dir, action, status, payload_hash, record_hash, created_at, updated_at, approval_json)
-VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+
+	// Read-then-write is atomic here: the DSN opens every transaction with
+	// _txlock=immediate, so this tx already holds the write lock and no other
+	// connection can insert the row between the SELECT and the INSERT.
+	existingStatus, existingCreated, found, err := lookupApprovalMintTx(ctx, tx, b.StateDir, persisted.ID)
+	if err != nil {
+		return approvalPutKept, err
+	}
+	// A zero CreatedAt is NOT a newer mint. normalize() maps zero to time.Now(),
+	// so without this an approval whose CreatedAt never got set - a legacy or
+	// hand-edited state.json decodes the plain `created_at` field to zero, and
+	// Put is exported - would always look strictly newer and reset an already
+	// claimed row back to pending, re-opening the claim-once gate this package
+	// exists to protect. Unknown provenance keeps the row.
+	mintKnown := !persisted.CreatedAt.IsZero()
+	mintedAt := normalize(persisted.CreatedAt)
+	if found && (!mintKnown || !mintedAt.After(existingCreated)) {
+		// Explicit keep branch — the one case where not writing is correct.
+		if string(persisted.Status) != existingStatus {
+			log.Printf("[approvalstore] keeping approval %s (state_dir=%s): stored status=%s, re-seed says %s; same mint %s, an advanced row is never reset",
+				persisted.ID, b.StateDir, existingStatus, persisted.Status, formatTime(existingCreated))
+		}
+		return approvalPutKept, nil
+	}
+
+	if _, err := tx.ExecContext(ctx, `
+INSERT INTO approvals(id, decision_id, project, repo, state_dir, action, status, payload_hash, record_hash, created_at, updated_at, approval_json)
+VALUES(?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+ON CONFLICT(state_dir, id) DO UPDATE SET
+	decision_id   = excluded.decision_id,
+	project       = excluded.project,
+	repo          = excluded.repo,
+	action        = excluded.action,
+	status        = excluded.status,
+	payload_hash  = excluded.payload_hash,
+	record_hash   = excluded.record_hash,
+	created_at    = excluded.created_at,
+	updated_at    = excluded.updated_at,
+	approval_json = excluded.approval_json`,
 		persisted.ID, persisted.DecisionID, b.Project, b.Repo, b.StateDir, persisted.Action, string(persisted.Status), persisted.PayloadHash, recordHash,
-		formatTime(normalize(persisted.CreatedAt)), formatTime(normalize(persisted.UpdatedAt)), string(blob))
-	if err != nil {
-		return false, err
+		formatTime(mintedAt), formatTime(normalize(persisted.UpdatedAt)), string(blob)); err != nil {
+		return approvalPutKept, err
 	}
-	n, err := res.RowsAffected()
-	if err != nil {
-		return false, err
+	if !found {
+		return approvalPutInserted, nil
 	}
-	return n == 1, nil
+	log.Printf("[approvalstore] re-minted approval %s (state_dir=%s): status %s -> %s, mint %s -> %s",
+		persisted.ID, b.StateDir, existingStatus, persisted.Status, formatTime(existingCreated), formatTime(mintedAt))
+	return approvalPutReminted, nil
+}
+
+// lookupApprovalMintTx returns the stored status and mint time of the row
+// under (state_dir, id). It reads the columns directly rather than going
+// through loadApprovalTx so a delivery-integrity failure on an unrelated
+// pre-existing row cannot block seeding a new approval.
+func lookupApprovalMintTx(ctx context.Context, tx *sql.Tx, stateDir, id string) (string, time.Time, bool, error) {
+	var status, createdAt string
+	err := tx.QueryRowContext(ctx,
+		`SELECT status, created_at FROM approvals WHERE state_dir = ? AND id = ?`, stateDir, id).
+		Scan(&status, &createdAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", time.Time{}, false, nil
+	}
+	if err != nil {
+		return "", time.Time{}, false, err
+	}
+	created, perr := time.Parse(time.RFC3339Nano, createdAt)
+	if perr != nil {
+		return "", time.Time{}, false, fmt.Errorf("approval %s (state_dir=%s) has unparsable created_at %q: %w", id, stateDir, createdAt, perr)
+	}
+	return status, created.UTC(), true, nil
 }
 
 func writeApprovalJSONTx(ctx context.Context, tx *sql.Tx, b RowBinding, a *state.Approval) error {

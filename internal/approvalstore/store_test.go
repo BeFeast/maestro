@@ -413,7 +413,7 @@ func TestPut_DoesNotResetStatus(t *testing.T) {
 		t.Fatalf("re-put: %v", err)
 	}
 	if inserted {
-		t.Fatalf("re-put reported inserted; INSERT OR IGNORE must keep the existing row")
+		t.Fatalf("re-put reported inserted; a same-mint re-seed must keep the existing row")
 	}
 	got, err := s.Get(context.Background(), testStateDir, "p1")
 	if err != nil {
