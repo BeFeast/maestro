@@ -25,6 +25,42 @@ func remint(id, action string, target *state.SupervisorTarget, b RowBinding, min
 	return a
 }
 
+// An approval whose CreatedAt was never set must NOT count as a newer mint.
+// normalize() maps a zero time to time.Now(), so without an explicit guard such
+// a record always looks strictly newer and resets an already-claimed row back
+// to pending — re-opening the claim-once gate and allowing a second merge_pr or
+// close_issue. Approval.CreatedAt is a plain json field, so a legacy or
+// hand-edited state.json decodes it to zero, and Put is exported.
+func TestPut_ZeroMintNeverResetsClaimedRow(t *testing.T) {
+	s := openTestStore(t)
+	ctx := context.Background()
+	rb := RowBinding{Project: "owner/repo", Repo: "owner/repo", StateDir: testStateDir}
+	target := &state.SupervisorTarget{PR: 91}
+
+	seedPending(t, s, "zc1", "merge_pr", target)
+	if _, err := s.Approve(ctx, testStateDir, "zc1", time.Now().UTC(), "x", "green"); err != nil {
+		t.Fatalf("approve first instance: %v", err)
+	}
+
+	zero := makeApproval("zc1", "merge_pr", target, rb)
+	zero.CreatedAt = time.Time{}
+	zero.UpdatedAt = time.Time{}
+	zero.Status = state.ApprovalStatusPending
+	zero.PayloadHash = zero.ComputePayloadHash()
+
+	if _, err := s.Put(ctx, zero, rb); err != nil {
+		t.Fatalf("put zero-mint: %v", err)
+	}
+
+	got, err := s.Get(ctx, testStateDir, "zc1")
+	if err != nil {
+		t.Fatalf("get after zero-mint: %v", err)
+	}
+	if got.Status != state.ApprovalStatusApproved {
+		t.Fatalf("status = %s, want approved: a zero CreatedAt reset a claimed row and re-opened the gate", got.Status)
+	}
+}
+
 // A re-minted approval must replace the row, not be swallowed. With the old
 // `INSERT OR IGNORE` the row kept the FIRST instance's status forever: the
 // mirror reported `approved` for an approval the JSON state had already

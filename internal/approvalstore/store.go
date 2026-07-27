@@ -24,8 +24,8 @@
 // and every claim predicate are therefore scoped by state_dir (the JSON state
 // directory, which is 1:1 with a project — repo can be shared by two configs,
 // the project name can be aliased, but the state dir is unique). Without that
-// scope the second project's INSERT OR IGNORE would be dropped and an
-// approve/reject would consume or block the first project's claim.
+// scope the second project's write would collide with the first project's row
+// and an approve/reject would consume or block the wrong project's claim.
 package approvalstore
 
 import (
@@ -65,8 +65,8 @@ CREATE TABLE IF NOT EXISTS approvals (
 	approval_json TEXT NOT NULL,
 	-- Scope the row identity by state_dir: ids are content-addressed on
 	-- (action, target) only, so two projects can mint the same id. Without
-	-- (state_dir, id) the second project's INSERT OR IGNORE is dropped and a
-	-- claim consumes the wrong project's approval.
+	-- (state_dir, id) the second project's write collides with the first
+	-- project's row and a claim consumes the wrong project's approval.
 	PRIMARY KEY (state_dir, id)
 );`
 
@@ -372,9 +372,10 @@ func canonicalStateDir(path string) (string, error) {
 // were scoped by state_dir. The original table used `id TEXT PRIMARY KEY`, so
 // CREATE TABLE IF NOT EXISTS above is a no-op against it and the composite
 // PRIMARY KEY (state_dir, id) is never installed. In that unscoped table two
-// projects that mint the same content-addressed id collide: the second
-// project's INSERT OR IGNORE is dropped and a scoped claim cannot find — or is
-// blocked by — the wrong project's row. This detects the legacy primary key
+// projects that mint the same content-addressed id collide: the write path
+// resolves the conflict on (state_dir, id), which an unscoped `id PRIMARY KEY`
+// table does not have, so the statement ERRORS at runtime instead of writing —
+// and a scoped claim cannot find, or is blocked by, the wrong project's row. This detects the legacy primary key
 // and rebuilds the table in place (rename → recreate → copy → drop), so the
 // fix reaches already-created databases, not only fresh ones. No-op once the
 // table already carries the composite key.
@@ -1316,8 +1317,15 @@ func putApprovalTx(ctx context.Context, tx *sql.Tx, a *state.Approval, b RowBind
 	if err != nil {
 		return approvalPutKept, err
 	}
+	// A zero CreatedAt is NOT a newer mint. normalize() maps zero to time.Now(),
+	// so without this an approval whose CreatedAt never got set - a legacy or
+	// hand-edited state.json decodes the plain `created_at` field to zero, and
+	// Put is exported - would always look strictly newer and reset an already
+	// claimed row back to pending, re-opening the claim-once gate this package
+	// exists to protect. Unknown provenance keeps the row.
+	mintKnown := !persisted.CreatedAt.IsZero()
 	mintedAt := normalize(persisted.CreatedAt)
-	if found && !mintedAt.After(existingCreated) {
+	if found && (!mintKnown || !mintedAt.After(existingCreated)) {
 		// Explicit keep branch — the one case where not writing is correct.
 		if string(persisted.Status) != existingStatus {
 			log.Printf("[approvalstore] keeping approval %s (state_dir=%s): stored status=%s, re-seed says %s; same mint %s, an advanced row is never reset",
