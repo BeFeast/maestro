@@ -244,7 +244,7 @@ type Orchestrator struct {
 
 // New creates a new Orchestrator
 func New(cfg *config.Config) *Orchestrator {
-	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+	n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 	n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 	if cfg.Telegram.DigestMode {
 		n.SetDigestMode(true)

@@ -25,12 +25,59 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// TelegramConfig configures the Telegram notification channel.
+//
+// The bot token is a credential and MUST NOT be stored in config (#1143) --
+// the same rule ServerAuthConfig states for the dashboard token. Set
+// BotTokenEnv to the name of an environment variable the operator populates
+// from a secret manager (Infisical, 1Password, ...); the process reads the
+// value at send time and the config store only ever holds the variable name,
+// so `maestro config-store export` and every DB backup stay credential-free.
+//
+// The legacy plaintext BotToken still works so existing rows keep notifying,
+// but Config.Warnings() names the field at load time so an operator migrates.
+// When BotTokenEnv resolves to a non-empty value it wins over BotToken.
 type TelegramConfig struct {
-	Target      string `yaml:"target"`
-	BotToken    string `yaml:"bot_token"`
+	Target string `yaml:"target"`
+	// BotToken is the DEPRECATED plaintext form of the bot token (#1143).
+	// Prefer BotTokenEnv; a non-empty value here raises a config warning.
+	BotToken string `yaml:"bot_token"`
+	// BotTokenEnv names an environment variable holding the bot token; the
+	// token itself is never stored here.
+	BotTokenEnv string `yaml:"bot_token_env"`
 	Mode        string `yaml:"mode"`         // "direct" (Telegram Bot API) or "openclaw" (OpenClaw relay); default: "direct"
 	OpenclawURL string `yaml:"openclaw_url"` // only needed when mode=openclaw
 	DigestMode  bool   `yaml:"digest_mode"`  // batch notifications per cycle instead of sending immediately
+}
+
+// Token resolves the Telegram bot token. BotTokenEnv is consulted first: when
+// it names an environment variable that holds a non-empty value, that value is
+// used and the plaintext BotToken is ignored. Otherwise the legacy plaintext
+// BotToken is returned so pre-#1143 rows keep working. Returns "" when neither
+// source yields a value, which callers treat as "Telegram direct mode not
+// configured" (the openclaw relay path is unaffected).
+func (c TelegramConfig) Token() string {
+	if env := strings.TrimSpace(c.BotTokenEnv); env != "" {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(c.BotToken)
+}
+
+// PlaintextTokenActive reports whether the plaintext BotToken is the value
+// Token() would return -- i.e. the credential is really being read out of the
+// config store rather than the environment.
+func (c TelegramConfig) PlaintextTokenActive() bool {
+	if strings.TrimSpace(c.BotToken) == "" {
+		return false
+	}
+	if env := strings.TrimSpace(c.BotTokenEnv); env != "" {
+		if strings.TrimSpace(os.Getenv(env)) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // NotifyConfig (#1018) carries lightweight push-notification transports that
@@ -3261,7 +3308,109 @@ func (c *Config) Warnings() []string {
 		warnings = append(warnings, msg)
 	}
 	warnings = append(warnings, c.deliveryWarnings()...)
+	warnings = append(warnings, c.credentialWarnings()...)
 	return warnings
+}
+
+// credentialWarnings surfaces config fields that still carry credential
+// material in plaintext (#1143). Plaintext keeps working -- refusing to load
+// would strand every pre-migration row -- but the value is visible in
+// `maestro config-store export`, in any YAML dumped from the store, and in
+// every DB backup, so the operator is told which field to move.
+//
+// Audit of every credential-bearing field in internal/config, for the record:
+//
+//   - telegram.bot_token          -- plaintext; migrate to telegram.bot_token_env (below)
+//   - server.auth.token_env       -- env-only already (#487)
+//   - notify.ntfy.token_env       -- env-only already (#1018)
+//   - self_deploy.health_token_env -- env-only already
+//   - github_app.private_key_path -- a path; the PEM never enters config (#823)
+//   - model.backends.*.mcp.servers.*.bearer_token_env_var -- env-only already
+//   - model.backends.*.mcp.servers.*.{headers,env} -- free-form maps handed to
+//     the worker harness verbatim, so a literal secret pasted there is stored
+//     just like telegram.bot_token was. Warned about below.
+func (c *Config) credentialWarnings() []string {
+	if c == nil {
+		return nil
+	}
+	var out []string
+	if strings.TrimSpace(c.Telegram.BotToken) != "" {
+		if c.Telegram.PlaintextTokenActive() {
+			out = append(out, "config: telegram.bot_token stores the bot token in plaintext — it is visible in `maestro config-store export` and in every DB backup. Move the token into a secret manager, expose it to the daemon as an environment variable, and set telegram.bot_token_env to that variable name instead.")
+		} else {
+			out = append(out, fmt.Sprintf("config: telegram.bot_token still holds a plaintext credential but is unused because telegram.bot_token_env (%s) resolves — delete telegram.bot_token from the config store.", strings.TrimSpace(c.Telegram.BotTokenEnv)))
+		}
+	}
+	out = append(out, c.mcpCredentialWarnings()...)
+	return out
+}
+
+// credentialKeyHints are substrings that mark a header/env key as carrying a
+// credential. Matched case-insensitively against the key only; values are
+// never logged.
+var credentialKeyHints = []string{"authorization", "token", "secret", "password", "passwd", "apikey", "api_key", "access_key", "private_key", "credential"}
+
+// looksLikeCredentialKey reports whether a header or env key names a secret.
+func looksLikeCredentialKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+	for _, hint := range credentialKeyHints {
+		if strings.Contains(k, hint) {
+			return true
+		}
+	}
+	// "key" alone is too generic to match as a substring (it hits "keyword",
+	// "monkey"), so only an exact/suffixed form counts.
+	return k == "key" || strings.HasSuffix(k, "-key") || strings.HasSuffix(k, "_key")
+}
+
+// isEnvReference reports whether a value is an indirection ($VAR or ${VAR})
+// rather than the credential itself.
+func isEnvReference(value string) bool {
+	v := strings.TrimSpace(value)
+	return strings.HasPrefix(v, "$")
+}
+
+// mcpCredentialWarnings names MCP server headers/env entries whose key marks a
+// credential and whose value is a literal rather than an environment
+// reference. The value is never echoed.
+func (c *Config) mcpCredentialWarnings() []string {
+	var out []string
+	for _, backend := range sortedKeys(c.Model.Backends) {
+		servers := c.Model.Backends[backend].MCP.Servers
+		for _, server := range sortedKeys(servers) {
+			def := servers[server]
+			for _, block := range []struct {
+				name   string
+				values map[string]string
+			}{{"headers", def.Headers}, {"env", def.Env}} {
+				for _, key := range sortedKeys(block.values) {
+					value := strings.TrimSpace(block.values[key])
+					if value == "" || !looksLikeCredentialKey(key) || isEnvReference(value) {
+						continue
+					}
+					out = append(out, fmt.Sprintf("config: model.backends.%s.mcp.servers.%s.%s.%s stores a credential in plaintext — it is visible in `maestro config-store export` and in every DB backup. Keep the secret in the environment and reference it (for an HTTP server use bearer_token_env_var).", backend, server, block.name, key))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// sortedKeys returns the map keys in deterministic order so warning output is
+// stable across loads.
+func sortedKeys[V any](m map[string]V) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // deliveryWarnings surfaces the #872 delivery-block misconfigurations at load

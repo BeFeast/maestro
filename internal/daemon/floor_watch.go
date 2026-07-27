@@ -104,7 +104,7 @@ func fleetFloorNotifierFor(cfgs []*config.Config) *notify.Notifier {
 			continue
 		}
 		n := notify.NewWithToken(
-			cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL,
+			cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL,
 		)
 		n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 		return n
