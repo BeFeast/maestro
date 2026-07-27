@@ -57,7 +57,7 @@ var (
 		return github.New(repo)
 	}
 	newFutileRecoveryNotifier = func(cfg *config.Config) futileRecoveryNotifier {
-		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 		return n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 	}
 )

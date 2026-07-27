@@ -218,7 +218,7 @@ func notifyEmergency(ef *emergencyFlags, msg string) {
 		if cfg == nil || (strings.TrimSpace(cfg.Telegram.Target) == "" && !cfg.Notify.Ntfy.Enabled()) {
 			continue
 		}
-		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 		n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 		// Alert covers both transports: ntfy when configured, otherwise the
 		// base Telegram/OpenClaw send. Keyed by message so a repeated identical

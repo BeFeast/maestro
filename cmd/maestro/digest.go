@@ -65,7 +65,7 @@ func digestCmd(args []string) {
 		if notifierCfg == nil {
 			log.Printf("digest: %d decision(s) pending but no project has a notifier target configured", report.DecideTodayCount())
 		} else {
-			n := notify.NewWithToken(notifierCfg.Telegram.BotToken, notifierCfg.Telegram.Target, notifierCfg.Telegram.Mode, notifierCfg.Telegram.OpenclawURL)
+			n := notify.NewWithToken(notifierCfg.Telegram.Token(), notifierCfg.Telegram.Target, notifierCfg.Telegram.Mode, notifierCfg.Telegram.OpenclawURL)
 			if err := n.Send(report.NotifySummary(writtenPath)); err != nil {
 				log.Printf("digest: notifier send failed: %v", err)
 			}
