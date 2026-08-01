@@ -130,8 +130,8 @@ Emergency stop (#840) — fleet-wide BIG RED BUTTON:
                                   supervisor drops to deterministic-only, no new
                                   worker spawns, router calls stopped. The daemon
                                   keeps running (dashboards/state/reads stay up);
-                                  in-flight workers are left running unless you
-                                  in-flight workers are killed. Flag lives in the unified
+                                  in-flight workers and attached verify/build
+                                  children are killed. Flag lives in the unified
                                   DB and survives a daemon restart.
   maestro emergency stop-all      Whole-fleet stop, recorded as an emergency
                                   state that survives restart until resumed.
