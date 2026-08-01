@@ -12,6 +12,14 @@ import (
 	"github.com/befeast/maestro/internal/worker"
 )
 
+// defaultEmergencyDBPath resolves the ambient emergency switch DB when
+// Options.EmergencyDBPath is empty. It is a seam so the package's tests can
+// isolate themselves from the HOST's real switch: with #1150 an active real
+// emergency makes daemon startup KILL the PIDs recorded in (test-seeded)
+// state files — a unit test must never inherit that from ~/.maestro/maestro.db.
+// The production CLI always passes --emergency-db explicitly.
+var defaultEmergencyDBPath = emergencystore.DefaultDBPath
+
 // configureEmergencyStop opens the fleet-wide EMERGENCY STOP switch store (#840)
 // against the unified maestro.db, seeds the cached state, wires the fleet
 // snapshot's emergency source, and builds the notifier used on activation/resume.
@@ -23,7 +31,7 @@ import (
 func (d *Daemon) configureEmergencyStop(ctx context.Context, cfgs []*config.Config) *emergencystore.Store {
 	dbPath := strings.TrimSpace(d.opts.EmergencyDBPath)
 	if dbPath == "" {
-		dbPath = emergencystore.DefaultDBPath()
+		dbPath = defaultEmergencyDBPath()
 	}
 	store, err := emergencystore.Open(dbPath)
 	if err != nil {
