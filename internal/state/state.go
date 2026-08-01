@@ -407,6 +407,14 @@ type Session struct {
 	// without this memory that single blip would look like "the reviewer never
 	// showed up" and expire a gate that is genuinely working.
 	ReviewGateObserved bool `json:"review_gate_observed,omitempty"`
+	// ReviewGateStreamObserved is the per-stream refinement of
+	// ReviewGateObserved (#1148): stream name -> ever seen on
+	// ReviewPendingHeadSHA. A multi-stream gate can be half-observed (one
+	// stream settled, the other never reported); the absent-reviewer escape
+	// lets only never-seen streams expire, so it needs attribution, not just
+	// the aggregate bit. Reset together with ReviewGateObserved on a head
+	// change.
+	ReviewGateStreamObserved map[string]bool `json:"review_gate_stream_observed,omitempty"`
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits

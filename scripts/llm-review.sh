@@ -62,19 +62,27 @@ if [[ ! -s "$DIFF_FILE" ]]; then
     exit 0
 fi
 diff_size=$(wc -c <"$DIFF_FILE")
+TRUNC_NOTE=""
 if (( diff_size > MAX_DIFF_BYTES )); then
     echo "llm-review: diff is $diff_size bytes; truncating to $MAX_DIFF_BYTES" >&2
     truncate -s "$MAX_DIFF_BYTES" "$DIFF_FILE"
+    # Surfaced in the final status description: a verdict over a truncated
+    # diff is weaker evidence and the operator must be able to see that.
+    TRUNC_NOTE="; warning: diff truncated to $MAX_DIFF_BYTES bytes"
 fi
 
 # --- helpers ----------------------------------------------------------------
 
-# status_exists <context> — true when a commit status with this context is
-# already present on the head SHA (the idempotency key).
-status_exists() {
+# status_settled <context> — true when a commit status with this context has
+# already SETTLED (success/failure) on the head SHA: that is the idempotency
+# key. error statuses (run failed, creds missing, unparseable output) and
+# stale pending statuses (a previous run died mid-flight) are retryable — a
+# re-run replaces them instead of treating them as done.
+status_settled() {
     local context="$1"
     gh api "repos/$REPO/commits/$HEAD_SHA/status" --jq \
-        "[.statuses[].context] | index(\"$context\") != null" 2>/dev/null | grep -qx true
+        "[.statuses[] | select(.context == \"$context\") | .state] | map(select(. == \"success\" or . == \"failure\")) | length > 0" \
+        2>/dev/null | grep -qx true
 }
 
 # post_status <context> <state> <description>
@@ -128,17 +136,42 @@ preamble, no summary, no markdown fences.
 DIFF:
 '
 
+# prepare_model <stream-name> <mode>
+# Phase 1 of the pending-first protocol: decide whether this model runs and
+# publish its status BEFORE any model output or comment lands. A pending
+# status for every model that will run means Maestro never observes the
+# half-state "comments exist but a stream has no status yet" (the gate would
+# read that stream as absent), and advisory comments posted mid-run cannot
+# race a still-missing verdict.
+# Return: 0 = run it, 1 = settled already (skip), 2 = skipped for missing
+# creds (error status posted — the pair must not wedge on a silent stream).
+prepare_model() {
+    local stream="$1" mode="$2"
+
+    if status_settled "$stream"; then
+        echo "llm-review: $stream already settled on $HEAD_SHA — skipping (idempotent)"
+        return 1
+    fi
+
+    if [[ "$mode" == terra && ( -z "${LLM_REVIEW_TERRA_BASE_URL:-}" || -z "${LLM_REVIEW_TERRA_AUTH_TOKEN:-}" ) ]]; then
+        echo "llm-review: LLM_REVIEW_TERRA_BASE_URL/AUTH_TOKEN not set — skipping $stream" >&2
+        # An explicit error status instead of silence: with one stream settled
+        # and the other absent, Maestro's aggregate used to sit at
+        # Pending+Observed forever with no escape (#1148 review round 1, P1-2).
+        post_status "$stream" error "skipped: credentials not configured"
+        return 2
+    fi
+
+    post_status "$stream" pending "review in progress"
+    return 0
+}
+
 # run_model <stream-name> <mode>
 # mode "opus":  subscription seat — ANTHROPIC_* endpoint vars must be unset.
 # mode "terra": CLIProxy — ANTHROPIC_BASE_URL/AUTH_TOKEN + --model.
 run_model() {
     local stream="$1" mode="$2"
     local context="$stream"
-
-    if status_exists "$context"; then
-        echo "llm-review: $context already reported on $HEAD_SHA — skipping (idempotent)"
-        return 0
-    fi
 
     local prompt
     # shellcheck disable=SC2059
@@ -158,10 +191,6 @@ run_model() {
             fi
             ;;
         terra)
-            if [[ -z "${LLM_REVIEW_TERRA_BASE_URL:-}" || -z "${LLM_REVIEW_TERRA_AUTH_TOKEN:-}" ]]; then
-                echo "llm-review: LLM_REVIEW_TERRA_BASE_URL/AUTH_TOKEN not set — skipping $context" >&2
-                return 0
-            fi
             if ! output="$(ANTHROPIC_BASE_URL="$LLM_REVIEW_TERRA_BASE_URL" \
                     ANTHROPIC_AUTH_TOKEN="$LLM_REVIEW_TERRA_AUTH_TOKEN" \
                     claude -p --model "$TERRA_MODEL" "$prompt$(cat "$DIFF_FILE")" 2>&1)"; then
@@ -176,9 +205,23 @@ run_model() {
             ;;
     esac
 
-    # Parse findings: only lines matching the contract count.
-    local findings
-    findings="$(grep -E '^\[P[0-3]\] ' <<<"$output" || true)"
+    # Strip markdown fences (models love wrapping output in ```-blocks) and
+    # leading indentation so fenced findings and a fenced NO_FINDINGS still
+    # parse, then keep only lines matching the contract.
+    local parsed findings
+    parsed="$(sed -e '/^[[:space:]]*```/d' -e 's/^[[:space:]]*//' <<<"$output")"
+    findings="$(grep -E '^\[P[0-3]\] ' <<<"$parsed" || true)"
+
+    # Fail closed on unparseable output (#1148 review round 1, P1-4): success
+    # requires either at least one parsed finding line or the explicit
+    # NO_FINDINGS sentinel. A refusal, an apology, or a format drift must
+    # never read as "clean review".
+    if [[ -z "$findings" ]] && ! grep -qE '^NO_FINDINGS[[:space:]]*$' <<<"$parsed"; then
+        echo "llm-review: $context output matched neither findings nor NO_FINDINGS:" >&2
+        echo "$output" >&2
+        post_status "$context" error "review output unparseable"
+        return 1
+    fi
 
     local blocking=0 total=0
     if [[ -n "$findings" ]]; then
@@ -201,13 +244,29 @@ run_model() {
     fi
 
     if (( blocking > 0 )); then
-        post_status "$context" failure "$blocking blocking (P0/P1) of $total findings"
+        post_status "$context" failure "$blocking blocking (P0/P1) of $total findings$TRUNC_NOTE"
     else
-        post_status "$context" success "$total advisory findings, none blocking"
+        post_status "$context" success "$total advisory findings, none blocking$TRUNC_NOTE"
     fi
 }
 
+# Phase 1: settle every model's status (pending / skipped-error) before any
+# model runs or any comment is posted, so the pair is never half-observed.
 rc=0
-run_model "llm-review-opus" opus || rc=1
-run_model "llm-review-terra" terra || rc=1
+RUN_OPUS=0
+RUN_TERRA=0
+prep_rc=0
+prepare_model "llm-review-opus" opus || prep_rc=$?
+if (( prep_rc == 0 )); then RUN_OPUS=1; elif (( prep_rc == 2 )); then rc=1; fi
+prep_rc=0
+prepare_model "llm-review-terra" terra || prep_rc=$?
+if (( prep_rc == 0 )); then RUN_TERRA=1; elif (( prep_rc == 2 )); then rc=1; fi
+
+# Phase 2: run the reviews and flip each pending status to its final state.
+if (( RUN_OPUS )); then
+    run_model "llm-review-opus" opus || rc=1
+fi
+if (( RUN_TERRA )); then
+    run_model "llm-review-terra" terra || rc=1
+fi
 exit "$rc"

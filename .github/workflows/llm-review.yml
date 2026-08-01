@@ -29,11 +29,14 @@ permissions:
 jobs:
   review:
     # Gated off by default. For issue_comment, only a "/llm-review" comment on
-    # a PR triggers a run.
+    # a PR from a repo member/owner/collaborator triggers a run — anyone else
+    # commenting the magic string must not be able to spend review tokens.
     if: >-
       vars.LLM_REVIEW_ENABLED == 'true' &&
       (github.event_name == 'pull_request' ||
-       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/llm-review')))
+       (github.event.issue.pull_request &&
+        startsWith(github.event.comment.body, '/llm-review') &&
+        contains(fromJSON('["MEMBER", "OWNER", "COLLABORATOR"]'), github.event.comment.author_association)))
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4

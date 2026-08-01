@@ -212,13 +212,138 @@ func TestIsLLMReviewBotLogin(t *testing.T) {
 	}
 }
 
-// The llm-review bot is part of the actionable-feedback reviewer set.
-func TestIsReviewBotLogin_IncludesLLMReviewBot(t *testing.T) {
-	if !isReviewBotLogin("okbot") {
-		t.Fatal("okbot must count as a review bot login")
+// #1148 review round 1, P1-3: the llm-review bot logins must NOT be part of
+// the global reviewer set. The glue posts as the fleet bot ("okbot"), which
+// also comments on PRs for reasons that have nothing to do with reviews;
+// folding it into isReviewBotLogin made every fleet-bot comment with a
+// file:line reference look like review feedback on ALL projects, including
+// greptile-gated rows, and triggered retry/close churn.
+func TestIsReviewBotLogin_ExcludesLLMReviewBot(t *testing.T) {
+	for _, login := range []string{"okbot", "OKBot", "llm-review-bot"} {
+		if isReviewBotLogin(login) {
+			t.Errorf("isReviewBotLogin(%q) = true, want false — llm-review logins are stream-scoped, not global", login)
+		}
 	}
 	if !isReviewBotLogin("greptile-apps[bot]") {
 		t.Fatal("greptile regression: existing bot logins must keep matching")
+	}
+	if !isReviewBotLogin("chatgpt-codex-connector[bot]") {
+		t.Fatal("codex regression: existing bot logins must keep matching")
+	}
+}
+
+// P1-3 regression through the real collector: a fleet-bot-style comment with a
+// file:line position on a greptile row must NOT be collected as review
+// feedback (pre-PR behavior), while a genuine Greptile comment still is.
+func TestCollectReviewFeedback_FleetBotCommentNotCollected(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"deploy note: rollout toggle lives in internal/foo.go:12",
+		   "path":"internal/foo.go","line":12,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}},
+		  {"body":"[P1] leaked handle","path":"a.go","line":3,
+		   "commit_id":"abcdef1234567890","user":{"login":"greptile-apps[bot]"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	feedback, err := c.CollectReviewFeedback(7)
+	if err != nil {
+		t.Fatalf("CollectReviewFeedback: %v", err)
+	}
+	if len(feedback) != 1 {
+		t.Fatalf("feedback = %+v, want exactly the greptile comment — fleet-bot comments must not be review feedback", feedback)
+	}
+	if feedback[0].User != "greptile-apps[bot]" {
+		t.Fatalf("feedback user = %q, want greptile-apps[bot]", feedback[0].User)
+	}
+}
+
+// --- convergence-merge critical check (#565 escape × #1148 streams) ----------
+
+// P1-1 regression: on an llm-review row, the bot's P0 on head must hard-block
+// the convergence merge exactly like a Greptile P0 does.
+func TestPRHasCriticalReviewOnHead_LLMReviewP0Blocks(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P0] nil deref\n\n<sub>llm-review-opus @ abcdef123456</sub>",
+		   "path":"internal/foo.go","line":3,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"llm-review"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if !critical {
+		t.Fatal("an llm-review P0 on head must block the convergence merge")
+	}
+}
+
+// P0/P1 is the llm-review gate's entire blocking contract, so a P1 blocks the
+// convergence escape too (unlike greptile, where only P0 is critical).
+func TestPRHasCriticalReviewOnHead_LLMReviewP1Blocks(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P1] auth bypass on the retry path\n\n<sub>llm-review-terra @ abcdef123456</sub>",
+		   "path":"internal/foo.go","line":3,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"llm-review"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if !critical {
+		t.Fatal("an llm-review P1 on head must block the convergence merge — P0/P1 is that gate's blocking contract")
+	}
+}
+
+// Advisory llm-review findings (P2/P3) must not block the convergence escape.
+func TestPRHasCriticalReviewOnHead_LLMReviewAdvisoryDoesNotBlock(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P2] naming nit\n\n<sub>llm-review-opus @ abcdef123456</sub>",
+		   "path":"internal/foo.go","line":3,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"llm-review"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if critical {
+		t.Fatal("a P2 advisory finding must not block the convergence merge")
+	}
+}
+
+// The stream scoping cuts both ways: on a greptile row a fleet-bot P0-looking
+// comment is not part of the gate and must not block, while a Greptile P0
+// still does (and P1 stays non-critical for greptile).
+func TestPRHasCriticalReviewOnHead_StreamScoping(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P0] scary-looking fleet-bot note",
+		   "path":"internal/foo.go","line":3,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}},
+		  {"body":"<img alt=\"P1\" src=\"x\"> real greptile finding","path":"a.go","line":4,
+		   "commit_id":"abcdef1234567890","user":{"login":"greptile-apps[bot]"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"greptile"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if critical {
+		t.Fatal("greptile row: a fleet-bot comment must not block, and a greptile P1 is not critical")
+	}
+}
+
+func TestPRHasCriticalReviewOnHead_GreptileP0StillBlocks(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"<img alt=\"P0\" src=\"x\"> data loss on restart","path":"a.go","line":4,
+		   "commit_id":"abcdef1234567890","user":{"login":"greptile-apps[bot]"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"greptile"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if !critical {
+		t.Fatal("greptile P0 regression: the legacy critical block must keep working")
 	}
 }
 

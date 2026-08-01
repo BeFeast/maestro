@@ -2741,15 +2741,27 @@ func isGreptileLogin(login string) bool {
 	return strings.Contains(strings.ToLower(strings.TrimSpace(login)), "greptile")
 }
 
+// isReviewBotLogin is the GLOBAL reviewer set for the gate-independent
+// feedback consumers (CollectReviewFeedback and the issue-comment summary
+// path), which run on every project regardless of the configured review
+// streams. The llm-review bot logins deliberately do NOT belong here: the
+// glue posts under the fleet bot account ("okbot"), and folding it into the
+// global set made every fleet-bot comment with a file:line look like review
+// feedback on greptile-gated projects too, triggering retry/close churn.
+// llm-review attribution is scoped to the stream-verdict paths
+// (reviewStreamSpec.UserContains) and to PRBlockingReviewFindingsOnHead /
+// PRHasCriticalReviewOnHead when the llm streams are configured.
 func isReviewBotLogin(login string) bool {
 	lower := strings.ToLower(strings.TrimSpace(login))
-	return strings.Contains(lower, "greptile") || strings.Contains(lower, "codex") || isLLMReviewBotLogin(login)
+	return strings.Contains(lower, "greptile") || strings.Contains(lower, "codex")
 }
 
 // isLLMReviewBotLogin reports whether the login belongs to the bot that posts
 // llm-review findings (#1148). The glue runner posts under the fleet bot
 // account ("okbot" by default); any login containing "llm-review" also counts
-// so a dedicated reviewer account works without a code change.
+// so a dedicated reviewer account works without a code change. Only consulted
+// on paths that know the llm streams are configured — never globally (see
+// isReviewBotLogin).
 func isLLMReviewBotLogin(login string) bool {
 	lower := strings.ToLower(strings.TrimSpace(login))
 	return containsAny(lower, llmReviewBotLogins)
@@ -2831,37 +2843,47 @@ func hasSeverityMarker(body, level string) bool {
 	return false
 }
 
-// hasGreptileCriticalCommentOnHead reports whether any Greptile inline comment
-// on the current head SHA is P0 (critical).
-func hasGreptileCriticalCommentOnHead(comments []greptileReviewComment, sha string) bool {
+// hasCriticalReviewCommentOnHead reports whether any configured review stream
+// left a finding on the current head that the #565 convergence-merge escape
+// must not bypass: a Greptile P0, or — when the llm-review streams are
+// configured — a P0/P1 from the llm-review bot (P0/P1 is that gate's entire
+// blocking contract; the glue never posts anything blocking below P1).
+// Streams pass through normalizeReviewStreams, so an empty list keeps the
+// historical greptile-only behavior.
+func hasCriticalReviewCommentOnHead(comments []greptileReviewComment, sha string, streams []string) bool {
+	greptileEnabled := streamEnabled(streams, "greptile")
+	llmEnabled := streamEnabled(streams, "llm-review-opus") || streamEnabled(streams, "llm-review-terra")
 	for _, comment := range comments {
-		if !isGreptileLogin(comment.User.Login) {
-			continue
-		}
 		if !reviewCommentTargetsHead(comment, sha) {
 			continue
 		}
-		if isCriticalSeverity(comment.Body) {
+		login := comment.User.Login
+		if greptileEnabled && isGreptileLogin(login) && isCriticalSeverity(comment.Body) {
+			return true
+		}
+		if llmEnabled && isLLMReviewBotLogin(login) && isHighSeverity(comment.Body) {
 			return true
 		}
 	}
 	return false
 }
 
-// PRHasCriticalReviewOnHead reports whether the PR has a P0 (critical) Greptile
-// inline comment on its current head SHA. Used by the orchestrator #565
-// convergence-merge escape: a retry-exhausted green PR with only non-critical
-// findings may merge, but a P0 on head hard-blocks.
-func (c *Client) PRHasCriticalReviewOnHead(prNumber int) (bool, error) {
+// PRHasCriticalReviewOnHead reports whether the PR has a merge-blocking
+// critical review comment on its current head SHA for the configured streams.
+// Used by the orchestrator #565 convergence-merge escape: a retry-exhausted
+// green PR with only non-critical findings may merge, but a critical finding
+// on head hard-blocks. For the greptile stream that means a P0; for the
+// llm-review streams it means the bot's P0/P1 blocking findings.
+func (c *Client) PRHasCriticalReviewOnHead(prNumber int, streams []string) (bool, error) {
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
 		return false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
 	comments, err := c.greptileReviewComments(prNumber)
 	if err != nil {
-		return false, fmt.Errorf("greptile review comments for PR %d: %w", prNumber, err)
+		return false, fmt.Errorf("review comments for PR %d: %w", prNumber, err)
 	}
-	return hasGreptileCriticalCommentOnHead(comments, sha), nil
+	return hasCriticalReviewCommentOnHead(comments, sha, streams), nil
 }
 
 // PRHighSeverityReviewOnHead returns the head SHA and the list of P0/P1

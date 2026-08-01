@@ -844,7 +844,10 @@ func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
 		// Fail safe: cannot determine criticality -> caller must NOT auto-merge.
 		return false, fmt.Errorf("no github client configured for critical-review check")
 	}
-	return o.gh.PRHasCriticalReviewOnHead(prNumber)
+	// The check must cover whatever streams actually gate this project: an
+	// llm-review P0/P1 on head blocks the #565 convergence merge exactly like
+	// a Greptile P0 does (#1148 review round 1, P1-1).
+	return o.gh.PRHasCriticalReviewOnHead(prNumber, o.cfg.EffectiveReviewGateStreams())
 }
 
 func (o *Orchestrator) prUnresolvedReviewThreadsOnHead(prNumber int) (string, []github.ReviewThread, error) {
@@ -6320,9 +6323,24 @@ func (o *Orchestrator) trackReviewGateHead(sess *state.Session, head string, ver
 		sess.ReviewPendingSince = nil
 		sess.ReviewRetriggerCount = 0
 		sess.ReviewGateObserved = false
+		sess.ReviewGateStreamObserved = nil
 	}
 	if verdict.Observed {
 		sess.ReviewGateObserved = true
+	}
+	// Per-stream sticky memory (#1148 review round 1, P1-2): a multi-stream
+	// gate can be half-observed — one stream settled, the other never spoke.
+	// The absent-stream escape needs to know WHICH streams were ever seen on
+	// this head, so an observed stream keeps hard-blocking while a silent one
+	// can expire.
+	for _, stream := range verdict.Streams {
+		if !stream.Observed || stream.Name == "" {
+			continue
+		}
+		if sess.ReviewGateStreamObserved == nil {
+			sess.ReviewGateStreamObserved = make(map[string]bool)
+		}
+		sess.ReviewGateStreamObserved[stream.Name] = true
 	}
 	if verdict.Pending && sess.ReviewPendingSince == nil {
 		started := now
@@ -6363,17 +6381,26 @@ func (o *Orchestrator) notifyMissingReviewGate(prNumber int, silentFor time.Dura
 	}
 }
 
-// missingReviewGateElapsed reports whether the review gate has been completely
-// silent — no check run, no comment, nothing — on this head for longer than
-// review_retrigger.missing_after_minutes. A gate that produced ANY signal is
-// never "missing": a reviewer working, or one that reported findings, keeps
-// blocking exactly as before. Opt-in: 0 keeps today's block-forever behavior.
+// missingReviewGateElapsed reports whether every stream still holding the gate
+// at pending has been completely silent — no check run, no status, no comment
+// — on this head for longer than review_retrigger.missing_after_minutes.
+//
+// The evaluation is per-stream (#1148 review round 1, P1-2): a multi-stream
+// gate can be half-observed — one stream posted its status while the other
+// never reported at all. The aggregate used to be Pending+Observed forever in
+// that state, so the escape never fired and no re-trigger existed: the PR was
+// wedged for good. Now a pending stream that was never seen on this head (this
+// read or the sticky per-stream memory) can expire, while a stream that DID
+// produce any signal keeps blocking at any duration, and a settled rejection
+// from any stream disables the escape outright.
+//
+// Opt-in: 0 keeps today's block-forever behavior.
 func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict github.ReviewGateVerdict, now time.Time) (time.Duration, bool) {
 	if o == nil || o.cfg == nil || sess == nil {
 		return 0, false
 	}
 	grace := o.cfg.ReviewRetrigger.MissingReviewGraceOrZero()
-	if grace <= 0 || verdict.Observed || !verdict.Pending {
+	if grace <= 0 || !verdict.Pending {
 		return 0, false
 	}
 	// A degraded read cannot prove silence. Without this, a GitHub check-runs
@@ -6383,14 +6410,38 @@ func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict git
 	if verdict.LookupFailed {
 		return 0, false
 	}
-	// Sticky memory: a reviewer seen on this head keeps blocking even if this
-	// read came back unobserved (e.g. a failed check-runs lookup fell through
-	// to the comment path).
-	if sess.ReviewGateObserved {
-		return 0, false
-	}
 	if sess.ReviewPendingSince == nil {
 		return 0, false
+	}
+	if len(verdict.Streams) == 0 {
+		// Legacy aggregate-only verdict (narrow test hooks): keep the
+		// original whole-gate semantics, including the sticky memory.
+		if verdict.Observed || sess.ReviewGateObserved {
+			return 0, false
+		}
+	} else {
+		// State written by a pre-#1148 binary has the aggregate sticky bit
+		// without per-stream attribution — treat it conservatively as "some
+		// stream was seen" and keep blocking.
+		if len(sess.ReviewGateStreamObserved) == 0 && sess.ReviewGateObserved {
+			return 0, false
+		}
+		for _, stream := range verdict.Streams {
+			// A stream that settled as failed is a live rejection, not an
+			// absent reviewer; the escape must never merge past it.
+			if !stream.Pending && !stream.Passed {
+				return 0, false
+			}
+			if !stream.Pending {
+				continue
+			}
+			// Sticky per-stream memory: a reviewer seen on this head keeps
+			// blocking even if this read came back unobserved (e.g. a failed
+			// check-runs lookup fell through to the comment path).
+			if stream.Observed || sess.ReviewGateStreamObserved[stream.Name] {
+				return 0, false
+			}
+		}
 	}
 	silentFor := now.Sub(*sess.ReviewPendingSince)
 	if silentFor < grace {
