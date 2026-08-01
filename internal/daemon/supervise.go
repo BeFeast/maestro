@@ -100,6 +100,12 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		// the stop must not keep re-creating them under the daemon cgroup.
 		if emergencyLLMHalt != nil && emergencyLLMHalt() {
 			log.Printf("[%s] supervise: EMERGENCY STOP — skipping cycle (no GitHub/outcome/LLM)", name)
+			// Keep the #499 liveness heartbeat fresh: the skip is deliberate, not
+			// a wedged cycle, and without a stamp the watchdog would mark every
+			// flow SupervisorStuck for the whole duration of the stop.
+			if err := supervisor.StampHeartbeat(getCfg().StateDir); err != nil {
+				log.Printf("[%s] supervise: emergency heartbeat stamp failed: %v", name, err)
+			}
 			return nil
 		}
 		opts := []supervisor.RunOption{supervisor.WithApprovalsDBPath(approvalsDBPath)}

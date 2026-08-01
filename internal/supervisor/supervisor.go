@@ -494,6 +494,16 @@ func supervisorDecisionQuiescent(decision state.SupervisorDecision) bool {
 		analysis.ExcludedIssues == analysis.OpenIssues
 }
 
+// StampHeartbeat refreshes state.LastRunOnceAt (and clears any SupervisorStuck
+// flag) without running a cycle. The daemon calls it while the EMERGENCY STOP
+// cycle-skip is active (#1150): the skip intentionally runs no supervise work,
+// but the #499 watchdog keys liveness off LastRunOnceAt, and without a stamp it
+// would flag every flow as stuck (and churn state.json with stuck markers) for
+// the whole duration of the stop.
+func StampHeartbeat(stateDir string) error {
+	return persistSupervisorHeartbeat(stateDir, time.Now().UTC())
+}
+
 func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
 	if at.IsZero() {
 		at = time.Now().UTC()

@@ -143,11 +143,12 @@ func (d *Daemon) announceEmergencyTransition(prev, cur emergencystore.State) {
 		// CRITICAL: engaging the switch must halt live LLM spend immediately.
 		// Historically the gate only refused new spawns and left in-flight
 		// workers (and their codex/claude/opencode children) running until the
-		// operator passed --kill-workers. Kill on every inactive→active edge
-		// (and on startup seed) so dashboard/CLI/API all get the same behavior.
-		if !prev.Active() {
-			d.killInFlightWorkersForEmergency("engage")
-		}
+		// operator passed --kill-workers. Kill on every transition into an
+		// active level — including an escalation (llm_stopped → all_stopped) —
+		// so a worker that raced the first sweep (e.g. was still pre-Running
+		// when the state sweep ran) is re-swept, and dashboard/CLI/API all get
+		// the same behavior. The sweep is idempotent and cheap when idle.
+		d.killInFlightWorkersForEmergency("engage")
 		return
 	}
 	// cur is LevelNone (a resume).
