@@ -169,7 +169,7 @@ func TestAutoMergePRs_HeadChangeAfterFailedRollupDoesNotScheduleStaleRetry(t *te
 		t.Fatal("stale failed head must not be consumed into a repair prompt")
 		return "", nil
 	}
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) {
 		t.Fatal("stale failed head must not read review feedback for a repair")
 		return "", nil
 	}
@@ -217,7 +217,7 @@ func TestAutoMergePRs_HeadChangeWhileCollectingFailureContextDoesNotScheduleStal
 		return newHead, nil
 	}
 	o.ghPRChecksOutputFn = func(int) (string, error) { return "old head failed", nil }
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) { return "old head review", nil }
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) { return "old head review", nil }
 	o.ghPRFailingChecksFn = func(int) ([]github.FailingCheck, error) {
 		return []github.FailingCheck{{Name: "old-check", Conclusion: "failure", Excerpt: "old head"}}, nil
 	}

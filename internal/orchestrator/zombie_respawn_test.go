@@ -134,7 +134,7 @@ func TestRespawnDueRetries_PROpenDuringCIRetryThenMerged_NoRespawn(t *testing.T)
 	respawned := false
 	o := zombieRetryOrchestrator(t, &respawned)
 	o.ghPRChecksOutputFn = func(prNumber int) (string, error) { return "build failed", nil }
-	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) { return "", nil }
+	o.ghCollectPRReviewFeedbackFn = func(prNumber int, _ []string) (string, error) { return "", nil }
 	o.ghClosePRFn = func(prNumber int, comment string) error { return nil }
 	o.workerStopFn = func(cfg *config.Config, slotName string, sess *state.Session) error { return nil }
 

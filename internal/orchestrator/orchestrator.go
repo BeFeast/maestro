@@ -200,7 +200,7 @@ type Orchestrator struct {
 	ghClosePRFn                  func(prNumber int, comment string) error
 	ghPRChecksOutputFn           func(prNumber int) (string, error)
 	ghPRFailingChecksFn          func(prNumber int) ([]github.FailingCheck, error)
-	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
+	ghCollectPRReviewFeedbackFn  func(prNumber int, streams []string) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
 	ghPRDetailsFn                func(prNumber int) (github.PR, error)
@@ -954,10 +954,16 @@ func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
 }
 
 func (o *Orchestrator) collectPRReviewFeedback(prNumber int) (string, error) {
+	// The configured review streams scope which bot logins count as review
+	// feedback: on llm-review rows the bot's inline findings must reach the
+	// retry pipeline (otherwise AutoRetryReviewFeedback never fires and the
+	// PR hangs), while on greptile-only rows fleet-bot comments stay
+	// invisible (#1148 round 2, P1).
+	streams := o.cfg.EffectiveReviewGateStreams()
 	if o.ghCollectPRReviewFeedbackFn != nil {
-		return o.ghCollectPRReviewFeedbackFn(prNumber)
+		return o.ghCollectPRReviewFeedbackFn(prNumber, streams)
 	}
-	return o.gh.CollectPRReviewFeedback(prNumber)
+	return o.gh.CollectPRReviewFeedback(prNumber, streams)
 }
 
 func (o *Orchestrator) prFailingChecks(prNumber int) ([]github.FailingCheck, error) {

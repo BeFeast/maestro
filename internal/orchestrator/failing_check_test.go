@@ -304,7 +304,7 @@ func TestHandleCIFailureRetry_CapturesFailingCheck(t *testing.T) {
 			cfg:                         &config.Config{Repo: "owner/repo", MaxRetriesPerIssue: 3, MaxRetryBackoffMs: 300000},
 			notifier:                    &notify.Notifier{},
 			ghPRChecksOutputFn:          func(int) (string, error) { return "agent-lint\tfailure\nbuild\tsuccess\n", nil },
-			ghCollectPRReviewFeedbackFn: func(int) (string, error) { return "", nil },
+			ghCollectPRReviewFeedbackFn: func(int, []string) (string, error) { return "", nil },
 			ghPRFailingChecksFn:         func(int) ([]github.FailingCheck, error) { return failing, nil },
 			ghClosePRFn:                 func(int, string) error { return nil },
 			workerStopFn:                func(*config.Config, string, *state.Session) error { return nil },

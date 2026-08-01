@@ -244,7 +244,7 @@ func TestCollectReviewFeedback_FleetBotCommentNotCollected(t *testing.T) {
 		  {"body":"[P1] leaked handle","path":"a.go","line":3,
 		   "commit_id":"abcdef1234567890","user":{"login":"greptile-apps[bot]"}}]`)
 	c := &Client{Repo: "owner/repo"}
-	feedback, err := c.CollectReviewFeedback(7)
+	feedback, err := c.CollectReviewFeedback(7, []string{"greptile"})
 	if err != nil {
 		t.Fatalf("CollectReviewFeedback: %v", err)
 	}
@@ -253,6 +253,51 @@ func TestCollectReviewFeedback_FleetBotCommentNotCollected(t *testing.T) {
 	}
 	if feedback[0].User != "greptile-apps[bot]" {
 		t.Fatalf("feedback user = %q, want greptile-apps[bot]", feedback[0].User)
+	}
+}
+
+// #1148 round 2, P1 — the complement of the fleet-bot regression above: on a
+// row whose configured streams include llm-review, the bot's [P0] inline
+// finding MUST be collected as review feedback. Round 1 removed okbot from
+// the global reviewer set without adding the stream-scoped path, which left
+// feedback permanently empty on llm-review rows: AutoRetryReviewFeedback
+// never fired, sessions never reached retry_exhausted, and convergence
+// (#565), review-repair, and the exhaustion notification were unreachable.
+func TestCollectReviewFeedback_LLMReviewRowCollectsBotFinding(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P0] nil deref on empty verdict\n\n<sub>llm-review-opus @ abcdef123456</sub>",
+		   "path":"internal/foo.go","line":12,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	feedback, err := c.CollectReviewFeedback(7, []string{"llm-review"})
+	if err != nil {
+		t.Fatalf("CollectReviewFeedback: %v", err)
+	}
+	if len(feedback) != 1 {
+		t.Fatalf("feedback = %+v, want the bot's P0 finding — the llm-review repair circuit depends on it", feedback)
+	}
+	if feedback[0].User != "okbot" || !strings.Contains(feedback[0].Body, "[P0]") {
+		t.Fatalf("feedback = %+v, want the okbot [P0] comment", feedback[0])
+	}
+}
+
+// Same circuit one level up: CollectPRReviewFeedback on an llm-review row
+// returns a non-empty prompt-ready string for a bot [P0] inline finding, so
+// the orchestrator's AutoRetryReviewFeedback path has something to act on.
+func TestCollectPRReviewFeedback_LLMReviewRowFeedbackNonEmpty(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"[P0] nil deref on empty verdict\n\n<sub>llm-review-opus @ abcdef123456</sub>",
+		   "path":"internal/foo.go","line":12,"commit_id":"abcdef1234567890",
+		   "user":{"login":"okbot"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	feedback, err := c.CollectPRReviewFeedback(7, []string{"llm-review"})
+	if err != nil {
+		t.Fatalf("CollectPRReviewFeedback: %v", err)
+	}
+	if !strings.Contains(feedback, "[P0]") || !strings.Contains(feedback, "internal/foo.go") {
+		t.Fatalf("feedback = %q, want the formatted P0 finding with its path", feedback)
 	}
 }
 
@@ -332,6 +377,26 @@ func TestPRHasCriticalReviewOnHead_StreamScoping(t *testing.T) {
 	}
 }
 
+// #1148 round 2, P2: a Greptile P0 on head blocks the convergence merge even
+// when greptile is NOT among the configured streams. The Greptile app keeps
+// reviewing repos it is installed on after a project row migrates to another
+// gate; the stream migration must not silently downgrade its P0 from
+// hard-block to advisory.
+func TestPRHasCriticalReviewOnHead_GreptileP0BlocksOutsideConfiguredStreams(t *testing.T) {
+	sha := "abcdef1234567890"
+	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
+		`[{"body":"<img alt=\"P0\" src=\"x\"> data loss on restart","path":"a.go","line":4,
+		   "commit_id":"abcdef1234567890","user":{"login":"greptile-apps[bot]"}}]`)
+	c := &Client{Repo: "owner/repo"}
+	critical, err := c.PRHasCriticalReviewOnHead(7, []string{"simplicity"})
+	if err != nil {
+		t.Fatalf("PRHasCriticalReviewOnHead: %v", err)
+	}
+	if !critical {
+		t.Fatal("a greptile P0 must block unconditionally — migration off the greptile stream must not downgrade it")
+	}
+}
+
 func TestPRHasCriticalReviewOnHead_GreptileP0StillBlocks(t *testing.T) {
 	sha := "abcdef1234567890"
 	stubLLMReviewAPI(t, sha, `{"state":"success","statuses":[]}`,
@@ -361,6 +426,8 @@ func stubLLMReviewAPI(t *testing.T, sha string, statuses string, comments string
 		switch {
 		case strings.Contains(joined, "/pulls/7/comments"):
 			return []byte(comments), nil
+		case strings.Contains(joined, "/issues/7/comments"):
+			return []byte(`[]`), nil
 		case strings.Contains(joined, "/check-runs"):
 			return []byte(`{"check_runs":[]}`), nil
 		case strings.Contains(joined, "/commits/"+sha+"/status"):

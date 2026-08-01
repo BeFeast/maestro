@@ -14,9 +14,12 @@
 # surfaces: the status is the stream verdict, the P0/P1 comments are the
 # blocking findings (internal/github/github.go llmReviewStreamSpec).
 #
-# Idempotent per head SHA: a model whose status already exists for the current
-# head is skipped, so re-runs (cron, workflow retries, /llm-review comments)
-# do not duplicate reviews or comments.
+# Idempotent per head SHA: a model whose status already settled
+# (success/failure) on the current head is skipped, so re-runs (cron,
+# workflow retries, /llm-review comments) do not duplicate reviews or
+# comments. A fresh pending status also skips (another run is mid-flight);
+# a pending older than REVIEW_PENDING_STALE_MINUTES (default 30) is treated
+# as a crashed run and retried.
 #
 # Requirements: gh (authenticated), git, jq, claude CLI. For the terra pass:
 # LLM_REVIEW_TERRA_BASE_URL + LLM_REVIEW_TERRA_AUTH_TOKEN (the CLIProxy
@@ -73,25 +76,63 @@ fi
 
 # --- helpers ----------------------------------------------------------------
 
-# status_settled <context> — true when a commit status with this context has
-# already SETTLED (success/failure) on the head SHA: that is the idempotency
-# key. error statuses (run failed, creds missing, unparseable output) and
-# stale pending statuses (a previous run died mid-flight) are retryable — a
-# re-run replaces them instead of treating them as done.
+# status_settled <context> — true when this context needs no run on the head
+# SHA: a SETTLED state (success/failure — the idempotency key), or a FRESH
+# pending (younger than REVIEW_PENDING_STALE_MINUTES: another run is
+# presumably mid-flight, e.g. a manual run racing CI). Retryable instead:
+# error statuses (run failed, creds missing, unparseable output), pendings
+# older than the threshold (the posting run died after phase 1 — the
+# crashed-pending self-heal, #1148 round 2), and pendings whose created_at
+# cannot be parsed (assume crashed rather than wedge). The combined-status
+# endpoint returns one entry per context (the latest), so no dedup is needed.
 status_settled() {
     local context="$1"
-    gh api "repos/$REPO/commits/$HEAD_SHA/status" --jq \
-        "[.statuses[] | select(.context == \"$context\") | .state] | map(select(. == \"success\" or . == \"failure\")) | length > 0" \
-        2>/dev/null | grep -qx true
+    local stale_minutes="${REVIEW_PENDING_STALE_MINUTES:-30}"
+    local line state created_at
+    line="$(gh api "repos/$REPO/commits/$HEAD_SHA/status" --jq \
+        "[.statuses[] | select(.context == \"$context\")][0] // empty | [.state, (.created_at // \"\")] | @tsv" \
+        2>/dev/null)" || line=""
+    [[ -z "$line" ]] && return 1
+    state="${line%%$'\t'*}"
+    created_at="${line#*$'\t'}"
+    case "$state" in
+        success|failure)
+            return 0
+            ;;
+        pending)
+            local created_epoch now_epoch
+            created_epoch="$(date -u -d "$created_at" +%s 2>/dev/null)" || created_epoch=""
+            if [[ -z "$created_epoch" ]]; then
+                echo "llm-review: $context pending with unparseable created_at (${created_at:-<empty>}) — treating as crashed, retrying" >&2
+                return 1
+            fi
+            now_epoch="$(date -u +%s)"
+            if (( now_epoch - created_epoch < stale_minutes * 60 )); then
+                echo "llm-review: $context pending since $created_at (< ${stale_minutes}m) — another run appears to be in flight"
+                return 0
+            fi
+            echo "llm-review: $context pending since $created_at (> ${stale_minutes}m) — treating as crashed, retrying" >&2
+            return 1
+            ;;
+        *)
+            return 1
+            ;;
+    esac
 }
 
 # post_status <context> <state> <description>
+# Returns non-zero when the status API call fails, so callers can distinguish
+# "posted" from "gh error" — a swallowed failure here is what used to let a
+# transient gh error read as a green no-op run.
 post_status() {
     local context="$1" state="$2" description="$3"
-    gh api "repos/$REPO/statuses/$HEAD_SHA" \
+    if ! gh api "repos/$REPO/statuses/$HEAD_SHA" \
         -f state="$state" \
         -f context="$context" \
-        -f description="$description" >/dev/null
+        -f description="$description" >/dev/null; then
+        echo "llm-review: FAILED to post status $context=$state on $HEAD_SHA" >&2
+        return 1
+    fi
     echo "llm-review: status $context=$state on $HEAD_SHA"
 }
 
@@ -144,12 +185,16 @@ DIFF:
 # read that stream as absent), and advisory comments posted mid-run cannot
 # race a still-missing verdict.
 # Return: 0 = run it, 1 = settled already (skip), 2 = skipped for missing
-# creds (error status posted — the pair must not wedge on a silent stream).
+# creds (error status posted — the pair must not wedge on a silent stream),
+# 3 = could not post the pending status (transient gh error) — the caller
+# must abort the run with a non-zero exit instead of pretending phase 1
+# happened; a green no-op run over a failed pending post would hide the
+# protocol violation.
 prepare_model() {
     local stream="$1" mode="$2"
 
     if status_settled "$stream"; then
-        echo "llm-review: $stream already settled on $HEAD_SHA — skipping (idempotent)"
+        echo "llm-review: $stream needs no run on $HEAD_SHA — skipping (idempotent)"
         return 1
     fi
 
@@ -158,11 +203,13 @@ prepare_model() {
         # An explicit error status instead of silence: with one stream settled
         # and the other absent, Maestro's aggregate used to sit at
         # Pending+Observed forever with no escape (#1148 review round 1, P1-2).
-        post_status "$stream" error "skipped: credentials not configured"
+        post_status "$stream" error "skipped: credentials not configured" || true
         return 2
     fi
 
-    post_status "$stream" pending "review in progress"
+    if ! post_status "$stream" pending "review in progress"; then
+        return 3
+    fi
     return 0
 }
 
@@ -257,10 +304,18 @@ RUN_OPUS=0
 RUN_TERRA=0
 prep_rc=0
 prepare_model "llm-review-opus" opus || prep_rc=$?
-if (( prep_rc == 0 )); then RUN_OPUS=1; elif (( prep_rc == 2 )); then rc=1; fi
+case "$prep_rc" in
+    0) RUN_OPUS=1 ;;
+    1) ;;       # settled / in flight — legitimate skip
+    *) rc=1 ;;  # 2 = creds skip (error status posted), 3 = pending post failed
+esac
 prep_rc=0
 prepare_model "llm-review-terra" terra || prep_rc=$?
-if (( prep_rc == 0 )); then RUN_TERRA=1; elif (( prep_rc == 2 )); then rc=1; fi
+case "$prep_rc" in
+    0) RUN_TERRA=1 ;;
+    1) ;;
+    *) rc=1 ;;
+esac
 
 # Phase 2: run the reviews and flip each pending status to its final state.
 if (( RUN_OPUS )); then

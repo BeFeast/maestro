@@ -21,6 +21,14 @@ on:
   issue_comment:
     types: [created]
 
+# One run per PR at a time: a superseded run (new push, duplicate trigger) is
+# cancelled instead of racing the fresh one. Together with the stale-pending
+# retry in scripts/llm-review.sh this self-heals a run that died after
+# posting its pending statuses (#1148 round 2).
+concurrency:
+  group: llm-review-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
 permissions:
   contents: read
   pull-requests: write

@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func llmReviewScriptPath(t *testing.T) string {
@@ -54,6 +55,10 @@ elif [[ "$cmd" == "api" ]]; then
                 prev="$a"
             done
             jq -r "$expr" < "$STUB_DIR/combined-status.json"
+            ;;
+        */statuses/*)
+            if [[ -n "${STUB_FAIL_STATUS_POST:-}" ]]; then exit 1; fi
+            exit 0
             ;;
         *)
             exit 0
@@ -233,6 +238,75 @@ func TestLLMReviewScript_ErrorStatusIsNotSettled(t *testing.T) {
 	}
 }
 
+// Crashed-pending self-heal (#1148 round 2): a pending status older than
+// REVIEW_PENDING_STALE_MINUTES means the run that posted it died mid-flight
+// — a re-run must treat it as retryable and replace it.
+func TestLLMReviewScript_StalePendingIsRetried(t *testing.T) {
+	stale := time.Now().UTC().Add(-2 * time.Hour).Format(time.RFC3339)
+	preexisting := fmt.Sprintf(`{"state":"pending","statuses":[
+		{"context":"llm-review-opus","state":"success","created_at":%q},
+		{"context":"llm-review-terra","state":"pending","created_at":%q}]}`, stale, stale)
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", preexisting, true)
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "state=success", "context=llm-review-terra")) == 0 {
+		t.Fatalf("terra was not re-run over its stale pending status\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+	if len(callsMatching(res.calls, "state=pending", "context=llm-review-opus")) != 0 {
+		t.Fatalf("settled opus must not be re-run\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// The other side of the self-heal boundary: a FRESH pending (younger than the
+// stale threshold) means another run is mid-flight — skip instead of racing
+// it with duplicate reviews and comments.
+func TestLLMReviewScript_FreshPendingSkips(t *testing.T) {
+	fresh := time.Now().UTC().Add(-1 * time.Minute).Format(time.RFC3339)
+	preexisting := fmt.Sprintf(`{"state":"pending","statuses":[
+		{"context":"llm-review-opus","state":"success","created_at":%q},
+		{"context":"llm-review-terra","state":"pending","created_at":%q}]}`, fresh, fresh)
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", preexisting, true)
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 (a legitimate skip is not a failure)\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "claude ")) != 0 {
+		t.Fatalf("a fresh pending must not trigger a duplicate model run\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// The threshold is env-overridable: with REVIEW_PENDING_STALE_MINUTES=1 even
+// a few-minutes-old pending is already stale and retried.
+func TestLLMReviewScript_PendingStaleMinutesOverride(t *testing.T) {
+	recent := time.Now().UTC().Add(-5 * time.Minute).Format(time.RFC3339)
+	preexisting := fmt.Sprintf(`{"state":"pending","statuses":[
+		{"context":"llm-review-opus","state":"success","created_at":%q},
+		{"context":"llm-review-terra","state":"pending","created_at":%q}]}`, recent, recent)
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", preexisting, true,
+		"REVIEW_PENDING_STALE_MINUTES=1")
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "state=success", "context=llm-review-terra")) == 0 {
+		t.Fatalf("terra was not re-run with the lowered stale threshold\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// prepare_model conflation fix (#1148 round 2): a transient gh failure while
+// posting the pending status must abort the run with a non-zero exit — it is
+// NOT the settled-skip case, and a green no-op run here would hide a review
+// that never happened.
+func TestLLMReviewScript_PendingPostFailureAbortsNonZero(t *testing.T) {
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", emptyStatus, true,
+		"STUB_FAIL_STATUS_POST=1")
+	if res.exitCode == 0 {
+		t.Fatalf("exit = 0, want non-zero when the pending status cannot be posted\n%s", res.output)
+	}
+	if len(callsMatching(res.calls, "claude ")) != 0 {
+		t.Fatalf("no model may run when phase 1 (pending-first) failed\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
 // A genuinely settled status (success or failure) still short-circuits.
 func TestLLMReviewScript_SettledStatusSkips(t *testing.T) {
 	preexisting := `{"state":"failure","statuses":[
@@ -316,5 +390,29 @@ func TestLLMReviewWorkflowCommentTriggerGatedOnAuthor(t *testing.T) {
 		if !strings.Contains(wf, fmt.Sprintf("%q", role)) {
 			t.Errorf("workflow author gate is missing the %s role", role)
 		}
+	}
+}
+
+// Crashed-pending self-heal, workflow side (#1148 round 2): one run per PR at
+// a time, superseded runs cancelled — a duplicate trigger must not race a
+// live run into posting conflicting statuses.
+func TestLLMReviewWorkflowHasPerPRConcurrencyGroup(t *testing.T) {
+	p, err := filepath.Abs(filepath.Join("..", "..", ".github", "workflows", "llm-review.yml"))
+	if err != nil {
+		t.Fatalf("resolve workflow path: %v", err)
+	}
+	data, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatalf("read workflow: %v", err)
+	}
+	wf := string(data)
+	if !strings.Contains(wf, "concurrency:") {
+		t.Fatal("workflow has no concurrency block")
+	}
+	if !strings.Contains(wf, "llm-review-${{ github.event.pull_request.number || github.event.issue.number }}") {
+		t.Fatal("concurrency group is not keyed per PR (pull_request.number || issue.number)")
+	}
+	if !strings.Contains(wf, "cancel-in-progress: true") {
+		t.Fatal("superseded runs must be cancelled (cancel-in-progress: true)")
 	}
 }

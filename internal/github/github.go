@@ -2749,8 +2749,9 @@ func isGreptileLogin(login string) bool {
 // global set made every fleet-bot comment with a file:line look like review
 // feedback on greptile-gated projects too, triggering retry/close churn.
 // llm-review attribution is scoped to the stream-verdict paths
-// (reviewStreamSpec.UserContains) and to PRBlockingReviewFindingsOnHead /
-// PRHasCriticalReviewOnHead when the llm streams are configured.
+// (reviewStreamSpec.UserContains) and — when the llm streams are configured —
+// to PRBlockingReviewFindingsOnHead, PRHasCriticalReviewOnHead, and the
+// feedback collectors (via isCollectableReviewFeedbackLogin).
 func isReviewBotLogin(login string) bool {
 	lower := strings.ToLower(strings.TrimSpace(login))
 	return strings.Contains(lower, "greptile") || strings.Contains(lower, "codex")
@@ -2770,6 +2771,31 @@ func isLLMReviewBotLogin(login string) bool {
 // llmReviewBotLogins are the login substrings attributed to the llm-review
 // glue runner (#1148).
 var llmReviewBotLogins = []string{"okbot", "llm-review"}
+
+// llmReviewStreamsConfigured reports whether at least one llm-review model
+// stream is part of the configured review streams (the "llm-review" pair
+// alias normalizes to both model streams).
+func llmReviewStreamsConfigured(streams []string) bool {
+	return streamEnabled(streams, "llm-review-opus") || streamEnabled(streams, "llm-review-terra")
+}
+
+// isCollectableReviewFeedbackLogin decides whose comments the feedback
+// collectors (CollectReviewFeedback / CollectPRReviewFeedback) treat as
+// review feedback. The global reviewer set (greptile/codex) is collected on
+// every project; the llm-review bot ("okbot") is collected ONLY when the
+// project's configured streams include an llm-review stream. Without the
+// stream scoping one of two failure modes wins: folding okbot into the
+// global set turns every fleet-bot comment with a file:line into review
+// feedback on greptile rows (#1148 round 1, P1-3 churn), while dropping it
+// entirely severs the repair circuit on llm-review rows — feedback comes
+// back empty, AutoRetryReviewFeedback never fires, sessions never reach
+// retry_exhausted, and the PR hangs forever (#1148 round 2, P1).
+func isCollectableReviewFeedbackLogin(login string, streams []string) bool {
+	if isReviewBotLogin(login) {
+		return true
+	}
+	return llmReviewStreamsConfigured(streams) && isLLMReviewBotLogin(login)
+}
 
 func hasGreptileInlineCommentOnHead(comments []greptileReviewComment, sha string) bool {
 	for _, comment := range comments {
@@ -2843,22 +2869,24 @@ func hasSeverityMarker(body, level string) bool {
 	return false
 }
 
-// hasCriticalReviewCommentOnHead reports whether any configured review stream
-// left a finding on the current head that the #565 convergence-merge escape
-// must not bypass: a Greptile P0, or — when the llm-review streams are
-// configured — a P0/P1 from the llm-review bot (P0/P1 is that gate's entire
-// blocking contract; the glue never posts anything blocking below P1).
-// Streams pass through normalizeReviewStreams, so an empty list keeps the
-// historical greptile-only behavior.
+// hasCriticalReviewCommentOnHead reports whether a review finding on the
+// current head must not be bypassed by the #565 convergence-merge escape.
+// A Greptile P0 blocks UNCONDITIONALLY — regardless of the configured
+// streams — preserving the pre-#1148 behavior: the Greptile app keeps
+// reviewing a repo it is installed on even after the project row migrates to
+// another gate, and a config migration must not silently downgrade a P0 from
+// hard-block to advisory (#1148 round 2, P2). On top of that, when the
+// llm-review streams are configured, a P0/P1 from the llm-review bot blocks
+// too (P0/P1 is that gate's entire blocking contract; the glue never posts
+// anything blocking below P1).
 func hasCriticalReviewCommentOnHead(comments []greptileReviewComment, sha string, streams []string) bool {
-	greptileEnabled := streamEnabled(streams, "greptile")
-	llmEnabled := streamEnabled(streams, "llm-review-opus") || streamEnabled(streams, "llm-review-terra")
+	llmEnabled := llmReviewStreamsConfigured(streams)
 	for _, comment := range comments {
 		if !reviewCommentTargetsHead(comment, sha) {
 			continue
 		}
 		login := comment.User.Login
-		if greptileEnabled && isGreptileLogin(login) && isCriticalSeverity(comment.Body) {
+		if isGreptileLogin(login) && isCriticalSeverity(comment.Body) {
 			return true
 		}
 		if llmEnabled && isLLMReviewBotLogin(login) && isHighSeverity(comment.Body) {
@@ -2869,11 +2897,12 @@ func hasCriticalReviewCommentOnHead(comments []greptileReviewComment, sha string
 }
 
 // PRHasCriticalReviewOnHead reports whether the PR has a merge-blocking
-// critical review comment on its current head SHA for the configured streams.
-// Used by the orchestrator #565 convergence-merge escape: a retry-exhausted
-// green PR with only non-critical findings may merge, but a critical finding
-// on head hard-blocks. For the greptile stream that means a P0; for the
-// llm-review streams it means the bot's P0/P1 blocking findings.
+// critical review comment on its current head SHA. Used by the orchestrator
+// #565 convergence-merge escape: a retry-exhausted green PR with only
+// non-critical findings may merge, but a critical finding on head
+// hard-blocks. A Greptile P0 blocks regardless of the configured streams;
+// the llm-review bot's P0/P1 blocking findings count only when those
+// streams are configured (see hasCriticalReviewCommentOnHead).
 func (c *Client) PRHasCriticalReviewOnHead(prNumber int, streams []string) (bool, error) {
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
@@ -3842,8 +3871,12 @@ func (v ReviewGateVerdict) Summary() string {
 
 var reviewLocationPattern = regexp.MustCompile(`(?mi)(^|\s)([A-Za-z0-9_./-]+\.[A-Za-z0-9]+:\d+|file:\s*\S+)`)
 
-// CollectReviewFeedback collects actionable inline review comments from Greptile and Codex on a PR.
-func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
+// CollectReviewFeedback collects actionable inline review comments on a PR
+// from the global reviewer set (Greptile/Codex) and — when the project's
+// configured review streams include an llm-review stream — from the
+// llm-review bot (see isCollectableReviewFeedbackLogin for why the bot is
+// stream-scoped).
+func (c *Client) CollectReviewFeedback(prNumber int, streams []string) ([]ReviewComment, error) {
 	// Get HEAD SHA — only return comments on the latest commit. Errors are
 	// tolerated (empty SHA matches all comments, as before); the shared
 	// wrapper (#797) gives the read backoff + conditional caching.
@@ -3856,7 +3889,7 @@ func (c *Client) CollectReviewFeedback(prNumber int) ([]ReviewComment, error) {
 	var result []ReviewComment
 	for _, cm := range comments {
 		login := cm.User.Login
-		if !isReviewBotLogin(login) {
+		if !isCollectableReviewFeedbackLogin(login, streams) {
 			continue
 		}
 		// Skip comments that were originally left on older commits — they may already be fixed.
@@ -3950,8 +3983,7 @@ func (c *Client) PRBlockingReviewFindingsOnHead(prNumber int, streams []string) 
 		}
 		// llm-review (#1148): only P0/P1 block, whichever of the two model
 		// streams posted the finding — the repair scope is the union.
-		if (streamEnabled(streams, "llm-review-opus") || streamEnabled(streams, "llm-review-terra")) &&
-			isLLMReviewBotLogin(login) && isHighSeverity(body) {
+		if llmReviewStreamsConfigured(streams) && isLLMReviewBotLogin(login) && isHighSeverity(body) {
 			findings = append(findings, ReviewComment{Path: cm.Path, Line: cm.Line, Body: body, User: login})
 		}
 	}
@@ -4372,11 +4404,13 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 	return s, nil
 }
 
-// CollectPRReviewFeedback collects actionable Greptile/Codex review feedback
-// from a PR, including inline review comments and issue-level summary comments.
-// Returns a formatted string ready to inject into a worker prompt, or empty
-// string if no actionable review feedback exists.
-func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
+// CollectPRReviewFeedback collects actionable review feedback from a PR —
+// inline review comments and issue-level summary comments — for the global
+// reviewer set plus, when the configured streams include an llm-review
+// stream, the llm-review bot. Returns a formatted string ready to inject
+// into a worker prompt, or empty string if no actionable review feedback
+// exists.
+func (c *Client) CollectPRReviewFeedback(prNumber int, streams []string) (string, error) {
 	var sections []string
 
 	// 1. Fetch issue-level comments (Greptile summary with confidence score),
@@ -4391,7 +4425,7 @@ func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
 		}
 		if json.Unmarshal(issueCommentsOut, &comments) == nil {
 			for _, cm := range comments {
-				if isReviewBotLogin(cm.User.Login) && isActionableReviewSummary(cm.Body) {
+				if isCollectableReviewFeedbackLogin(cm.User.Login, streams) && isActionableReviewSummary(cm.Body) {
 					sections = append(sections, cm.Body)
 				}
 			}
@@ -4399,7 +4433,7 @@ func (c *Client) CollectPRReviewFeedback(prNumber int) (string, error) {
 	}
 
 	// 2. Fetch inline review comments
-	inlineComments, err := c.CollectReviewFeedback(prNumber)
+	inlineComments, err := c.CollectReviewFeedback(prNumber, streams)
 	if err == nil && len(inlineComments) > 0 {
 		sections = append(sections, FormatReviewFeedback(inlineComments))
 	}

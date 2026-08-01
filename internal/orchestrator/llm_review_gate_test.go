@@ -1,11 +1,14 @@
 package orchestrator
 
 import (
+	"slices"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
+	"github.com/befeast/maestro/internal/state"
 )
 
 // llmReviewTestConfig is a project on the #1148 llm-review gate (opus + terra
@@ -330,6 +333,65 @@ func TestAutoMergePRs_HalfObservedPairWaitsInsideGrace(t *testing.T) {
 
 	if len(*merged) != 0 {
 		t.Fatalf("merged = %v, want none inside the grace window", *merged)
+	}
+}
+
+// #1148 round 2, P1 — the repair circuit end to end at the orchestrator: on
+// an llm-review row a bot [P0] inline finding must reach the retry pipeline.
+// collectPRReviewFeedback threads the configured streams into the collector,
+// the feedback comes back non-empty, and handleReviewFeedbackRetry schedules
+// the bounded review repair. Round 1 left this circuit dead: with okbot out
+// of the global reviewer set and no stream-scoped path, feedback was always
+// empty on llm-review rows, so retries, retry_exhausted, convergence (#565)
+// and the exhaustion notification were all unreachable.
+func TestAutoMergePRs_LLMReviewBotFindingEntersRetryPipeline(t *testing.T) {
+	prs := []github.PR{{Number: 10, HeadRefName: "feat/a", Mergeable: "MERGEABLE"}}
+	cfg := llmReviewTestConfig()
+	cfg.MergeStrategy = "parallel"
+	cfg.AutoRetryReviewFeedback = true
+	cfg.MaxRetriesPerIssue = 3
+	cfg.MaxRetryBackoffMs = 300000
+	o, merged := newMergeTestOrchestrator(cfg, prs)
+	head := strings.Repeat("a", 40)
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Fingerprint: strings.Repeat("1", 16), Complete: true}, nil
+	}
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{
+			Passed:   false,
+			Observed: true,
+			Streams: []github.ReviewStreamVerdict{
+				{Name: "llm-review-opus", Passed: false, Observed: true, Verdict: "repair_required",
+					Findings: []github.ReviewComment{{Path: "internal/foo.go", Line: 12, Body: "[P0] nil deref", User: "okbot"}}},
+				{Name: "llm-review-terra", Passed: true, Observed: true},
+			},
+		}, nil
+	}
+	var collectedStreams []string
+	o.ghCollectPRReviewFeedbackFn = func(_ int, streams []string) (string, error) {
+		collectedStreams = streams
+		return "## Review Feedback\n\ninternal/foo.go:12 [P0] nil deref (okbot)", nil
+	}
+	st := makeTestState(prs)
+	st.Sessions["slot-0"].Worktree = "/tmp/maestro-slot-0"
+
+	o.autoMergePRs(st)
+
+	if len(*merged) != 0 {
+		t.Fatalf("a blocking llm-review finding must not merge: %v", *merged)
+	}
+	for _, stream := range []string{"llm-review-opus", "llm-review-terra"} {
+		if !slices.Contains(collectedStreams, stream) {
+			t.Fatalf("collector streams = %v, want %s threaded from the project config", collectedStreams, stream)
+		}
+	}
+	sess := st.Sessions["slot-0"]
+	if sess.Status != state.StatusDead || sess.MaintenanceRetryCount != 1 || sess.NextRetryAt == nil {
+		t.Fatalf("bounded review repair not scheduled: status=%q maintenance=%d next=%v", sess.Status, sess.MaintenanceRetryCount, sess.NextRetryAt)
+	}
+	if !strings.Contains(sess.PreviousAttemptFeedback, "internal/foo.go:12") {
+		t.Fatalf("repair context lost the concrete finding: %q", sess.PreviousAttemptFeedback)
 	}
 }
 
