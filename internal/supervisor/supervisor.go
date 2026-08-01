@@ -2132,7 +2132,7 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 				fmt.Sprintf("PR #%d checks=failure", pr.Number)))
 		}
 
-		if e.cfg.ReviewGate == "greptile" && (ciStatus == "" || ciStatus == "success") {
+		if (e.cfg.ReviewGate == "greptile" || e.cfg.ReviewGate == "llm-review") && (ciStatus == "" || ciStatus == "success") {
 			streams := e.cfg.EffectiveReviewGateStreams()
 			if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok && !onlyGreptileReviewStream(streams) {
 				verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, streams)
@@ -2150,7 +2150,7 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 							fmt.Sprintf("PR #%d review_gate=%s", pr.Number, verdict.Summary())))
 					}
 				}
-			} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
+			} else if greptileReader, ok := e.reader.(prGreptileReader); ok && e.cfg.ReviewGate == "greptile" {
 				approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 				if err == nil {
 					switch {
@@ -3296,11 +3296,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		}
 	}
 
-	// Greptile gate — when the reader exposes Greptile signal, require
-	// approved=true and pending=false. Missing reader -> proceed (some
-	// projects don't use Greptile and the cautious gate still requires
-	// human approval before merge_pr executes).
-	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+	// Review gate — when the reader exposes the review signal, require it to
+	// have settled approved. Missing reader -> proceed (some projects don't
+	// use a review bot and the cautious gate still requires human approval
+	// before merge_pr executes). For the stream-based llm-review gate
+	// (#1148) the aggregate verdict is the signal; the historical
+	// greptile-only setup keeps the Greptile read.
+	if e.cfg != nil && e.cfg.ReviewGate == "llm-review" {
+		if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok {
+			verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, e.cfg.EffectiveReviewGateStreams())
+			if err != nil || verdict.Pending || !verdict.Passed {
+				return false, "", nil
+			}
+		}
+	} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 		if err != nil {
 			return false, "", nil
@@ -3423,7 +3432,17 @@ func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr githu
 			reasons = append(reasons, "CI status could not be read")
 		}
 	}
-	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+	if e.cfg != nil && e.cfg.ReviewGate == "llm-review" {
+		if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok {
+			if verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, e.cfg.EffectiveReviewGateStreams()); err == nil {
+				if verdict.Pending {
+					reasons = append(reasons, "llm-review pending")
+				} else if !verdict.Passed {
+					reasons = append(reasons, "llm-review not approved")
+				}
+			}
+		}
+	} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		if approved, pending, err := greptileReader.PRGreptileApproved(pr.Number); err == nil {
 			if pending {
 				reasons = append(reasons, "Greptile review pending")

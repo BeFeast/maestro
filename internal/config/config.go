@@ -2384,8 +2384,8 @@ type Config struct {
 	Delivery                        DeliveryConfig                `yaml:"delivery"`                           // #872: approval-gated post-merge delivery (disabled|approval_required|automatic)
 	MergeStrategy                   string                        `yaml:"merge_strategy"`                     // "sequential" | "parallel"
 	MergeIntervalSeconds            int                           `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
-	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "none"
-	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
+	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "llm-review" (#1148 opus+terra pair) | "none"
+	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default follows review_gate ("greptile" → ["greptile"], "llm-review" → ["llm-review-opus","llm-review-terra"]); "llm-review" is a pair alias
 	ReviewRetrigger                 ReviewRetriggerConfig         `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
 	AutoRetryReviewFeedback         bool                          `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
@@ -2961,6 +2961,9 @@ func parse(data []byte) (*Config, error) {
 		cfg.ReviewGate = "greptile"
 	case "none", "off", "disabled":
 		cfg.ReviewGate = "none"
+	case "llm-review", "llm_review", "llmreview":
+		// #1148: the llm-review pair (opus + terra lenses) as the primary gate.
+		cfg.ReviewGate = "llm-review"
 	default:
 		cfg.ReviewGate = "greptile"
 	}
@@ -3054,32 +3057,46 @@ func validateDeliverySafeLabel(name, value string, maxRunes int) error {
 }
 
 func normalizeReviewGateStreams(reviewGate string, streams []string) []string {
-	if strings.EqualFold(strings.TrimSpace(reviewGate), "none") {
+	gate := strings.ToLower(strings.TrimSpace(reviewGate))
+	if gate == "none" {
 		return nil
 	}
+	// The gate value picks the default stream set when review_gate_streams is
+	// not configured explicitly: "llm-review" means the model pair (#1148),
+	// everything else keeps the historical greptile default.
+	defaults := []string{"greptile"}
+	if gate == "llm-review" {
+		defaults = []string{"llm-review-opus", "llm-review-terra"}
+	}
 	if len(streams) == 0 {
-		return []string{"greptile"}
+		return defaults
 	}
 	out := make([]string, 0, len(streams))
 	seen := make(map[string]struct{}, len(streams))
+	add := func(name string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
 	for _, raw := range streams {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		switch name {
 		case "", "off", "disabled", "none":
 			continue
-		case "greptile", "simplicity":
-			// supported as configured
+		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra":
+			add(name)
+		case "llm-review":
+			// Pair alias (#1148): both model lenses.
+			add("llm-review-opus")
+			add("llm-review-terra")
 		default:
 			continue
 		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
 	}
 	if len(out) == 0 {
-		return []string{"greptile"}
+		return defaults
 	}
 	return out
 }

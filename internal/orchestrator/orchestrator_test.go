@@ -2147,7 +2147,7 @@ func TestAutoMergePRs_PassedReviewGateDoesNotRetryAdvisoryFeedback(t *testing.T)
 		AutoRetryReviewFeedback: true,
 	}
 	o, merged := newMergeTestOrchestrator(cfg, prs)
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) {
 		return "P1 advisory finding on a head Greptile has approved", nil
 	}
 	s := makeTestState(prs)
@@ -2188,7 +2188,7 @@ func TestAutoMergePRs_GreptileThreeOfFiveEntersBoundedRepairWithFindings(t *test
 			}},
 		}, nil
 	}
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) {
 		return "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic", nil
 	}
 	st := makeTestState(prs)
@@ -2393,7 +2393,7 @@ func TestAutoMergePRs_ReviewFeedbackKeepsPROpenAndSchedulesInPlaceRetry(t *testi
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
 		},
 		ghClosePRFn: func(prNumber int, comment string) error {
@@ -2460,7 +2460,7 @@ func TestAutoMergePRs_ReviewFeedbackFallsBackToCloseWhenWorktreeMissing(t *testi
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
 		},
 		ghClosePRFn: func(prNumber int, comment string) error {
@@ -2501,7 +2501,7 @@ func TestAutoMergePRs_ReviewFeedbackImplementationRetryLimitStillSchedulesMainte
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
 		},
 	}
@@ -2550,7 +2550,7 @@ func TestAutoMergePRs_ReviewFeedbackMaintenanceBudgetMarksTerminal(t *testing.T)
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "docs/ROADMAP.md:34 remove false cost-budget claim", nil
 		},
 	}
@@ -2602,7 +2602,7 @@ func TestAutoMergePRs_RetryExhaustedGreenPRNoFeedbackMerges(t *testing.T) {
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "", nil
 		},
 		ghMergePRFn: func(prNumber int) error {
@@ -2660,7 +2660,7 @@ func TestAutoMergePRs_RetryExhaustedActionableFeedbackGetsMaintenancePass(t *tes
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "## Review Feedback\n\ninternal/foo.go:42 P1: nil pointer panic", nil
 		},
 		ghMergePRFn: func(prNumber int) error {
@@ -2740,7 +2740,7 @@ func TestAutoMergePRs_RetryExhaustedFeedback_NoReSyncAfterSettled(t *testing.T) 
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "## Review Feedback\n\ninternal/foo.go:42 P1: unaddressed nil pointer", nil
 		},
 		rateLimitFn: func() (github.RateLimitStatus, error) {
@@ -3020,7 +3020,7 @@ func TestAutoMergePRs_CIFailureBlocksMerge(t *testing.T) {
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "Build failed: exit code 1", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "", nil
 		},
 		ghCloseIssueFn: func(number int, comment string) error {
@@ -4229,7 +4229,7 @@ func TestAutoMergePRs_RetryExhaustedConflictDoesNotLoopHaltQueue(t *testing.T) {
 		ghPRCIStatusFn: func(prNumber int) (string, error) {
 			return "success", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "P3 nit: rename foo", nil
 		},
 		ghPRHasCriticalReviewFn: func(prNumber int) (bool, error) {
@@ -9182,7 +9182,7 @@ func newCIFailureRetryOrchestrator(cfg *config.Config, prs []github.PR, ciStatus
 		workerStopFn: func(cfg *config.Config, slotName string, sess *state.Session) error {
 			return nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "", nil
 		},
 	}, &merged, &closedPRs
@@ -9398,7 +9398,7 @@ func TestAutoMergePRs_CIFailure_DoesNotDependOnClosePR(t *testing.T) {
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "some CI output", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "", nil
 		},
 		ghCloseIssueFn: func(number int, comment string) error {
@@ -9453,7 +9453,7 @@ func TestAutoMergePRs_CIFailure_AlreadyNotified_NoDoubleRetry(t *testing.T) {
 		ghPRChecksOutputFn: func(prNumber int) (string, error) {
 			return "CI output", nil
 		},
-		ghCollectPRReviewFeedbackFn: func(prNumber int) (string, error) {
+		ghCollectPRReviewFeedbackFn: func(prNumber int, _ []string) (string, error) {
 			return "", nil
 		},
 		ghCloseIssueFn: func(number int, comment string) error {
@@ -10196,7 +10196,7 @@ func TestAutoMergePRs_CIFailure_CollectsReviewFeedback(t *testing.T) {
 	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
 
 	// Override with review feedback
-	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(prNumber int, _ []string) (string, error) {
 		return "Confidence 3/5 — Not safe to merge\nP2: null dereference on pool.interface", nil
 	}
 
@@ -10220,7 +10220,7 @@ func TestAutoMergePRs_CIFailure_NoGreptileFeedback_FeedbackEmpty(t *testing.T) {
 	o, _, _ := newCIFailureRetryOrchestrator(cfg, prs, map[int]string{10: "failure"})
 
 	// No review feedback (returns empty)
-	o.ghCollectPRReviewFeedbackFn = func(prNumber int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(prNumber int, _ []string) (string, error) {
 		return "", nil
 	}
 
@@ -10581,7 +10581,7 @@ func TestAutoMergePRs_ConvergenceMergesRetryExhaustedNonCritical(t *testing.T) {
 		notifier:                    &notify.Notifier{},
 		listOpenPRsFn:               func() ([]github.PR, error) { return []github.PR{pr}, nil },
 		ghPRCIStatusFn:              func(int) (string, error) { return "success", nil },
-		ghCollectPRReviewFeedbackFn: func(int) (string, error) { return "P1: non-blocking nit", nil },
+		ghCollectPRReviewFeedbackFn: func(int, []string) (string, error) { return "P1: non-blocking nit", nil },
 		ghPRHasCriticalReviewFn:     func(int) (bool, error) { return false, nil },
 		ghPRGreptileApprovedFn:      func(int) (bool, bool, error) { return false, false, nil },
 		ghMergePRFn:                 func(n int) error { merged = append(merged, n); return nil },
@@ -10610,7 +10610,7 @@ func TestAutoMergePRs_ConvergenceHoldsOnCritical(t *testing.T) {
 		notifier:                    &notify.Notifier{},
 		listOpenPRsFn:               func() ([]github.PR, error) { return []github.PR{pr}, nil },
 		ghPRCIStatusFn:              func(int) (string, error) { return "success", nil },
-		ghCollectPRReviewFeedbackFn: func(int) (string, error) { return "P0: critical", nil },
+		ghCollectPRReviewFeedbackFn: func(int, []string) (string, error) { return "P0: critical", nil },
 		ghPRHasCriticalReviewFn:     func(int) (bool, error) { return true, nil },
 		ghMergePRFn:                 func(n int) error { merged = append(merged, n); return nil },
 		ghCloseIssueFn:              func(int, string) error { return nil },

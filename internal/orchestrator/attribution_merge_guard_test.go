@@ -180,7 +180,7 @@ func TestAutoMergePRs_ConcurrentWorkerPushWithNarrowFetchDoesNotRewriteOrStarveR
 	}
 	o.ghPRHeadSHAFn = func(int) (string, error) { return currentHead, nil }
 	feedbackReads := 0
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) {
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) {
 		feedbackReads++
 		if feedbackReads == 1 {
 			currentHead = advanceAttributionGuardBranch(t, origin, branch)
