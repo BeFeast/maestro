@@ -32,7 +32,14 @@ func TestSystemdLeaseForcedKillReapsReparentedDescendantAndKeepsNeighbor(t *test
 	if err != nil {
 		t.Fatal(err)
 	}
-	maestroBin := filepath.Join(t.TempDir(), "maestro")
+	// NOT t.TempDir(): that follows TMPDIR, which is /tmp by default, and every
+	// lease binds its private scratch over /tmp for the unit. ExecStopPost then
+	// runs in a namespace where the host /tmp is shadowed and systemd fails the
+	// step with "Unable to locate executable", so the scratch is never cleaned
+	// and the test blames the production path for its own setup. diskTestDir
+	// puts the binary next to the repo, which the namespace can still see;
+	// production is unaffected because maestroBin is /usr/local/bin/maestro.
+	maestroBin := filepath.Join(diskTestDir(t), "maestro")
 	build := exec.Command("go", "build", "-o", maestroBin, "./cmd/maestro/")
 	build.Dir = repoRoot
 	if out, err := build.CombinedOutput(); err != nil {

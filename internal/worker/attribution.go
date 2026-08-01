@@ -26,10 +26,28 @@ func beginSessionAttempt(cfg *config.Config, sess *state.Session, backendName, r
 	sess.Backend = backendName
 	sess.Model = ""
 	sess.CostUSDBackend = 0
-	sess.UsageTokensWatermark = 0
+	// #1120: the per-attempt counters restart at zero, but the usage-stream
+	// read positions (UsageTokensWatermark / UsageStreamCursors) must not.
+	// They index the backend's append-only side channel, and a fallover
+	// respawn recomputes the same <slot>.log path while the stream splitter
+	// reopens <slot>.jsonl with O_APPEND — clearing them here made the next
+	// orchestrator poll re-add the previous attempt's whole cumulative total
+	// to TokensUsedTotal. The orchestrator rewinds them itself when a parse
+	// proves the file behind them restarted; an in-place respawn does rotate
+	// <slot>.log (rotateWorkerAttemptLog) and a phase transition points the
+	// session at a new log path.
+	//
+	// TokenBudgetTokensWatermark is not a read position: it is the high-water
+	// mark of the absolute, already-attempt-scoped budget observations (the
+	// generic text total and the per-generation live-monitor marker), so it
+	// does reset here. Leaving it set would hand the replacement worker the
+	// previous attempt's ceiling, and for a backend without usage_stream
+	// there is no splitter, no live monitor and no marker —
+	// TokenBudgetTokensAttempt is then the only thing enforcing
+	// worker_max_tokens at all.
 	sess.TokensUsedAttempt = 0
-	sess.TokenBudgetTokensWatermark = 0
 	sess.TokenBudgetTokensAttempt = 0
+	sess.TokenBudgetTokensWatermark = 0
 	sess.TokenBudgetMeasure = ""
 	sess.WorkerOutcome = ""
 	sess.WorkerLeaseID = ""

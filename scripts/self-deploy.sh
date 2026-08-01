@@ -111,8 +111,49 @@ DEADLINE=$((START_TS + TIMEOUT_SECONDS))
 # to recover even after the main deadline is spent.
 ROLLBACK_RESTART_TIMEOUT=600
 
-BUILD_ROOT=$(mktemp -d /tmp/maestro-self-deploy.XXXXXX)
+# --- build root: disk-backed, never the RAM-backed /tmp (#1129) --------------
+# The build root holds a full detached git worktree plus the ~25 MB binary, and
+# a self-deploy fires by itself on every merge to main. /tmp on the fleet host
+# is a RAM-backed tmpfs on a swapless box, so every merge built the whole source
+# tree and linked the binary in RAM; the old hardcoded /tmp template also made
+# mktemp ignore $TMPDIR, so no environment-level lever could move it either.
+#
+# Moving BUILD_ROOT alone is NOT sufficient: Go puts its own $WORK scratch tree
+# (where the linker writes exe/a.out) under $GOTMPDIR/$TMPDIR, which still
+# defaults to /tmp regardless of -o. The build invocation therefore pins both to
+# a directory inside BUILD_ROOT — see "build-invocation" below.
+#
+# /tmp is rejected outright, even when an operator hands it to us via TMPDIR:
+# "no /tmp growth from a merge-triggered deploy" is the acceptance criterion of
+# #1129, and the transient deploy unit inherits only PATH, so an ambient TMPDIR
+# here would be an accident rather than an intent.
+#
+# The two marker-delimited regions below are extracted and executed verbatim by
+# internal/selfdeploy/selfdeploy_script_test.go. Keep the markers intact.
+# >>> build-root-selection (#1129)
+DEFAULT_BUILD_TMPDIR=/var/tmp
+BUILD_TMPDIR=${TMPDIR:-$DEFAULT_BUILD_TMPDIR}
+# Drop trailing slashes so the template does not gain a double slash, but never
+# collapse the value to "" — TMPDIR=/ would otherwise build the template
+# "/maestro-self-deploy.XXXXXX" and blow the deploy up at mktemp.
+while [[ "$BUILD_TMPDIR" == */ && ${#BUILD_TMPDIR} -gt 1 ]]; do
+  BUILD_TMPDIR=${BUILD_TMPDIR%/}
+done
+# An unusable or forbidden TMPDIR must not take the deploy down with it: fall
+# back to the disk-backed default. "/" and /tmp (and anything under it) are
+# refused; a non-directory or unwritable path is refused too.
+if [[ -z "$BUILD_TMPDIR" || "$BUILD_TMPDIR" == "/" \
+   || "$BUILD_TMPDIR" == "/tmp" || "$BUILD_TMPDIR" == /tmp/* \
+   || ! -d "$BUILD_TMPDIR" || ! -w "$BUILD_TMPDIR" ]]; then
+  BUILD_TMPDIR=$DEFAULT_BUILD_TMPDIR
+fi
+BUILD_ROOT=$(mktemp -d "$BUILD_TMPDIR/maestro-self-deploy.XXXXXX")
+# <<< build-root-selection (#1129)
 BUILD_DIR="$BUILD_ROOT/src"
+# How long a build root must be untouched before another deploy may reap it.
+# Any live deploy is bounded by --timeout-seconds (default 1800s) and the
+# transient unit's RuntimeMaxSec backstop (2x that), so 6h cannot race one.
+STALE_BUILD_ROOT_MINUTES=360
 INSTALLED=0
 HAVE_PREV=0
 RESULT_WRITTEN=0
@@ -180,6 +221,45 @@ cleanup_build() {
   git -C "$REPO_DIR" worktree remove --force "$BUILD_DIR" >/dev/null 2>&1 || true
   rm -rf "$BUILD_ROOT"
 }
+
+# reap_stale_build_roots removes self-deploy build roots that an earlier deploy
+# never cleaned up, under each base directory passed as an argument (#1129).
+#
+# cleanup_build runs from an EXIT trap, which a SIGKILL does not honor — and the
+# transient unit's RuntimeMaxSec backstop is exactly that, a documented scenario
+# in docs/self-deploy-runbook.md. Under the old /tmp build root such a leftover
+# (~26 MB, source tree + binary) at least disappeared at the next reboot. On the
+# disk-backed /var/tmp it does not, and Maestro's own sweeper cannot help:
+# internal/tmpfshygiene refuses any root that is not tmpfs ("refusing tmpfs
+# hygiene: %s is not tmpfs") and permanently protects anything containing .git,
+# which a git worktree always does. So the deploy path reaps its own litter:
+# every deploy sweeps roots older than STALE_BUILD_ROOT_MINUTES before creating
+# its own. /tmp is swept too, so leftovers from pre-#1129 deploys are collected.
+#
+# Best-effort throughout — cleanup must never fail a deploy.
+# >>> stale-build-root-reap (#1129)
+reap_stale_build_roots() {
+  local base dir reaped=0
+  for base in "$@"; do
+    [[ -n "$base" && -d "$base" ]] || continue
+    while IFS= read -r dir; do
+      [[ -n "$dir" ]] || continue
+      log "reaping stale self-deploy build root $dir"
+      if rm -rf "$dir"; then
+        reaped=1
+      else
+        log "could not reap stale build root $dir"
+      fi
+    done < <(find "$base" -maxdepth 1 -type d -name 'maestro-self-deploy.*' \
+      -mmin "+$STALE_BUILD_ROOT_MINUTES" -print 2>/dev/null)
+  done
+  # Each reaped root held a registered git worktree; drop the now-dangling
+  # administrative entries so $REPO_DIR/.git/worktrees does not accumulate them.
+  if (( reaped )); then
+    git -C "$REPO_DIR" worktree prune >/dev/null 2>&1 || true
+  fi
+}
+# <<< stale-build-root-reap (#1129)
 
 # restart_units restarts each configured unit, scoped per --scope (#716).
 # user-scope uses the per-user manager (`systemctl --user restart`); system-scope
@@ -506,6 +586,10 @@ else
   log "flock not found — proceeding without single-flight lock"
 fi
 
+# --- 0. reap leftovers from a previously killed deploy (#1129) --------------
+# Runs under the single-flight lock, so it can never race a live sibling deploy.
+reap_stale_build_roots "$BUILD_TMPDIR" "$DEFAULT_BUILD_TMPDIR" /tmp
+
 # --- 1. build from merged origin/main, version-stamped (#682) ---------------
 log "fetching origin/main in $REPO_DIR"
 git -C "$REPO_DIR" fetch --quiet origin main
@@ -525,7 +609,18 @@ log "building maestro v$STAMP from $SHA"
 # merge silently never ships. The version is already stamped via -ldflags below,
 # so VCS stamping adds nothing; disabling it makes the build independent of git
 # VCS status in the transient unit. Keep -trimpath and the -X main.version stamp.
-(cd "$BUILD_DIR" && go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$STAMP" -o "$BUILD_ROOT/maestro" ./cmd/maestro/)
+# TMPDIR/GOTMPDIR (#1129): -o only places the finished binary. Go's $WORK
+# scratch tree — every compiled package archive plus the linker's exe/a.out —
+# goes to $GOTMPDIR, falling back to $TMPDIR, falling back to /tmp. Without this
+# pin, `go build -x` on the fleet host prints "WORK=/tmp/go-build<n>" and the
+# whole link still happens in the RAM-backed tmpfs no matter where BUILD_ROOT
+# is. Pointing both inside BUILD_ROOT also means cleanup_build (and the stale
+# reaper) reclaim the scratch tree along with everything else.
+# >>> build-invocation (#1129)
+BUILD_TMP="$BUILD_ROOT/tmp"
+mkdir -p "$BUILD_TMP"
+(cd "$BUILD_DIR" && TMPDIR="$BUILD_TMP" GOTMPDIR="$BUILD_TMP" go build -buildvcs=false -trimpath -ldflags "-s -w -X main.version=$STAMP" -o "$BUILD_ROOT/maestro" ./cmd/maestro/)
+# <<< build-invocation (#1129)
 
 BUILT_VERSION=$("$BUILD_ROOT/maestro" version)
 [[ "$BUILT_VERSION" == *"v$STAMP"* ]] || fail "built binary reports '$BUILT_VERSION', want 'maestro v$STAMP'"

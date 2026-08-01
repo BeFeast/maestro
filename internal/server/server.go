@@ -538,7 +538,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		TokensCacheRead:           sess.TokensCacheRead,
 		TokensCacheWrite:          sess.TokensCacheWrite,
 		CostUSDBackend:            sess.CostUSDBackend,
-		StartedAt:                 sess.StartedAt.Format(time.RFC3339),
+		StartedAt:                 sess.StartedAt.Format(time.RFC3339Nano),
 		WorkerGeneration:          sess.WorkerGeneration,
 		Worktree:                  sess.Worktree,
 		Branch:                    sess.Branch,
@@ -566,7 +566,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 	end := now
 	if sess.FinishedAt != nil {
 		end = *sess.FinishedAt
-		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339)
+		info.FinishedAt = sess.FinishedAt.Format(time.RFC3339Nano)
 	}
 	if sess.IssueClosedAt != nil {
 		info.IssueClosedAt = sess.IssueClosedAt.Format(time.RFC3339)

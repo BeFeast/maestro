@@ -232,12 +232,12 @@ func TestCollectProcessProtectsSkipsSweeperProcess(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	protected, scanErrors, err := collectProcessProtects(proc, root, map[string]struct{}{"tmp.self": {}}, 789)
+	protected, scan, err := collectProcessProtects(proc, root, map[string]struct{}{"tmp.self": {}}, 789)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scanErrors != 0 || len(protected) != 0 {
-		t.Fatalf("protected = %#v, scanErrors = %d", protected, scanErrors)
+	if scan.errors != 0 || len(protected) != 0 {
+		t.Fatalf("protected = %#v, scan = %+v", protected, scan)
 	}
 }
 
@@ -256,7 +256,7 @@ func TestCollectProcessProtectsMapsIsolatedCandidatePath(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	protected, scanErrors, err := collectProcessProtects(
+	protected, scan, err := collectProcessProtects(
 		proc,
 		root,
 		map[string]struct{}{quarantineName: {}},
@@ -265,12 +265,95 @@ func TestCollectProcessProtectsMapsIsolatedCandidatePath(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if scanErrors != 0 {
-		t.Fatalf("scanErrors = %d", scanErrors)
+	if scan.errors != 0 {
+		t.Fatalf("scan = %+v", scan)
 	}
 	if _, ok := protected[quarantineName]["process_cwd"]; !ok {
 		t.Fatalf("protected = %#v, want isolated cwd hit", protected)
 	}
+}
+
+func TestSweepDeletesLeakedNativeLibsAndKeepsMappedOnes(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	leakedSo := filepath.Join(root, ".bcddfd9eb5fdb63f-00000000.so")
+	leakedHm := filepath.Join(root, ".18c737bd3e5dfeff-00000000.hm")
+	mappedSo := filepath.Join(root, ".bcddfddebceffe6f-00000000.so")
+	for _, path := range []string{leakedSo, leakedHm, mappedSo} {
+		if err := os.WriteFile(path, []byte("elf"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		old := now.Add(-3 * time.Hour)
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// A live process holds the third copy open through an fd link.
+	processDir := filepath.Join(proc, "321")
+	if err := os.MkdirAll(filepath.Join(processDir, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(mappedSo, filepath.Join(processDir, "fd", "3")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("opencode\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.DeletedEntries != 2 {
+		t.Fatalf("summary = %+v, want the two unreferenced leak files deleted", summary)
+	}
+	stats := summary.Categories["native_lib_leak"]
+	if stats.Candidates != 3 || stats.Deleted != 2 || stats.Protected != 1 {
+		t.Fatalf("native_lib_leak stats = %+v", stats)
+	}
+	assertMissing(t, leakedSo)
+	assertMissing(t, leakedHm)
+	assertExists(t, mappedSo)
+}
+
+func TestSweepIgnoresForeignProcessPermissionDenials(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission denials cannot be simulated as root")
+	}
+	root, proc, now := fakeRoots(t)
+	stale := oldDir(t, root, "tmp.stale", now, 3*time.Hour, "stale")
+	// The fixture cannot chown itself to another UID without root, and
+	// ownership is what separates a foreign process from a same-UID one that
+	// cleared PR_SET_DUMPABLE, so state the foreign ownership explicitly.
+	restoreOwner := procOwnerIsSelf
+	procOwnerIsSelf = func(string) bool { return false }
+	t.Cleanup(func() { procOwnerIsSelf = restoreOwner })
+	// A foreign process whose /proc internals are unreadable (EACCES), like
+	// every other user's process on a shared host. It must not freeze the
+	// sweep: before the 2026-07-23 fix this blanket-protected every candidate.
+	processDir := filepath.Join(proc, "654")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fdDir := filepath.Join(processDir, "fd")
+	if err := os.MkdirAll(fdDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("foreign\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProcScanErrors != 0 || summary.ProcPermissionSkips == 0 {
+		t.Fatalf("summary = %+v, want permission skips counted without scan errors", summary)
+	}
+	if summary.ProtectHits["proc_scan_error"] != 0 || summary.DeletedEntries != 1 {
+		t.Fatalf("summary = %+v, want stale candidate deleted despite foreign EACCES", summary)
+	}
+	assertMissing(t, stale)
 }
 
 func TestSweepRevalidatesAgeImmediatelyBeforeApply(t *testing.T) {
@@ -474,7 +557,12 @@ func fakeOptions(root, proc string, now time.Time, mode string, usePct int, tmpf
 		Mode:     mode,
 		Now:      func() time.Time { return now },
 		InspectMount: func(string) (MountUsage, error) {
-			return MountUsage{Tmpfs: tmpfs, UsePct: usePct, TotalBytes: 100, UsedBytes: int64(usePct)}, nil
+			// Model the real mount: a 16GiB RAM-backed /tmp. The pressure verdict
+			// is measured in absolute free bytes (#1128), so the fixture has to
+			// express a plausible capacity rather than a 100-byte stub.
+			const total = int64(16) << 30
+			used := total * int64(usePct) / 100
+			return MountUsage{Tmpfs: tmpfs, UsePct: usePct, TotalBytes: total, UsedBytes: used, AvailableBytes: total - used}, nil
 		},
 		EffectiveUID: os.Geteuid,
 		processID:    func() int { return -1 },
@@ -542,5 +630,215 @@ func assertMissing(t *testing.T, path string) {
 	t.Helper()
 	if _, err := os.Lstat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected %s to be absent, err=%v", path, err)
+	}
+}
+
+// Codex review catch (P1): the `.*-00000000.so` glob enforces neither the
+// documented hex stem nor a regular-file type, so an unrelated plugin file —
+// or a directory that merely ends the same way — was recursively deleted by
+// every apply sweep.
+func TestSweepLeavesNonGeneratedNativeLibLookalikes(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	old := now.Add(-3 * time.Hour)
+
+	// Not a hex stem: a real plugin that happens to share the suffix.
+	foreignFile := filepath.Join(root, ".my-plugin-00000000.so")
+	if err := os.WriteFile(foreignFile, []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A directory the glob also matched.
+	foreignDir := filepath.Join(root, ".bcddfd9eb5fdb63f-00000000.so.d")
+	if err := os.MkdirAll(foreignDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignDir, "keep"), []byte("payload"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// A genuine leak, to prove the policy still fires.
+	leaked := filepath.Join(root, ".18c737bd3e5dfeff-00000000.so")
+	if err := os.WriteFile(leaked, []byte("elf"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{foreignFile, foreignDir, leaked} {
+		if err := os.Chtimes(path, old, old); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	if _, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true)); err != nil {
+		t.Fatal(err)
+	}
+	assertExists(t, foreignFile)
+	assertExists(t, filepath.Join(foreignDir, "keep"))
+	assertMissing(t, leaked)
+}
+
+// EACCES does not prove the process belongs to another user — Linux denies the
+// same read for a same-UID process that cleared PR_SET_DUMPABLE. Such a process
+// still protects what it demonstrably references, but only that: charging its
+// denial to every candidate is what made the sweeper a permanent no-op on the
+// fleet host (#1125).
+func TestSweepScopesSameUIDDenialToTheProcessThatDenied(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission denials cannot be simulated as root")
+	}
+	root, proc, now := fakeRoots(t)
+	held := oldDir(t, root, "tmp.held", now, 3*time.Hour, "held")
+	stale := oldDir(t, root, "tmp.stale", now, 3*time.Hour, "stale")
+
+	processDir := filepath.Join(proc, "655")
+	if err := os.MkdirAll(processDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	fdDir := filepath.Join(processDir, "fd")
+	if err := os.MkdirAll(fdDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
+	// Its fd table is unreadable, but its world-readable command line still ties
+	// it to one candidate.
+	cmdline := []byte("dumpable-off\x00--state=" + filepath.Join(held, "state.json") + "\x00")
+	if err := os.WriteFile(filepath.Join(processDir, "cmdline"), cmdline, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeApply, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProcScanErrors == 0 || summary.ProcUnresolvedProcesses == 0 {
+		t.Fatalf("summary = %+v, want the same-UID denial reported", summary)
+	}
+	if summary.ProtectHits["proc_scan_error"] != 1 {
+		t.Fatalf("protect hits = %#v, want only the referenced candidate unresolvable", summary.ProtectHits)
+	}
+	if summary.DeletedEntries != 1 {
+		t.Fatalf("summary = %+v, want the unreferenced candidate swept", summary)
+	}
+	assertExists(t, held)
+	assertMissing(t, stale)
+}
+
+// Regression for #1125: with a /proc scan that fails for a subset of pids, the
+// failing pids must not change the verdict for candidates they never touched,
+// and a candidate a live worker really holds must still be protected.
+func TestSweepKeepsPerCandidateVerdictsWhenSomeProcessesFailToScan(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("permission denials cannot be simulated as root")
+	}
+	root, proc, now := fakeRoots(t)
+	live := oldDir(t, root, "tmp.live", now, 3*time.Hour, "live")
+	garbage := oldDir(t, root, "tmp.garbage", now, 3*time.Hour, "garbage")
+
+	// A healthy worker sitting in tmp.live: fully resolvable, so tmp.live is
+	// protected on the evidence itself.
+	worker := filepath.Join(proc, "700")
+	if err := os.MkdirAll(filepath.Join(worker, "fd"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(live, filepath.Join(worker, "cwd")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(worker, "cmdline"), []byte("claude\x00"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two same-UID session daemons that deny every read, like `systemd --user`
+	// and `(sd-pam)` on the fleet host. They reference no candidate.
+	for _, pid := range []string{"701", "702"} {
+		processDir := filepath.Join(proc, pid)
+		if err := os.MkdirAll(processDir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+		fdDir := filepath.Join(processDir, "fd")
+		if err := os.MkdirAll(fdDir, 0o000); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { os.Chmod(fdDir, 0o755) })
+		if err := os.WriteFile(filepath.Join(processDir, "cmdline"), []byte("session-daemon\x00"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 1, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.ProcUnresolvedProcesses != 2 || summary.ProcScanErrors == 0 {
+		t.Fatalf("summary = %+v, want both denying processes counted", summary)
+	}
+	if summary.ProtectHits["proc_scan_error"] != 0 {
+		t.Fatalf("protect hits = %#v, want no candidate charged with an unrelated denial", summary.ProtectHits)
+	}
+	if summary.ProtectHits["process_cwd"] != 1 || summary.ProtectedEntries != 1 {
+		t.Fatalf("summary = %+v, want only the worker-held candidate protected", summary)
+	}
+	if summary.ReclaimableBytes != int64(len("garbage")) || summary.SweepIneffective {
+		t.Fatalf("summary = %+v, want the abandoned candidate reported as reclaimable", summary)
+	}
+	assertExists(t, live)
+	assertExists(t, garbage)
+}
+
+// #1125: a sweep that protects everything it matched and reclaims nothing is
+// the shape of a broken reaper, not of a clean /tmp, so it must not read as a
+// quiet successful tick.
+func TestSweepFlagsFullyProtectedZeroReclaimSweep(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+	young := oldDir(t, root, "tmp.young", now, 10*time.Minute, "new")
+
+	summary, err := Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.SweepIneffective || summary.AttentionCode != "tmpfs_sweep_ineffective" {
+		t.Fatalf("summary = %+v, want the no-op sweep flagged", summary)
+	}
+
+	setTreeAge(t, young, now.Add(-3*time.Hour))
+	summary, err = Sweep(context.Background(), fakeOptions(root, proc, now, ModeDryRun, 40, true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.SweepIneffective || summary.AttentionCode != "" {
+		t.Fatalf("summary = %+v, want a productive sweep left unflagged", summary)
+	}
+}
+
+// The 2026-07-25 event: 8.5GB used of a ~15GiB RAM-backed /tmp. That is only
+// 55% of the mount, so the old "85% utilization" rule stayed silent while 8.5GB
+// of a 24GiB host's RAM was already gone. Pressure is decided on the remaining
+// absolute bytes (#1128).
+func TestSweepPressureUsesFreeByteBudgetNotUtilizationPct(t *testing.T) {
+	root, proc, now := fakeRoots(t)
+
+	tight := fakeOptions(root, proc, now, ModeApply, 55, true)
+	tight.InspectMount = func(string) (MountUsage, error) {
+		const total = int64(15) << 30
+		const used = int64(8_500_000_000)
+		return MountUsage{Tmpfs: true, UsePct: 55, TotalBytes: total, UsedBytes: used, AvailableBytes: total - used}, nil
+	}
+	summary, err := Sweep(context.Background(), tight)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !summary.Pressure || summary.AttentionCode != "tmpfs_pressure" {
+		t.Fatalf("summary at %d%% use with %d free bytes = %+v, want pressure", summary.UsePct, summary.AvailableBytes, summary)
+	}
+
+	// And the mirror image: a high utilization ratio on a mount that still has
+	// tens of gigabytes free is not an emergency and must not page anyone.
+	roomy := fakeOptions(root, proc, now, ModeApply, 92, true)
+	roomy.InspectMount = func(string) (MountUsage, error) {
+		const total = int64(400) << 30
+		const available = int64(32) << 30
+		return MountUsage{Tmpfs: true, UsePct: 92, TotalBytes: total, UsedBytes: total - available, AvailableBytes: available}, nil
+	}
+	summary, err = Sweep(context.Background(), roomy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if summary.Pressure || summary.AttentionCode != "" {
+		t.Fatalf("summary at %d%% use with %d free bytes = %+v, want no pressure", summary.UsePct, summary.AvailableBytes, summary)
 	}
 }

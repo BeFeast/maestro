@@ -335,7 +335,7 @@ func TestAutoMergePRs_AmbiguousFailureRetriesAfterGateOpens(t *testing.T) {
 	o.getIssueFn = func(number int) (github.Issue, error) { return makeIssue(number, "android gate"), nil }
 	o.ghPRLabelsFn = func(int) ([]string, error) { return nil, nil }
 	o.ghPRChecksOutputFn = func(int) (string, error) { return "ordinary CI\tfailure\n", nil }
-	o.ghCollectPRReviewFeedbackFn = func(int) (string, error) { return "", nil }
+	o.ghCollectPRReviewFeedbackFn = func(int, []string) (string, error) { return "", nil }
 	o.ghPRFailingChecksFn = func(int) ([]github.FailingCheck, error) { return nil, nil }
 	closed := 0
 	o.ghClosePRFn = func(int, string) error {

@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"testing"
@@ -131,10 +132,15 @@ func TestCheckpointInFlightForRestart_PastDeadlineStampsMarkerWithoutCheckpointF
 // tail before later workers receive their correctness-critical restart markers.
 // Markers are persisted for the whole state dir first; CHECKPOINT.md is optional.
 func TestCheckpointInFlightForRestart_WedgedContextStillMarksEveryWorker(t *testing.T) {
-	oldCheckpointFn := checkpointFn
+	oldCheckpointFn, oldCancelGrace := checkpointFn, checkpointCancelGrace
+	// #1121: this stub deliberately ignores cancellation, standing in for a git
+	// child that refuses to die even after its process group is killed. Shorten
+	// the post-cancel join so the assertion below still measures the shutdown
+	// hold and not the grace.
+	checkpointCancelGrace = 20 * time.Millisecond
 	blocked := make(chan struct{})
 	checkpointFinished := make(chan struct{})
-	checkpointFn = func(*state.Session) (string, error) {
+	checkpointFn = func(context.Context, *state.Session) (string, error) {
 		defer close(checkpointFinished)
 		<-blocked
 		return "", nil
@@ -143,6 +149,7 @@ func TestCheckpointInFlightForRestart_WedgedContextStillMarksEveryWorker(t *test
 		close(blocked)
 		<-checkpointFinished
 		checkpointFn = oldCheckpointFn
+		checkpointCancelGrace = oldCancelGrace
 	}()
 
 	stateDir := t.TempDir()

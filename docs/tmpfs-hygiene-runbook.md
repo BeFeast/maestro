@@ -35,7 +35,12 @@ service journal. Important fields are:
 - `protect_hits`: counts for cwd, fd, cmdline, age, configured-path, git,
   socket/lock, ownership, symlink, scan, and filesystem-boundary guards;
 - `use_pct`: tmpfs utilization after the sweep;
-- `attention_code`: `tmpfs_pressure` when post-sweep `use_pct >= 85`.
+- `total_bytes` / `available_bytes`: the post-sweep capacity the pressure
+  verdict was made on;
+- `attention_code`: `tmpfs_pressure` when post-sweep `available_bytes` falls
+  below `pressure_floor_bytes` (default 8GiB). This is an absolute free-byte
+  budget, not a share of the mount (#1128): 85% of a RAM-backed tmpfs says
+  nothing about how close the host is to running out of memory.
 
 Example inspection without printing unrelated service logs:
 
@@ -79,9 +84,22 @@ symlinks. Deletion uses no-follow, file-descriptor-relative operations rooted
 at the already-open tmpfs directory, so neither a symlink nor a concurrent
 symlink swap can redirect removal outside `/tmp`.
 
-`proc_scan_errors` records process entries that disappeared or could not be
-read during collection. A non-root daemon only removes entries owned by its own
-uid; a root-run installation can inspect and sweep all owners.
+`proc_scan_errors` records `/proc` reads that failed during collection and
+`proc_unresolved_processes` counts the processes behind them — typically
+`systemd --user`, `(sd-pam)` and `ssh-agent`, which run under the daemon's own
+uid with `PR_SET_DUMPABLE` cleared and are therefore present on every tick. A
+failed read protects only the candidates that one process demonstrably
+references (`protect_hits.proc_scan_error`); it is never a verdict on unrelated
+candidates. Charging it to the whole sweep made the sweeper a permanent no-op
+with `protected_entries == matched_entries` and `reclaimable_bytes: 0` (#1125).
+A non-root daemon only removes entries owned by its own uid; a root-run
+installation can inspect and sweep all owners.
+
+A sweep that protects every candidate it matched and reclaims nothing reports
+`sweep_ineffective: true`, attention code `tmpfs_sweep_ineffective` when nothing
+more urgent is pending, and a `SUSPICIOUS` daemon log line. Treat it as a broken
+reaper until proven otherwise: in the metric it is indistinguishable from a
+clean `/tmp`.
 
 ## Scheduling and Fleet pressure
 
@@ -98,6 +116,8 @@ After every apply, Fleet exposes the exact post-sweep state:
     "mode": "apply",
     "tmpfs": true,
     "use_pct": 87,
+    "available_bytes": 2147483648,
+    "pressure_floor_bytes": 8589934592,
     "pressure": true,
     "attention_code": "tmpfs_pressure"
   }
@@ -107,6 +127,44 @@ After every apply, Fleet exposes the exact post-sweep state:
 If `/tmp` is not tmpfs, or the configured protection paths cannot be loaded,
 the sweep fails closed, deletes nothing, emits an `error` field, and preserves
 that failed result for Fleet inspection.
+
+## Pressure alert and spawn precondition (#1128)
+
+The pressure signal does not depend on a sweep. The daemon samples the tmpfs
+root every `--tmpfs-pressure-interval` (default 30s) and publishes the result as
+`/api/v1/fleet.tmpfs_pressure`, so the signal exists even when the sweeper is
+refused or reclaims nothing:
+
+```json
+{
+  "tmpfs_pressure": {
+    "root": "/tmp",
+    "total_bytes": 16686817280,
+    "available_bytes": 2147483648,
+    "use_pct": 87,
+    "pressure_floor_bytes": 8589934592,
+    "spawn_floor_bytes": 4294967296,
+    "pressure": true,
+    "spawn_hold": true,
+    "held_spawns": 3
+  }
+}
+```
+
+Two independent absolute floors act on that sample:
+
+- `--tmpfs-pressure-floor-bytes` (default 8GiB) — two consecutive samples below
+  it send an ntfy CRITICAL of class `tmpfs_pressure` at priority 5, one page per
+  episode, cleared on recovery. Negative disables the alert.
+- `--tmpfs-spawn-floor-bytes` (default 4GiB) — below it the orchestrator skips
+  its dispatch cycle before listing issues, logging the reason and counting the
+  skip in `held_spawns`. Negative disables the pause.
+
+The spawn precondition is a **throughput pause, never a freeze**: it persists no
+state, requires no approval, produces no `ActionNone` decision, and spends no
+issue retry budget. Every poll re-evaluates it, so dispatch resumes on its own
+as soon as space is reclaimed. It also fails open — a missing or failed sample
+lets dispatch through, because a measurement gap must not park the fleet.
 
 ## 24-hour dogfood verification
 
@@ -120,11 +178,16 @@ Deployment/runtime verification remains an operator step after the code lands:
    `browser_profile`, `worker_scratch`, and `tooling_cache` candidates are
    deleted after their age gates rather than increasing monotonically.
 4. Confirm `/api/v1/fleet.tmpfs_hygiene` advances every interval and that a
-   forced or naturally observed post-sweep utilization of at least 85% reports
-   `attention_code: tmpfs_pressure`.
+   forced or naturally observed post-sweep `available_bytes` below the
+   pressure floor reports `attention_code: tmpfs_pressure`. Confirm
+   `/api/v1/fleet.tmpfs_pressure` advances on its own 30s cadence even when a
+   sweep deleted nothing, and that crossing the spawn floor raises
+   `spawn_hold` with a rising `held_spawns` rather than any stuck state.
 5. Investigate persistent `scan_error`, `mount_boundary`, or high
    `proc_scan_errors` counts before broadening policy. Do not add a catch-all
    pattern or a blanket `/tmp` removal.
+6. Treat any `sweep_ineffective: true` record as a defect report, not as a
+   quiet tick.
 
 Changing tmpfs size, worktree GC, distributed runner cleanup, and producer-side
 ok-player fixes are intentionally outside this runbook.

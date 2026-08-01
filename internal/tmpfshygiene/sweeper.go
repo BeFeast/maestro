@@ -15,6 +15,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -30,12 +31,32 @@ type policy struct {
 	Category string
 	Pattern  string
 	MinAge   time.Duration
+	// GeneratedName, when set, must also match the entry basename. The glob
+	// alone is far too loose for the leak categories: `.*-00000000.so` happily
+	// matches an unrelated `.my-plugin-00000000.so`. RegularOnly additionally
+	// refuses directories, which the same glob matched. Without both, every
+	// apply sweep recursively deleted foreign entries that merely shared the
+	// suffix.
+	GeneratedName *regexp.Regexp
+	RegularOnly   bool
 }
+
+// nativeLibLeakName pins the documented generated basename: a hex stem, the
+// fixed -00000000 discriminator, and the extension the extractor writes.
+var nativeLibLeakName = regexp.MustCompile(`^\.[0-9a-f]+-00000000\.(so|hm)$`)
 
 // defaultPolicies is the compiled policy table used by both the CLI and
 // daemon. It is intentionally not configurable at runtime: broadening the
 // deletion surface requires a reviewed code-and-test change.
 var defaultPolicies = []policy{
+	// Bun/Zig-compiled CLIs (opencode) extract a ~5.6MB embedded native
+	// library to $TMPDIR/.<hex>-00000000.so on every invocation and never
+	// delete it (plus an empty .hm marker). Supervisor backend probes mint
+	// these around the clock; on the RAM-backed /tmp this leaked ~10.5GB
+	// across 1978 copies before the 2026-07-23 overload. Deleting a mapped
+	// .so is safe on Linux: the inode survives until the mapping is gone.
+	{Category: "native_lib_leak", Pattern: ".*-00000000.so", MinAge: time.Hour, GeneratedName: nativeLibLeakName, RegularOnly: true},
+	{Category: "native_lib_leak", Pattern: ".*-00000000.hm", MinAge: time.Hour, GeneratedName: nativeLibLeakName, RegularOnly: true},
 	{Category: "outcome_snapshot", Pattern: "tmp.*", MinAge: time.Hour},
 	{Category: "browser_profile", Pattern: "playwright-*", MinAge: 2 * time.Hour},
 	{Category: "browser_profile", Pattern: "playwright_chromiumdev_profile-*", MinAge: 2 * time.Hour},
@@ -94,6 +115,9 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	}
 	summary.Tmpfs = usage.Tmpfs
 	summary.UsePct = usage.UsePct
+	summary.TotalBytes = usage.TotalBytes
+	summary.AvailableBytes = usage.AvailableBytes
+	summary.PressureFloorBytes = opts.PressureFloorBytes
 	if !usage.Tmpfs {
 		return fail(fmt.Errorf("refusing tmpfs hygiene: %s is not tmpfs", opts.Root))
 	}
@@ -118,7 +142,7 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	candidates := make([]candidate, 0)
 	nameSet := make(map[string]struct{})
 	for _, entry := range entries {
-		policy, matched := matchPolicy(entry.Name())
+		policy, matched := matchPolicy(entry.Name(), entry)
 		if !matched {
 			continue
 		}
@@ -169,17 +193,24 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 		nameSet[item.name] = struct{}{}
 	}
 
-	procProtect, scanErrors, err := collectProcessProtects(opts.ProcRoot, opts.Root, nameSet, opts.processID())
+	procProtect, procScan, err := collectProcessProtects(opts.ProcRoot, opts.Root, nameSet, opts.processID())
 	if err != nil {
 		return fail(fmt.Errorf("build process protect set: %w", err))
 	}
-	summary.ProcScanErrors = scanErrors
+	summary.ProcScanErrors = procScan.errors
+	summary.ProcPermissionSkips = procScan.permissionSkips
+	summary.ProcUnresolvedProcesses = procScan.unresolvedProcesses
+	// A /proc read failure protects only the candidates the failing process is
+	// demonstrably linked to; collectProcessProtects attributes that per candidate
+	// as "proc_scan_error". Vetoing every candidate instead turned the sweeper
+	// into a permanent no-op (#1125): `systemd --user`, `(sd-pam)` and `ssh-agent`
+	// run under the daemon's own uid with PR_SET_DUMPABLE cleared, so a same-uid
+	// EACCES is present on every tick and the veto never lifted — protected ==
+	// matched, reclaimable == 0, while /tmp filled RAM. Deleting a same-uid entry
+	// stays safe even when some holder went unseen: the inode outlives the unlink.
 	for i := range candidates {
 		for reason := range procProtect[candidates[i].name] {
 			candidates[i].protects[reason] = struct{}{}
-		}
-		if scanErrors > 0 {
-			candidates[i].protects["proc_scan_error"] = struct{}{}
 		}
 	}
 
@@ -271,8 +302,10 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 				// path; cmdlines can still contain the former public path, so both top-
 				// level names are mapped back to this candidate.
 				freshNames := map[string]struct{}{item.name: {}, quarantine.name: {}}
-				freshProtect, freshScanErrors, scanErr := collectProcessProtects(opts.ProcRoot, opts.Root, freshNames, opts.processID())
-				summary.ProcScanErrors += freshScanErrors
+				freshProtect, freshScan, scanErr := collectProcessProtects(opts.ProcRoot, opts.Root, freshNames, opts.processID())
+				summary.ProcScanErrors += freshScan.errors
+				summary.ProcPermissionSkips += freshScan.permissionSkips
+				summary.ProcUnresolvedProcesses += freshScan.unresolvedProcesses
 				if scanErr != nil {
 					if restoreErr := quarantine.restore(rootFD, item.name); restoreErr != nil {
 						scanErr = fmt.Errorf("%w; also failed to restore isolated candidate: %v", scanErr, restoreErr)
@@ -284,9 +317,6 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 					for reason := range freshProtect[name] {
 						item.protects[reason] = struct{}{}
 					}
-				}
-				if freshScanErrors > 0 {
-					item.protects["proc_scan_error"] = struct{}{}
 				}
 				if len(item.protects) > 0 {
 					if restoreErr := quarantine.restore(rootFD, item.name); restoreErr != nil {
@@ -334,9 +364,25 @@ func Sweep(ctx context.Context, opts Options) (Summary, error) {
 	}
 	summary.Tmpfs = finalUsage.Tmpfs
 	summary.UsePct = finalUsage.UsePct
-	summary.Pressure = finalUsage.UsePct >= PressureThresholdPct
+	summary.TotalBytes = finalUsage.TotalBytes
+	summary.AvailableBytes = finalUsage.AvailableBytes
+	// Pressure is an absolute free-byte budget, not a share of the mount
+	// (#1128). A percentage of a RAM-backed tmpfs says nothing about how close
+	// the host is to running out of memory.
+	summary.Pressure = BelowFloor(finalUsage.AvailableBytes, finalUsage.TotalBytes, opts.PressureFloorBytes)
 	if summary.Pressure {
 		summary.AttentionCode = "tmpfs_pressure"
+	}
+	// Protecting every match while reclaiming nothing is the signature of a
+	// sweeper that has stopped discriminating. It reads as "there was nothing to
+	// clean", which is exactly why the blanket /proc veto stayed invisible until
+	// an operator had to prune 8.4GB of /tmp by hand (#1125), so report it instead
+	// of letting it pass for a quiet tick.
+	if summary.MatchedEntries > 0 && summary.ProtectedEntries == summary.MatchedEntries && summary.ReclaimableBytes == 0 {
+		summary.SweepIneffective = true
+		if summary.AttentionCode == "" {
+			summary.AttentionCode = "tmpfs_sweep_ineffective"
+		}
 	}
 	return summary, nil
 }
@@ -350,6 +396,9 @@ func normalizeOptions(opts Options) Options {
 		opts.ProcRoot = "/proc"
 	}
 	opts.ProcRoot = filepath.Clean(opts.ProcRoot)
+	if opts.PressureFloorBytes == 0 {
+		opts.PressureFloorBytes = DefaultPressureFreeBytes
+	}
 	if opts.Now == nil {
 		opts.Now = time.Now
 	}
@@ -443,14 +492,45 @@ func InspectLinuxMount(root string) (MountUsage, error) {
 	}, nil
 }
 
-func matchPolicy(name string) (policy, bool) {
+func matchPolicy(name string, entry fs.DirEntry) (policy, bool) {
 	for _, policy := range defaultPolicies {
 		matched, err := filepath.Match(policy.Pattern, name)
-		if err == nil && matched {
-			return policy, true
+		if err != nil || !matched {
+			continue
 		}
+		if policy.GeneratedName != nil && !policy.GeneratedName.MatchString(name) {
+			continue
+		}
+		if policy.RegularOnly && entry != nil && !entry.Type().IsRegular() {
+			continue
+		}
+		return policy, true
 	}
 	return policy{}, false
+}
+
+// procOwnerIsSelf reports whether /proc/<pid> belongs to the sweeper's own UID.
+//
+// EACCES on /proc/<pid>/cwd does not prove the process belongs to another
+// user: Linux denies the same read for a same-UID process that cleared
+// PR_SET_DUMPABLE. Counting that as a routine foreign-process skip would let
+// the sweep quarantine and delete a tree such a process is actively sitting
+// in, so same-UID denials stay fail-closed.
+// procOwnerIsSelf is a variable so tests can simulate a foreign-owned
+// /proc entry: without root they cannot chown the fixture, and ownership is
+// the only thing separating the two EACCES cases.
+var procOwnerIsSelf = defaultProcOwnerIsSelf
+
+func defaultProcOwnerIsSelf(processDir string) bool {
+	info, err := os.Stat(processDir)
+	if err != nil {
+		return false
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return false
+	}
+	return int(stat.Uid) == os.Getuid()
 }
 
 func alwaysKeepTopLevel(name string) bool {
@@ -554,23 +634,25 @@ func pathWithin(path, base string) bool {
 	return rel == "." || (rel != ".." && !strings.HasPrefix(rel, ".."+string(filepath.Separator)))
 }
 
-func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]struct{}, ignoredPID int) (map[string]map[string]struct{}, int, error) {
+// procScanResult splits /proc scan outcomes: errors are failures that hid part
+// of one process's held paths; permissionSkips are EACCES reads of other users'
+// processes, which are routine for a non-root sweeper and must not disable
+// deletion (2026-07-23 RCA: they froze every apply sweep into a no-op).
+// unresolvedProcesses counts the processes behind those errors. None of the
+// three is a global verdict: a process the scan could not read in full still
+// protects only the candidates it is demonstrably linked to (#1125).
+type procScanResult struct {
+	errors              int
+	permissionSkips     int
+	unresolvedProcesses int
+}
+
+func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]struct{}, ignoredPID int) (map[string]map[string]struct{}, procScanResult, error) {
 	protected := make(map[string]map[string]struct{})
+	var scan procScanResult
 	entries, err := os.ReadDir(procRoot)
 	if err != nil {
-		return nil, 0, err
-	}
-	scanErrors := 0
-	add := func(value, reason string) {
-		for _, name := range candidateNamesFromValue(value, tmpRoot) {
-			if _, ok := candidates[name]; !ok {
-				continue
-			}
-			if protected[name] == nil {
-				protected[name] = make(map[string]struct{})
-			}
-			protected[name][reason] = struct{}{}
-		}
+		return nil, scan, err
 	}
 	for _, entry := range entries {
 		if !entry.IsDir() {
@@ -584,42 +666,78 @@ func collectProcessProtects(procRoot, tmpRoot string, candidates map[string]stru
 			continue
 		}
 		processDir := filepath.Join(procRoot, entry.Name())
-		if cwd, err := os.Readlink(filepath.Join(processDir, "cwd")); err == nil {
-			add(trimDeletedSuffix(cwd), "process_cwd")
-		} else if !errors.Is(err, fs.ErrNotExist) && !errors.Is(err, fs.ErrPermission) {
-			scanErrors++
-		} else if errors.Is(err, fs.ErrPermission) {
-			scanErrors++
+		// linked records the candidates this one process is demonstrably using,
+		// so an unreadable /proc entry can be charged to the candidates that
+		// process actually touches instead of to every candidate (#1125).
+		linked := make(map[string]struct{})
+		unresolved := false
+		add := func(value, reason string) {
+			for _, name := range candidateNamesFromValue(value, tmpRoot) {
+				if _, ok := candidates[name]; !ok {
+					continue
+				}
+				if protected[name] == nil {
+					protected[name] = make(map[string]struct{})
+				}
+				protected[name][reason] = struct{}{}
+				linked[name] = struct{}{}
+			}
+		}
+		// note classifies one failed read of this process. A foreign-uid EACCES
+		// is the normal state on any multi-user host and hides nothing the sweep
+		// needs: cmdline stays world-readable and same-uid entries are what gets
+		// deleted. Anything else leaves this process's held paths partly unknown.
+		note := func(err error) {
+			if errors.Is(err, fs.ErrNotExist) {
+				// The process exited mid-scan, so it holds nothing.
+				return
+			}
+			if errors.Is(err, fs.ErrPermission) && !procOwnerIsSelf(processDir) {
+				scan.permissionSkips++
+				return
+			}
+			scan.errors++
+			unresolved = true
 		}
 
-		fdEntries, err := os.ReadDir(filepath.Join(processDir, "fd"))
-		if err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				scanErrors++
-			}
+		if cwd, err := os.Readlink(filepath.Join(processDir, "cwd")); err == nil {
+			add(trimDeletedSuffix(cwd), "process_cwd")
+		} else {
+			note(err)
+		}
+
+		if fdEntries, err := os.ReadDir(filepath.Join(processDir, "fd")); err != nil {
+			note(err)
 		} else {
 			for _, fd := range fdEntries {
 				target, err := os.Readlink(filepath.Join(processDir, "fd", fd.Name()))
-				if err == nil {
-					add(trimDeletedSuffix(target), "process_fd")
-				} else if !errors.Is(err, fs.ErrNotExist) {
-					scanErrors++
+				if err != nil {
+					note(err)
+					continue
 				}
+				add(trimDeletedSuffix(target), "process_fd")
 			}
 		}
 
-		cmdline, err := os.ReadFile(filepath.Join(processDir, "cmdline"))
-		if err != nil {
-			if !errors.Is(err, fs.ErrNotExist) {
-				scanErrors++
+		if cmdline, err := os.ReadFile(filepath.Join(processDir, "cmdline")); err != nil {
+			note(err)
+		} else {
+			for _, arg := range strings.Split(string(cmdline), "\x00") {
+				add(arg, "process_cmdline")
 			}
-			continue
 		}
-		for _, arg := range strings.Split(string(cmdline), "\x00") {
-			add(arg, "process_cmdline")
+
+		if unresolved {
+			scan.unresolvedProcesses++
+			// Only part of what this process holds was readable, so every
+			// candidate it did reference is individually unresolvable and stays
+			// protected. Candidates it never referenced keep their own verdict.
+			for name := range linked {
+				protected[name]["proc_scan_error"] = struct{}{}
+			}
 		}
 	}
-	return protected, scanErrors, nil
+	return protected, scan, nil
 }
 
 func trimDeletedSuffix(path string) string {

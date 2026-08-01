@@ -23,6 +23,16 @@ const superviseJitterCap = 60 * time.Second
 // can make the offset deterministic.
 var superviseJitterFrac = rand.Float64
 
+// superviseCycleCancelGrace bounds how long the loop waits for a cancelled
+// cycle to unwind before abandoning it (#1119). A cycle that honors its context
+// returns almost immediately; one that does not must not hold up the watchdog
+// kick or flow shutdown behind it. A package var so tests can shrink it.
+var superviseCycleCancelGrace = 10 * time.Second
+
+// superviseRunOnce is the supervisor entry point the loop drives, indirected
+// through a package var so tests can wedge a cycle deterministically (#1119).
+var superviseRunOnce = supervisor.RunOnce
+
 // superviseStartupJitter returns a random phase offset in
 // [0, min(interval, cap)) used to de-synchronize this flow's supervise GitHub
 // reads from the rest of the fleet — and the ticker anchored to the first
@@ -63,7 +73,13 @@ func computeSuperviseJitter(interval time.Duration, frac float64) time.Duration 
 // flow restart (#768). The GitHub client is built once from the startup repo —
 // repo is a restart-required field the orchestrator refuses to hot-apply, so it
 // is stable for the flow's lifetime.
-func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, approvalsDBPath string, emergencyLLMHalt func() bool) {
+//
+// kickCh is the watchdog's self-heal signal (#1119), nil for callers that do not
+// wire one. A kick means "your cycle is wedged": the loop cancels the in-flight
+// cycle and moves on, rather than waiting on the very goroutine that is stuck —
+// waiting is what made the earlier attempt (#820) a no-op that relocated the
+// block instead of clearing it.
+func runSupervise(ctx context.Context, name string, getCfg func() *config.Config, reader supervisor.Reader, interval time.Duration, approvalsDBPath string, emergencyLLMHalt func() bool, kickCh <-chan struct{}) {
 	// reader is the flow's read surface. The daemon passes a mirror-first source
 	// when github_mirror.source is mirror-first (#826); it satisfies
 	// supervisor.Reader and serves the poll reads locally when the mirror is warm,
@@ -77,22 +93,52 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 	// supervisor do that" trail was dropped — turning debugging into journal
 	// archaeology (#764). Logs key on the unique fleet name (not the possibly
 	// shared session prefix) so two same-basename repos stay distinguishable.
-	runOnce := func() error {
-		// Fleet-wide EMERGENCY STOP (#840): skip the whole supervise cycle while
-		// the switch is active. Deterministic-only still spawned gh api children
-		// and outcome/verify scripts (java/gradle/go/android); engaging the
-		// stop must not keep re-creating them under the daemon cgroup.
+	runOnce := func(cycleCtx context.Context) error {
+		// Fleet-wide EMERGENCY STOP (#840, #1150): skip the whole supervise cycle
+		// while the switch is active. Deterministic-only still spawned gh api
+		// children and outcome/verify scripts (java/gradle/go/android); engaging
+		// the stop must not keep re-creating them under the daemon cgroup.
 		if emergencyLLMHalt != nil && emergencyLLMHalt() {
 			log.Printf("[%s] supervise: EMERGENCY STOP — skipping cycle (no GitHub/outcome/LLM)", name)
 			return nil
 		}
 		opts := []supervisor.RunOption{supervisor.WithApprovalsDBPath(approvalsDBPath)}
-		decision, err := supervisor.RunOnce(getCfg(), reader, opts...)
+		decision, err := superviseRunOnce(cycleCtx, getCfg(), reader, opts...)
 		if err != nil {
 			return err
 		}
 		logSupervisorDecision(name, decision)
 		return nil
+	}
+
+	// runCycle runs one cycle under its own cancellable context so the loop can
+	// get rid of a wedged one (#1119). Both escape hatches — a watchdog kick and
+	// flow shutdown — cancel first and then wait only a bounded grace: a cycle
+	// that ignores cancellation is abandoned with a loud log instead of pinning
+	// the loop (or the flow's shutdown) to it forever.
+	runCycle := func(first bool) {
+		cycleCtx, cancelCycle := context.WithCancel(ctx)
+		defer cancelCycle()
+		done := make(chan error, 1)
+		go func() { done <- runOnce(cycleCtx) }()
+		select {
+		case err := <-done:
+			if err == nil {
+				return
+			}
+			if first {
+				log.Printf("[%s] supervise: first cycle failed (will retry): %v", name, err)
+				return
+			}
+			log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", name, interval, err)
+		case <-kickCh:
+			log.Printf("[%s] supervise: watchdog kick — cancelling the in-flight cycle", name)
+			cancelCycle()
+			awaitCancelledCycle(name, done)
+		case <-ctx.Done():
+			cancelCycle()
+			awaitCancelledCycle(name, done)
+		}
 	}
 
 	// #794: de-phase this flow's supervise reads from the rest of the fleet.
@@ -114,9 +160,7 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		}
 	}
 
-	if err := runOnce(); err != nil {
-		log.Printf("[%s] supervise: first cycle failed (will retry): %v", name, err)
-	}
+	runCycle(true)
 
 	if interval <= 0 {
 		return
@@ -129,13 +173,32 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			// #689: a failed cycle is logged and retried on the next tick,
-			// never fatal — a transient GitHub/decision-layer failure must
-			// not crash the daemon.
-			if err := runOnce(); err != nil {
-				log.Printf("[%s] supervise: cycle failed (will retry in %s): %v", name, interval, err)
-			}
+		case <-kickCh:
+			// The previous cycle was already cancelled by the kick that
+			// interrupted it (or none was running); either way the loop
+			// answers a wedge with a fresh cycle instead of idling until
+			// the next tick.
+			log.Printf("[%s] supervise: watchdog kick — starting a fresh cycle", name)
 		}
+		// #689: a failed cycle is logged and retried on the next tick,
+		// never fatal — a transient GitHub/decision-layer failure must
+		// not crash the daemon.
+		runCycle(false)
+	}
+}
+
+// awaitCancelledCycle waits a bounded grace for an already-cancelled supervise
+// cycle to unwind, then gives up on it (#1119). Abandoning is the point: the
+// caller cancels precisely because the cycle is suspected wedged, so waiting
+// for it unconditionally would put the block back where the kick — or flow
+// shutdown — was supposed to remove it.
+func awaitCancelledCycle(name string, done <-chan error) {
+	timer := time.NewTimer(superviseCycleCancelGrace)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		log.Printf("[%s] supervise: WARNING cancelled cycle did not return within %s — abandoning it", name, superviseCycleCancelGrace)
 	}
 }
 

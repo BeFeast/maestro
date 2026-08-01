@@ -312,10 +312,25 @@ func WithApprovalsDBPath(path string) RunOption {
 
 // RunOnce records one supervisor decision in Maestro state and applies any safe
 // queue mutations selected by the decision.
-func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.SupervisorDecision, error) {
+//
+// ctx bounds the cycle (#1119). It is checked at each phase boundary — before
+// the state load, before Decide, and before the mutating phase — so a cancelled
+// cycle stops advancing instead of running to completion; the caller (the
+// daemon supervise loop) can therefore abandon a wedged cycle and recover.
+// Cancellation is deliberately NOT honored inside the mutating phase: once
+// approvals/labels/comments start landing, aborting halfway would leave GitHub
+// mutated with the matching state unsaved. The reads themselves are bounded by
+// the gh subprocess deadline in internal/github, so a phase cannot outlive it.
+func RunOnce(ctx context.Context, cfg *config.Config, reader Reader, opts ...RunOption) (state.SupervisorDecision, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
 	var ro runOptions
 	for _, opt := range opts {
 		opt(&ro)
+	}
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
 	}
 	st, err := state.Load(cfg.StateDir)
 	if err != nil {
@@ -346,6 +361,9 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 		recordOutcomeHealth(cfg, st)
 	}
 
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
+	}
 	engine := NewEngine(cfg, reader)
 	engine.SetEmergencyLLMHalt(ro.emergencyLLMHalt)
 	decision, err := engine.Decide(st)
@@ -374,6 +392,9 @@ func RunOnce(cfg *config.Config, reader Reader, opts ...RunOption) (state.Superv
 	}
 	state.PrepareSupervisorRecommendation(&decision)
 	decision.Quiescent = supervisorDecisionQuiescent(decision)
+	if err := ctx.Err(); err != nil {
+		return state.SupervisorDecision{}, err
+	}
 	if !cfg.Supervisor.DryRun {
 		// Execute any approvals that were transitioned to status=approved
 		// outside this loop (CLI approve already executes inline; this
@@ -1360,6 +1381,26 @@ func (e *Engine) decideDynamicWave(st *state.State, now time.Time, projectState 
 			continue
 		}
 
+		// A gate-fail-streak issue is Maestro reporting that a scheduled gate
+		// failed N times — it is a notification, not a triaged task. Whether a
+		// worker can fix it depends entirely on what the gate checks: repo code,
+		// or an external service Maestro has no reach into. Auto-promoting it
+		// spawns workers against outages they cannot fix (live 2026-07-23:
+		// ok-folio's LAN healthcheck flapped under host load and the fleet
+		// ground through 31 failed sessions on the minted issues). The operator
+		// decides; an explicitly labelled streak issue still runs normally.
+		//
+		// This must stay ahead of the SelectedCandidate assignment below: with
+		// owns_ready_label enabled, a skipped-but-selected candidate is handed
+		// to applySupervisorOwnedReadyFilter, which admits it to the dispatch
+		// list even though the decision itself was `none`.
+		if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+			baseReasons = appendReasons(baseReasons,
+				fmt.Sprintf("Issue #%d is an auto-minted gate-fail-streak report — it needs an operator to judge whether the gate failure is repo-fixable before it enters the queue", issue.Number),
+			)
+			continue
+		}
+
 		if analysis != nil {
 			analysis.SelectedCandidate = supervisorIssueCandidate(issue)
 		}
@@ -1531,6 +1572,9 @@ func detectVisualEvidenceStuckStates(st *state.State) []state.SupervisorStuckSta
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || sess.VisualEvidence != state.VisualEvidenceMissing || sess.PRNumber <= 0 {
+			continue
+		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		switch sess.Status {
@@ -1871,6 +1915,9 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 		if sess == nil {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		target := &state.SupervisorTarget{Issue: sess.IssueNumber, PR: sess.PRNumber, Session: slot}
 
 		// #877: a session the daemon deliberately checkpointed on shutdown
@@ -1915,7 +1962,8 @@ func (e *Engine) detectWorkerStuckStates(st *state.State, now time.Time, cache *
 			}
 		}
 
-		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 && !e.retryExhaustedSessionResolved(st, sess, cache) {
+		if sess.Status == state.StatusRetryExhausted && sess.PRNumber == 0 &&
+			state.SessionProvesFailedAttempt(sess) && !e.retryExhaustedSessionResolved(st, sess, cache) {
 			findings = append(findings, stuckState("retry_exhausted", SeverityBlocked,
 				fmt.Sprintf("Issue #%d exhausted its retry budget.", sess.IssueNumber),
 				"Review the failed attempts, adjust the issue or retry budget, then restart intentionally.", false, target,
@@ -1987,13 +2035,13 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 		if sess == nil {
 			continue
 		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
+			continue
+		}
 		if !sessionCanStillBlockProgress(sess.Status) {
 			continue
 		}
 		if e.sessionResolvedOnGitHub(sess, cache) {
-			continue
-		}
-		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)
@@ -2089,7 +2137,7 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 				fmt.Sprintf("PR #%d checks=failure", pr.Number)))
 		}
 
-		if e.cfg.ReviewGate == "greptile" && (ciStatus == "" || ciStatus == "success") {
+		if (e.cfg.ReviewGate == "greptile" || e.cfg.ReviewGate == "llm-review") && (ciStatus == "" || ciStatus == "success") {
 			streams := e.cfg.EffectiveReviewGateStreams()
 			if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok && !onlyGreptileReviewStream(streams) {
 				verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, streams)
@@ -2107,7 +2155,7 @@ func (e *Engine) detectPRStuckStates(st *state.State, prs []github.PR, cache *re
 							fmt.Sprintf("PR #%d review_gate=%s", pr.Number, verdict.Summary())))
 					}
 				}
-			} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
+			} else if greptileReader, ok := e.reader.(prGreptileReader); ok && e.cfg.ReviewGate == "greptile" {
 				approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 				if err == nil {
 					switch {
@@ -2231,6 +2279,9 @@ func (e *Engine) detectEnvironmentStuckStates(st *state.State, eligible []github
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || strings.TrimSpace(sess.Worktree) == "" || strings.TrimSpace(e.cfg.WorktreeBase) == "" {
+			continue
+		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		if !pathWithinBase(sess.Worktree, e.cfg.WorktreeBase) {
@@ -2850,6 +2901,9 @@ func (e *Engine) issueRepairSkipReason(st *state.State, issue github.Issue) (str
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
 	}
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
+	}
 	policyExcludedLabels := e.policyExcludedLabels()
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(e.excludeLabels(), label) || hasLabelName(policyExcludedLabels, label)) {
 		return heldMetaSkipReason(fmt.Sprintf("label %q", label)), nil
@@ -2897,6 +2951,12 @@ func (e *Engine) issueSkipReasonWithExcludeLabels(st *state.State, issue github.
 	}
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), nil
+	}
+	// Gate-streak intake is enabled independently of dynamic-wave policy, so the
+	// hold cannot live only in decideDynamicWave: the default eligibility path
+	// and the repair path both reach dispatch through here.
+	if isGateFailStreakIssue(issue) && !e.operatorTriagedGateStreak(issue) {
+		return heldMetaSkipReason("auto-minted gate-fail-streak report awaits operator triage"), nil
 	}
 	policyExcludedLabels := excludeLabelsExcept(e.policyExcludedLabels(), ignoredBlockedLabel)
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok && (hasLabelName(excludeLabels, label) || hasLabelName(policyExcludedLabels, label)) {
@@ -3016,6 +3076,9 @@ func (e *Engine) sessionWithOpenPR(st *state.State, prs []github.PR, cache *reso
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
 		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
+			continue
+		}
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		var pr github.PR
@@ -3238,11 +3301,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 		}
 	}
 
-	// Greptile gate — when the reader exposes Greptile signal, require
-	// approved=true and pending=false. Missing reader -> proceed (some
-	// projects don't use Greptile and the cautious gate still requires
-	// human approval before merge_pr executes).
-	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+	// Review gate — when the reader exposes the review signal, require it to
+	// have settled approved. Missing reader -> proceed (some projects don't
+	// use a review bot and the cautious gate still requires human approval
+	// before merge_pr executes). For the stream-based llm-review gate
+	// (#1148) the aggregate verdict is the signal; the historical
+	// greptile-only setup keeps the Greptile read.
+	if e.cfg != nil && e.cfg.ReviewGate == "llm-review" {
+		if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok {
+			verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, e.cfg.EffectiveReviewGateStreams())
+			if err != nil || verdict.Pending || !verdict.Passed {
+				return false, "", nil
+			}
+		}
+	} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 		if err != nil {
 			return false, "", nil
@@ -3365,7 +3437,17 @@ func (e *Engine) monitorOpenPRReasons(slot string, sess *state.Session, pr githu
 			reasons = append(reasons, "CI status could not be read")
 		}
 	}
-	if greptileReader, ok := e.reader.(prGreptileReader); ok {
+	if e.cfg != nil && e.cfg.ReviewGate == "llm-review" {
+		if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok {
+			if verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, e.cfg.EffectiveReviewGateStreams()); err == nil {
+				if verdict.Pending {
+					reasons = append(reasons, "llm-review pending")
+				} else if !verdict.Passed {
+					reasons = append(reasons, "llm-review not approved")
+				}
+			}
+		}
+	} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		if approved, pending, err := greptileReader.PRGreptileApproved(pr.Number); err == nil {
 			if pending {
 				reasons = append(reasons, "Greptile review pending")
@@ -3525,7 +3607,8 @@ func (e *Engine) hasLiveRunningSessionForIssue(st *state.State, issueNumber int)
 func (e *Engine) retryExhaustedSession(st *state.State, cache *resolutionCache) (string, *state.Session, bool) {
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted {
+		if sess == nil || sess.Status != state.StatusRetryExhausted ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {
@@ -3546,7 +3629,8 @@ func (e *Engine) retryExhaustedRepairCandidate(st *state.State, issues []github.
 	}
 	for _, slot := range sortedSessionNames(st) {
 		sess := st.Sessions[slot]
-		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 {
+		if sess == nil || sess.Status != state.StatusRetryExhausted || sess.PRNumber > 0 ||
+			!state.SessionProvesFailedAttempt(sess) {
 			continue
 		}
 		if e.retryExhaustedSessionResolved(st, sess, cache) {
@@ -3580,42 +3664,8 @@ func (e *Engine) retryExhaustedSessionResolvedOnGitHub(sess *state.Session, cach
 }
 
 func (e *Engine) retryExhaustedSessionResolved(st *state.State, sess *state.Session, cache *resolutionCache) bool {
-	return e.retryExhaustedSessionResolvedOnGitHub(sess, cache) || e.retryExhaustedSessionSupersededByIssueProgress(st, sess)
-}
-
-func (e *Engine) retryExhaustedSessionSupersededByIssueProgress(st *state.State, exhausted *state.Session) bool {
-	if st == nil || exhausted == nil || exhausted.IssueNumber <= 0 {
-		return false
-	}
-	exhaustedAt := state.SessionChangedAt(exhausted)
-	for _, sess := range st.Sessions {
-		if sess == nil || sess == exhausted || sess.IssueNumber != exhausted.IssueNumber {
-			continue
-		}
-		if !sessionCanSupersedeRetryExhausted(sess) {
-			continue
-		}
-		if !exhaustedAt.IsZero() && !state.SessionChangedAt(sess).After(exhaustedAt) {
-			continue
-		}
-		if sess.Status == state.StatusRunning && sess.PID > 0 && !e.pidAlive(sess.PID) {
-			continue
-		}
-		return true
-	}
-	return false
-}
-
-func sessionCanSupersedeRetryExhausted(sess *state.Session) bool {
-	if sess == nil {
-		return false
-	}
-	switch sess.Status {
-	case state.StatusRunning, state.StatusQueued, state.StatusPROpen, state.StatusCodeLanded, state.StatusDone:
-		return true
-	default:
-		return false
-	}
+	_, _, superseded := st.SupersedingSession(sess)
+	return e.retryExhaustedSessionResolvedOnGitHub(sess, cache) || superseded
 }
 
 func (e *Engine) sessionResolvedOnGitHub(sess *state.Session, cache *resolutionCache) bool {
@@ -4637,7 +4687,7 @@ func (e *Engine) canonicalOpenPROwners(st *state.State, byNumber map[int]github.
 		if sess == nil || !sessionCanStillBlockProgress(sess.Status) || e.sessionResolvedOnGitHub(sess, cache) {
 			continue
 		}
-		if sess.Status == state.StatusRetryExhausted && e.retryExhaustedSessionSupersededByIssueProgress(st, sess) {
+		if _, _, superseded := st.SupersedingSession(sess); superseded {
 			continue
 		}
 		pr, found := openPRForSession(sess, byNumber, byBranch)

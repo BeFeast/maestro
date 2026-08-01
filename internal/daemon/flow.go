@@ -94,6 +94,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	d.flows[flow.key] = flow
 	d.mu.Unlock()
 
+	// Per-flow watchdog → supervise kick channel (#1119). Buffered by one so a
+	// watchdog tick never blocks on a loop that has not drained the previous
+	// kick; the send side is non-blocking anyway.
+	kickCh := make(chan struct{}, 1)
+
 	var wg sync.WaitGroup
 	wg.Add(2)
 	go func() {
@@ -112,7 +117,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		// its decision/cycle logs on it so two same-basename repos are
 		// distinguishable in the journal, matching the watchdog (#764). It reads
 		// the flow's CURRENT config through the holder each cycle (#768).
-		d.superviseLoop(fctx, flow.name, flow.holder.Load, d.opts)
+		d.superviseLoop(fctx, flow.name, flow.holder.Load, d.opts, kickCh)
 	}()
 	// Reload pump (#768): consume the store watcher and fan a config-store edit
 	// out to the holder (supervisor + dashboard) and the orchestrator. Tracked
@@ -137,7 +142,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 		go func() {
 			defer wg.Done()
 			defer recoverFlow(flow, "watchdog")
-			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval)
+			d.watchdogLoop(fctx, flow.name, cfg.StateDir, d.opts.SuperviseInterval, kickCh)
 		}()
 	}
 	// #887: the material-progress evaluator owns a separate per-project clock.
@@ -439,6 +444,11 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// leaves the closure reading a permanently-normal cache, i.e. inert.
 	orch.SetEmergencyHalt(d.emergencySpawnHalt)
 	orch.SetFleetSpawnCeiling(d.fleetSpawnCeilingReached)
+	// Host-resource precondition (#1128): /tmp is a RAM-backed tmpfs, so
+	// dispatching into a nearly-full one turns a space problem into a host
+	// memory outage. Daemon.tmpfsSpawnHold is a self-clearing throughput pause
+	// re-evaluated every poll, not a gate and not an approval.
+	orch.SetSpawnResourceHold(d.tmpfsSpawnHold)
 	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
 		return d.reserveFleetSpawn(orchCfg.StateDir)
 	})

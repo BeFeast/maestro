@@ -87,6 +87,12 @@ func (d *Daemon) runTmpfsHygieneTick(ctx context.Context) {
 	if err != nil {
 		log.Printf("[tmpfs-hygiene] sweep refused or failed: %v", err)
 	}
+	if summary.SweepIneffective {
+		// Loud on purpose: a reaper that reclaims nothing looks identical to a
+		// clean /tmp in the metric, so it has to announce itself (#1125).
+		log.Printf("[tmpfs-hygiene] SUSPICIOUS: protected every matched entry and reclaimed nothing (matched=%d protected=%d reclaimable_bytes=0 protect_hits=%v proc_scan_errors=%d proc_unresolved_processes=%d) — protection may have stopped discriminating",
+			summary.MatchedEntries, summary.ProtectedEntries, summary.ProtectHits, summary.ProcScanErrors, summary.ProcUnresolvedProcesses)
+	}
 }
 
 func (d *Daemon) sweepTmpfsHygiene(ctx context.Context) (tmpfshygiene.Summary, error) {

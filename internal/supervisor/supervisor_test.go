@@ -1,6 +1,7 @@
 package supervisor
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net/http"
@@ -1681,11 +1682,11 @@ func TestRunOnce_BlockedIssueWithOpenPRIsQuiescentUntilGuardTransition(t *testin
 		t.Fatalf("save initial state: %v", err)
 	}
 
-	first, err := RunOnce(cfg, reader)
+	first, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("first RunOnce: %v", err)
 	}
-	second, err := RunOnce(cfg, reader)
+	second, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("second RunOnce: %v", err)
 	}
@@ -1704,7 +1705,7 @@ func TestRunOnce_BlockedIssueWithOpenPRIsQuiescentUntilGuardTransition(t *testin
 	}
 
 	reader.issues = []github.Issue{testIssue(331, "canonical PR #335")}
-	edge, err := RunOnce(cfg, reader)
+	edge, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("guard exit RunOnce: %v", err)
 	}
@@ -2213,7 +2214,7 @@ func TestRunOnceRecordsDecision(t *testing.T) {
 	cfg := testConfig(t)
 	reader := &fakeReader{}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -2244,7 +2245,7 @@ func TestRunOnce_StampsLastRunOnceAt(t *testing.T) {
 	reader := &fakeReader{}
 
 	before := time.Now().UTC()
-	if _, err := RunOnce(cfg, reader); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	after := time.Now().UTC()
@@ -2308,7 +2309,7 @@ func TestRunOnce_ClearsSupervisorStuckFlag(t *testing.T) {
 		t.Fatalf("Save: %v", err)
 	}
 
-	if _, err := RunOnce(cfg, reader); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 
@@ -2337,7 +2338,7 @@ func TestRunOnceRecordsOutcomeHealth(t *testing.T) {
 	}
 	reader := &fakeReader{}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -2359,7 +2360,7 @@ func TestRunOnceRecordsPendingApprovalForRiskyDecision(t *testing.T) {
 	cfg.IssueLabels = []string{"maestro-ready"}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -2400,11 +2401,11 @@ func TestRunOnceRecommendationDedupKeepsApprovalMintingStable(t *testing.T) {
 	cfg.IssueLabels = []string{"maestro-ready"}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 
-	first, err := RunOnce(cfg, reader)
+	first, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("first RunOnce: %v", err)
 	}
-	second, err := RunOnce(cfg, reader)
+	second, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("second RunOnce: %v", err)
 	}
@@ -2438,7 +2439,7 @@ func TestRunOnceDecisionSurvivesStaleRunLoopSave(t *testing.T) {
 	}
 
 	reader := &fakeReader{issues: []github.Issue{testIssue(302, "Prevent state lost-update", "maestro-ready")}}
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -2686,7 +2687,7 @@ func TestRunOnceDynamicWaveAddsReadyOnlyToBestCandidateAndCleansStale(t *testing
 		testIssue(20, "best candidate", "p0"),
 	}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3005,7 +3006,7 @@ func TestRunOnceLabelsNextIssueReadyAndComments(t *testing.T) {
 	cfg.Supervisor.QueueComments = true
 	reader := &fakeReader{issues: []github.Issue{testIssue(308, "implement supervisor")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3043,7 +3044,7 @@ func TestRunOnceLabelsNextIssueReadyAndComments(t *testing.T) {
 		t.Fatalf("latest decision = %#v, want succeeded decision with mutations", latest)
 	}
 
-	second, err := RunOnce(cfg, reader)
+	second, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("second RunOnce: %v", err)
 	}
@@ -3063,7 +3064,7 @@ func TestRunOnceOrderedQueueRemovesBlockedLabelWhenPolicyAllows(t *testing.T) {
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "was blocked", "maestro-ready", "blocked")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3090,7 +3091,7 @@ func TestRunOnceOrderedQueueUsesConfiguredSupervisorBlockedLabel(t *testing.T) {
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionRemoveBlockedLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "waiting work", "maestro-ready", "waiting")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3117,7 +3118,7 @@ func TestRunOnceDynamicWaveNeverRemovesBlockedLabel(t *testing.T) {
 		testIssue(2, "regular", "p1"),
 	}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3146,7 +3147,7 @@ func TestRunOnceDoesNotRemoveBlockedLabelWithOpenBlocker(t *testing.T) {
 		closedIssues: map[int]bool{10: false},
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3175,7 +3176,7 @@ func TestRunOnceRunningWorkerDoesNotLabelAtCapacity(t *testing.T) {
 	}
 	reader := &fakeReader{issues: []github.Issue{testIssue(308, "next")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3197,7 +3198,7 @@ func TestRunOnceAlreadyReadyDoesNotDuplicateQueueAction(t *testing.T) {
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel, config.SupervisorActionAddIssueComment}
 	reader := &fakeReader{issues: []github.Issue{testIssue(42, "ready work", "maestro-ready")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3219,7 +3220,7 @@ func TestRunOnceGitHubFailureRecordsFailedMutation(t *testing.T) {
 		addLabelErr: errors.New("boom"),
 	}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3601,7 +3602,7 @@ func TestRunOnceDryRunDoesNotRecordDecision(t *testing.T) {
 	cfg.Supervisor.DryRun = true
 	reader := &fakeReader{}
 
-	if _, err := RunOnce(cfg, reader); err != nil {
+	if _, err := RunOnce(context.Background(), cfg, reader); err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
 	st, err := state.Load(cfg.StateDir)
@@ -3835,7 +3836,7 @@ func TestRunOnce_SpawnWorker_RecommendedActionRequiresApprovalReflectsGate(t *te
 	}
 	reader := &fakeReader{issues: []github.Issue{testIssue(119, "fix CI flake", "maestro-ready")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}
@@ -3887,7 +3888,7 @@ func TestRunOnce_SpawnWorker_AutonomousModeReportsNoApprovalRequired(t *testing.
 	cfg.Supervisor.ApprovalRequiredActions = []string{ActionMergePR}
 	reader := &fakeReader{issues: []github.Issue{testIssue(119, "fix CI flake", "maestro-ready")}}
 
-	decision, err := RunOnce(cfg, reader)
+	decision, err := RunOnce(context.Background(), cfg, reader)
 	if err != nil {
 		t.Fatalf("RunOnce: %v", err)
 	}

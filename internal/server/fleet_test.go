@@ -4274,6 +4274,134 @@ func TestFleetSupersedingIssueSessionSuppressesTerminalDuplicate(t *testing.T) {
 	}
 }
 
+func TestFleetAPISuppressesPredecessorAttentionBehindCurrentLifecycle(t *testing.T) {
+	tests := []struct {
+		name             string
+		currentStatus    state.SessionStatus
+		wantAttention    int
+		wantOperatorSlot string
+		wantFailed       int
+	}{
+		{name: "later done clears predecessor attention", currentStatus: state.StatusDone, wantAttention: 0, wantFailed: 2},
+		{name: "code landed needs no operator action", currentStatus: state.StatusCodeLanded, wantAttention: 0, wantOperatorSlot: "current", wantFailed: 2},
+		{name: "current regression owns attention", currentStatus: state.StatusFailed, wantAttention: 1, wantOperatorSlot: "current", wantFailed: 3},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			stateDir := filepath.Join(dir, "state")
+			base := time.Now().UTC().Add(-time.Hour).Truncate(time.Second)
+			finishedA := base.Add(150 * time.Millisecond)
+			finishedB := base.Add(250 * time.Millisecond)
+			finishedCurrent := base.Add(400 * time.Millisecond)
+			saveFleetTestState(t, stateDir, map[string]*state.Session{
+				"attempt-a": {
+					IssueNumber: 976, IssueTitle: "historical failed A", Status: state.StatusFailed,
+					StartedAt: base.Add(100 * time.Millisecond), FinishedAt: &finishedA, TokensUsedTotal: 11,
+				},
+				"attempt-b": {
+					IssueNumber: 976, IssueTitle: "historical dead B", Status: state.StatusDead,
+					StartedAt: base.Add(200 * time.Millisecond), FinishedAt: &finishedB, TokensUsedTotal: 22,
+				},
+				"current": {
+					IssueNumber: 976, IssueTitle: "current lifecycle C", Status: tc.currentStatus, PRNumber: 1033,
+					StartedAt: base.Add(300 * time.Millisecond), FinishedAt: &finishedCurrent, TokensUsedTotal: 33,
+				},
+			})
+
+			disabled := false
+			srv := NewFleet([]FleetProject{
+				NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+					Repo:        "BeFeast/maestro",
+					StateDir:    stateDir,
+					MaxParallel: 4,
+					StaleSessionReconciler: config.StaleSessionReconcilerConfig{
+						Enabled: &disabled,
+					},
+				}),
+			}, "127.0.0.1", 8786, true)
+
+			resp := srv.snapshot()
+			project := findFleetProject(t, resp.Projects, "maestro")
+			if project.NeedsAttention != tc.wantAttention {
+				t.Fatalf("needs_attention = %d, want %d; operator=%+v attention=%+v", project.NeedsAttention, tc.wantAttention, project.OperatorState, project.Attention)
+			}
+			if project.OperatorState.Session != tc.wantOperatorSlot {
+				t.Fatalf("operator session = %q, want %q; state=%+v", project.OperatorState.Session, tc.wantOperatorSlot, project.OperatorState)
+			}
+			if project.Failed != tc.wantFailed || project.Sessions != 3 {
+				t.Fatalf("historical accounting = failed:%d sessions:%d, want failed:%d sessions:3", project.Failed, project.Sessions, tc.wantFailed)
+			}
+
+			for slot, wantTokens := range map[string]int{"attempt-a": 11, "attempt-b": 22, "current": 33} {
+				worker := findFleetWorker(t, resp.Workers, slot)
+				if worker.TokensUsedTotal != wantTokens {
+					t.Fatalf("%s tokens = %d, want %d", slot, worker.TokensUsedTotal, wantTokens)
+				}
+				if slot != "current" && worker.NeedsAttention {
+					t.Fatalf("historical predecessor %s remained actionable: %+v", slot, worker)
+				}
+			}
+		})
+	}
+}
+
+func TestMakeSessionInfoPreservesSubsecondLifecycleOrdering(t *testing.T) {
+	started := time.Date(2026, 7, 21, 18, 0, 0, 987654321, time.UTC)
+	finished := started.Add(123456789 * time.Nanosecond)
+	info := makeSessionInfo("BeFeast/maestro", "current", &state.Session{
+		IssueNumber: 976,
+		Status:      state.StatusDone,
+		StartedAt:   started,
+		FinishedAt:  &finished,
+	})
+
+	if info.StartedAt != started.Format(time.RFC3339Nano) || info.FinishedAt != finished.Format(time.RFC3339Nano) {
+		t.Fatalf("projected timestamps = %q / %q, want nanosecond precision", info.StartedAt, info.FinishedAt)
+	}
+}
+
+func TestFleetAPISharedPRContinuationMakesDeadSourceNonActionable(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	base := time.Now().UTC().Add(-time.Hour)
+	finished := base.Add(10 * time.Minute)
+	saveFleetTestState(t, stateDir, map[string]*state.Session{
+		"source": {
+			IssueNumber: 900, IssueTitle: "superseded source", Status: state.StatusDead, PRNumber: 1033,
+			StartedAt: base, FinishedAt: &finished, TokensUsedTotal: 21,
+		},
+		"continuation": {
+			IssueNumber: 976, IssueTitle: "active continuation", Status: state.StatusPROpen, PRNumber: 1033,
+			StartedAt: base.Add(20 * time.Minute), TokensUsedTotal: 34,
+		},
+	})
+
+	disabled := false
+	srv := NewFleet([]FleetProject{
+		NewFleetProject("maestro", "/tmp/maestro.yaml", "", &config.Config{
+			Repo:        "BeFeast/maestro",
+			StateDir:    stateDir,
+			MaxParallel: 4,
+			StaleSessionReconciler: config.StaleSessionReconcilerConfig{
+				Enabled: &disabled,
+			},
+		}),
+	}, "127.0.0.1", 8786, true)
+
+	resp := srv.snapshot()
+	project := findFleetProject(t, resp.Projects, "maestro")
+	if project.NeedsAttention != 0 || project.OperatorState.Session != "continuation" || project.OperatorState.PRNumber != 1033 {
+		t.Fatalf("continuation did not own operator state: project=%+v", project)
+	}
+	source := findFleetWorker(t, resp.Workers, "source")
+	continuation := findFleetWorker(t, resp.Workers, "continuation")
+	if source.NeedsAttention || source.TokensUsedTotal != 21 || continuation.TokensUsedTotal != 34 || project.Sessions != 2 {
+		t.Fatalf("shared-PR history/accounting changed: source=%+v continuation=%+v project=%+v", source, continuation, project)
+	}
+}
+
 func TestFleetSupersedingIssueSessionUsesCanonicalMergedPRForReconciledDuplicate(t *testing.T) {
 	duplicate := sessionInfo{
 		Slot:           "ok-player-271",

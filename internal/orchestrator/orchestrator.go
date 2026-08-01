@@ -77,7 +77,13 @@ type Orchestrator struct {
 	// direct GitHub client — it serves fresh mirror rows locally and falls back
 	// to the API on a miss/stale. Writes and un-mirrored reads always stay on
 	// gh, so GitHub remains authoritative. nil = today's API-direct behavior.
-	readSource            githubReadSource
+	readSource githubReadSource
+	// tokenBudgetMillNotified remembers the streak length already alerted per
+	// issue so a held budget-wall issue alerts on escalation, not every cycle.
+	tokenBudgetMillNotified map[int]int
+	// missingReviewNotified remembers PRs already reported as merged past an
+	// absent review gate, so the alert fires once per PR.
+	missingReviewNotified map[int]bool
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -165,6 +171,12 @@ type Orchestrator struct {
 	fleetSpawnCeilingFn func() bool
 	fleetSpawnReserveFn func() (commit func(slot string), release func(), ok bool)
 
+	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
+	// whether the host is too short on tmpfs space to accept another worker, and
+	// why. nil = no precondition. It is a throughput pause only — see
+	// SetSpawnResourceHold.
+	spawnResourceHoldFn func() (hold bool, reason string)
+
 	// Restart-required signal. Some config fields (currently routing.*) cannot be
 	// hot-applied because their runtime components are built once at startup. When
 	// such a field changes during a config reload we do not apply it; instead we raise this
@@ -188,7 +200,7 @@ type Orchestrator struct {
 	ghClosePRFn                  func(prNumber int, comment string) error
 	ghPRChecksOutputFn           func(prNumber int) (string, error)
 	ghPRFailingChecksFn          func(prNumber int) ([]github.FailingCheck, error)
-	ghCollectPRReviewFeedbackFn  func(prNumber int) (string, error)
+	ghCollectPRReviewFeedbackFn  func(prNumber int, streams []string) (string, error)
 	ghCloseIssueFn               func(number int, comment string) error
 	ghPRHeadSHAFn                func(prNumber int) (string, error)
 	ghPRDetailsFn                func(prNumber int) (github.PR, error)
@@ -232,7 +244,7 @@ type Orchestrator struct {
 
 // New creates a new Orchestrator
 func New(cfg *config.Config) *Orchestrator {
-	n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+	n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 	n.WithNtfy(cfg.Notify.Ntfy.BaseURL, cfg.Notify.Ntfy.Topic, cfg.Notify.Ntfy.Token())
 	if cfg.Telegram.DigestMode {
 		n.SetDigestMode(true)
@@ -283,6 +295,18 @@ func (o *Orchestrator) SetEmergencyHalt(fn func() bool) {
 // nil disables the gate for legacy single-project callers and tests.
 func (o *Orchestrator) SetFleetSpawnCeiling(fn func() bool) {
 	o.fleetSpawnCeilingFn = fn
+}
+
+// SetSpawnResourceHold wires the host-resource spawn precondition (#1128). fn
+// is consulted at the top of startNewWorkers; when it reports a hold the
+// orchestrator lists nothing and spawns nothing for this cycle.
+//
+// It is deliberately a throughput pause and not a gate: no state is written, no
+// approval is requested, no ActionNone decision is produced, and no issue's
+// retry budget is touched. The next poll re-evaluates fn, so dispatch resumes
+// on its own as soon as the host recovers. Passing nil clears the precondition.
+func (o *Orchestrator) SetSpawnResourceHold(fn func() (bool, string)) {
+	o.spawnResourceHoldFn = fn
 }
 
 // SetFleetSpawnReserve wires the daemon's atomic one-worker reservation. The
@@ -820,7 +844,10 @@ func (o *Orchestrator) prHasCriticalReview(prNumber int) (bool, error) {
 		// Fail safe: cannot determine criticality -> caller must NOT auto-merge.
 		return false, fmt.Errorf("no github client configured for critical-review check")
 	}
-	return o.gh.PRHasCriticalReviewOnHead(prNumber)
+	// The check must cover whatever streams actually gate this project: an
+	// llm-review P0/P1 on head blocks the #565 convergence merge exactly like
+	// a Greptile P0 does (#1148 review round 1, P1-1).
+	return o.gh.PRHasCriticalReviewOnHead(prNumber, o.cfg.EffectiveReviewGateStreams())
 }
 
 func (o *Orchestrator) prUnresolvedReviewThreadsOnHead(prNumber int) (string, []github.ReviewThread, error) {
@@ -927,10 +954,16 @@ func (o *Orchestrator) prChecksOutput(prNumber int) (string, error) {
 }
 
 func (o *Orchestrator) collectPRReviewFeedback(prNumber int) (string, error) {
+	// The configured review streams scope which bot logins count as review
+	// feedback: on llm-review rows the bot's inline findings must reach the
+	// retry pipeline (otherwise AutoRetryReviewFeedback never fires and the
+	// PR hangs), while on greptile-only rows fleet-bot comments stay
+	// invisible (#1148 round 2, P1).
+	streams := o.cfg.EffectiveReviewGateStreams()
 	if o.ghCollectPRReviewFeedbackFn != nil {
-		return o.ghCollectPRReviewFeedbackFn(prNumber)
+		return o.ghCollectPRReviewFeedbackFn(prNumber, streams)
 	}
-	return o.gh.CollectPRReviewFeedback(prNumber)
+	return o.gh.CollectPRReviewFeedback(prNumber, streams)
 }
 
 func (o *Orchestrator) prFailingChecks(prNumber int) ([]github.FailingCheck, error) {
@@ -1441,7 +1474,20 @@ func (o *Orchestrator) updateTokensUsedFromOutput(slotName string, sess *state.S
 	return true
 }
 
-func updateTokenBudgetUsage(sess *state.Session, cumulative int, measure string) bool {
+// updateTokenBudgetUsage records an absolute budget observation for the
+// current attempt: the generic text parser's total, or the durable marker the
+// per-generation live token monitor wrote. Both figures already cover exactly
+// one attempt, which is why TokenBudgetTokensWatermark is cleared by
+// beginSessionAttempt while the UsageStreamCursors read positions are not
+// (#1120) — mixing a file-cumulative scale into this field is what let a
+// respawn inherit the previous attempt's ceiling.
+//
+// The attempt counter is raised to the observation instead of accumulating on
+// top of it, so an absolute marker cannot be added a second time to the
+// per-attempt deltas a JSONL stream already contributed. With only absolute
+// feeders the watermark and the attempt counter move together, which is the
+// behaviour this function has always had.
+func updateTokenBudgetUsage(sess *state.Session, observed int, measure string) bool {
 	if sess == nil {
 		return false
 	}
@@ -1450,13 +1496,164 @@ func updateTokenBudgetUsage(sess *state.Session, cumulative int, measure string)
 		sess.TokenBudgetMeasure = measure
 		changed = true
 	}
-	if cumulative > sess.TokenBudgetTokensWatermark {
-		delta := cumulative - sess.TokenBudgetTokensWatermark
-		sess.TokenBudgetTokensWatermark = cumulative
+	if observed > sess.TokenBudgetTokensWatermark {
+		sess.TokenBudgetTokensWatermark = observed
+		changed = true
+	}
+	if sess.TokenBudgetTokensWatermark > sess.TokenBudgetTokensAttempt {
+		sess.TokenBudgetTokensAttempt = sess.TokenBudgetTokensWatermark
+		changed = true
+	}
+	return changed
+}
+
+// updateTokenBudgetUsageFromStream folds a file-cumulative budget measure into
+// the attempt counter through that parser's own read position, so a respawn
+// which keeps appending to the same file contributes only the new tail and a
+// fallover partner's frames stay on their own cursor (#1120).
+func updateTokenBudgetUsageFromStream(sess *state.Session, stream string, cumulative int, measure string) bool {
+	if sess == nil {
+		return false
+	}
+	changed := false
+	if measure = strings.TrimSpace(measure); measure != "" && sess.TokenBudgetMeasure != measure {
+		sess.TokenBudgetMeasure = measure
+		changed = true
+	}
+	cursor := usageStreamCursor(sess, stream)
+	if cumulative > cursor.BudgetTokens {
+		delta := cumulative - cursor.BudgetTokens
+		cursor.BudgetTokens = cumulative
+		setUsageStreamCursor(sess, stream, cursor)
 		sess.TokenBudgetTokensAttempt += delta
 		changed = true
 	}
 	return changed
+}
+
+// Usage stream identifiers — one per parser, not one per backend. A fallover
+// respawn hands the same <slot>.jsonl to a different backend and each parser
+// sums only the frames it recognises, so after a codex->claude fallover
+// ParseCodexUsage still returns the codex total while ParseClaudeUsage returns
+// claude's, on two independent scales. A single shared watermark silently
+// undercounts whichever of the two is the smaller number (#1120), so every
+// parser keeps its own read position.
+const (
+	usageStreamPi       = "pi"
+	usageStreamClaude   = "claude"
+	usageStreamCodex    = "codex"
+	usageStreamKimi     = "kimi"
+	usageStreamOpencode = "opencode"
+
+	// The two files usage parsers read. pi consumes the rendered <slot>.log;
+	// the structured parsers consume the <slot>.jsonl side channel (#1140).
+	usageStreamGroupLog   = "log"
+	usageStreamGroupJSONL = "jsonl"
+)
+
+// usageStreamCursor returns this parser's read position into the worker's
+// append-only usage side channel.
+//
+// A session that was already running when the cursor map was introduced
+// carries only the flat watermarks. They were produced by whichever parser was
+// polling at the time — in practice the one asking now, because the
+// orchestrator polls the live attempt every tick — so they seed the first
+// lookup instead of restarting from zero and re-counting the whole file. The
+// first stored cursor closes that upgrade window.
+func usageStreamCursor(sess *state.Session, stream string) state.UsageStreamCursor {
+	if sess == nil {
+		return state.UsageStreamCursor{}
+	}
+	if sess.UsageStreamCursors != nil {
+		return sess.UsageStreamCursors[stream]
+	}
+	return state.UsageStreamCursor{
+		TotalTokens:  sess.UsageTokensWatermark,
+		BudgetTokens: sess.TokenBudgetTokensWatermark,
+	}
+}
+
+// setUsageStreamCursor stores a parser's advanced read position. The flat
+// UsageTokensWatermark is kept as a mirror of the stream that last reported so
+// persisted state stays readable and a downgrade still finds a sane position.
+func setUsageStreamCursor(sess *state.Session, stream string, cursor state.UsageStreamCursor) {
+	if sess == nil {
+		return
+	}
+	if sess.UsageStreamCursors == nil {
+		sess.UsageStreamCursors = make(map[string]state.UsageStreamCursor, 2)
+	}
+	sess.UsageStreamCursors[stream] = cursor
+	sess.UsageTokensWatermark = cursor.TotalTokens
+}
+
+// usageStreamGroup names the file a parser reads. The pi parser consumes the
+// rendered <slot>.log; every structured parser consumes the <slot>.jsonl side
+// channel. Two files, so a restart of one must not rewind readers of the other.
+func usageStreamGroup(stream string) string {
+	if stream == usageStreamPi {
+		return usageStreamGroupLog
+	}
+	return usageStreamGroupJSONL
+}
+
+// usageStreamRead returns the read position for stream, first rewinding the
+// cursors that share its file when cumulative proves that file restarted.
+//
+// Each parser is cumulative over an append-only file, so its own total can
+// only shrink when that file was replaced: an in-place respawn rotates
+// <slot>.log (worker.rotateWorkerAttemptLog), a phase transition points the
+// session at a different log path, and state-dir cleanup can remove either
+// file. Nothing rotates the <slot>.jsonl side channel today —
+// rotateWorkerAttemptLog moves <slot>.log and <slot>.log.jsonl, which is not
+// the path JSONLPathForLog derives — so for the structured parsers this is a
+// guard against an out-of-band replacement rather than a routine event.
+//
+// The rewind is scoped to the restarted file. Clearing every cursor instead
+// meant an in-place respawn, which rotates only <slot>.log, also wiped the
+// structured cursors; the next frame from a .jsonl parser then re-read an
+// un-rotated file from zero and counted it a second time (#1140).
+//
+// A cumulative of zero is never a restart: a terminal frame with missing usage
+// reports zero, and rewinding on it would let the next real frame be counted
+// twice.
+func usageStreamRead(sess *state.Session, stream string, cumulative int) state.UsageStreamCursor {
+	cursor := usageStreamCursor(sess, stream)
+	if sess == nil || cumulative <= 0 || cumulative >= cursor.TotalTokens {
+		return cursor
+	}
+	// Keep the cursors reading the OTHER file; only this file restarted.
+	group := usageStreamGroup(stream)
+	kept := make(map[string]state.UsageStreamCursor, len(sess.UsageStreamCursors))
+	highest := 0
+	for name, c := range sess.UsageStreamCursors {
+		if usageStreamGroup(name) == group {
+			continue
+		}
+		kept[name] = c
+		if c.TotalTokens > highest {
+			highest = c.TotalTokens
+		}
+	}
+	sess.UsageStreamCursors = kept
+	// UsageTokensWatermark mirrors the most advanced surviving cursor. Zeroing
+	// it unconditionally would hand a stale legacy seed to whichever parser
+	// asks next, which is the same double-count by another route.
+	sess.UsageTokensWatermark = highest
+	return state.UsageStreamCursor{}
+}
+
+// cloneUsageStreamCursors copies the read-position map so a runtime projection
+// overlay cannot alias the source session's map.
+func cloneUsageStreamCursors(src map[string]state.UsageStreamCursor) map[string]state.UsageStreamCursor {
+	if src == nil {
+		return nil
+	}
+	out := make(map[string]state.UsageStreamCursor, len(src))
+	for stream, cursor := range src {
+		out[stream] = cursor
+	}
+	return out
 }
 
 func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetMarker) {
@@ -1476,6 +1673,69 @@ func applyTokenBudgetObservation(sess *state.Session, marker worker.TokenBudgetM
 		sess.TokensUsedAttempt = marker.TokensObserved
 		sess.TokensUsedTotal += delta
 	}
+}
+
+// tokenBudgetKillStreakLimit is how many consecutive PR-less token-budget
+// stops on one issue are treated as a misconfigured budget rather than three
+// unlucky workers. Two is deliberate: one stop is a plausible runaway worker,
+// two in a row on the same issue means the budget itself is the wall.
+const tokenBudgetKillStreakLimit = 2
+
+// tokenBudgetMillHold reports whether fresh dispatch must hold for this issue's
+// budget-kill streak, and owns the alert bookkeeping. A streak below the limit
+// clears the alert memory: once a worker ends any other way the wall is gone,
+// and a later wall on the same issue must alert again rather than hold it
+// silently — a guard that parks work without telling anyone is the failure mode
+// this whole change exists to remove.
+func (o *Orchestrator) tokenBudgetMillHold(issueNumber, kills int) bool {
+	if o == nil {
+		return false
+	}
+	if kills < tokenBudgetKillStreakLimit {
+		delete(o.tokenBudgetMillNotified, issueNumber)
+		return false
+	}
+	o.notifyTokenBudgetMill(issueNumber, kills)
+	return true
+}
+
+// notifyTokenBudgetMill surfaces a budget-kill streak once per streak length so
+// a held issue cannot become a silent stall. The alert class is futile_recovery:
+// automated re-dispatch that cannot succeed until an operator changes config.
+func (o *Orchestrator) notifyTokenBudgetMill(issueNumber, kills int) {
+	if o == nil || o.notifier == nil {
+		return
+	}
+	if o.tokenBudgetMillNotified == nil {
+		o.tokenBudgetMillNotified = make(map[int]int)
+	}
+	if o.tokenBudgetMillNotified[issueNumber] >= kills {
+		return
+	}
+	o.tokenBudgetMillNotified[issueNumber] = kills
+	project := strings.TrimSpace(o.repo)
+	if project == "" && o.cfg != nil {
+		project = strings.TrimSpace(o.cfg.Repo)
+	}
+	title := "maestro token budget wall"
+	if project != "" {
+		title += ": " + project
+	}
+	body := tokenBudgetMillAlertBody(issueNumber, kills, o.cfg.WorkerMaxTokens)
+	if err := o.notifier.Alert(notify.AlertFutileRecovery, fmt.Sprintf("%s:token_budget_wall:%d", project, issueNumber), title, body); err != nil {
+		log.Printf("[orch] token-budget-wall notification failed for issue #%d: %v", issueNumber, err)
+	}
+}
+
+// tokenBudgetMillAlertBody names the one action that actually releases the hold.
+// The pre-#1124 text asked the operator to raise the budget while the streak
+// ignored the budget entirely, so the stated remedy was silently ineffective;
+// the escape route has to be both true and specific.
+func tokenBudgetMillAlertBody(issueNumber, kills, maxTokens int) string {
+	return fmt.Sprintf(
+		"issue #%d stopped at the token budget %d times in a row with no PR; worker_max_tokens=%d is likely below the floor this issue needs. Dispatch stays held until worker_max_tokens is raised above %d — the hold then clears itself on the next dispatch cycle, because stops recorded under a lower ceiling stop counting (#1124). Re-adding a ready label does not release it.",
+		issueNumber, kills, maxTokens, maxTokens,
+	)
 }
 
 func tokenBudgetObservation(sess *state.Session) (int, string) {
@@ -1498,6 +1758,11 @@ func (o *Orchestrator) markTokenBudgetExceeded(slotName string, sess *state.Sess
 	}
 	o.updateTokensUsedFromWorkerLog(slotName, sess)
 	applyTokenBudgetObservation(sess, marker)
+	// Stamp the ceiling this stop actually hit so a later budget raise can
+	// retire the kill streak instead of holding the issue forever (#1124).
+	if marker.MaxTokens > 0 {
+		sess.TokenBudgetMaxTokens = marker.MaxTokens
+	}
 	budgetObserved, budgetMeasure := tokenBudgetObservation(sess)
 	sess.WorkerOutcome = worker.TokenBudgetExceededOutcome
 	sess.LastNotifiedStatus = worker.TokenBudgetExceededOutcome
@@ -1596,17 +1861,20 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 	if !ok {
 		return false
 	}
+	cursor := usageStreamRead(sess, usageStreamPi, usage.TotalTokens)
 	changed := false
 	// #730: Pi re-parses the full appended slot log on each call, so
 	// usage.TotalTokens is the cumulative run total across every attempt.
 	// On a respawn, the runner keeps appending to the same slot log while
 	// TokensUsedAttempt resets to 0 — comparing against TokensUsedAttempt
-	// would re-add the prior attempts' tokens. Use a separate monotonic
-	// watermark (UsageTokensWatermark) that persists across respawns so only
-	// the new attempt's tokens are counted.
-	if usage.TotalTokens > sess.UsageTokensWatermark {
-		delta := usage.TotalTokens - sess.UsageTokensWatermark
-		sess.UsageTokensWatermark = usage.TotalTokens
+	// would re-add the prior attempts' tokens. #1120: the Pi read position in
+	// UsageStreamCursors survives the new attempt instead (beginSessionAttempt
+	// no longer clears it) so only the unseen tail is counted, and an in-place
+	// respawn that really does rotate <slot>.log rewinds it in usageStreamRead.
+	if usage.TotalTokens > cursor.TotalTokens {
+		delta := usage.TotalTokens - cursor.TotalTokens
+		cursor.TotalTokens = usage.TotalTokens
+		setUsageStreamCursor(sess, usageStreamPi, cursor)
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		// #739: stamp the cache-aware split so the cost panel can price each
@@ -1619,14 +1887,14 @@ func (o *Orchestrator) updatePiUsageFromOutput(slotName string, sess *state.Sess
 		sess.TokensCacheWrite = usage.CacheWrite
 		changed = true
 	}
-	if updateTokenBudgetUsage(sess, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
+	if updateTokenBudgetUsageFromStream(sess, usageStreamPi, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
 		changed = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
 		sess.Model = usage.Model
 		changed = true
 	}
-	// #730: cost uses the same monotonic watermark as tokens — the full-log
+	// #730: cost uses the same monotonic read position as tokens — the full-log
 	// parse returns the cumulative run cost, so guard with `>` instead of a
 	// first-non-zero freeze (which would never update after the first turn).
 	if usage.CostUSD > sess.CostUSDBackend {
@@ -1654,12 +1922,17 @@ func (o *Orchestrator) workerJSONLFile(slotName string, sess *state.Session) str
 // updateClaudeUsageFromJSONL parses the claude stream-json side-channel
 // (slot.jsonl) and stamps model/tokens/cost_usd onto the session (#737).
 // Like the Pi path it re-parses the full appended jsonl on each call, so
-// ParseClaudeUsage returns the cumulative run total across every attempt;
-// the monotonic UsageTokensWatermark persists across respawns so only the
-// new attempt's tokens are added (no double-count on retry/respawn). Cost
-// prefers the backend-reported total_cost_usd. A successful terminal frame
-// with missing/zero usage marks the active attribution usage-unreliable and
-// logs once; zero never advances token counters or budget progress.
+// ParseClaudeUsage returns the cumulative total of every claude frame in the
+// file. #1120: no respawn rotates that file — the same <slot>.log path is
+// recomputed and the splitter reopens the jsonl with O_APPEND — so claude's
+// read position in UsageStreamCursors survives the new attempt and only the
+// unseen tail is added. The position is claude's alone: after a codex->claude
+// fallover the same file also holds codex frames that ParseClaudeUsage never
+// sees, and a shared watermark would undercount claude's first result frame by
+// whatever codex had already reached. Cost prefers the backend-reported
+// total_cost_usd. A successful terminal frame with missing/zero usage marks
+// the active attribution usage-unreliable and logs once; zero never advances
+// token counters or budget progress.
 func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1672,6 +1945,10 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		return false
 	}
 	usage, ok := worker.ParseClaudeUsage(string(data))
+	cursor := state.UsageStreamCursor{}
+	if ok {
+		cursor = usageStreamRead(sess, usageStreamClaude, usage.TotalTokens)
+	}
 	changed := false
 	if usage.UsageUnreliable && state.MarkActiveAttributionUsageUnreliable(sess, usage.UsageUnreliableReason, usage.UsageUnreliableScope) {
 		log.Printf("[orch] %s claude usage-unreliable: scope=%s reason=%s; preserving observed counters and treating zero tokens as unavailable, not progress",
@@ -1679,22 +1956,23 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 		changed = true
 	}
 	telemetryChanged := false
-	if ok && usage.TotalTokens > sess.UsageTokensWatermark {
-		delta := usage.TotalTokens - sess.UsageTokensWatermark
-		sess.UsageTokensWatermark = usage.TotalTokens
+	if ok && usage.TotalTokens > cursor.TotalTokens {
+		delta := usage.TotalTokens - cursor.TotalTokens
+		cursor.TotalTokens = usage.TotalTokens
+		setUsageStreamCursor(sess, usageStreamClaude, cursor)
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		// #739: stamp the cache-aware split (input/output/cache_read/cache_write)
 		// so the cost panel can price the cache-read discount. The full-jsonl
-		// parse is cumulative, so assigning the run totals is respawn-safe
-		// alongside the watermark guard.
+		// parse is cumulative, so assigning the run totals tracks this parser's
+		// running total alongside the read-position guard.
 		sess.TokensInput = usage.Input
 		sess.TokensOutput = usage.Output
 		sess.TokensCacheRead = usage.CacheRead
 		sess.TokensCacheWrite = usage.CacheWrite
 		telemetryChanged = true
 	}
-	if ok && updateTokenBudgetUsage(sess, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
+	if ok && updateTokenBudgetUsageFromStream(sess, usageStreamClaude, usage.BudgetTokens, worker.TokenBudgetMeasureUncached) {
 		telemetryChanged = true
 	}
 	if strings.TrimSpace(usage.Model) != "" && strings.TrimSpace(sess.Model) == "" {
@@ -1719,11 +1997,14 @@ func (o *Orchestrator) updateClaudeUsageFromJSONL(slotName string, sess *state.S
 // (slot.jsonl) and stamps tokens onto the session (#738). codex emits one
 // terminal turn.completed usage event per `codex exec` invocation; the
 // splitter appends each attempt's frames to the same slot.jsonl, so
-// ParseCodexUsage sums them to the cumulative run total. The monotonic
-// UsageTokensWatermark persists across respawns so a forced retry never
-// double-counts (mirrors the claude/Pi paths). codex reports no USD, so cost
-// stays virtual: CostUSDBackend is left at 0 and sessionCostEstimate supplies
-// the dollar figure from the configured pricing block. codex --json carries no
+// ParseCodexUsage sums them to the cumulative codex total. #1120: nothing
+// rotates that file, so codex's read position in UsageStreamCursors survives a
+// respawn and a forced retry adds only the unseen tail. The position is
+// codex's alone, because after a fallover the same file also holds the other
+// backend's frames that ParseCodexUsage never sees (mirrors the claude/Pi
+// paths). codex reports no USD, so cost stays virtual:
+// CostUSDBackend is left at 0 and sessionCostEstimate supplies the dollar
+// figure from the configured pricing block. codex --json carries no
 // model name, so sess.Model is left as configured. Returns true when tokens
 // changed; false (tokens stay 0) when the jsonl is absent — the documented
 // degradation when the stream-splitter was unavailable.
@@ -1742,15 +2023,17 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 	if !ok {
 		return false
 	}
+	cursor := usageStreamRead(sess, usageStreamCodex, usage.TotalTokens)
 	changed := false
-	if usage.TotalTokens > sess.UsageTokensWatermark {
-		delta := usage.TotalTokens - sess.UsageTokensWatermark
-		sess.UsageTokensWatermark = usage.TotalTokens
+	if usage.TotalTokens > cursor.TotalTokens {
+		delta := usage.TotalTokens - cursor.TotalTokens
+		cursor.TotalTokens = usage.TotalTokens
+		setUsageStreamCursor(sess, usageStreamCodex, cursor)
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		changed = true
 	}
-	if updateTokenBudgetUsage(sess, usage.TotalTokens, worker.TokenBudgetMeasureCodexRollout) {
+	if updateTokenBudgetUsageFromStream(sess, usageStreamCodex, usage.TotalTokens, worker.TokenBudgetMeasureCodexRollout) {
 		changed = true
 	}
 	if changed {
@@ -1762,10 +2045,12 @@ func (o *Orchestrator) updateCodexUsageFromJSONL(slotName string, sess *state.Se
 
 // updateKimiUsageFromJSONL parses Kimi's first-class stream-json side channel
 // and stamps split tokens onto the session. ParseKimiUsage returns cumulative
-// usage across the append-only file, so UsageTokensWatermark keeps retries and
-// respawns from double-counting. Native Kimi usage normally has no USD field;
-// when absent, Fleet cost observability applies the backend's configured split
-// pricing to these counters.
+// Kimi usage across the append-only file, so Kimi's own read position in
+// UsageStreamCursors survives a respawn and keeps retries from double-counting
+// (#1120) without hiding a fallover partner's frames behind a shared
+// watermark. Native Kimi usage normally has no USD field; when absent, Fleet cost
+// observability applies the backend's configured split pricing to these
+// counters.
 func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
 	if jsonlPath == "" {
@@ -1779,10 +2064,12 @@ func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Ses
 	if !ok {
 		return false
 	}
+	cursor := usageStreamRead(sess, usageStreamKimi, usage.TotalTokens)
 	changed := false
-	if usage.TotalTokens > sess.UsageTokensWatermark {
-		delta := usage.TotalTokens - sess.UsageTokensWatermark
-		sess.UsageTokensWatermark = usage.TotalTokens
+	if usage.TotalTokens > cursor.TotalTokens {
+		delta := usage.TotalTokens - cursor.TotalTokens
+		cursor.TotalTokens = usage.TotalTokens
+		setUsageStreamCursor(sess, usageStreamKimi, cursor)
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		sess.TokensInput = usage.Input
@@ -1811,11 +2098,13 @@ func (o *Orchestrator) updateKimiUsageFromJSONL(slotName string, sess *state.Ses
 // (slot.jsonl) and stamps tokens/cost onto the session. opencode emits one
 // terminal step_finish event per `opencode run` invocation; the stream-splitter
 // appends each attempt's frames to the same slot.jsonl, so
-// ParseOpenCodeUsage sums them to the cumulative run total. The monotonic
-// UsageTokensWatermark persists across respawns so a forced retry never
-// double-counts (mirrors the claude/codex/Pi paths). opencode carries no model
-// name in the event stream, so sess.Model is left as configured. Returns true
-// when anything changed; false (tokens stay 0) when the jsonl is absent — the
+// ParseOpenCodeUsage sums them to the cumulative opencode total. #1120:
+// nothing rotates that file, so opencode's own read position in
+// UsageStreamCursors survives a respawn and a forced retry adds only the
+// unseen tail, while a fallover partner's frames stay on their own cursor
+// (mirrors the claude/codex/Pi paths). opencode carries no model name in the
+// event stream, so sess.Model is left as configured. Returns true when
+// anything changed; false (tokens stay 0) when the jsonl is absent — the
 // documented degradation when the stream-splitter was unavailable.
 func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state.Session) bool {
 	jsonlPath := o.workerJSONLFile(slotName, sess)
@@ -1830,10 +2119,12 @@ func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state
 	if !ok {
 		return false
 	}
+	cursor := usageStreamRead(sess, usageStreamOpencode, usage.TotalTokens)
 	changed := false
-	if usage.TotalTokens > sess.UsageTokensWatermark {
-		delta := usage.TotalTokens - sess.UsageTokensWatermark
-		sess.UsageTokensWatermark = usage.TotalTokens
+	if usage.TotalTokens > cursor.TotalTokens {
+		delta := usage.TotalTokens - cursor.TotalTokens
+		cursor.TotalTokens = usage.TotalTokens
+		setUsageStreamCursor(sess, usageStreamOpencode, cursor)
 		sess.TokensUsedAttempt += delta
 		sess.TokensUsedTotal += delta
 		// Reasoning tokens are a separate thinking-tokens bucket in opencode
@@ -1845,7 +2136,7 @@ func (o *Orchestrator) updateOpenCodeUsageFromJSONL(slotName string, sess *state
 		sess.TokensCacheWrite = usage.CacheWrite
 		changed = true
 	}
-	if updateTokenBudgetUsage(sess, usage.TotalTokens, worker.TokenBudgetMeasureInputOutputReasoning) {
+	if updateTokenBudgetUsageFromStream(sess, usageStreamOpencode, usage.TotalTokens, worker.TokenBudgetMeasureInputOutputReasoning) {
 		changed = true
 	}
 	if usage.CostUSD > sess.CostUSDBackend {
@@ -4353,6 +4644,7 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	current.Model = runtime.Model
 	current.CostUSDBackend = runtime.CostUSDBackend
 	current.UsageTokensWatermark = runtime.UsageTokensWatermark
+	current.UsageStreamCursors = cloneUsageStreamCursors(runtime.UsageStreamCursors)
 	current.TokensUsedAttempt = runtime.TokensUsedAttempt
 	current.TokenBudgetTokensWatermark = runtime.TokenBudgetTokensWatermark
 	current.TokenBudgetTokensAttempt = runtime.TokenBudgetTokensAttempt
@@ -5343,6 +5635,11 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		sess     *state.Session
 		pr       github.PR
 		headSHA  string
+		// missingReviewFor is non-zero when this candidate bypassed a silent
+		// review gate. The operator alert fires only after the merge actually
+		// succeeds — a candidate can still be deferred by the merge interval,
+		// dropped by conflict filtering, or fail to merge.
+		missingReviewFor time.Duration
 	}
 
 	ready := make([]mergeCandidate, 0)
@@ -5550,9 +5847,31 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			}
 			addPRGateReviewVerdict(&gateTransition, reviewVerdict)
 			persistGate()
+			// Record what the gate said for this head BEFORE branching: a
+			// settled rejection is evidence the reviewer is alive just as much
+			// as a pending one, and only a head change may erase it.
+			now := time.Now().UTC()
+			o.trackReviewGateHead(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 			if reviewVerdict.Pending {
-				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
+				// A gate that never produced any signal is not "reviewing" —
+				// it is absent. Past the configured grace the PR proceeds on
+				// its own merits (CI is already green here) instead of waiting
+				// forever on a reviewer that is not coming.
+				if silentFor, missing := o.missingReviewGateElapsed(sess, reviewVerdict, now); missing {
+					log.Printf("[orch] PR #%d: review gate produced no signal for %s — treating the missing review as non-blocking (review_retrigger.missing_after_minutes)",
+						pr.Number, silentFor.Round(time.Minute))
+					// Deliberately keep the per-head tracking: sequential mode
+					// may defer this candidate, or the merge may fail, and
+					// clearing here would restart the grace from zero on the
+					// next cycle. Repeated deferrals would then reset the
+					// window forever and the PR would never merge. The state
+					// is irrelevant once the merge succeeds, and a new head
+					// resets it through trackReviewGateHead.
+					ready = append(ready, mergeCandidate{slotName: slotName, sess: sess, pr: pr, headSHA: gateTransition.HeadSHA, missingReviewFor: silentFor})
+					continue
+				}
+				log.Printf("[orch] PR #%d waiting for review gate (%s)", pr.Number, reviewVerdict.Summary())
 				continue // not ready yet
 			}
 			clearReviewPendingTracking(sess)
@@ -5626,7 +5945,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	strategy := o.mergeStrategy()
 	if strategy == "parallel" {
 		for _, candidate := range ready {
-			o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+			if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+				o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+			}
 		}
 		return
 	}
@@ -5662,7 +5983,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	}
 
 	candidate := ready[0]
-	o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA)
+	if o.mergeReadyPRAtExpectedHead(s, candidate.slotName, candidate.sess, candidate.pr, candidate.headSHA) && candidate.missingReviewFor > 0 {
+		o.notifyMissingReviewGate(candidate.pr.Number, candidate.missingReviewFor)
+	}
 	if len(ready) > 1 {
 		log.Printf("[orch] sequential merge mode: deferring %d additional ready PR(s) to next cycle", len(ready)-1)
 	}
@@ -5895,7 +6218,7 @@ func (o *Orchestrator) attachPreservedSiblingHandoffs(s *state.State, issue int,
 		// its branch/worktree intact for forensics and recovery. Without this,
 		// the preserved worktree itself blocks the canonical repair forever.
 		sibling.ReleasedForRedispatch = true
-		sibling.WorkerOutcome = "duplicate_dispatch_reconciled"
+		sibling.WorkerOutcome = state.WorkerOutcomeDuplicateDispatchReconciled
 		released = append(released, siblingSlot)
 	}
 	if len(handoffs) > 0 {
@@ -5949,18 +6272,10 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if !greptileReviewStreamPending(verdict) {
 		return // a non-greptile stream is pending; "@greptile review" won't help
 	}
-	head, err := o.prHeadSHA(pr.Number)
-	if err != nil {
-		log.Printf("[orch] review re-trigger: head SHA for PR #%d: %v", pr.Number, err)
-		return
-	}
+	head := sess.ReviewPendingHeadSHA
 	now := time.Now().UTC()
-	if sess.ReviewPendingSince == nil || sess.ReviewPendingHeadSHA != head {
-		// First pending observation on this head — start the clock. A new
-		// head (push or server-side update-branch) restarts it.
-		sess.ReviewPendingHeadSHA = head
-		sess.ReviewPendingSince = &now
-		return
+	if sess.ReviewPendingSince == nil {
+		return // clock not started yet; trackReviewGateHead owns that
 	}
 	pendingFor := now.Sub(*sess.ReviewPendingSince)
 	if pendingFor < o.cfg.ReviewRetrigger.EffectivePendingFor() {
@@ -5969,13 +6284,191 @@ func (o *Orchestrator) maybeRetriggerStalePendingReview(sess *state.Session, pr 
 	if sess.ReviewRetriggerAt != nil && now.Sub(*sess.ReviewRetriggerAt) < o.cfg.ReviewRetrigger.EffectiveCooldown() {
 		return
 	}
+	// Stop nagging a reviewer that is not answering, when the operator opted
+	// into a cap. Past it the PR still waits (or clears through the
+	// missing-review policy). Unlimited by default: the nudges are the only
+	// automatic recovery for a reviewer that comes back later, so silencing
+	// them without the missing-review escape hatch would wedge the PR for good.
+	maxAttempts := o.cfg.ReviewRetrigger.EffectiveMaxAttempts()
+	if maxAttempts > 0 && sess.ReviewRetriggerCount >= maxAttempts {
+		return
+	}
 	if err := o.commentPR(pr.Number, greptileRetriggerComment); err != nil {
 		log.Printf("[orch] review re-trigger: comment on PR #%d: %v", pr.Number, err)
 		return
 	}
 	sess.ReviewRetriggerAt = &now
-	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (#691)",
-		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment)
+	sess.ReviewRetriggerCount++
+	cap := "unlimited"
+	if maxAttempts > 0 {
+		cap = strconv.Itoa(maxAttempts)
+	}
+	log.Printf("[orch] review re-trigger: PR #%d greptile=pending for %s on head %s with no review — posted %q (attempt %d/%s, #691)",
+		pr.Number, pendingFor.Round(time.Second), shortHeadSHA(head), greptileRetriggerComment,
+		sess.ReviewRetriggerCount, cap)
+}
+
+// reviewClockHead picks the head SHA the review clock applies to: the one the
+// gate transition already read, falling back to a direct lookup when the gate
+// is not observable. An empty result skips the clock rather than anchoring it
+// to the wrong head.
+func (o *Orchestrator) reviewClockHead(pr github.PR, gateHead string) string {
+	if strings.TrimSpace(gateHead) != "" {
+		return gateHead
+	}
+	head, err := o.prHeadSHA(pr.Number)
+	if err != nil {
+		log.Printf("[orch] review clock: head SHA for PR #%d: %v", pr.Number, err)
+		return ""
+	}
+	return head
+}
+
+// trackReviewGateHead maintains the per-head review-gate memory. It runs for
+// EVERY verdict, not just pending ones: a settled rejection is also proof the
+// reviewer is alive, and skipping it would let a later run of failed
+// check-runs reads look like "the reviewer never showed up" and merge a PR the
+// reviewer had already rejected.
+//
+// ReviewGateObserved is sticky within a head and reset ONLY when the head
+// actually changes — a push or server-side update-branch genuinely restarts
+// the review, everything else must not erase what we already saw. The pending
+// clock starts at the first pending observation on the head; the
+// Greptile-specific comment re-trigger does not own any of this.
+func (o *Orchestrator) trackReviewGateHead(sess *state.Session, head string, verdict github.ReviewGateVerdict, now time.Time) {
+	if sess == nil || head == "" {
+		return
+	}
+	if sess.ReviewPendingHeadSHA != head {
+		sess.ReviewPendingHeadSHA = head
+		sess.ReviewPendingSince = nil
+		sess.ReviewRetriggerCount = 0
+		sess.ReviewGateObserved = false
+		sess.ReviewGateStreamObserved = nil
+	}
+	if verdict.Observed {
+		sess.ReviewGateObserved = true
+	}
+	// Per-stream sticky memory (#1148 review round 1, P1-2): a multi-stream
+	// gate can be half-observed — one stream settled, the other never spoke.
+	// The absent-stream escape needs to know WHICH streams were ever seen on
+	// this head, so an observed stream keeps hard-blocking while a silent one
+	// can expire.
+	for _, stream := range verdict.Streams {
+		if !stream.Observed || stream.Name == "" {
+			continue
+		}
+		if sess.ReviewGateStreamObserved == nil {
+			sess.ReviewGateStreamObserved = make(map[string]bool)
+		}
+		sess.ReviewGateStreamObserved[stream.Name] = true
+	}
+	if verdict.Pending && sess.ReviewPendingSince == nil {
+		started := now
+		sess.ReviewPendingSince = &started
+	}
+}
+
+// notifyMissingReviewGate tells the operator that a merge proceeded without a
+// review, once per PR. Merging past an absent gate is a deliberate, bounded
+// weakening of the safety net — it must never be silent.
+func (o *Orchestrator) notifyMissingReviewGate(prNumber int, silentFor time.Duration) {
+	if o == nil || o.notifier == nil {
+		return
+	}
+	if o.missingReviewNotified == nil {
+		o.missingReviewNotified = make(map[int]bool)
+	}
+	if o.missingReviewNotified[prNumber] {
+		return
+	}
+	o.missingReviewNotified[prNumber] = true
+	project := strings.TrimSpace(o.repo)
+	if project == "" && o.cfg != nil {
+		project = strings.TrimSpace(o.cfg.Repo)
+	}
+	title := "maestro review gate absent"
+	if project != "" {
+		title += ": " + project
+	}
+	if err := o.notifier.Alert(
+		notify.AlertGateFailStreak,
+		fmt.Sprintf("%s:missing_review:%d", project, prNumber),
+		title,
+		fmt.Sprintf("PR #%d merged with NO review signal at all (gate silent for %s). CI was green. Check whether the review service is down or out of credits.",
+			prNumber, silentFor.Round(time.Minute)),
+	); err != nil {
+		log.Printf("[orch] missing-review notification failed for PR #%d: %v", prNumber, err)
+	}
+}
+
+// missingReviewGateElapsed reports whether every stream still holding the gate
+// at pending has been completely silent — no check run, no status, no comment
+// — on this head for longer than review_retrigger.missing_after_minutes.
+//
+// The evaluation is per-stream (#1148 review round 1, P1-2): a multi-stream
+// gate can be half-observed — one stream posted its status while the other
+// never reported at all. The aggregate used to be Pending+Observed forever in
+// that state, so the escape never fired and no re-trigger existed: the PR was
+// wedged for good. Now a pending stream that was never seen on this head (this
+// read or the sticky per-stream memory) can expire, while a stream that DID
+// produce any signal keeps blocking at any duration, and a settled rejection
+// from any stream disables the escape outright.
+//
+// Opt-in: 0 keeps today's block-forever behavior.
+func (o *Orchestrator) missingReviewGateElapsed(sess *state.Session, verdict github.ReviewGateVerdict, now time.Time) (time.Duration, bool) {
+	if o == nil || o.cfg == nil || sess == nil {
+		return 0, false
+	}
+	grace := o.cfg.ReviewRetrigger.MissingReviewGraceOrZero()
+	if grace <= 0 || !verdict.Pending {
+		return 0, false
+	}
+	// A degraded read cannot prove silence. Without this, a GitHub check-runs
+	// outage lasting longer than the grace would look exactly like a reviewer
+	// that never showed up, and PRs would merge unreviewed because of an API
+	// failure.
+	if verdict.LookupFailed {
+		return 0, false
+	}
+	if sess.ReviewPendingSince == nil {
+		return 0, false
+	}
+	if len(verdict.Streams) == 0 {
+		// Legacy aggregate-only verdict (narrow test hooks): keep the
+		// original whole-gate semantics, including the sticky memory.
+		if verdict.Observed || sess.ReviewGateObserved {
+			return 0, false
+		}
+	} else {
+		// State written by a pre-#1148 binary has the aggregate sticky bit
+		// without per-stream attribution — treat it conservatively as "some
+		// stream was seen" and keep blocking.
+		if len(sess.ReviewGateStreamObserved) == 0 && sess.ReviewGateObserved {
+			return 0, false
+		}
+		for _, stream := range verdict.Streams {
+			// A stream that settled as failed is a live rejection, not an
+			// absent reviewer; the escape must never merge past it.
+			if !stream.Pending && !stream.Passed {
+				return 0, false
+			}
+			if !stream.Pending {
+				continue
+			}
+			// Sticky per-stream memory: a reviewer seen on this head keeps
+			// blocking even if this read came back unobserved (e.g. a failed
+			// check-runs lookup fell through to the comment path).
+			if stream.Observed || sess.ReviewGateStreamObserved[stream.Name] {
+				return 0, false
+			}
+		}
+	}
+	silentFor := now.Sub(*sess.ReviewPendingSince)
+	if silentFor < grace {
+		return 0, false
+	}
+	return silentFor, true
 }
 
 // greptileReviewStreamPending reports whether the greptile stream is the one
@@ -5992,8 +6485,13 @@ func greptileReviewStreamPending(verdict github.ReviewGateVerdict) bool {
 // clearReviewPendingTracking resets the #691 pending clock once the review
 // gate resolves (passed or blocked by findings) so a later pending phase on
 // the same head starts a fresh window.
+// clearReviewPendingTracking stops the pending clock once the gate settles.
+// The head anchor is deliberately KEPT: a check that settles and then goes
+// pending again on the same commit (a re-run, or a check that disappears) must
+// not look like a new head, or the per-head re-trigger cap would reset on every
+// such flap and the PR could collect unlimited "@greptile review" comments.
+// Only trackReviewGateHead clears the anchor, and only for a real head change.
 func clearReviewPendingTracking(sess *state.Session) {
-	sess.ReviewPendingHeadSHA = ""
 	sess.ReviewPendingSince = nil
 }
 
@@ -6773,6 +7271,8 @@ func (o *Orchestrator) reviewGate() string {
 	switch strings.ToLower(strings.TrimSpace(o.cfg.ReviewGate)) {
 	case "none", "off", "disabled":
 		return "none"
+	case "llm-review":
+		return "llm-review"
 	default:
 		return "greptile"
 	}
@@ -9932,6 +10432,17 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
 		return
 	}
+	// Host-resource precondition (#1128): the host tmpfs is RAM-backed, so
+	// spawning into a nearly-full one is how a space problem becomes an
+	// out-of-memory outage. This sits before issue listing so a held cycle also
+	// costs no GitHub quota. It is a pause, not a freeze: nothing is persisted,
+	// no retry budget is spent, and the next poll re-checks and resumes.
+	if o.spawnResourceHoldFn != nil {
+		if hold, reason := o.spawnResourceHoldFn(); hold {
+			log.Printf("[orch] spawn held on host resources: %s (local_running=%d) — retrying next cycle", reason, s.RunningSessionCount())
+			return
+		}
+	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`
@@ -10042,6 +10553,34 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		if label, ok := matchingIssueLabel(issue, o.operatorGateLabels()); ok {
 			log.Printf("[orch] skipping issue #%d: held by operator gate label %q", issue.Number, label)
 			continue
+		}
+
+		// A gate-fail-streak issue is Maestro's own report that a scheduled gate
+		// failed N times, not a triaged task — see the supervisor's hold. This
+		// loop lists issues itself, so with no issue_labels configured (every
+		// open issue eligible) the supervisor's hold is not in the path and the
+		// report would be dispatched here. There is no label for an operator to
+		// apply in that configuration, so the report is never auto-eligible.
+		if len(o.cfg.IssueLabels) == 0 && supervisor.IsGateFailStreakIssue(issue) && !repairSpawn {
+			log.Printf("[orch] skipping issue #%d: auto-minted gate-fail-streak report awaits operator triage", issue.Number)
+			continue
+		}
+
+		// Break the budget-kill mill: a token budget below the floor a worker
+		// needs to load its initial context kills every dispatch identically,
+		// and budget stops are excluded from the retry budget by design, so
+		// nothing else stops the loop (#628 live: 9 spawns in 4.5h, each ~2
+		// min at observed≈157k vs max=120k). After a streak of PR-less budget
+		// kills the issue is held and the misconfiguration is surfaced once —
+		// the operator raises worker_max_tokens (or fixes the measure) instead
+		// of watching the fleet re-spawn into the same wall.
+		if !repairSpawn {
+			kills := s.ConsecutiveTokenBudgetKillsForIssue(issue.Number, o.cfg.WorkerMaxTokens)
+			if o.tokenBudgetMillHold(issue.Number, kills) {
+				log.Printf("[orch] skipping issue #%d: %d consecutive token-budget stops — worker_max_tokens=%d is likely below the viable floor for this issue",
+					issue.Number, kills, o.cfg.WorkerMaxTokens)
+				continue
+			}
 		}
 
 		// Check retry limit: skip issues that have exhausted their retry budget
@@ -10195,7 +10734,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 					if retryAt != nil {
 						expiry = "earliest cooldown expires " + retryAt.UTC().Format(time.RFC3339)
 					}
-					log.Printf("[orch] dispatch paused: all backends blocked or cooling down (%s) — not spawning fresh workers this cycle", expiry)
+					if decision.Reason == selectionReasonHoldOnCooldown {
+						log.Printf("[orch] dispatch hold: routed backend %s cooling down (%s) — hold_on_cooldown waits for the reset instead of cascading to fallback rungs", decision.Backend, expiry)
+					} else {
+						log.Printf("[orch] dispatch paused: all backends blocked or cooling down (%s) — not spawning fresh workers this cycle", expiry)
+					}
 					dispatchPauseLogged = true
 				}
 				continue

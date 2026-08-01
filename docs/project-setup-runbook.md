@@ -227,6 +227,10 @@ outcome:
   runtime_target: https://app.example.com
   deployment_status_command: /path/to/repo/scripts/status.sh
   healthcheck_url: https://app.example.com/healthz
+  # Budget for one health check (URL or command). Defaults to 15s; raise it for
+  # a deploy verification or smoke test that legitimately runs longer. A
+  # timed-out check kills the whole command process group.
+  healthcheck_timeout_seconds: 15
   source_repo_path: /path/to/local/clone
   runtime_host: production host or platform
   # Opt-in bounded hands-off recovery for a failing health signal. The
@@ -263,7 +267,7 @@ delivery:
 # Telegram notifications (optional, via OpenClaw gateway)
 telegram:
   target: "YOUR_TELEGRAM_CHAT_ID"
-  bot_token: "YOUR_BOT_TOKEN"
+  bot_token_env: OK_GOBOT_TELEGRAM_TOKEN  # env var name; the token itself never enters config (#1143)
   openclaw_url: "http://localhost:18789"
 ```
 
@@ -282,6 +286,7 @@ telegram:
 | `model.backends.<name>.subagent_hint` | Optional sub-agent model policy injected into the worker prompt for that backend; omitted means the prompt is unchanged |
 | `max_parallel` | Maximum concurrent worker sessions |
 | `worker_runtime` | Opt-in durable worker lease runtime. `isolated` gives every attempt a private disk-backed `/tmp`, Go temp directory, Cargo target directory, and exact systemd cleanup boundary; `legacy` is the temporary rollback path. See [isolated worker runtime rollout](worker-runtime-runbook.md) |
+| `supervisor.temp_dir` | Disk-backed `TMPDIR`/`TMP`/`TEMP` for the supervisor's model backend probes, which run outside any worker lease. Defaults to `/var/tmp/maestro-supervisor-<uid>`. See [isolated worker runtime rollout](worker-runtime-runbook.md) |
 | `delivery` | Post-merge delivery block (#872): `mode` (disabled/approval_required/automatic), exact-SHA repo-relative `command` and `verify_command`, timeouts, config-only `target`/`rollback`, and mandatory persistence-safe target/verification/rollback labels. Default-safe: a merge mints an expiring approval and runs nothing until approved |
 | `deploy_cmd` | Deprecated (#872): legacy shell command run automatically after merge; folds into `delivery.mode: automatic` with a deprecation warning |
 | `session_prefix` | Prefix for tmux session names |

@@ -96,6 +96,13 @@ const (
 	// worker that disappeared again after Maestro already gave the same
 	// canonical session one automatic unexpected-exit recovery.
 	WorkerOutcomeRepeatedUnexpectedExit = "repeated_unexpected_exit"
+	// WorkerOutcomeDuplicateDispatchReconciled marks a SIBLING session that
+	// Maestro itself retired while reconciling duplicate dispatches for one
+	// issue: its durable work was proven patch-equivalent or handed off to the
+	// canonical session, and only its dispatcher claim was released. It is
+	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
+	// must not consume the per-issue retry budget.
+	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
 )
 
 const (
@@ -190,6 +197,9 @@ type BackendSelection struct {
 	CandidateScores      []BackendCandidate `json:"candidate_scores,omitempty"`
 	HardPin              bool               `json:"hard_pin,omitempty"`
 	PreviousBackend      string             `json:"previous_backend,omitempty"`
+	// HoldUntil (RFC3339) is set when hold_on_cooldown suppressed a fallback
+	// cascade: no backend was selected and the work waits for this instant.
+	HoldUntil string `json:"hold_until,omitempty"`
 
 	// Task-aware policy routing observability (#783, RFC §2.7). Tier is the
 	// strength tier the policy resolved to; Effort/Model are the per-tier
@@ -226,6 +236,15 @@ type AdvisorReview struct {
 	TerminalReason string    `json:"terminal_reason,omitempty"`
 	Bypassed       bool      `json:"bypassed,omitempty"`
 	ReviewedAt     time.Time `json:"reviewed_at"`
+}
+
+// UsageStreamCursor is one parser's read position into the worker's
+// append-only usage side channel. Every usage parser re-reads the whole file
+// and returns a cumulative total, so the cursor records how much of that
+// total has already been folded into the session's counters (#1120).
+type UsageStreamCursor struct {
+	TotalTokens  int `json:"total_tokens,omitempty"`  // cumulative provider total already counted into TokensUsedTotal
+	BudgetTokens int `json:"budget_tokens,omitempty"` // cumulative budget measure already counted into TokenBudgetTokensAttempt
 }
 
 type Session struct {
@@ -269,9 +288,20 @@ type Session struct {
 	// usage stream (Pi --mode json event stream). Empty/zero for backends
 	// that do not self-report; the fleet cost panel then falls back to the
 	// configured per-backend pricing estimate.
-	Model                      string     `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
-	CostUSDBackend             float64    `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
-	UsageTokensWatermark       int        `json:"usage_tokens_watermark,omitempty"` // #730/#737: high-water mark of the current attempt's backend usage stream; reset when an attempt log is rotated so a replacement process starts from its own zero while TokensUsedTotal remains cumulative
+	Model                string  `json:"model,omitempty"`                  // model the backend reported for this run (e.g. glm-5.2:cloud, claude-opus-4-8)
+	CostUSDBackend       float64 `json:"cost_usd_backend,omitempty"`       // USD cost the backend self-reported (Pi cost.total / claude total_cost_usd)
+	UsageTokensWatermark int     `json:"usage_tokens_watermark,omitempty"` // #730/#737/#1120: mirror of the usage-stream read position that last advanced; UsageStreamCursors is authoritative, this stays readable in state dumps and seeds the cursor of a session upgraded mid-attempt
+
+	// #1120: per-parser read positions into the worker's append-only usage
+	// side channel (<slot>.log for the text/Pi parsers, <slot>.jsonl for the
+	// structured ones). A respawn recomputes those exact paths, so the
+	// positions must survive a new attempt or the next poll re-adds the
+	// previous attempt's whole cumulative total to TokensUsedTotal. They are
+	// keyed per parser because a fallover leaves one file holding two
+	// backends' frames and each parser sums only its own: one shared position
+	// would silently swallow whichever backend's total is the smaller number.
+	UsageStreamCursors map[string]UsageStreamCursor `json:"usage_stream_cursors,omitempty"`
+
 	LongRunning                bool       `json:"long_running,omitempty"`
 	RebaseAttempted            bool       `json:"rebase_attempted,omitempty"`
 	NotifiedCIFail             bool       `json:"notified_ci_fail,omitempty"`           // deprecated: use LastNotifiedStatus
@@ -287,8 +317,9 @@ type Session struct {
 	TokensUsedAttempt          int        `json:"tokens_used_attempt,omitempty"`           // tokens consumed in current attempt (reset on respawn)
 	TokensUsedTotal            int        `json:"tokens_used_total,omitempty"`             // cumulative tokens across the issue lifecycle (sum of the split dimensions below; kept for back-compat)
 	TokenBudgetTokensAttempt   int        `json:"token_budget_tokens_attempt,omitempty"`   // current-attempt usage under TokenBudgetMeasure; kept separate from inclusive cost telemetry
-	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // high-water mark for the current attempt's cumulative budget measure
+	TokenBudgetTokensWatermark int        `json:"token_budget_tokens_watermark,omitempty"` // #1120: high-water mark of the absolute, already-attempt-scoped budget observations (generic text total, live-monitor marker); reset per attempt, unlike the UsageStreamCursors read positions
 	TokenBudgetMeasure         string     `json:"token_budget_measure,omitempty"`          // explicit live-ceiling measure, e.g. uncached_tokens
+	TokenBudgetMaxTokens       int        `json:"token_budget_max_tokens,omitempty"`       // worker_max_tokens ceiling in effect when the budget stop was recorded (#1124); lets a raised budget retire a stale kill streak
 	WorkerOutcome              string     `json:"worker_outcome,omitempty"`                // deterministic terminal worker outcome, e.g. token_budget_exceeded
 	// #739: cache-aware split token counters stamped from a backend usage
 	// stream (claude stream-json / Pi --mode json). Cumulative run totals so
@@ -369,6 +400,21 @@ type Session struct {
 	ReviewPendingHeadSHA string     `json:"review_pending_head_sha,omitempty"` // head SHA the pending clock applies to
 	ReviewPendingSince   *time.Time `json:"review_pending_since,omitempty"`    // first observation of greptile=pending on that head
 	ReviewRetriggerAt    *time.Time `json:"review_retrigger_at,omitempty"`     // last "@greptile review" re-trigger (cooldown anchor)
+	ReviewRetriggerCount int        `json:"review_retrigger_count,omitempty"`  // re-triggers posted for ReviewPendingHeadSHA; capped by review_retrigger.max_attempts
+	// ReviewGateObserved is sticky for ReviewPendingHeadSHA: once ANY reviewer
+	// signal is seen on that head it stays true until the head changes. A
+	// transient check-runs API error degrades one read to "unobserved", and
+	// without this memory that single blip would look like "the reviewer never
+	// showed up" and expire a gate that is genuinely working.
+	ReviewGateObserved bool `json:"review_gate_observed,omitempty"`
+	// ReviewGateStreamObserved is the per-stream refinement of
+	// ReviewGateObserved (#1148): stream name -> ever seen on
+	// ReviewPendingHeadSHA. A multi-stream gate can be half-observed (one
+	// stream settled, the other never reported); the absent-reviewer escape
+	// lets only never-seen streams expire, so it needs attribution, not just
+	// the aggregate bit. Reset together with ReviewGateObserved on a head
+	// change.
+	ReviewGateStreamObserved map[string]bool `json:"review_gate_stream_observed,omitempty"`
 
 	// #426: distinguish agent execution time from workflow elapsed time.
 	// WorkerEndedAt is stamped the FIRST time the worker process exits
@@ -5057,27 +5103,148 @@ func (s *State) IssueDone(issueNum int) bool {
 // as failed attempts: neither condition proves the implementation itself failed,
 // and both must remain runnable after their independent hold/release policy.
 // See #432 / #458 / #466 / #693.
+//
+// Sessions Maestro itself retired while reconciling duplicate dispatches are
+// excluded for the same reason: that outcome records the control plane tidying
+// up after spawning two workers for one issue, not an attempt that failed.
+// Live 2026-07-23 (ok-player #627): a respawn-thrash incident produced two such
+// siblings, and with only one genuine failure the issue still reported 3/3
+// attempts and stopped being dispatched at all.
 func (s *State) FailedAttemptsForIssue(issueNum int) int {
 	count := 0
 	for _, sess := range s.Sessions {
 		if sess.IssueNumber == issueNum && sess.PRNumber == 0 &&
 			(sess.Status == StatusDead || sess.Status == StatusFailed || sess.Status == StatusRetryExhausted) &&
-			!sess.RateLimitHit && sess.WorkerOutcome != string(DisplayTokenBudgetExceeded) {
+			sessionProvesFailedAttempt(sess) {
 			count++
 		}
 	}
 	return count
 }
 
+// ConsecutiveTokenBudgetKillsForIssue counts how many of the issue's most
+// recent PR-less sessions ended at the token budget, stopping at the first
+// session that ended any other way.
+//
+// A budget stop is deliberately excluded from FailedAttemptsForIssue — it is a
+// governor, not a work failure, so it must not burn the per-issue retry budget.
+// The gap that leaves: when the configured budget sits BELOW the floor a worker
+// needs just to load its initial context, every dispatch dies the same way and
+// nothing ever stops re-dispatching. Live 2026-07-24: ok-player #628 spawned 9
+// times in 4.5h, each killed after ~2 minutes at observed≈157k vs max=120k.
+// Callers use this streak to break the mill and surface the misconfiguration.
+//
+// currentMaxTokens is the worker_max_tokens ceiling configured right now (0 when
+// none is configured, which counts every stop as before). Stops recorded under a
+// LOWER ceiling are stale evidence — the wall they hit no longer exists — so the
+// walk stops there and the streak clears. Without that the hold had no
+// self-clearing path: the only thing that reset the streak was a new non-budget
+// session, and creating one required the dispatch the hold itself blocked, so
+// raising the budget — the remedy the alert asks for — changed nothing (#1124).
+func (s *State) ConsecutiveTokenBudgetKillsForIssue(issueNum, currentMaxTokens int) int {
+	if s == nil {
+		return 0
+	}
+	type ended struct {
+		at      time.Time
+		budget  bool
+		ceiling int
+	}
+	var history []ended
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issueNum || sess.PRNumber != 0 {
+			continue
+		}
+		if sess.Status != StatusDead && sess.Status != StatusFailed && sess.Status != StatusRetryExhausted {
+			continue
+		}
+		at := sess.StartedAt
+		if sess.FinishedAt != nil {
+			at = *sess.FinishedAt
+		}
+		history = append(history, ended{
+			at:      at,
+			budget:  sess.WorkerOutcome == string(DisplayTokenBudgetExceeded),
+			ceiling: tokenBudgetKillCeiling(sess),
+		})
+	}
+	sort.Slice(history, func(i, j int) bool { return history[i].at.After(history[j].at) })
+	streak := 0
+	for _, entry := range history {
+		if !entry.budget {
+			break
+		}
+		if currentMaxTokens > 0 && entry.ceiling > 0 && entry.ceiling < currentMaxTokens {
+			break
+		}
+		streak++
+	}
+	return streak
+}
+
+// tokenBudgetKillCeiling reports the worker_max_tokens ceiling a budget stop was
+// recorded under, or 0 when it cannot be established at all.
+//
+// Sessions stopped before #1124 carry no explicit ceiling, so their observed
+// budget usage stands in for it: the stop only fires once usage has reached the
+// ceiling, so observed >= ceiling, and an observation below the current budget
+// still proves the stop happened under a lower one. That fallback is what
+// releases the issues frozen when #1124 was filed (ok-folio #280, ok-player
+// #628) — their whole history predates the field.
+func tokenBudgetKillCeiling(sess *Session) int {
+	if sess == nil {
+		return 0
+	}
+	if sess.TokenBudgetMaxTokens > 0 {
+		return sess.TokenBudgetMaxTokens
+	}
+	if sess.TokenBudgetTokensAttempt > 0 {
+		return sess.TokenBudgetTokensAttempt
+	}
+	return sess.TokensUsedAttempt
+}
+
 // IssueRetryExhausted returns true if any session for the given issue
 // has been marked as retry_exhausted.
 func (s *State) IssueRetryExhausted(issueNum int) bool {
 	for _, sess := range s.Sessions {
-		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted {
+		if sess.IssueNumber == issueNum && sess.Status == StatusRetryExhausted &&
+			sessionProvesFailedAttempt(sess) {
 			return true
 		}
 	}
 	return false
+}
+
+// sessionProvesFailedAttempt reports whether a terminal session is evidence the
+// implementation itself failed, as opposed to a transient backend block, a
+// deterministic governor stop, or Maestro's own bookkeeping.
+//
+// Both retry gates must agree on this, and both are consulted: the queue paths
+// check IssueRetryExhausted BEFORE FailedAttemptsForIssue, so excluding an
+// outcome from the count alone leaves the issue blocked anyway the moment one
+// such session carries the retry_exhausted status. Live ok-player #627: two
+// duplicate-dispatch siblings were retired with that status, and the issue
+// stayed permanently undispatchable even after the count was corrected.
+// SessionProvesFailedAttempt is the exported form for callers outside this
+// package that act on retry exhaustion — spawning a repair worker, or raising a
+// Blocked stuck-state. They must agree with the two retry gates: a session
+// retired by Maestro's own duplicate-dispatch cleanup, stopped deterministically
+// at the token budget, or blocked by a rate limit carries the retry_exhausted
+// status without being evidence that the implementation failed.
+func SessionProvesFailedAttempt(sess *Session) bool {
+	return sessionProvesFailedAttempt(sess)
+}
+
+func sessionProvesFailedAttempt(sess *Session) bool {
+	if sess == nil || sess.RateLimitHit {
+		return false
+	}
+	switch sess.WorkerOutcome {
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+		return false
+	}
+	return true
 }
 
 // MarkIssueRetryExhausted transitions the most recent dead/failed session

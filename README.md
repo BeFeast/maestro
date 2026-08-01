@@ -234,6 +234,52 @@ When `auth.token_env` resolves to a non-empty value, every request — `GET /api
 
 The authenticated identity replaces any `actor` field in the request body — operators cannot impersonate one another even if they share the token.
 
+### Secrets in config: `*_env` indirection
+
+The same rule applies to **every** credential Maestro consumes, not just the dashboard token: config rows carry the *name* of an environment variable, never the secret. Config rows are dumped verbatim by `maestro config-store export` and copied into every DB backup, so anything stored inline leaks with them.
+
+| Credential | Config field | Value lives in |
+|---|---|---|
+| Dashboard bearer token | `server.auth.token_env` | environment (secret manager) |
+| Self-deploy health token | `self_deploy.health_token_env` (defaults to `server.auth.token_env`) | environment |
+| ntfy bearer token | `notify.ntfy.token_env` | environment |
+| Telegram bot token | `telegram.bot_token_env` | environment |
+| GitHub App private key | `github_app.private_key_path` | a PEM file on disk |
+| MCP HTTP bearer token | `model.backends.<name>.mcp.servers.<server>.bearer_token_env_var` | environment |
+
+`telegram.bot_token` (the plaintext form) still works so pre-existing rows keep notifying, but it is deprecated: `bot_token_env` wins whenever it resolves to a non-empty value, and a row that still stores plaintext logs a load-time warning naming the field. The same warning fires for an MCP `headers`/`env` entry whose key names a credential (`Authorization`, `*_TOKEN`, `*_KEY`, ...) and whose value is a literal rather than a `$VAR` reference. Warning text never echoes the secret.
+
+**Migrating `telegram.bot_token` → `telegram.bot_token_env`:**
+
+1. Put the token in the secret manager (this fleet uses Infisical, e.g. `external/prod/telegram/<project>-bot-token`; Vaultwarden is the fallback). Configs keep a reference only.
+2. Hand it to the daemon as an environment variable. For the systemd unit, prefer a root-owned `EnvironmentFile` over an inline `Environment=` line so the value never lands in `systemctl show` output for unprivileged users:
+
+   ```ini
+   # /etc/systemd/system/maestro.service.d/secrets.conf   (chmod 0600 the env file)
+   [Service]
+   EnvironmentFile=/etc/maestro/secrets.env
+   ```
+
+   ```sh
+   # /etc/maestro/secrets.env
+   OK_GOBOT_TELEGRAM_TOKEN=123456:the-real-token
+   ```
+
+3. Point the row at the variable and drop the plaintext field:
+
+   ```yaml
+   telegram:
+     target: "YOUR_TELEGRAM_CHAT_ID"
+     bot_token_env: OK_GOBOT_TELEGRAM_TOKEN
+   ```
+
+4. Reload the unit and restart the daemon so the new environment is inherited (`systemctl daemon-reload`, then restart `maestro.service`).
+5. Verify:
+   - `maestro config-store export --db ~/.maestro/maestro.db --dir /tmp/cfg-check && grep -r bot_token /tmp/cfg-check` shows only `bot_token_env:` lines, no token material;
+   - the daemon logs no `telegram.bot_token` warning at load;
+   - a notification actually arrives (any action that emits one, e.g. a supervisor alert).
+
+
 To watch workers live in a tmux dashboard:
 ```bash
 maestro watch
@@ -289,6 +335,7 @@ exclude_labels:
   - blocked
 telegram:
   target: "YOUR_TELEGRAM_CHAT_ID" # Telegram user ID
+  bot_token_env: MAESTRO_TELEGRAM_BOT_TOKEN  # env var name; the token never enters config (#1143)
   openclaw_url: "http://localhost:18789"  # OpenClaw gateway
 ```
 

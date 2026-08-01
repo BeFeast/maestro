@@ -25,12 +25,59 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+// TelegramConfig configures the Telegram notification channel.
+//
+// The bot token is a credential and MUST NOT be stored in config (#1143) --
+// the same rule ServerAuthConfig states for the dashboard token. Set
+// BotTokenEnv to the name of an environment variable the operator populates
+// from a secret manager (Infisical, 1Password, ...); the process reads the
+// value at send time and the config store only ever holds the variable name,
+// so `maestro config-store export` and every DB backup stay credential-free.
+//
+// The legacy plaintext BotToken still works so existing rows keep notifying,
+// but Config.Warnings() names the field at load time so an operator migrates.
+// When BotTokenEnv resolves to a non-empty value it wins over BotToken.
 type TelegramConfig struct {
-	Target      string `yaml:"target"`
-	BotToken    string `yaml:"bot_token"`
+	Target string `yaml:"target"`
+	// BotToken is the DEPRECATED plaintext form of the bot token (#1143).
+	// Prefer BotTokenEnv; a non-empty value here raises a config warning.
+	BotToken string `yaml:"bot_token"`
+	// BotTokenEnv names an environment variable holding the bot token; the
+	// token itself is never stored here.
+	BotTokenEnv string `yaml:"bot_token_env"`
 	Mode        string `yaml:"mode"`         // "direct" (Telegram Bot API) or "openclaw" (OpenClaw relay); default: "direct"
 	OpenclawURL string `yaml:"openclaw_url"` // only needed when mode=openclaw
 	DigestMode  bool   `yaml:"digest_mode"`  // batch notifications per cycle instead of sending immediately
+}
+
+// Token resolves the Telegram bot token. BotTokenEnv is consulted first: when
+// it names an environment variable that holds a non-empty value, that value is
+// used and the plaintext BotToken is ignored. Otherwise the legacy plaintext
+// BotToken is returned so pre-#1143 rows keep working. Returns "" when neither
+// source yields a value, which callers treat as "Telegram direct mode not
+// configured" (the openclaw relay path is unaffected).
+func (c TelegramConfig) Token() string {
+	if env := strings.TrimSpace(c.BotTokenEnv); env != "" {
+		if v := strings.TrimSpace(os.Getenv(env)); v != "" {
+			return v
+		}
+	}
+	return strings.TrimSpace(c.BotToken)
+}
+
+// PlaintextTokenActive reports whether the plaintext BotToken is the value
+// Token() would return -- i.e. the credential is really being read out of the
+// config store rather than the environment.
+func (c TelegramConfig) PlaintextTokenActive() bool {
+	if strings.TrimSpace(c.BotToken) == "" {
+		return false
+	}
+	if env := strings.TrimSpace(c.BotTokenEnv); env != "" {
+		if strings.TrimSpace(os.Getenv(env)) != "" {
+			return false
+		}
+	}
+	return true
 }
 
 // NotifyConfig (#1018) carries lightweight push-notification transports that
@@ -150,6 +197,13 @@ type BackendDef struct {
 	// matches ordinary work output (a prompt echo, test output) causes
 	// false backend gating. Validated to compile at config parse.
 	UsageLimitPatterns []string `yaml:"usage_limit_patterns,omitempty"`
+
+	// SupervisorAttemptTimeoutSeconds overrides supervisor.attempt_timeout_seconds
+	// for this backend when it serves a supervisor consult. Set it on slow
+	// print-mode carriers (claude CLI at high effort ≈ 180) so the walk gives
+	// them a real chance instead of billing a generation and killing it at the
+	// 45s default. Workers are unaffected — this is a supervisor-only knob.
+	SupervisorAttemptTimeoutSeconds int `yaml:"supervisor_attempt_timeout_seconds,omitempty"`
 
 	// SubagentHint steers an orchestrating backend (e.g. Claude Code) to
 	// delegate grunt subtasks to cheaper sub-agent models instead of
@@ -385,6 +439,41 @@ type ModelConfig struct {
 	// project override. Otherwise lanes compose in declaration order, with each
 	// provider's default followed by its local fallbacks before the next provider.
 	ProviderLanes []ProviderLane `yaml:"provider_lanes,omitempty"`
+	// HoldOnCooldown makes quota-class backend cooldowns a wait, not a cascade:
+	// when the routed backend is cooling down with a known reset inside the
+	// configured window, dispatch/retry hold for that reset instead of walking
+	// the fallback chain. See HoldOnCooldownConfig.
+	HoldOnCooldown HoldOnCooldownConfig `yaml:"hold_on_cooldown,omitempty"`
+}
+
+// HoldOnCooldownConfig controls hold-vs-cascade semantics for quota-class
+// backend cooldowns (provider_limit, usage_limit, model_cooldown,
+// model_overloaded, quota_pressure). Off, a cooling backend cascades work onto
+// the next fallback rung immediately — under a fleet-wide primary cooldown
+// that dumps every project onto one fallback seat (2026-07 live: an Anthropic
+// cooldown pushed ~80% of the week's tokens through the single ChatGPT seat).
+// On, a cooldown whose RetryAfter lands within max_wait_minutes holds the work
+// for the reset; only unknown or beyond-window resets (weekly caps), and
+// non-quota failures (auth_failure, model_unavailable, disabled), still
+// cascade.
+type HoldOnCooldownConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// MaxWaitMinutes bounds how long a hold may wait for a stated reset.
+	// 0 means the default (360 = 6h, covering a 5-hour subscription window);
+	// resets further out than this cascade to the next rung as before.
+	MaxWaitMinutes int `yaml:"max_wait_minutes,omitempty"`
+}
+
+// defaultHoldOnCooldownMaxWait covers a full 5-hour subscription window with
+// slack; a stated reset beyond it (e.g. a weekly cap) is not worth idling for.
+const defaultHoldOnCooldownMaxWait = 360 * time.Minute
+
+// MaxWait returns the bounded hold window as a duration.
+func (h HoldOnCooldownConfig) MaxWait() time.Duration {
+	if h.MaxWaitMinutes > 0 {
+		return time.Duration(h.MaxWaitMinutes) * time.Minute
+	}
+	return defaultHoldOnCooldownMaxWait
 }
 
 // VersioningConfig controls automatic version bumping on PR merge.
@@ -899,6 +988,18 @@ type SupervisorConfig struct {
 	ApprovalRequiredActions []string                        `yaml:"approval_required_actions" json:"approval_required_actions,omitempty"`
 	PolicyPath              string                          `yaml:"-" json:"policy_path,omitempty"`
 	LessonProposalsEnabled  *bool                           `yaml:"lesson_proposals_enabled" json:"lesson_proposals_enabled,omitempty"`
+	// AttemptTimeoutSeconds bounds ONE supervisor LLM backend attempt. Default
+	// 45s — calibrated for fast print-mode backends (codex/sol). A slow carrier
+	// (claude CLI at high effort through a proxy) needs more; give it a
+	// per-backend override (model.backends.<name>.supervisor_attempt_timeout_seconds)
+	// instead of raising this global. Burn RCA 2026-07-24: a chain of three
+	// claude-binary candidates under the 45s default produced ~365
+	// paid-and-discarded generations in 4.5h — every attempt billed
+	// server-side, then killed client-side before the answer arrived.
+	AttemptTimeoutSeconds int `yaml:"attempt_timeout_seconds" json:"attempt_timeout_seconds,omitempty"`
+	// TotalTimeoutSeconds bounds the whole candidate walk for one consult so a
+	// slow chain can never overrun the supervise interval. Default 180s.
+	TotalTimeoutSeconds int `yaml:"total_timeout_seconds" json:"total_timeout_seconds,omitempty"`
 	// AlwaysConsultLLM restores the pre-#837 behavior of calling the supervisor
 	// LLM on every enabled cycle, even when the deterministic guardrail already
 	// decided a safe, mutation-free action (action=none / wait_* / monitor_open_pr).
@@ -907,6 +1008,13 @@ type SupervisorConfig struct {
 	// cannot change it (see internal/supervisor/llm.go decideWithLLM). Set true to
 	// force a full-context second opinion on every cycle regardless of token cost.
 	AlwaysConsultLLM bool `yaml:"always_consult_llm" json:"always_consult_llm,omitempty"`
+
+	// TempDir repoints TMPDIR/TMP/TEMP for the supervisor's backend children
+	// (#1127). These probes are started directly by the daemon and never enter a
+	// worker lease, so worker_runtime isolation cannot reach them; without an
+	// explicit environment they inherit the daemon's, which on the fleet host
+	// means the RAM-backed /tmp. Empty selects DefaultSupervisorTempDir().
+	TempDir string `yaml:"temp_dir" json:"temp_dir,omitempty"`
 
 	// AllowMeteredBackend opts this project's supervisor LLM loop into running on
 	// a metered (per-token) backend (#838). Default false: when supervisor.backend
@@ -1721,6 +1829,20 @@ type ReviewRetriggerConfig struct {
 	Enabled         *bool `yaml:"enabled"`          // default: true
 	PendingMinutes  int   `yaml:"pending_minutes"`  // re-trigger after this many minutes of greptile=pending on one head (default: 10)
 	CooldownMinutes int   `yaml:"cooldown_minutes"` // minimum minutes between re-trigger comments per session (default: 30)
+	// MaxAttempts caps how many re-trigger comments one session may post for
+	// a single head. Without a cap a permanently silent reviewer collects a
+	// "@greptile review" comment every cooldown window forever (live 2026-07:
+	// Greptile paused after exhausting its free credits and every wedged PR
+	// kept accruing comments). Default 3; <= 0 means the default, and a
+	// deliberate "never stop" is spelled as a large number.
+	MaxAttempts int `yaml:"max_attempts,omitempty"`
+	// MissingAfterMinutes makes an UNOBSERVED review gate non-blocking once the
+	// gate has been silent this long on one head — no check run, no comment,
+	// nothing. 0 (default) preserves today's behavior: a silent gate holds the
+	// PR forever. A reviewer that DOES answer still hard-blocks regardless of
+	// this value, so enabling it never weakens a working gate; it only bounds
+	// the wait on a reviewer that never shows up.
+	MissingAfterMinutes int `yaml:"missing_after_minutes,omitempty"`
 }
 
 // Active reports whether the stale-review re-trigger runs. Default true —
@@ -1749,6 +1871,35 @@ func (c ReviewRetriggerConfig) EffectiveCooldown() time.Duration {
 		return 30 * time.Minute
 	}
 	return time.Duration(c.CooldownMinutes) * time.Minute
+}
+
+// EffectiveMaxAttempts caps re-trigger comments per head; 0 means unlimited,
+// which is the default.
+//
+// The cap is deliberately opt-in. Capping by default would REMOVE the only
+// automatic recovery an untouched install has: before this knob existed, a
+// wedged gate kept being nudged every cooldown window, so a review service that
+// came back hours later was woken by the next nudge and the PR merged
+// hands-off. A default cap silences those nudges after N tries while the
+// escape hatch that would release the PR (missing_after_minutes) is itself
+// off by default — turning "eventually self-heals" into "wedged forever" for an
+// operator who changed nothing. An operator who sets a cap is accepting that
+// trade, and should set missing_after_minutes with it.
+func (c ReviewRetriggerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts <= 0 {
+		return 0
+	}
+	return c.MaxAttempts
+}
+
+// MissingReviewGraceOrZero returns how long a fully silent review gate may hold
+// a PR before it is treated as non-blocking, or 0 when the operator has not
+// opted in (today's block-forever behavior).
+func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
+	if c.MissingAfterMinutes <= 0 {
+		return 0
+	}
+	return time.Duration(c.MissingAfterMinutes) * time.Minute
 }
 
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting
@@ -2233,8 +2384,8 @@ type Config struct {
 	Delivery                        DeliveryConfig                `yaml:"delivery"`                           // #872: approval-gated post-merge delivery (disabled|approval_required|automatic)
 	MergeStrategy                   string                        `yaml:"merge_strategy"`                     // "sequential" | "parallel"
 	MergeIntervalSeconds            int                           `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
-	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "none"
-	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default ["greptile"], opt-in ["greptile","simplicity"]
+	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "llm-review" (#1148 opus+terra pair) | "none"
+	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default follows review_gate ("greptile" → ["greptile"], "llm-review" → ["llm-review-opus","llm-review-terra"]); "llm-review" is a pair alias
 	ReviewRetrigger                 ReviewRetriggerConfig         `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
 	AutoRetryReviewFeedback         bool                          `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
@@ -2474,6 +2625,9 @@ func parse(data []byte) (*Config, error) {
 	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {
 		return nil, err
 	}
+	if err := validateSupervisorTempDir(cfg.Supervisor); err != nil {
+		return nil, err
+	}
 	if err := validateRemoteRunner(cfg); err != nil {
 		return nil, err
 	}
@@ -2554,6 +2708,7 @@ func parse(data []byte) (*Config, error) {
 	cfg.LocalPath = expandHome(cfg.LocalPath)
 	cfg.WorktreeBase = expandHome(cfg.WorktreeBase)
 	cfg.WorkerRuntime.ScratchRoot = expandHome(cfg.WorkerRuntime.ScratchRoot)
+	cfg.Supervisor.TempDir = expandHome(cfg.Supervisor.TempDir)
 	cfg.Outcome = cfg.Outcome.Normalized()
 	if cfg.Outcome.Configured() {
 		cfg.Outcome.SourceRepoPath = expandHome(cfg.Outcome.SourceRepoPath)
@@ -2655,6 +2810,20 @@ func parse(data []byte) (*Config, error) {
 		}
 		if def.NonAgentic {
 			return nil, fmt.Errorf("config: model.fallback_backends includes %q which is marked non_agentic; the fallback chain is the worker chain — a non-agentic entry would produce fake-PR sessions when paid backends are exhausted. Remove %q from fallback_backends and use it only for supervisor sub-tasks", fb, fb)
+		}
+	}
+	if cfg.Model.HoldOnCooldown.MaxWaitMinutes < 0 {
+		return nil, fmt.Errorf("config: model.hold_on_cooldown.max_wait_minutes = %d; want >= 0 (0 uses the default window)", cfg.Model.HoldOnCooldown.MaxWaitMinutes)
+	}
+	if cfg.Supervisor.AttemptTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.attempt_timeout_seconds = %d; want >= 0 (0 uses the 45s default)", cfg.Supervisor.AttemptTimeoutSeconds)
+	}
+	if cfg.Supervisor.TotalTimeoutSeconds < 0 {
+		return nil, fmt.Errorf("config: supervisor.total_timeout_seconds = %d; want >= 0 (0 uses the 180s default)", cfg.Supervisor.TotalTimeoutSeconds)
+	}
+	for name, def := range cfg.Model.Backends {
+		if def.SupervisorAttemptTimeoutSeconds < 0 {
+			return nil, fmt.Errorf("config: model.backends.%s.supervisor_attempt_timeout_seconds = %d; want >= 0", name, def.SupervisorAttemptTimeoutSeconds)
 		}
 	}
 	// #704: quota calibration sanity. Capacities must be non-negative and
@@ -2792,6 +2961,9 @@ func parse(data []byte) (*Config, error) {
 		cfg.ReviewGate = "greptile"
 	case "none", "off", "disabled":
 		cfg.ReviewGate = "none"
+	case "llm-review", "llm_review", "llmreview":
+		// #1148: the llm-review pair (opus + terra lenses) as the primary gate.
+		cfg.ReviewGate = "llm-review"
 	default:
 		cfg.ReviewGate = "greptile"
 	}
@@ -2885,32 +3057,46 @@ func validateDeliverySafeLabel(name, value string, maxRunes int) error {
 }
 
 func normalizeReviewGateStreams(reviewGate string, streams []string) []string {
-	if strings.EqualFold(strings.TrimSpace(reviewGate), "none") {
+	gate := strings.ToLower(strings.TrimSpace(reviewGate))
+	if gate == "none" {
 		return nil
 	}
+	// The gate value picks the default stream set when review_gate_streams is
+	// not configured explicitly: "llm-review" means the model pair (#1148),
+	// everything else keeps the historical greptile default.
+	defaults := []string{"greptile"}
+	if gate == "llm-review" {
+		defaults = []string{"llm-review-opus", "llm-review-terra"}
+	}
 	if len(streams) == 0 {
-		return []string{"greptile"}
+		return defaults
 	}
 	out := make([]string, 0, len(streams))
 	seen := make(map[string]struct{}, len(streams))
+	add := func(name string) {
+		if _, ok := seen[name]; ok {
+			return
+		}
+		seen[name] = struct{}{}
+		out = append(out, name)
+	}
 	for _, raw := range streams {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		switch name {
 		case "", "off", "disabled", "none":
 			continue
-		case "greptile", "simplicity":
-			// supported as configured
+		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra":
+			add(name)
+		case "llm-review":
+			// Pair alias (#1148): both model lenses.
+			add("llm-review-opus")
+			add("llm-review-terra")
 		default:
 			continue
 		}
-		if _, ok := seen[name]; ok {
-			continue
-		}
-		seen[name] = struct{}{}
-		out = append(out, name)
 	}
 	if len(out) == 0 {
-		return []string{"greptile"}
+		return defaults
 	}
 	return out
 }
@@ -3139,7 +3325,109 @@ func (c *Config) Warnings() []string {
 		warnings = append(warnings, msg)
 	}
 	warnings = append(warnings, c.deliveryWarnings()...)
+	warnings = append(warnings, c.credentialWarnings()...)
 	return warnings
+}
+
+// credentialWarnings surfaces config fields that still carry credential
+// material in plaintext (#1143). Plaintext keeps working -- refusing to load
+// would strand every pre-migration row -- but the value is visible in
+// `maestro config-store export`, in any YAML dumped from the store, and in
+// every DB backup, so the operator is told which field to move.
+//
+// Audit of every credential-bearing field in internal/config, for the record:
+//
+//   - telegram.bot_token          -- plaintext; migrate to telegram.bot_token_env (below)
+//   - server.auth.token_env       -- env-only already (#487)
+//   - notify.ntfy.token_env       -- env-only already (#1018)
+//   - self_deploy.health_token_env -- env-only already
+//   - github_app.private_key_path -- a path; the PEM never enters config (#823)
+//   - model.backends.*.mcp.servers.*.bearer_token_env_var -- env-only already
+//   - model.backends.*.mcp.servers.*.{headers,env} -- free-form maps handed to
+//     the worker harness verbatim, so a literal secret pasted there is stored
+//     just like telegram.bot_token was. Warned about below.
+func (c *Config) credentialWarnings() []string {
+	if c == nil {
+		return nil
+	}
+	var out []string
+	if strings.TrimSpace(c.Telegram.BotToken) != "" {
+		if c.Telegram.PlaintextTokenActive() {
+			out = append(out, "config: telegram.bot_token stores the bot token in plaintext — it is visible in `maestro config-store export` and in every DB backup. Move the token into a secret manager, expose it to the daemon as an environment variable, and set telegram.bot_token_env to that variable name instead.")
+		} else {
+			out = append(out, fmt.Sprintf("config: telegram.bot_token still holds a plaintext credential but is unused because telegram.bot_token_env (%s) resolves — delete telegram.bot_token from the config store.", strings.TrimSpace(c.Telegram.BotTokenEnv)))
+		}
+	}
+	out = append(out, c.mcpCredentialWarnings()...)
+	return out
+}
+
+// credentialKeyHints are substrings that mark a header/env key as carrying a
+// credential. Matched case-insensitively against the key only; values are
+// never logged.
+var credentialKeyHints = []string{"authorization", "token", "secret", "password", "passwd", "apikey", "api_key", "access_key", "private_key", "credential"}
+
+// looksLikeCredentialKey reports whether a header or env key names a secret.
+func looksLikeCredentialKey(key string) bool {
+	k := strings.ToLower(strings.TrimSpace(key))
+	if k == "" {
+		return false
+	}
+	for _, hint := range credentialKeyHints {
+		if strings.Contains(k, hint) {
+			return true
+		}
+	}
+	// "key" alone is too generic to match as a substring (it hits "keyword",
+	// "monkey"), so only an exact/suffixed form counts.
+	return k == "key" || strings.HasSuffix(k, "-key") || strings.HasSuffix(k, "_key")
+}
+
+// isEnvReference reports whether a value is an indirection ($VAR or ${VAR})
+// rather than the credential itself.
+func isEnvReference(value string) bool {
+	v := strings.TrimSpace(value)
+	return strings.HasPrefix(v, "$")
+}
+
+// mcpCredentialWarnings names MCP server headers/env entries whose key marks a
+// credential and whose value is a literal rather than an environment
+// reference. The value is never echoed.
+func (c *Config) mcpCredentialWarnings() []string {
+	var out []string
+	for _, backend := range sortedKeys(c.Model.Backends) {
+		servers := c.Model.Backends[backend].MCP.Servers
+		for _, server := range sortedKeys(servers) {
+			def := servers[server]
+			for _, block := range []struct {
+				name   string
+				values map[string]string
+			}{{"headers", def.Headers}, {"env", def.Env}} {
+				for _, key := range sortedKeys(block.values) {
+					value := strings.TrimSpace(block.values[key])
+					if value == "" || !looksLikeCredentialKey(key) || isEnvReference(value) {
+						continue
+					}
+					out = append(out, fmt.Sprintf("config: model.backends.%s.mcp.servers.%s.%s.%s stores a credential in plaintext — it is visible in `maestro config-store export` and in every DB backup. Keep the secret in the environment and reference it (for an HTTP server use bearer_token_env_var).", backend, server, block.name, key))
+				}
+			}
+		}
+	}
+	return out
+}
+
+// sortedKeys returns the map keys in deterministic order so warning output is
+// stable across loads.
+func sortedKeys[V any](m map[string]V) []string {
+	if len(m) == 0 {
+		return nil
+	}
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
 }
 
 // deliveryWarnings surfaces the #872 delivery-block misconfigurations at load

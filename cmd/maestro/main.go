@@ -6,6 +6,7 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"log"
 	"os"
 	"os/exec"
@@ -61,7 +62,7 @@ Commands:
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
-  config-store  Manage the SQLite config store (migrate/export/add/rm/edit)
+  config-store  Manage the SQLite config store (list/migrate/export/add/rm/edit)
   settings      View/flip fleet-level cost/LLM knobs (list/get/set/rm/audit)
   history       Show recently completed sessions
   digest        Write the morning operator digest across all fleet projects
@@ -556,7 +557,8 @@ func loadConfigsWithStore(paths []string, storePath, project string) []*config.C
 
 func configStoreCmd(args []string) {
 	if len(args) == 0 {
-		fmt.Fprintln(os.Stderr, "usage: maestro config-store <migrate|export|add|rm|edit> ...")
+		fmt.Fprintln(os.Stderr, "usage: maestro config-store <list|migrate|export|add|rm|edit> ...")
+		fmt.Fprintln(os.Stderr, "  list    [--db <path>] [--json]          print the project keys of the store")
 		fmt.Fprintln(os.Stderr, "  migrate --db <path> --dir <maestro.d>   import a directory of YAML configs")
 		fmt.Fprintln(os.Stderr, "  export  --db <path> --dir <out>         export every project to YAML")
 		fmt.Fprintln(os.Stderr, "  add     --file <yaml> [--name <name>]   add/replace a single project")
@@ -565,6 +567,8 @@ func configStoreCmd(args []string) {
 		os.Exit(1)
 	}
 	switch args[0] {
+	case "list":
+		configStoreList(args[1:])
 	case "add":
 		configStoreAdd(args[1:])
 	case "rm":
@@ -610,6 +614,58 @@ func configStoreCmd(args []string) {
 // daemon reads.
 func configStoreDBFlag(fs *flag.FlagSet) *string {
 	return fs.String("db", defaultConfigStorePath(), "SQLite config store path")
+}
+
+// configStoreList implements `config-store list [--json]`: it prints the project
+// keys of the store, one per line. It is the entry point for fleet inspection —
+// `export` and `status` both need a project name the operator does not have yet
+// — so it deliberately reports rows without parsing their config documents
+// (#1123).
+func configStoreList(args []string) {
+	fs := flag.NewFlagSet("config-store list", flag.ExitOnError)
+	dbPath := configStoreDBFlag(fs)
+	asJSON := fs.Bool("json", false, "Print the project keys as a JSON array")
+	fs.Parse(args)
+
+	if err := listStoreProjects(os.Stdout, *dbPath, *asJSON); err != nil {
+		log.Fatalf("config-store list: %v", err)
+	}
+}
+
+// listStoreProjects reads the store without writing to it. configstore.Open
+// creates the file and initializes the schema, so an inspection command that
+// defaulted to it would silently materialize an empty store on a host whose
+// real fleet database lives elsewhere — and the daemon would then start with
+// zero projects (P2 raised on #796). Hence: stat first, fail closed if the path
+// is absent, and read through OpenReadOnly.
+func listStoreProjects(w io.Writer, dbPath string, asJSON bool) error {
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return fmt.Errorf("config store %s does not exist; listing never creates one", dbPath)
+		}
+		return err
+	}
+	store, err := configstore.OpenReadOnly(dbPath)
+	if err != nil {
+		return fmt.Errorf("open db %s: %w", dbPath, err)
+	}
+	defer store.Close()
+	names, err := store.ProjectNames(context.Background())
+	if err != nil {
+		return fmt.Errorf("read %s: %w", dbPath, err)
+	}
+	if asJSON {
+		if names == nil {
+			names = []string{}
+		}
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		return enc.Encode(names)
+	}
+	for _, name := range names {
+		fmt.Fprintln(w, name)
+	}
+	return nil
 }
 
 // configStoreAdd implements `config-store add --file <yaml> [--name <name>]`:
@@ -938,8 +994,13 @@ func superviseCmd(args []string) {
 		cfg.Supervisor.DryRun = true
 	}
 	gh := github.New(cfg.Repo)
+	// The cycle is context-aware (#1119): a cancelled ctx stops it at the next
+	// phase boundary. SIGINT/SIGTERM cancel it for the looping command below;
+	// --once inherits the same ctx and cancels it on return.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
 	runOnce := func() error {
-		decision, err := supervisor.RunOnce(cfg, gh, supervisor.WithApprovalsDBPath(*approvalsDB))
+		decision, err := supervisor.RunOnce(ctx, cfg, gh, supervisor.WithApprovalsDBPath(*approvalsDB))
 		if err != nil {
 			return err
 		}
@@ -952,15 +1013,13 @@ func superviseCmd(args []string) {
 	// initialized (and, for a persistent command, launched) before this network/
 	// LLM-dependent cycle so a blocked first RunOnce cannot pause it (#887).
 	if *once {
-		if err := runInitialSuperviseCycle(context.Background(), cfg, true, *dryRun, runOnce,
+		if err := runInitialSuperviseCycle(ctx, cfg, true, *dryRun, runOnce,
 			supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
 			log.Fatalf("supervise: %v", err)
 		}
 		return
 	}
 
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	if err := runInitialSuperviseCycle(ctx, cfg, false, *dryRun, runOnce,
 		supervisor.EvaluateMaterialProgressOnce, supervisor.RunMaterialProgressEvaluator); err != nil {
 		cancel()
@@ -984,7 +1043,10 @@ func superviseCmd(args []string) {
 	// been bumped in 3*interval. The warning persists into state
 	// (SupervisorStuck=true) so the Fleet API and dashboards can
 	// surface it without grepping the journal.
-	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval)
+	// nil kick channel: this loop calls RunOnce inline, so there is no separable
+	// cycle to cancel and the watchdog stays warn-only. The daemon's per-flow
+	// loops wire a real one (#1119).
+	go supervisor.Watchdog(ctx, cfg.SessionPrefix, cfg.StateDir, *interval, nil)
 	ticker := time.NewTicker(*interval)
 	defer ticker.Stop()
 	for {
@@ -2804,7 +2866,7 @@ func killCmd(args []string) {
 			log.Fatalf("save state: %v", err)
 		}
 
-		n := notify.NewWithToken(cfg.Telegram.BotToken, cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
+		n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
 		n.Sendf("maestro: manually killed worker %s (issue #%d: %s)", slotName, sess.IssueNumber, sess.IssueTitle)
 
 		fmt.Printf("Killed session %s (issue #%d: %s)\n", slotName, sess.IssueNumber, sess.IssueTitle)
