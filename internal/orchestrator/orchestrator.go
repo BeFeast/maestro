@@ -7199,6 +7199,8 @@ func (o *Orchestrator) reviewGate() string {
 	switch strings.ToLower(strings.TrimSpace(o.cfg.ReviewGate)) {
 	case "none", "off", "disabled":
 		return "none"
+	case "llm-review":
+		return "llm-review"
 	default:
 		return "greptile"
 	}
