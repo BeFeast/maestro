@@ -1,0 +1,53 @@
+# llm-review — the glue workflow for the llm-review gate (#1148).
+#
+# DISABLED BY DEFAULT: every job is gated on the repository variable
+# LLM_REVIEW_ENABLED == 'true'. Set it (Settings → Secrets and variables →
+# Actions → Variables) to turn the workflow on. The daemon-side trigger is a
+# follow-up; until then this workflow (or a manual scripts/llm-review.sh run
+# on any host with the claude CLI) is what produces the statuses the gate
+# reads.
+#
+# Secrets used when enabled:
+#   LLM_REVIEW_TERRA_BASE_URL   — CLIProxy endpoint for the terra pass
+#   LLM_REVIEW_TERRA_AUTH_TOKEN — CLIProxy key for the terra pass
+#   ANTHROPIC_API_KEY           — auth for the opus pass (subscription seats
+#                                 do not exist on CI runners)
+
+name: llm-review
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  pull-requests: write
+  statuses: write
+
+jobs:
+  review:
+    # Gated off by default. For issue_comment, only a "/llm-review" comment on
+    # a PR triggers a run.
+    if: >-
+      vars.LLM_REVIEW_ENABLED == 'true' &&
+      (github.event_name == 'pull_request' ||
+       (github.event.issue.pull_request && startsWith(github.event.comment.body, '/llm-review')))
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install claude CLI
+        run: npm install -g @anthropic-ai/claude-code
+
+      - name: Run llm-review
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LLM_REVIEW_TERRA_BASE_URL: ${{ secrets.LLM_REVIEW_TERRA_BASE_URL }}
+          LLM_REVIEW_TERRA_AUTH_TOKEN: ${{ secrets.LLM_REVIEW_TERRA_AUTH_TOKEN }}
+        run: |
+          PR_NUMBER="${{ github.event.pull_request.number || github.event.issue.number }}"
+          bash scripts/llm-review.sh "$PR_NUMBER" "$GH_REPO"
