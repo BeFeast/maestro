@@ -1902,6 +1902,84 @@ func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
 	return time.Duration(c.MissingAfterMinutes) * time.Minute
 }
 
+// ReviewProducerConfig governs the daemon-side llm-review producer (#1162 S5):
+// when the review gate expects llm-review-* streams that are unobserved on a
+// PR head, the orchestrator produces them in-process (internal/review) instead
+// of relying on the interim CI/timer bash glue. Credentials are env-only
+// (*_env indirection, never values); the chat lenses talk to CLIProxy — never
+// a direct provider login (the #1148 bash design defect this replaces).
+type ReviewProducerConfig struct {
+	Enabled bool `yaml:"enabled"` // opt-in per project row
+	// ChatBaseURL is the CLIProxy root for the opus/terra chat lenses, e.g.
+	// "http://127.0.0.1:23020". Required for those streams to run.
+	ChatBaseURL string `yaml:"chat_base_url,omitempty"`
+	// ChatAPIKeyEnv names the env var holding the CLIProxy key. Default:
+	// CLIPROXY_API_KEY.
+	ChatAPIKeyEnv string `yaml:"chat_api_key_env,omitempty"`
+	OpusModel     string `yaml:"opus_model,omitempty"`  // default: claude-opus-5
+	TerraModel    string `yaml:"terra_model,omitempty"` // default: gpt-5.6-terra
+	// CursorModel default composer-2.5 — the included-usage pool (cost-safe).
+	CursorModel string `yaml:"cursor_model,omitempty"`
+	// CursorAPIKeyEnv names the env var holding the Cursor key. Default:
+	// CURSOR_API_KEY.
+	CursorAPIKeyEnv string `yaml:"cursor_api_key_env,omitempty"`
+	// PendingStaleMinutes is the crashed-pending self-heal threshold
+	// (default 30, the bash REVIEW_PENDING_STALE_MINUTES).
+	PendingStaleMinutes int `yaml:"pending_stale_minutes,omitempty"`
+	// MaxDiffBytes caps the diff fed to the models (default 400000, the bash
+	// LLM_REVIEW_MAX_DIFF_BYTES). Truncation is surfaced in the status.
+	MaxDiffBytes int `yaml:"max_diff_bytes,omitempty"`
+}
+
+func (c ReviewProducerConfig) EffectiveChatAPIKeyEnv() string {
+	if strings.TrimSpace(c.ChatAPIKeyEnv) == "" {
+		return "CLIPROXY_API_KEY"
+	}
+	return strings.TrimSpace(c.ChatAPIKeyEnv)
+}
+
+func (c ReviewProducerConfig) EffectiveCursorAPIKeyEnv() string {
+	if strings.TrimSpace(c.CursorAPIKeyEnv) == "" {
+		return "CURSOR_API_KEY"
+	}
+	return strings.TrimSpace(c.CursorAPIKeyEnv)
+}
+
+func (c ReviewProducerConfig) EffectiveOpusModel() string {
+	if strings.TrimSpace(c.OpusModel) == "" {
+		return "claude-opus-5"
+	}
+	return strings.TrimSpace(c.OpusModel)
+}
+
+func (c ReviewProducerConfig) EffectiveTerraModel() string {
+	if strings.TrimSpace(c.TerraModel) == "" {
+		return "gpt-5.6-terra"
+	}
+	return strings.TrimSpace(c.TerraModel)
+}
+
+func (c ReviewProducerConfig) EffectiveCursorModel() string {
+	if strings.TrimSpace(c.CursorModel) == "" {
+		return "composer-2.5"
+	}
+	return strings.TrimSpace(c.CursorModel)
+}
+
+func (c ReviewProducerConfig) EffectivePendingStale() time.Duration {
+	if c.PendingStaleMinutes <= 0 {
+		return 30 * time.Minute
+	}
+	return time.Duration(c.PendingStaleMinutes) * time.Minute
+}
+
+func (c ReviewProducerConfig) EffectiveMaxDiffBytes() int {
+	if c.MaxDiffBytes <= 0 {
+		return 400000
+	}
+	return c.MaxDiffBytes
+}
+
 // SessionRetentionConfig bounds the growth of state.Sessions by compacting
 // terminal sessions once both the count and age floors are exceeded (#497).
 // Defaults keep the 20 newest terminal sessions per project and any terminal
@@ -2387,6 +2465,7 @@ type Config struct {
 	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "llm-review" (#1148 opus+terra pair) | "none"
 	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default follows review_gate ("greptile" → ["greptile"], "llm-review" → ["llm-review-opus","llm-review-terra"]); "llm-review" is a pair alias; "llm-review-cursor" is an opt-in third lens (name it explicitly, e.g. ["llm-review-opus","llm-review-cursor"]). NOTE: the producer (scripts/llm-review.sh via its LLM_REVIEW_STREAMS input) must be configured to emit the same streams, or the gate degrades on an unproduced stream via missing_after_minutes.
 	ReviewRetrigger                 ReviewRetriggerConfig         `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
+	ReviewProducer                  ReviewProducerConfig          `yaml:"review_producer"`                    // #1162: daemon-side llm-review producer for unobserved llm-review-* streams (replaces the bash glue)
 	AutoRetryReviewFeedback         bool                          `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
 	AutoRetryRebaseConflicts        bool                          `yaml:"auto_retry_rebase_conflicts"`        // retry PRs whose auto-rebase fails with conflicts
