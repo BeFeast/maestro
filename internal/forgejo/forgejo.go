@@ -28,6 +28,12 @@ import (
 // forge cannot wedge a producer cycle.
 const requestTimeout = 30 * time.Second
 
+// maxResponseBytes bounds one response body. Exceeding it is an explicit
+// error, never a silent cut: a truncated diff with a nil error would let the
+// producer post a full-diff verdict over a partial diff with no truncation
+// note — the exact evidence-weakening the bash glue's TRUNC_NOTE surfaces.
+const maxResponseBytes = 4 << 20
+
 // Client is the Forgejo forge. Zero value is not usable; construct with New.
 type Client struct {
 	baseURL string
@@ -44,11 +50,22 @@ func New(baseURL, token string) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		token:   token,
-		httpc:   &http.Client{Timeout: requestTimeout},
+		httpc: &http.Client{
+			Timeout: requestTimeout,
+			// Never follow redirects: Go rewrites a redirected POST into a
+			// body-less GET, and Forgejo's write paths have 200-answering GET
+			// twins (list statuses/comments) — a misconfigured base URL behind
+			// an http→https 301 would turn every write into a silent green
+			// no-op. Returning the 3xx as-is makes do() fail loudly instead.
+			CheckRedirect: func(*http.Request, []*http.Request) error {
+				return http.ErrUseLastResponse
+			},
+		},
 	}
 }
 
 // WithHTTPClient overrides the underlying HTTP client (tests, custom TLS).
+// The caller then owns the redirect policy New installs by default.
 func (c *Client) WithHTTPClient(httpc *http.Client) *Client {
 	c.httpc = httpc
 	return c
@@ -82,9 +99,14 @@ func (c *Client) do(ctx context.Context, method, path string, payload any) ([]by
 		return nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
-	out, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	// limit+1 so an at-limit body is distinguishable from an over-limit one
+	// (the appauth.go idiom) — oversize fails loudly instead of truncating.
+	out, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
 		return nil, fmt.Errorf("%s %s: read response: %w", method, path, err)
+	}
+	if len(out) > maxResponseBytes {
+		return nil, fmt.Errorf("%s %s: response exceeds %d bytes", method, path, maxResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		excerpt := strings.TrimSpace(string(out))

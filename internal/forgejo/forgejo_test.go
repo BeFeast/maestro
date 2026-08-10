@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -77,9 +78,69 @@ func TestGetPR_EmptyHeadSHA(t *testing.T) {
 }
 
 func TestGetPR_HTTPError(t *testing.T) {
-	c, _ := fixtureServer(t, 404, `{"message":"Not Found"}`)
+	// The body deliberately parses as a healthy PR (non-empty head.sha): the
+	// only thing that can fail this test is the non-2xx status check itself,
+	// not the empty-head-sha guard downstream.
+	c, _ := fixtureServer(t, 404, `{"number":3,"title":"t","head":{"sha":"fjsha1"},"base":{"ref":"main"}}`)
 	if _, err := c.GetPR(context.Background(), "owner/repo", 3); err == nil {
 		t.Fatal("a non-2xx response must surface as an error")
+	}
+}
+
+func TestCommitStatuses_HTTPError(t *testing.T) {
+	// A transient 500 must never read as "no statuses on this SHA": the
+	// producer's settled-check would treat the stream as never-run and
+	// re-review, breaking per-head idempotency.
+	c, _ := fixtureServer(t, 500, `{"message":"boom"}`)
+	if _, err := c.CommitStatuses(context.Background(), "owner/repo", "fjsha1"); err == nil {
+		t.Fatal("a non-2xx status read must surface as an error, not an empty list")
+	}
+}
+
+func TestWriteRedirectNotFollowed(t *testing.T) {
+	// Go rewrites a redirected POST into a body-less GET, and Forgejo's write
+	// paths have 200-answering GET twins — following the redirect would turn
+	// the write into a silent green no-op. The client must surface the 3xx.
+	var followed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			followed = true
+			w.Write([]byte(`[]`))
+			return
+		}
+		w.Header().Set("Location", "/elsewhere")
+		w.WriteHeader(http.StatusMovedPermanently)
+	}))
+	t.Cleanup(srv.Close)
+	c := New(srv.URL, "sekrit")
+	err := c.CreateCommitStatus(context.Background(), "owner/repo", "fjsha1", forge.Status{
+		Context: "llm-review-opus",
+		State:   forge.StatusPending,
+	})
+	if err == nil {
+		t.Fatal("a redirected write must fail loudly, not report success without writing")
+	}
+	if followed {
+		t.Fatal("the client must not re-issue a redirected write as a GET")
+	}
+}
+
+func TestGetPRDiff_OversizeFailsLoudly(t *testing.T) {
+	c, _ := fixtureServer(t, 200, strings.Repeat("x", maxResponseBytes+1))
+	if _, err := c.GetPRDiff(context.Background(), "owner/repo", 3); err == nil {
+		t.Fatal("an over-limit diff must error — a silent cut posts a full-diff verdict over a partial diff")
+	}
+}
+
+func TestGetPRDiff_AtLimitPasses(t *testing.T) {
+	body := strings.Repeat("x", maxResponseBytes)
+	c, _ := fixtureServer(t, 200, body)
+	out, err := c.GetPRDiff(context.Background(), "owner/repo", 3)
+	if err != nil {
+		t.Fatalf("an exactly-at-limit body must pass: %v", err)
+	}
+	if len(out) != maxResponseBytes {
+		t.Fatalf("len = %d, want %d", len(out), maxResponseBytes)
 	}
 }
 
