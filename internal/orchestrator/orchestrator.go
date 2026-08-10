@@ -85,12 +85,12 @@ type Orchestrator struct {
 	// missingReviewNotified remembers PRs already reported as merged past an
 	// absent review gate, so the alert fires once per PR.
 	missingReviewNotified map[int]bool
-	// reviewProduceInFlight guards one llm-review producer run per PR head in
-	// this process (#1162 S5); cross-process dedup is the posted statuses.
+	// reviewProduceInFlight guards one llm-review producer run per PR in this
+	// process (#1162 S5); cross-process dedup is the posted statuses.
 	reviewProduceMu       sync.Mutex
-	reviewProduceInFlight map[string]bool
+	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
-	reviewProduceFn func(prNumber int, headSHA string, streams []string)
+	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string

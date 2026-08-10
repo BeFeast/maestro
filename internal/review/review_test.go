@@ -359,15 +359,26 @@ func TestProducePR_TruncationSurfacedInStatus(t *testing.T) {
 	}
 }
 
-func TestProducePR_EmptyDiffNoOps(t *testing.T) {
+func TestProducePR_EmptyDiffSettlesStreams(t *testing.T) {
 	f := newFakeForge()
 	f.diff = []byte("  \n")
-	l := &fakeLens{name: "llm-review-opus", output: "NO_FINDINGS"}
-	if err := producer(f, l).ProducePR(context.Background(), 7); err != nil {
+	f.statuses = []forge.Status{{Context: "llm-review-cursor", State: forge.StatusSuccess}}
+	a := &fakeLens{name: "llm-review-opus", output: "NO_FINDINGS"}
+	b := &fakeLens{name: "llm-review-cursor", output: "NO_FINDINGS"}
+	if err := producer(f, a, b).ProducePR(context.Background(), 7); err != nil {
 		t.Fatalf("ProducePR: %v", err)
 	}
-	if l.runs != 0 || len(f.posted) != 0 {
-		t.Fatal("an empty diff must produce nothing")
+	if a.runs != 0 || b.runs != 0 {
+		t.Fatal("an empty diff must not run any model")
+	}
+	// The unsettled stream settles with success (else the daemon trigger
+	// would re-kick every cycle forever); the settled one stays untouched.
+	if len(f.posted) != 1 {
+		t.Fatalf("posted = %+v, want exactly the opus settle", f.posted)
+	}
+	st := f.posted[0]
+	if st.Context != "llm-review-opus" || st.State != forge.StatusSuccess || st.Description != "empty diff — nothing to review" {
+		t.Fatalf("status = %+v", st)
 	}
 }
 

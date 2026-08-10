@@ -22,7 +22,7 @@ func produceRecorder(o *Orchestrator) (*[]producedCall, *sync.WaitGroup) {
 	var mu sync.Mutex
 	var calls []producedCall
 	var wg sync.WaitGroup
-	o.reviewProduceFn = func(pr int, head string, streams []string) {
+	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig) {
 		mu.Lock()
 		calls = append(calls, producedCall{pr: pr, head: head, streams: streams})
 		mu.Unlock()
@@ -93,7 +93,7 @@ func TestMaybeProduceMissingReview_InFlightDedup(t *testing.T) {
 	started := 0
 	release := make(chan struct{})
 	done := make(chan struct{}, 2)
-	o.reviewProduceFn = func(pr int, head string, streams []string) {
+	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig) {
 		mu.Lock()
 		started++
 		mu.Unlock()
@@ -105,31 +105,34 @@ func TestMaybeProduceMissingReview_InFlightDedup(t *testing.T) {
 		Streams: []github.ReviewStreamVerdict{{Name: "llm-review-opus", Pending: true}},
 	}
 	o.maybeProduceMissingReview(7, "head1", verdict)
-	// Wait until the first goroutine has claimed the key.
+	// Wait until the first goroutine has claimed the PR.
 	for {
 		o.reviewProduceMu.Lock()
-		claimed := o.reviewProduceInFlight["7@head1"]
+		claimed := o.reviewProduceInFlight[7]
 		o.reviewProduceMu.Unlock()
 		if claimed {
 			break
 		}
 		time.Sleep(time.Millisecond)
 	}
-	o.maybeProduceMissingReview(7, "head1", verdict)
+	// A second kick — even on a NEW head — must dedup: the running producer
+	// already reviews the PR's current head, so a head-keyed second run would
+	// double-spend on the same commit.
+	o.maybeProduceMissingReview(7, "head2", verdict)
 	close(release)
 	<-done
 	mu.Lock()
 	defer mu.Unlock()
 	if started != 1 {
-		t.Fatalf("started = %d, want 1 — the second kick on the same head must dedup", started)
+		t.Fatalf("started = %d, want 1 — the second kick on the same PR must dedup", started)
 	}
 }
 
 func TestReviewLenses_ConfigMapping(t *testing.T) {
 	t.Setenv("CLIPROXY_API_KEY", "proxy-key")
 	t.Setenv("CURSOR_API_KEY", "cursor-key")
-	o := producerOrchestrator(true)
-	lenses := o.reviewLenses([]string{"llm-review-opus", "llm-review-terra", "llm-review-cursor", "greptile"})
+	rp := config.ReviewProducerConfig{Enabled: true, ChatBaseURL: "http://cliproxy.test"}
+	lenses := reviewLenses([]string{"llm-review-opus", "llm-review-terra", "llm-review-cursor", "greptile"}, rp)
 	if len(lenses) != 3 {
 		t.Fatalf("lenses = %d, want 3 (greptile is not produceable)", len(lenses))
 	}
@@ -149,8 +152,7 @@ func TestReviewLenses_ConfigMapping(t *testing.T) {
 
 func TestReviewLenses_MissingCredsStillBuildsLens(t *testing.T) {
 	t.Setenv("CLIPROXY_API_KEY", "")
-	o := producerOrchestrator(true)
-	lenses := o.reviewLenses([]string{"llm-review-opus"})
+	lenses := reviewLenses([]string{"llm-review-opus"}, config.ReviewProducerConfig{Enabled: true, ChatBaseURL: "http://cliproxy.test"})
 	if len(lenses) != 1 {
 		t.Fatalf("lenses = %d, want 1", len(lenses))
 	}

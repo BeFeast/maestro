@@ -2,12 +2,12 @@ package orchestrator
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/review"
 )
@@ -41,29 +41,36 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 		return
 	}
 
-	key := fmt.Sprintf("%d@%s", prNumber, headSHA)
+	// One run per PR (not per head): the producer reviews the PR's CURRENT
+	// head regardless of the head this cycle observed, so a head-keyed guard
+	// would let a run kicked on the old head race a second one kicked on the
+	// new — two full model passes over the same commit.
 	o.reviewProduceMu.Lock()
 	if o.reviewProduceInFlight == nil {
-		o.reviewProduceInFlight = make(map[string]bool)
+		o.reviewProduceInFlight = make(map[int]bool)
 	}
-	if o.reviewProduceInFlight[key] {
+	if o.reviewProduceInFlight[prNumber] {
 		o.reviewProduceMu.Unlock()
 		return
 	}
-	o.reviewProduceInFlight[key] = true
+	o.reviewProduceInFlight[prNumber] = true
 	o.reviewProduceMu.Unlock()
 
 	produce := o.reviewProduceFn
 	if produce == nil {
 		produce = o.produceReviewStreams
 	}
+	// Snapshot the config on this goroutine: the orchestrator loop owns both
+	// this call and the hot-reload writes, so reading o.cfg here is
+	// race-free, while the spawned goroutine below must never touch it.
+	rp := o.cfg.ReviewProducer
 	go func() {
 		defer func() {
 			o.reviewProduceMu.Lock()
-			delete(o.reviewProduceInFlight, key)
+			delete(o.reviewProduceInFlight, prNumber)
 			o.reviewProduceMu.Unlock()
 		}()
-		produce(prNumber, headSHA, missing)
+		produce(prNumber, headSHA, missing, rp)
 	}()
 }
 
@@ -77,8 +84,9 @@ const reviewProducerRunTimeout = 30 * time.Minute
 // kick time; a stream whose credentials are absent still gets its lens — the
 // producer's Available check turns that into the explicit
 // "skipped: credentials not configured" error status, never silence.
-func (o *Orchestrator) reviewLenses(streams []string) []review.Lens {
-	rp := o.cfg.ReviewProducer
+// rp travels by value: this runs on the producer goroutine, which must not
+// read o.cfg (the orchestrator loop hot-reloads it without a lock).
+func reviewLenses(streams []string, rp config.ReviewProducerConfig) []review.Lens {
 	var lenses []review.Lens
 	for _, stream := range streams {
 		switch stream {
@@ -110,8 +118,9 @@ func (o *Orchestrator) reviewLenses(streams []string) []review.Lens {
 // produceReviewStreams runs the producer for one PR head. The forge is the
 // GitHub client for now; per-project forge selection (Forgejo) arrives with
 // the Forgejo project wiring — the producer itself is already forge-agnostic.
-func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string) {
-	lenses := o.reviewLenses(streams)
+// Runs on the producer goroutine: everything it needs arrives by value.
+func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig) {
+	lenses := reviewLenses(streams, rp)
 	if len(lenses) == 0 {
 		return
 	}
@@ -119,8 +128,8 @@ func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, stream
 		Forge:             github.NewForge(),
 		Repo:              o.repo,
 		Lenses:            lenses,
-		PendingStaleAfter: o.cfg.ReviewProducer.EffectivePendingStale(),
-		MaxDiffBytes:      o.cfg.ReviewProducer.EffectiveMaxDiffBytes(),
+		PendingStaleAfter: rp.EffectivePendingStale(),
+		MaxDiffBytes:      rp.EffectiveMaxDiffBytes(),
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), reviewProducerRunTimeout)
 	defer cancel()

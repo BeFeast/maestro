@@ -140,8 +140,29 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
 	}
+	statuses, err := p.Forge.CommitStatuses(ctx, p.Repo, pr.HeadSHA)
+	if err != nil {
+		return fmt.Errorf("review %s#%d: statuses on %s: %w", p.Repo, prNumber, pr.HeadSHA, err)
+	}
 	if len(strings.TrimSpace(string(diff))) == 0 {
+		// An empty diff trivially has no findings — settle every unsettled
+		// lens with a success status. Bash just exited 0 here, which was fine
+		// for its per-event CI invocation; the daemon trigger re-kicks on
+		// every cycle an expected stream stays unobserved, so leaving the
+		// streams silent would poll forever on a PR that cannot settle.
 		p.logf("%s#%d: empty diff — nothing to review", p.Repo, prNumber)
+		var errs []error
+		for _, lens := range p.Lenses {
+			if settled, _ := p.statusSettled(lens.Name(), statuses); settled {
+				continue
+			}
+			if err := p.postFinalStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusSuccess, "empty diff — nothing to review"); err != nil {
+				errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
+			}
+		}
+		if len(errs) > 0 {
+			return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, errors.Join(errs...))
+		}
 		return nil
 	}
 	truncNote := ""
@@ -151,11 +172,6 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 		// Surfaced in the final status description: a verdict over a
 		// truncated diff is weaker evidence and the operator must see that.
 		truncNote = fmt.Sprintf("; warning: diff truncated to %d bytes", p.maxDiffBytes())
-	}
-
-	statuses, err := p.Forge.CommitStatuses(ctx, p.Repo, pr.HeadSHA)
-	if err != nil {
-		return fmt.Errorf("review %s#%d: statuses on %s: %w", p.Repo, prNumber, pr.HeadSHA, err)
 	}
 
 	// Phase 1: settle every lens's status (pending / skipped-error) before
