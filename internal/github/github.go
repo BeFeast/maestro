@@ -2776,7 +2776,9 @@ var llmReviewBotLogins = []string{"okbot", "llm-review"}
 // stream is part of the configured review streams (the "llm-review" pair
 // alias normalizes to both model streams).
 func llmReviewStreamsConfigured(streams []string) bool {
-	return streamEnabled(streams, "llm-review-opus") || streamEnabled(streams, "llm-review-terra")
+	return streamEnabled(streams, "llm-review-opus") ||
+		streamEnabled(streams, "llm-review-terra") ||
+		streamEnabled(streams, "llm-review-cursor")
 }
 
 // isCollectableReviewFeedbackLogin decides whose comments the feedback
@@ -3928,7 +3930,7 @@ func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGate
 				CheckContains: []string{"simplicity", "over-engineering", "overengineering"},
 				UserContains:  []string{"simplicity", "maestro-simplicity", "over-engineering", "overengineering"},
 			})
-		case "llm-review-opus", "llm-review-terra":
+		case "llm-review-opus", "llm-review-terra", "llm-review-cursor":
 			sv, err = c.namedReviewStreamVerdict(prNumber, llmReviewStreamSpec(stream))
 		default:
 			continue
@@ -4169,10 +4171,11 @@ func normalizeReviewStreams(streams []string) []string {
 	for _, raw := range streams {
 		name := strings.ToLower(strings.TrimSpace(raw))
 		switch name {
-		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra":
+		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra", "llm-review-cursor":
 			add(name)
 		case "llm-review":
 			// The pair alias (#1148): "llm-review" means both model lenses.
+			// llm-review-cursor is opt-in only, never expanded by the alias.
 			add("llm-review-opus")
 			add("llm-review-terra")
 		default:

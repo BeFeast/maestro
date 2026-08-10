@@ -57,6 +57,40 @@ review_gate_streams:
 	}
 }
 
+// The opt-in cursor lens is preserved verbatim when named explicitly, so an
+// operator can run the opus+cursor gate. Without the allowlist entry it would
+// be silently dropped.
+func TestParse_ReviewGateStreamsCursorLensOptIn(t *testing.T) {
+	yaml := `
+repo: owner/repo
+review_gate: llm-review
+review_gate_streams:
+  - llm-review-opus
+  - llm-review-cursor
+`
+	cfg, err := parse([]byte(yaml))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"llm-review-opus", "llm-review-cursor"}
+	if got := cfg.EffectiveReviewGateStreams(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("EffectiveReviewGateStreams() = %#v, want %v", got, want)
+	}
+}
+
+// The "llm-review" pair alias must NOT pull in the cursor lens — cursor stays
+// opt-in and is only present when named explicitly.
+func TestParse_ReviewGateAliasDoesNotIncludeCursor(t *testing.T) {
+	cfg, err := parse([]byte("repo: owner/repo\nreview_gate: llm-review\n"))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	want := []string{"llm-review-opus", "llm-review-terra"}
+	if got := cfg.EffectiveReviewGateStreams(); !reflect.DeepEqual(got, want) {
+		t.Fatalf("EffectiveReviewGateStreams() = %#v, want %v (cursor must not be pulled in by the alias)", got, want)
+	}
+}
+
 // Greptile stays the default and existing rows keep working unchanged.
 func TestParse_ReviewGateDefaultStillGreptile(t *testing.T) {
 	cfg, err := parse([]byte("repo: owner/repo\n"))

@@ -102,6 +102,29 @@ func TestStreamEnabled_LLMReviewAlias(t *testing.T) {
 	}
 }
 
+func TestNormalizeReviewStreams_CursorLensPreserved(t *testing.T) {
+	got := normalizeReviewStreams([]string{"llm-review-opus", "llm-review-cursor"})
+	want := []string{"llm-review-opus", "llm-review-cursor"}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("normalizeReviewStreams = %v, want %v (cursor lens must survive normalization)", got, want)
+	}
+}
+
+func TestNormalizeReviewStreams_AliasDoesNotAddCursor(t *testing.T) {
+	got := normalizeReviewStreams([]string{"llm-review"})
+	for _, s := range got {
+		if s == "llm-review-cursor" {
+			t.Fatalf("the llm-review alias must not expand to the opt-in cursor lens; got %v", got)
+		}
+	}
+}
+
+func TestLLMReviewStreamsConfigured_CursorOnly(t *testing.T) {
+	if !llmReviewStreamsConfigured([]string{"llm-review-cursor"}) {
+		t.Fatal("a cursor-only stream set must count as an llm-review gate (feedback collection + blocking-finding scoping depend on this)")
+	}
+}
+
 // --- external verdict decisions ---------------------------------------------
 
 func TestNamedCheckDecision_LLMReviewCheckNames(t *testing.T) {
