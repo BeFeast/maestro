@@ -4881,6 +4881,8 @@ func fleetPRReviewStreamSummary(stream fleetPRReviewStream) string {
 		name = "LLM review (opus)"
 	} else if strings.EqualFold(name, "llm-review-terra") {
 		name = "LLM review (terra)"
+	} else if strings.EqualFold(name, "llm-review-cursor") {
+		name = "LLM review (cursor)"
 	} else if name != "" {
 		name = strings.ToUpper(name[:1]) + name[1:]
 	} else {

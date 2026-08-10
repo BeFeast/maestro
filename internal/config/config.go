@@ -2385,7 +2385,7 @@ type Config struct {
 	MergeStrategy                   string                        `yaml:"merge_strategy"`                     // "sequential" | "parallel"
 	MergeIntervalSeconds            int                           `yaml:"merge_interval_seconds"`             // minimum seconds between merges in sequential mode
 	ReviewGate                      string                        `yaml:"review_gate"`                        // "greptile" (default) | "llm-review" (#1148 opus+terra pair) | "none"
-	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default follows review_gate ("greptile" → ["greptile"], "llm-review" → ["llm-review-opus","llm-review-terra"]); "llm-review" is a pair alias
+	ReviewGateStreams               []string                      `yaml:"review_gate_streams"`                // optional review dimensions; default follows review_gate ("greptile" → ["greptile"], "llm-review" → ["llm-review-opus","llm-review-terra"]); "llm-review" is a pair alias; "llm-review-cursor" is an opt-in third lens (name it explicitly, e.g. ["llm-review-opus","llm-review-cursor"]). NOTE: the producer (scripts/llm-review.sh via its LLM_REVIEW_STREAMS input) must be configured to emit the same streams, or the gate degrades on an unproduced stream via missing_after_minutes.
 	ReviewRetrigger                 ReviewRetriggerConfig         `yaml:"review_retrigger"`                   // #691: re-post "@greptile review" when the gate wedges at pending with no review on head
 	AutoRetryReviewFeedback         bool                          `yaml:"auto_retry_review_feedback"`         // close PRs with review comments and respawn a fixer
 	MergeExhaustedNonCriticalReview *bool                         `yaml:"merge_exhausted_noncritical_review"` // #565: merge a green PR after review-feedback retries exhaust when only non-critical (P1/P2/P3) findings remain (no P0 on head). nil = default-on.
@@ -3085,10 +3085,12 @@ func normalizeReviewGateStreams(reviewGate string, streams []string) []string {
 		switch name {
 		case "", "off", "disabled", "none":
 			continue
-		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra":
+		case "greptile", "simplicity", "llm-review-opus", "llm-review-terra", "llm-review-cursor":
 			add(name)
 		case "llm-review":
-			// Pair alias (#1148): both model lenses.
+			// Pair alias (#1148): both model lenses. The opt-in cursor lens
+			// (llm-review-cursor) is never pulled in by the alias — it must be
+			// named explicitly in review_gate_streams.
 			add("llm-review-opus")
 			add("llm-review-terra")
 		default:

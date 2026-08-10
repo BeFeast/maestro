@@ -1,14 +1,18 @@
 #!/usr/bin/env bash
 # llm-review.sh — glue runner for the llm-review gate (#1148).
 #
-# Runs two single-shot LLM reviews of a PR head diff — claude-opus-5 (the
-# subscription seat: plain `claude -p`) and gpt-5.6-terra (via CLIProxy:
-# ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN + --model) — and publishes, per
-# model:
+# Runs single-shot LLM reviews of a PR head diff and publishes, per model:
 #   1. inline PR review comments (one per finding, with a [P0]-[P3] severity
 #      marker and the stream marker so Maestro can attribute them), and
-#   2. a commit status `llm-review-opus` / `llm-review-terra` on the head SHA:
-#      success unless the model reported any P0/P1 finding.
+#   2. a commit status `llm-review-<lens>` on the head SHA: success unless the
+#      model reported any P0/P1 finding.
+#
+# Lenses:
+#   opus   — claude-opus-5, the subscription seat: plain `claude -p`. Always run.
+#   terra  — gpt-5.6-terra via CLIProxy (ANTHROPIC_BASE_URL/AUTH_TOKEN + --model).
+#            Always run; skipped-with-error if its creds are absent.
+#   cursor — cursor-agent headless (read-only: --mode ask, empty cwd, stdin).
+#            OPT-IN: run only when LLM_REVIEW_STREAMS names "llm-review-cursor".
 #
 # Maestro's review gate (review_gate: llm-review) reads exactly these two
 # surfaces: the status is the stream verdict, the P0/P1 comments are the
@@ -23,7 +27,9 @@
 #
 # Requirements: gh (authenticated), git, jq, claude CLI. For the terra pass:
 # LLM_REVIEW_TERRA_BASE_URL + LLM_REVIEW_TERRA_AUTH_TOKEN (the CLIProxy
-# endpoint/key) — without them the terra pass is skipped with a warning.
+# endpoint/key) — without them the terra pass is skipped with a warning. For
+# the opt-in cursor pass: the cursor-agent CLI on PATH + CURSOR_API_KEY, and
+# LLM_REVIEW_STREAMS must contain "llm-review-cursor".
 #
 # Usage: llm-review.sh <pr-number> [owner/repo]
 
@@ -42,6 +48,9 @@ fi
 
 OPUS_MODEL="${LLM_REVIEW_OPUS_MODEL:-claude-opus-5}"
 TERRA_MODEL="${LLM_REVIEW_TERRA_MODEL:-gpt-5.6-terra}"
+# composer-2.5 is the Cursor "included usage" pool default (cost-safe); raise
+# via LLM_REVIEW_CURSOR_MODEL for more recall at the paid-pool price.
+CURSOR_MODEL="${LLM_REVIEW_CURSOR_MODEL:-composer-2.5}"
 MAX_DIFF_BYTES="${LLM_REVIEW_MAX_DIFF_BYTES:-400000}"
 
 pr_json="$(gh pr view "$PR_NUMBER" --repo "$REPO" --json headRefOid,baseRefName,title,number)"
@@ -207,6 +216,14 @@ prepare_model() {
         return 2
     fi
 
+    if [[ "$mode" == cursor && -z "${CURSOR_API_KEY:-}" ]]; then
+        echo "llm-review: CURSOR_API_KEY not set — skipping $stream" >&2
+        # Same anti-wedge rule as terra: post an explicit error status rather
+        # than leaving the cursor stream silently unobserved.
+        post_status "$stream" error "skipped: credentials not configured" || true
+        return 2
+    fi
+
     if ! post_status "$stream" pending "review in progress"; then
         return 3
     fi
@@ -245,6 +262,33 @@ run_model() {
                 post_status "$context" error "review run failed"
                 return 1
             fi
+            ;;
+        cursor)
+            # cursor-agent authenticates via CURSOR_API_KEY from the env. Run it
+            # in an EMPTY temp dir with the prompt+diff piped on stdin so the
+            # only thing it can read is what we feed it — it cannot roam the
+            # repo. --mode ask keeps it read-only (no write/shell tools) and
+            # --trust suppresses the workspace-trust prompt WITHOUT the command
+            # auto-approve that -f/--yolo would grant. stdin (not an argv
+            # element) also sidesteps ARG_MAX on large diffs. --output-format
+            # text feeds the shared [P0]-[P3] parser below unchanged.
+            # Capture stdout (the review text) separately from stderr: only the
+            # final answer must reach the [P0]-[P3] parser, never a stray
+            # progress/telemetry line that could read as a spurious finding.
+            local review_dir cur_err
+            review_dir="$(mktemp -d)"
+            cur_err="$review_dir/stderr"
+            if ! output="$( (cd "$review_dir" && \
+                    printf '%s' "$prompt$(cat "$DIFF_FILE")" | \
+                    CURSOR_API_KEY="$CURSOR_API_KEY" cursor-agent -p \
+                        --output-format text --mode ask --trust \
+                        --model "$CURSOR_MODEL") 2>"$cur_err")"; then
+                echo "llm-review: $context run failed: $(cat "$cur_err" 2>/dev/null)" >&2
+                rm -rf "$review_dir"
+                post_status "$context" error "review run failed"
+                return 1
+            fi
+            rm -rf "$review_dir"
             ;;
         *)
             echo "llm-review: unknown mode $mode" >&2
@@ -297,25 +341,52 @@ run_model() {
     fi
 }
 
-# Phase 1: settle every model's status (pending / skipped-error) before any
-# model runs or any comment is posted, so the pair is never half-observed.
+# The producer runs exactly the lenses named in LLM_REVIEW_STREAMS. This MUST
+# mirror the project's review_gate_streams, because the daemon's gate waits on
+# that set — an unproduced-but-expected stream is not a permanent wedge (the
+# per-stream missing_after_minutes escape settles it, #1148 round 2) but it does
+# degrade the gate, so keep the two in sync. Default is the opus+terra pair, so
+# an unset var reproduces the pre-cursor behavior exactly. Whitespace in the
+# list is tolerated ("opus, cursor"). Today this var is provided by the CI
+# workflow from a repo variable; the planned daemon-side trigger will pass
+# review_gate_streams here directly.
+STREAMS=",${LLM_REVIEW_STREAMS:-llm-review-opus,llm-review-terra},"
+STREAMS="${STREAMS// /}"
+selected() { [[ "$STREAMS" == *",$1,"* ]]; }
+
+# Phase 1: settle every selected lens's status (pending / skipped-error) before
+# any model runs or any comment is posted, so the set is never half-observed.
 rc=0
 RUN_OPUS=0
 RUN_TERRA=0
-prep_rc=0
-prepare_model "llm-review-opus" opus || prep_rc=$?
-case "$prep_rc" in
-    0) RUN_OPUS=1 ;;
-    1) ;;       # settled / in flight — legitimate skip
-    *) rc=1 ;;  # 2 = creds skip (error status posted), 3 = pending post failed
-esac
-prep_rc=0
-prepare_model "llm-review-terra" terra || prep_rc=$?
-case "$prep_rc" in
-    0) RUN_TERRA=1 ;;
-    1) ;;
-    *) rc=1 ;;
-esac
+RUN_CURSOR=0
+if selected llm-review-opus; then
+    prep_rc=0
+    prepare_model "llm-review-opus" opus || prep_rc=$?
+    case "$prep_rc" in
+        0) RUN_OPUS=1 ;;
+        1) ;;       # settled / in flight — legitimate skip
+        *) rc=1 ;;  # 2 = creds skip (error status posted), 3 = pending post failed
+    esac
+fi
+if selected llm-review-terra; then
+    prep_rc=0
+    prepare_model "llm-review-terra" terra || prep_rc=$?
+    case "$prep_rc" in
+        0) RUN_TERRA=1 ;;
+        1) ;;
+        *) rc=1 ;;
+    esac
+fi
+if selected llm-review-cursor; then
+    prep_rc=0
+    prepare_model "llm-review-cursor" cursor || prep_rc=$?
+    case "$prep_rc" in
+        0) RUN_CURSOR=1 ;;
+        1) ;;
+        *) rc=1 ;;
+    esac
+fi
 
 # Phase 2: run the reviews and flip each pending status to its final state.
 if (( RUN_OPUS )); then
@@ -323,5 +394,8 @@ if (( RUN_OPUS )); then
 fi
 if (( RUN_TERRA )); then
     run_model "llm-review-terra" terra || rc=1
+fi
+if (( RUN_CURSOR )); then
+    run_model "llm-review-cursor" cursor || rc=1
 fi
 exit "$rc"

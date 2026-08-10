@@ -74,6 +74,23 @@ cat "$STUB_DIR/claude-output"
 exit 0
 `
 
+// cursorAgentStub mirrors the real cursor-agent (live-verified to read the
+// prompt from stdin): it consumes stdin fully (so the piping printf never hits
+// SIGPIPE under the script's pipefail) AND asserts the prompt actually arrived
+// — an empty stdin means the script stopped piping the prompt+diff, which would
+// otherwise ship a lens that reviews nothing yet posts success. On empty stdin
+// it exits non-zero so the cursor branch errors and the test fails loudly.
+const cursorAgentStub = `#!/usr/bin/env bash
+piped="$(cat)"
+if [[ -z "$piped" ]]; then
+    echo "cursor-agent stub: empty stdin — prompt was not piped" >&2
+    exit 3
+fi
+printf 'cursor-agent %s\n' "$*" >> "$STUB_DIR/calls"
+cat "$STUB_DIR/claude-output"
+exit 0
+`
+
 type llmScriptResult struct {
 	exitCode int
 	calls    []string
@@ -95,6 +112,7 @@ func runLLMReviewScript(t *testing.T, claudeOutput, combinedStatus string, terra
 	stubDir := t.TempDir()
 	writeStubFile(t, filepath.Join(stubDir, "gh"), ghStub, 0o755)
 	writeStubFile(t, filepath.Join(stubDir, "claude"), claudeStub, 0o755)
+	writeStubFile(t, filepath.Join(stubDir, "cursor-agent"), cursorAgentStub, 0o755)
 	writeStubFile(t, filepath.Join(stubDir, "claude-output"), claudeOutput, 0o644)
 	writeStubFile(t, filepath.Join(stubDir, "combined-status.json"), combinedStatus, 0o644)
 	writeStubFile(t, filepath.Join(stubDir, "diff"), "diff --git a/a.go b/a.go\n+real change\n", 0o644)
@@ -218,6 +236,76 @@ func TestLLMReviewScript_MissingTerraCredsPostsErrorStatus(t *testing.T) {
 	// The opus pass must still complete normally.
 	if len(callsMatching(res.calls, "state=success", "context=llm-review-opus")) == 0 {
 		t.Fatalf("opus did not finish despite terra being skipped\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// The cursor lens is opt-in: with no LLM_REVIEW_STREAMS the script runs exactly
+// the opus+terra pair and never invokes cursor-agent or posts a cursor status.
+// This is the behaviour-preserving guarantee for existing rows.
+func TestLLMReviewScript_CursorLensOffByDefault(t *testing.T) {
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", emptyStatus, true, "CURSOR_API_KEY=stub-cursor-key")
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "cursor-agent ")) != 0 {
+		t.Errorf("cursor-agent ran without LLM_REVIEW_STREAMS opting it in\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+	if len(callsMatching(res.calls, "context=llm-review-cursor")) != 0 {
+		t.Errorf("a cursor status was posted while the lens is off by default\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// When LLM_REVIEW_STREAMS opts the cursor lens in and CURSOR_API_KEY is present,
+// cursor-agent runs and posts an llm-review-cursor status, reusing the shared
+// parser (a fenced NO_FINDINGS reads as a clean success).
+func TestLLMReviewScript_CursorLensRunsWhenEnabled(t *testing.T) {
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", emptyStatus, true,
+		"CURSOR_API_KEY=stub-cursor-key",
+		"LLM_REVIEW_STREAMS=llm-review-opus,llm-review-terra,llm-review-cursor")
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "cursor-agent ")) == 0 {
+		t.Errorf("cursor-agent was not invoked despite being opted in\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+	if len(callsMatching(res.calls, "state=success", "context=llm-review-cursor")) == 0 {
+		t.Errorf("no success status for the cursor lens\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// The single selector makes the terra-free opus+cursor pairing (the whole
+// point of the change) actually achievable: naming only opus+cursor must run
+// exactly those two and never attempt terra.
+func TestLLMReviewScript_OpusCursorPairingSkipsTerra(t *testing.T) {
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", emptyStatus, false, // terra creds absent on purpose
+		"CURSOR_API_KEY=stub-cursor-key",
+		"LLM_REVIEW_STREAMS=llm-review-opus, llm-review-cursor") // note the space: whitespace tolerated
+	if res.exitCode != 0 {
+		t.Fatalf("exit = %d, want 0 — terra must not run (and thus not error) when unselected\n%s", res.exitCode, res.output)
+	}
+	if len(callsMatching(res.calls, "context=llm-review-terra")) != 0 {
+		t.Errorf("terra was attempted despite not being selected\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+	if len(callsMatching(res.calls, "state=success", "context=llm-review-opus")) == 0 ||
+		len(callsMatching(res.calls, "state=success", "context=llm-review-cursor")) == 0 {
+		t.Errorf("expected opus and cursor to both post success\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+}
+
+// P1-2 parity: an opted-in cursor lens with no CURSOR_API_KEY must post an
+// explicit error status (never a silent skip), exactly like the terra guard,
+// so Maestro's gate settles instead of wedging on an unobserved stream.
+func TestLLMReviewScript_CursorEnabledMissingKeyPostsError(t *testing.T) {
+	res := runLLMReviewScript(t, "NO_FINDINGS\n", emptyStatus, true,
+		"LLM_REVIEW_STREAMS=llm-review-opus,llm-review-cursor")
+	if res.exitCode == 0 {
+		t.Fatalf("exit = 0, want non-zero when the opted-in cursor lens cannot run\n%s", res.output)
+	}
+	if len(callsMatching(res.calls, "state=error", "context=llm-review-cursor", "skipped: credentials not configured")) == 0 {
+		t.Fatalf("no skipped-creds error status for cursor\ncalls:\n%s", strings.Join(res.calls, "\n"))
+	}
+	if len(callsMatching(res.calls, "cursor-agent ")) != 0 {
+		t.Errorf("cursor-agent ran despite a missing key\ncalls:\n%s", strings.Join(res.calls, "\n"))
 	}
 }
 
