@@ -2769,8 +2769,11 @@ func isLLMReviewBotLogin(login string) bool {
 }
 
 // llmReviewBotLogins are the login substrings attributed to the llm-review
-// glue runner (#1148).
-var llmReviewBotLogins = []string{"okbot", "llm-review"}
+// glue runner (#1148). "okbot" is the GitHub fleet bot; "oklabs-bot" is the
+// Forgejo fleet bot (git.oklabs.uk) — note it does NOT contain "okbot"
+// (ok-labs-bot, not ok-bot), so it needs its own entry or Forgejo review
+// comments go unattributed.
+var llmReviewBotLogins = []string{"okbot", "oklabs-bot", "llm-review"}
 
 // llmReviewStreamsConfigured reports whether at least one llm-review model
 // stream is part of the configured review streams (the "llm-review" pair
