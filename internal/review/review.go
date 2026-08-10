@@ -28,6 +28,7 @@ import (
 	"fmt"
 	"log"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -261,8 +262,13 @@ func (p *Producer) statusSettled(context string, statuses []forge.Status) (bool,
 	return false, ""
 }
 
-// findingLine matches one contract line: severity, path:line anchor, message.
-var findingLine = regexp.MustCompile(`^\[(P[0-3])\] +(\S+?):(\d+) *[—–-]+ *(.*)$`)
+// findingLine matches one contract line: severity, a path:line anchor token,
+// and the message. The separator is optional — bash's anchor extraction
+// (`[^ ]+:[0-9]+`) never required the dash, so a model that drifts to
+// "[P1] foo.go:12 fix the check" still gets an anchored inline comment; the
+// gate's blocking-findings collectors only read inline comments, so demoting
+// such a finding to a plain comment would drop it from the repair scope.
+var findingLine = regexp.MustCompile(`^\[(P[0-3])\] +(\S+:\d+)(?:(?: *[—–-]+ *| +)(.*))?$`)
 
 // looseFindingLine catches a contract-shaped severity line whose anchor part
 // did not parse (missing line number, spaces in the path). The finding is
@@ -283,13 +289,15 @@ type Finding struct {
 // Blocking reports whether the finding blocks merge (P0/P1).
 func (f Finding) Blocking() bool { return f.Severity == "P0" || f.Severity == "P1" }
 
-// parseOutput ports the bash parser: strip markdown fences and leading
-// indentation, keep contract lines. ok is false when the output matched
-// neither findings nor NO_FINDINGS — the fail-closed case.
+// parseOutput ports the bash parser: strip markdown fences, leading
+// indentation, and CRLF carriage returns (bash's `[[:space:]]` matched \r, so
+// a CRLF-emitting model must not fail closed here), keep contract lines. ok
+// is false when the output matched neither findings nor NO_FINDINGS — the
+// fail-closed case.
 func parseOutput(output string) (findings []Finding, ok bool) {
 	var cleaned []string
 	for _, line := range strings.Split(output, "\n") {
-		trimmed := strings.TrimLeft(line, " \t")
+		trimmed := strings.TrimRight(strings.TrimLeft(line, " \t"), "\r")
 		if strings.HasPrefix(trimmed, "```") {
 			continue
 		}
@@ -297,9 +305,16 @@ func parseOutput(output string) (findings []Finding, ok bool) {
 	}
 	for _, line := range cleaned {
 		if m := findingLine.FindStringSubmatch(line); m != nil {
-			lineNum := 0
-			fmt.Sscanf(m[3], "%d", &lineNum)
-			findings = append(findings, Finding{Severity: m[1], Path: m[2], Line: lineNum, Message: m[4]})
+			// The anchor token splits like bash: path up to the FIRST colon,
+			// line after the LAST — "foo.go:42:13" anchors at (foo.go, 13).
+			token := m[2]
+			path := token[:strings.Index(token, ":")]
+			lineNum, _ := strconv.Atoi(token[strings.LastIndex(token, ":")+1:])
+			msg := m[3]
+			if msg == "" {
+				msg = token
+			}
+			findings = append(findings, Finding{Severity: m[1], Path: path, Line: lineNum, Message: msg})
 			continue
 		}
 		if m := looseFindingLine.FindStringSubmatch(line); m != nil {

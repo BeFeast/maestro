@@ -390,9 +390,13 @@ func TestParseOutput(t *testing.T) {
 	}{
 		{"no findings sentinel", "NO_FINDINGS", 0, true, ""},
 		{"fenced sentinel", "```\nNO_FINDINGS\n```", 0, true, ""},
+		{"crlf sentinel", "NO_FINDINGS\r\n", 0, true, ""},
 		{"indented finding", "  [P1] a.go:3 — boom", 1, true, "a.go:3"},
 		{"hyphen separator", "[P2] b.go:4 - meh", 1, true, "b.go:4"},
 		{"en-dash separator", "[P2] c.go:5 – meh", 1, true, "c.go:5"},
+		{"dash-less anchor stays inline (bash parity)", "[P1] foo.go:12 fix the check", 1, true, "foo.go:12"},
+		{"double-colon token splits first/last (bash parity)", "[P0] foo.go:42:13 — msg", 1, true, "foo.go:13"},
+		{"crlf finding", "[P1] a.go:3 — boom\r\n", 1, true, "a.go:3"},
 		{"loose finding keeps severity", "[P0] everything is broken", 1, true, ":0"},
 		{"refusal fails closed", "I cannot help with that.", 0, false, ""},
 		{"empty fails closed", "", 0, false, ""},

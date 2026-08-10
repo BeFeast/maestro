@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestChatLens_Run(t *testing.T) {
@@ -133,6 +134,27 @@ func TestCursorLens_FailureCarriesStderr(t *testing.T) {
 	_, err := l.Run(context.Background(), "p")
 	if err == nil || !strings.Contains(err.Error(), "quota exhausted") {
 		t.Fatalf("err = %v — stderr is the diagnosis and must surface", err)
+	}
+}
+
+func TestCursorLens_TimeoutKillsProcessTree(t *testing.T) {
+	// A child that backgrounds an fd-inheriting helper and then hangs: without
+	// the process-group kill + WaitDelay, Run stays blocked long past the
+	// deadline because the orphan holds the output pipe open.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "cursor-agent")
+	if err := os.WriteFile(path, []byte("#!/bin/sh\nsleep 60 &\nexec sleep 120\n"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l := &CursorLens{Stream: "s", Model: "m", APIKey: "k", Binary: path, Timeout: time.Second}
+	start := time.Now()
+	_, err := l.Run(context.Background(), "p")
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("a run past the deadline must fail")
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("Run blocked %s past a 1s deadline — the orphan held the pipe", elapsed)
 	}
 }
 

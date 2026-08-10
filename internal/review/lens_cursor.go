@@ -3,10 +3,12 @@ package review
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
+	"syscall"
 	"time"
 )
 
@@ -82,6 +84,23 @@ func (l *CursorLens) Run(ctx context.Context, prompt string) (string, error) {
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
 	cmd.Env = append(os.Environ(), "CURSOR_API_KEY="+l.APIKey)
+	// Kill the whole process group at the deadline and bound the post-kill
+	// wait (the ghCommandContext pattern): the agent spawns helpers, and a
+	// surviving child holding the inherited output pipe would keep Run
+	// blocked past the deadline — an unbounded producer hang the Timeout
+	// field exists to prevent.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	cmd.Cancel = func() error {
+		if cmd.Process == nil {
+			return nil
+		}
+		err := syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
+		if errors.Is(err, syscall.ESRCH) {
+			return nil
+		}
+		return err
+	}
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Run(); err != nil {
 		detail := strings.TrimSpace(stderr.String())
 		if len(detail) > 512 {
