@@ -718,7 +718,11 @@ func (c *Client) fjCombinedStatusForSHA(sha string) (combinedStatusResponse, err
 // long; CI statuses proper arrive with the Actions runner (M4-ops). Until
 // then a PR whose producer never posts anything would read green — the
 // review gate (default llm-review pair, pending until observed) is what
-// still blocks its merge.
+// still blocks its merge. That backstop has exactly two operator opt-outs:
+// `review_gate: none` (no review gate at all) and a configured
+// `review_retrigger.missing_after_minutes` grace expiring against a dead
+// producer — under either, a zero-signal PR can merge (GitHub no-signal
+// parity; deliberate operator trade, not an escape).
 func (c *Client) fjPRCheckRollup(prNumber int) (PRCheckRollup, error) {
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {

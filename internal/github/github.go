@@ -1784,6 +1784,35 @@ func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse
 	// An empty combined status carries no signal and must not override the
 	// check-runs verdict; only honor pending/failure when statuses exist.
 	if len(combined.Statuses) > 0 {
+		// Per-status scan FIRST, server aggregate second. On GitHub the two
+		// are equivalent by construction (aggregate = failure iff any context
+		// is failure/error, else pending iff any context is pending), so the
+		// scan changes nothing there. On Forgejo they are NOT equivalent: its
+		// worst-wins priorities rank "warning" BELOW "pending"
+		// (error < failure < warning < pending < success < skipped, verified
+		// against v16.0.1 modules/structs/commit_status.go), so a coexisting
+		// warning context MASKS a pending one — {ci: pending, lint: warning}
+		// aggregates to "warning", which the aggregate arms below ignore, and
+		// a mid-run head would roll up "success". failure/error can never be
+		// masked (nothing ranks below them but each other); the scan hardens
+		// on them too so any aggregate-ordering surprise fails closed.
+		hasFailing, hasPending := false, false
+		for _, st := range combined.Statuses {
+			switch strings.ToLower(strings.TrimSpace(st.State)) {
+			case "failure", "error":
+				hasFailing = true
+			case "pending":
+				hasPending = true
+			}
+		}
+		if hasFailing {
+			return "failure"
+		}
+		if hasPending {
+			return "pending"
+		}
+		// Aggregate belt: a pending/failing server aggregate over per-status
+		// vocabulary the scan does not know still blocks.
 		if strings.EqualFold(combined.State, "pending") {
 			return "pending"
 		}
@@ -4253,6 +4282,12 @@ func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGate
 		// Forgejo-mode clients default to the llm-review pair instead; config
 		// validation independently rejects greptile/simplicity streams on
 		// forgejo rows, so this belt only catches callers passing no streams.
+		// NOTE: today no production caller reaches here with empty streams
+		// (orchestrator short-circuits len(streams)==0 before calling; the
+		// supervisor only calls under review_gate "llm-review"), so a future
+		// caller passing nil for a review_gate:"none" forgejo row gets a
+		// FORCED llm-review gate here where the orchestrator treats "none" as
+		// gate-passes — fail-closed by design; revisit if such a caller lands.
 		streams = []string{"llm-review-opus", "llm-review-terra"}
 	}
 	normalized := normalizeReviewStreams(streams)
@@ -4486,7 +4521,15 @@ func namedStatusDecision(combined combinedStatusResponse, needles []string) (fou
 			return true, true, false
 		case "pending":
 			return true, false, true
-		default: // "failure", "error"
+		default:
+			// "failure"/"error" on both forges, plus the forgejo-only
+			// "warning"/"skipped": all read as found-NOT-passed (hard
+			// rejection). Deliberate — the producer contract is
+			// pending/success/error only, and this mirrors gh-mode
+			// namedCheckDecision, whose fall-through hard-rejects a "skipped"
+			// check-run the same way. A review lens that did not actually run
+			// must fail loud with the named finding, never silently pass or
+			// hold the PR as unobserved-pending forever.
 			return true, false, false
 		}
 	}

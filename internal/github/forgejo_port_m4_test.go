@@ -512,6 +512,47 @@ func TestForgejoM4ReviewComments_MappingAndAnchoring(t *testing.T) {
 	}
 }
 
+// TestForgejoM4ReviewComments_BothCommitIDsEmptyMatchesEveryHead pins the
+// degenerate end of the D4 anchoring chain: when BOTH the review-level and the
+// per-comment commit_id are empty there is no anchor left, CommitID maps to ""
+// and reviewCommentTargetsHead's lenient arm (the same one gh-mode comments
+// take) matches EVERY head — so such a finding is never filtered out by a
+// force-push and can leak across heads. Not a regression to fix here: it is
+// exactly the gh behavior for an anchorless comment, and the llm-review
+// producer always anchors. Pinned so any future change to that arm is visible.
+func TestForgejoM4ReviewComments_BothCommitIDsEmptyMatchesEveryHead(t *testing.T) {
+	c, _, _ := newForgejoPortClient(t, fjRoute(t, map[string]string{
+		fjM4PullPath: fjM4PullJSON(true, false, fjM4BaseHead),
+		fjM4ReviewsPath: `[
+			{"id":48,"user":{"login":"Ghost"},"state":"COMMENT","body":"","commit_id":"","submitted_at":"2026-08-11T10:03:00Z","comments_count":1}
+		]`,
+		fjM4ReviewsPath + "/48/comments": `[
+			{"id":903,"body":"[P1] anchorless legacy finding","user":{"login":"Ghost"},"path":"internal/z/z.go","commit_id":"","original_commit_id":"","position":7,"created_at":"2026-08-11T10:03:00Z"}
+		]`,
+	}))
+
+	comments, err := c.greptileReviewComments(7)
+	if err != nil {
+		t.Fatalf("greptileReviewComments: %v", err)
+	}
+	if len(comments) != 1 {
+		t.Fatalf("comments = %+v, want one", comments)
+	}
+	if comments[0].CommitID != "" {
+		t.Fatalf("CommitID = %q, want empty — neither the review nor the comment carried an anchor", comments[0].CommitID)
+	}
+	if comments[0].OriginalCommitID != "" {
+		t.Fatalf("OriginalCommitID = %q, want empty (deliberately unmapped)", comments[0].OriginalCommitID)
+	}
+	// The lenient arm: an anchorless comment targets any head, including one
+	// that is not the head it was written against.
+	for _, head := range []string{fjM4Head, strings.Repeat("f", 40), ""} {
+		if !reviewCommentTargetsHead(comments[0], head) {
+			t.Fatalf("reviewCommentTargetsHead(head=%q) = false, want true (empty CommitID matches every head, gh-mode parity)", head)
+		}
+	}
+}
+
 // TestForgejoM4PRReviewGateVerdict_DefaultStreamsAndSuccess pins the D4
 // default: a forgejo-mode client with EMPTY streams gates on the llm-review
 // pair (never the greptile default, which would sit unobserved forever).

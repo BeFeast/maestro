@@ -263,6 +263,36 @@ func TestCIStatusFromREST(t *testing.T) {
 			combined: combinedStatusResponse{State: "failure", Statuses: []combinedStatusEntry{{Context: "ci/build", State: "failure"}}},
 			want:     "failure",
 		},
+		{
+			// Forgejo priorities rank warning BELOW pending, so the server
+			// aggregate for {pending, warning} is "warning" — the per-status
+			// scan must still surface the pending context, never "success".
+			name: "forgejo warning aggregate cannot mask a pending status",
+			combined: combinedStatusResponse{State: "warning", Statuses: []combinedStatusEntry{
+				{Context: "lint", State: "warning"},
+				{Context: "ci/build", State: "pending"},
+			}},
+			want: "pending",
+		},
+		{
+			// A failing context hardens the verdict regardless of what the
+			// server aggregate claims (aggregate-ordering surprises fail closed).
+			name: "per-status failure hardens over a non-failing aggregate",
+			combined: combinedStatusResponse{State: "warning", Statuses: []combinedStatusEntry{
+				{Context: "lint", State: "warning"},
+				{Context: "ci/build", State: "failure"},
+			}},
+			want: "failure",
+		},
+		{
+			// warning/skipped alone stay non-failing (pinned forgejo semantics).
+			name: "warning and skipped statuses alone stay success",
+			combined: combinedStatusResponse{State: "warning", Statuses: []combinedStatusEntry{
+				{Context: "lint", State: "warning"},
+				{Context: "optional", State: "skipped"},
+			}},
+			want: "success",
+		},
 	}
 
 	for _, tt := range tests {

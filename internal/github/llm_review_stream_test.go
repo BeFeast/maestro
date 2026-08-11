@@ -166,6 +166,24 @@ func TestNamedStatusDecision_CommitStatusStates(t *testing.T) {
 	if !found || passed || !pending {
 		t.Fatalf("pending status: found=%v passed=%v pending=%v, want true/false/true", found, passed, pending)
 	}
+
+	// Forgejo-only vocabulary: "warning" and "skipped" read as found-NOT-passed
+	// (hard rejection), mirroring namedCheckDecision's fall-through for a
+	// skipped check-run in gh-mode — a lens that did not actually run must
+	// fail loud, never silently pass or hold the PR as pending forever.
+	var fjOnly combinedStatusResponse
+	fjOnly.Statuses = []combinedStatusEntry{
+		{Context: "llm-review-opus", State: "skipped"},
+		{Context: "llm-review-terra", State: "warning"},
+	}
+	found, passed, pending = namedStatusDecision(fjOnly, []string{"llm-review-opus"})
+	if !found || passed || pending {
+		t.Fatalf("skipped status: found=%v passed=%v pending=%v, want true/false/false (rejection)", found, passed, pending)
+	}
+	found, passed, pending = namedStatusDecision(fjOnly, []string{"llm-review-terra"})
+	if !found || passed || pending {
+		t.Fatalf("warning status: found=%v passed=%v pending=%v, want true/false/false (rejection)", found, passed, pending)
+	}
 }
 
 // --- inline finding attribution + severity contract --------------------------

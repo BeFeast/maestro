@@ -898,6 +898,47 @@ func TestCombinedStatus_Pagination(t *testing.T) {
 	}
 }
 
+func TestCombinedStatus_ShortPageBelowTotalFailsLoud(t *testing.T) {
+	// A server whose paging clamp sits below our pageSize answers a short page
+	// while total_count says more statuses exist. Trusting the short-page stop
+	// there would feed a silently truncated set into the verdict/fingerprint —
+	// the belt must turn it into an explicit error instead (same contract as
+	// listPages' X-Total-Count belt; total_count semantics live-pinned:
+	// across-pages total, 0 on the no-signal shape).
+	c, _ := staticReads(t, 200, `{"state":"pending","total_count":5,"statuses":[
+		{"context":"a","status":"success","created_at":"2026-08-10T12:00:00Z"},
+		{"context":"b","status":"pending","created_at":"2026-08-10T12:00:01Z"}]}`)
+	_, err := c.CombinedStatus(context.Background(), "owner/repo", "sha")
+	if err == nil {
+		t.Fatal("a short page below total_count must error, never truncate silently")
+	}
+	if !strings.Contains(err.Error(), "refusing to truncate silently") {
+		t.Fatalf("error should name the truncation belt, got: %v", err)
+	}
+}
+
+func TestCombinedStatus_TotalReachedOnFullPageStops(t *testing.T) {
+	// Exactly pageSize statuses with a matching total_count: reaching the
+	// total on a full page must end the loop without demanding one empty
+	// page (and without tripping the page cap at exact multiples).
+	full := make([]string, pageSize)
+	for i := range full {
+		full[i] = fmt.Sprintf(`{"context":"ctx-%d","status":"success","created_at":"2026-08-10T12:00:00Z"}`, i)
+	}
+	c, seen := staticReads(t, 200,
+		fmt.Sprintf(`{"state":"success","total_count":%d,"statuses":[%s]}`, pageSize, strings.Join(full, ",")))
+	combined, err := c.CombinedStatus(context.Background(), "owner/repo", "sha")
+	if err != nil {
+		t.Fatalf("CombinedStatus: %v", err)
+	}
+	if len(combined.Statuses) != pageSize {
+		t.Fatalf("statuses = %d, want %d", len(combined.Statuses), pageSize)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("requests = %d, want 1 (total reached on a full page ends the loop)", len(*seen))
+	}
+}
+
 func TestCombinedStatus_PageCapFailsLoud(t *testing.T) {
 	// Every page full — including on a server that ignores the page param and
 	// re-serves the same clamped page forever — must end at the cap with a

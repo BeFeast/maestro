@@ -515,13 +515,21 @@ type CombinedStatus struct {
 // The statuses array is paginated (swagger page/limit; not exercisable live —
 // no probe SHA carries >1 page), so the loop cannot go through listPages (the
 // payload is an object, not a bare array) and cannot lean on x-total-count
-// semantics that were never pinned for this endpoint. It uses the short-page
-// stop plus the maxListPages cap: on a server that ignored the page param, a
+// header semantics that were never pinned for this endpoint. Instead the belt
+// uses the payload's own `total_count` (live-pinned: 0 on the no-signal shape,
+// equal to len(statuses) on gate-test PR#2's head — the across-pages total,
+// GitHub-shape parity): a short page that strands the accumulated set below
+// the server total (a server paging clamp below pageSize) is an explicit
+// error, never a silently truncated set fed to the verdict/fingerprint. The
+// maxListPages cap stays: on a server that ignored the page param, a
 // >=pageSize set would keep answering full pages and hit the cap as an
-// explicit error — never a silently duplicated or truncated set. The
-// aggregate is taken from page 1.
+// explicit error — never a silently duplicated set. The aggregate is taken
+// from page 1; total is re-read each page so a set that legitimately shrinks
+// mid-scan does not false-alarm, and reaching the total on a full page ends
+// the loop without demanding one empty page.
 func (c *Client) CombinedStatus(ctx context.Context, repo, sha string) (CombinedStatus, error) {
 	var combined CombinedStatus
+	total := -1 // -1: total_count absent, truncation belt disabled
 	for page := 1; ; page++ {
 		if page > maxListPages {
 			return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: more than %d pages (%d statuses so far); refusing to truncate silently", repo, sha, maxListPages, len(combined.Statuses))
@@ -532,8 +540,9 @@ func (c *Client) CombinedStatus(ctx context.Context, repo, sha string) (Combined
 			return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: %w", repo, sha, err)
 		}
 		var wire struct {
-			State    string `json:"state"`
-			Statuses []struct {
+			State      string `json:"state"`
+			TotalCount *int   `json:"total_count"`
+			Statuses   []struct {
 				Context     string `json:"context"`
 				Status      string `json:"status"`
 				Description string `json:"description"`
@@ -547,6 +556,9 @@ func (c *Client) CombinedStatus(ctx context.Context, repo, sha string) (Combined
 		if page == 1 {
 			combined.State = strings.ToLower(strings.TrimSpace(wire.State))
 		}
+		if wire.TotalCount != nil && *wire.TotalCount >= 0 {
+			total = *wire.TotalCount
+		}
 		for _, st := range wire.Statuses {
 			combined.Statuses = append(combined.Statuses, CommitStatus{
 				Context:     st.Context,
@@ -557,6 +569,12 @@ func (c *Client) CombinedStatus(ctx context.Context, repo, sha string) (Combined
 			})
 		}
 		if len(wire.Statuses) < pageSize {
+			if total >= 0 && len(combined.Statuses) < total {
+				return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: page %d came back short at %d items with only %d of %d total statuses accumulated (server page clamp below %d?); refusing to truncate silently", repo, sha, page, len(wire.Statuses), len(combined.Statuses), total, pageSize)
+			}
+			return combined, nil
+		}
+		if total >= 0 && len(combined.Statuses) >= total {
 			return combined, nil
 		}
 	}
