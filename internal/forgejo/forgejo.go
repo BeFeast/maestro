@@ -76,17 +76,24 @@ func (c *Client) WithHTTPClient(httpc *http.Client) *Client {
 // JSON is short and is exactly what distinguishes "line outside the diff"
 // from "bad token" for the caller's fallback decision.
 func (c *Client) do(ctx context.Context, method, path string, payload any) ([]byte, error) {
+	out, _, err := c.doHeader(ctx, method, path, payload)
+	return out, err
+}
+
+// doHeader is do plus the response headers, for callers that consume list
+// metadata (the pager cross-checks x-total-count against what it accumulated).
+func (c *Client) doHeader(ctx context.Context, method, path string, payload any) ([]byte, http.Header, error) {
 	var body io.Reader
 	if payload != nil {
 		encoded, err := json.Marshal(payload)
 		if err != nil {
-			return nil, fmt.Errorf("encode %s %s: %w", method, path, err)
+			return nil, nil, fmt.Errorf("encode %s %s: %w", method, path, err)
 		}
 		body = bytes.NewReader(encoded)
 	}
 	req, err := http.NewRequestWithContext(ctx, method, c.baseURL+path, body)
 	if err != nil {
-		return nil, fmt.Errorf("build %s %s: %w", method, path, err)
+		return nil, nil, fmt.Errorf("build %s %s: %w", method, path, err)
 	}
 	if c.token != "" {
 		req.Header.Set("Authorization", "token "+c.token)
@@ -96,26 +103,26 @@ func (c *Client) do(ctx context.Context, method, path string, payload any) ([]by
 	}
 	resp, err := c.httpc.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w", method, path, err)
+		return nil, nil, fmt.Errorf("%s %s: %w", method, path, err)
 	}
 	defer resp.Body.Close()
 	// limit+1 so an at-limit body is distinguishable from an over-limit one
 	// (the appauth.go idiom) — oversize fails loudly instead of truncating.
 	out, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBytes+1))
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: read response: %w", method, path, err)
+		return nil, nil, fmt.Errorf("%s %s: read response: %w", method, path, err)
 	}
 	if len(out) > maxResponseBytes {
-		return nil, fmt.Errorf("%s %s: response exceeds %d bytes", method, path, maxResponseBytes)
+		return nil, nil, fmt.Errorf("%s %s: response exceeds %d bytes", method, path, maxResponseBytes)
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
 		excerpt := strings.TrimSpace(string(out))
 		if len(excerpt) > 512 {
 			excerpt = excerpt[:512]
 		}
-		return nil, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, excerpt)
+		return nil, nil, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, excerpt)
 	}
-	return out, nil
+	return out, resp.Header, nil
 }
 
 // GetPR returns the PR metadata. An empty head SHA is rejected per the

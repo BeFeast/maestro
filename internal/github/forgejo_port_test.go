@@ -383,6 +383,34 @@ func TestForgejoPortGetRESTPullDerivedUnmerged(t *testing.T) {
 	}
 }
 
+// Forgejo's wire mergeable is the server-side Mergeable() predicate, forced
+// false on EVERY draft/WIP pull regardless of conflicts (live-verified: 41/41
+// draft pulls on a Forgejo 16.0 instance report false). GitHub's bool stays
+// true on a clean draft, so mapping the draft false through would flip every
+// draft PR to "CONFLICTING" and openPRNeedsRepair would authorize repair on it
+// each cycle. The port drops the contaminated false to nil → "UNKNOWN".
+func TestForgejoPortDraftMergeableFalseIsUnknown(t *testing.T) {
+	pullPath := "/repos/" + fjTestRepo + "/pulls/3"
+	c, _, ghCalls := newForgejoPortClient(t, fjRoute(t, map[string]string{
+		pullPath: `{"number":3,"title":"draft pr","body":"wip","state":"open","draft":true,
+			"mergeable":false,"merged":false,"merged_at":null,"merge_commit_sha":null,
+			"head":{"ref":"feat/wip","sha":"59e99c49c27d3e2f73bae1657f07cd2f9a15f926"},
+			"base":{"ref":"main"}}`,
+	}))
+
+	mergeable, err := c.PRMergeable(3)
+	if err != nil || mergeable != "UNKNOWN" {
+		t.Fatalf("PRMergeable on a draft = %q, %v; want UNKNOWN (draft false carries no conflict information)", mergeable, err)
+	}
+	pr, err := c.PRDetails(3)
+	if err != nil || !pr.IsDraft {
+		t.Fatalf("PRDetails = %+v, %v; draft flag must survive the mapping", pr, err)
+	}
+	if n := ghCalls.Load(); n != 0 {
+		t.Fatalf("gh runner invoked %d time(s), want 0", n)
+	}
+}
+
 func TestForgejoPortLatestMergedPRGenerationsBaseFilter(t *testing.T) {
 	repoPath := "/repos/" + fjTestRepo
 	pullsPath := "/repos/" + fjTestRepo + "/pulls"

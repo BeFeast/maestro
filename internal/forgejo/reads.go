@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 )
 
@@ -82,10 +83,13 @@ type IssueComment struct {
 // Pull is the widened pull view for the transport switch (forge.PR stays
 // minimal for the producer surface). State is "open"|"closed" verbatim
 // (lowercase — a merged pull is state=closed with MergedAt set). Mergeable is
-// a plain bool on the wire (no tri-state observed), kept as *bool so an
-// absent field is distinguishable from false. MergedAt is nil when unmerged,
-// RFC3339 when merged; MergeCommitSHA is "" when unmerged, 40-hex when
-// merged.
+// a plain bool on the wire (no tri-state), kept as *bool so an absent field
+// is distinguishable from false, and carried VERBATIM: the server forces it
+// false on draft/WIP pulls and during the async conflict re-check
+// (live-verified, 41/41 draft pulls report false), so the gh layer — not this
+// transport — owns mapping that contamination out (fjPullToREST). MergedAt is
+// nil when unmerged, RFC3339 when merged; MergeCommitSHA is "" when unmerged,
+// 40-hex when merged.
 type Pull struct {
 	Number         int
 	Title          string
@@ -140,27 +144,54 @@ func (wp wirePull) pull() Pull {
 // allPages=false bounds the read to the first page (50 entries). More than
 // maxListPages full pages is an explicit error — silent truncation would let
 // e.g. a merged-PR scan miss the PR it was looking for and re-dispatch work.
+//
+// The x-total-count header (live-verified present and filter-consistent on
+// every paged endpoint here) is a truncation belt: pageSize hardcodes THIS
+// instance's max_response_items clamp, and on a server clamped LOWER every
+// page would come back short, the short-page stop would fire after page one,
+// and an authoritative read (e.g. the #827 reconcile open-issue set) would
+// silently truncate — downstream would stamp still-open issues closed. A
+// short final page that leaves the accumulated count below the server's own
+// total is therefore an explicit error. The total is re-read on every page so
+// a set that legitimately shrinks mid-scan does not false-alarm, and reaching
+// the total on a full page ends the loop without demanding one empty page
+// (which at exactly maxListPages×pageSize entries would trip the cap error).
 func listPages[T any](ctx context.Context, c *Client, path string, allPages bool) ([]T, error) {
 	sep := "?"
 	if strings.Contains(path, "?") {
 		sep = "&"
 	}
 	var all []T
+	total := -1 // -1: header absent, belt disabled
 	for page := 1; ; page++ {
 		if page > maxListPages {
 			return nil, fmt.Errorf("GET %s: more than %d pages (%d entries so far); refusing to truncate silently", path, maxListPages, len(all))
 		}
 		paged := fmt.Sprintf("%s%slimit=%d&page=%d", path, sep, pageSize, page)
-		out, err := c.do(ctx, http.MethodGet, paged, nil)
+		out, header, err := c.doHeader(ctx, http.MethodGet, paged, nil)
 		if err != nil {
 			return nil, err
+		}
+		if raw := strings.TrimSpace(header.Get("X-Total-Count")); raw != "" {
+			if parsed, parseErr := strconv.Atoi(raw); parseErr == nil && parsed >= 0 {
+				total = parsed
+			}
 		}
 		var items []T
 		if err := json.Unmarshal(out, &items); err != nil {
 			return nil, fmt.Errorf("parse GET %s: %w", paged, err)
 		}
 		all = append(all, items...)
-		if !allPages || len(items) < pageSize {
+		if !allPages {
+			return all, nil
+		}
+		if len(items) < pageSize {
+			if total >= 0 && len(all) < total {
+				return nil, fmt.Errorf("GET %s: page %d came back short at %d items with only %d of %d total entries accumulated (server page clamp below %d?); refusing to truncate silently", path, page, len(items), len(all), total, pageSize)
+			}
+			return all, nil
+		}
+		if total >= 0 && len(all) >= total {
 			return all, nil
 		}
 	}

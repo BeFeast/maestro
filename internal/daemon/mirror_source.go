@@ -32,6 +32,16 @@ func (d *Daemon) newReadSource(repo string, getCfg func() *config.Config) *mirro
 		horizon = cfg.GitHubMirror.StaleHorizon()
 		fc = cfg.Forge
 	}
+	// The mirror store is fed by GITHUB webhooks and keyed by bare owner/name —
+	// the same key a mirrored repo has on BOTH forges. A forgejo row must never
+	// read it: the mirror would silently serve the GitHub mirror's issue/PR
+	// state instead of the Forgejo original (#1172 M2). Config validation
+	// already rejects mirror-first on forgejo rows; this belt covers the
+	// api-direct-but-mirror-open case and returns nil so the flow reads its
+	// own forge directly.
+	if fc.IsForgejo() {
+		return nil
+	}
 	return mirrorstore.NewSource(github.New(repo, fc), d.mirror, repo, mirrorstore.SourceOptions{
 		Horizon: horizon,
 		APIDirect: func() bool {
@@ -64,6 +74,14 @@ func (d *Daemon) runMirrorReconcile(ctx context.Context, name, repo string, getC
 	var fc config.ForgeConfig
 	if cfg := getCfg(); cfg != nil {
 		fc = cfg.Forge
+	}
+	// Never reconcile a forgejo row into the mirror store: the store is
+	// GitHub-webhook-defined, and a forgejo-mode client's ported reads would
+	// interleave Forgejo-reconciled rows with GitHub webhook rows under the
+	// same owner/name key (#1172 M2). Forgejo rows simply have no mirror.
+	if fc.IsForgejo() {
+		log.Printf("[%s] mirror reconcile skipped — repo=%s is a forgejo row; the mirror store is GitHub-webhook-fed", name, repo)
+		return
 	}
 	rec := mirrorstore.NewReconciler(d.mirror, github.New(repo, fc), repo)
 	interval := reconcileInterval(getCfg)

@@ -157,6 +157,95 @@ func TestListIssues_PageCapIsExplicitError(t *testing.T) {
 	}
 }
 
+// newReadsClientWithTotal is newReadsClient plus an x-total-count response
+// header, for the pager's truncation belt.
+func newReadsClientWithTotal(t *testing.T, fn func(r *http.Request) (total int, status int, body string)) (*Client, *[]readReq) {
+	t.Helper()
+	var seen []readReq
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		seen = append(seen, readReq{
+			Method: r.Method,
+			Path:   r.URL.EscapedPath(),
+			Query:  r.URL.Query(),
+		})
+		total, status, body := fn(r)
+		w.Header().Set("X-Total-Count", strconv.Itoa(total))
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
+	}))
+	t.Cleanup(srv.Close)
+	return New(srv.URL, "sekrit"), &seen
+}
+
+// pageSize hardcodes THIS instance's max_response_items clamp. On a server
+// clamped LOWER, every page comes back short, so without the x-total-count
+// belt the short-page stop would end the loop after page one and silently
+// truncate an authoritative read (#827 reconcile would stamp still-open
+// issues closed).
+func TestListIssues_LowerServerClampFailsLoud(t *testing.T) {
+	c, seen := newReadsClientWithTotal(t, func(*http.Request) (int, int, string) {
+		return 120, 200, issuesPage(t, 1, 25) // clamp 25 < pageSize, 120 total
+	})
+	_, err := c.ListIssues(context.Background(), "owner/repo", "open", "", true)
+	if err == nil {
+		t.Fatal("a short page with more entries outstanding must error, not truncate silently")
+	}
+	if !strings.Contains(err.Error(), "refusing to truncate") {
+		t.Fatalf("error should name the truncation, got: %v", err)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("requests = %d, want 1 (the mismatch is detectable on the first short page)", len(*seen))
+	}
+}
+
+// A short final page whose accumulated count MATCHES the server total is the
+// normal end of a listing — the belt must not false-alarm; and a total that
+// shrank mid-scan (an issue closed between pages) must also pass, which is
+// why the pager re-reads the header on every page.
+func TestListIssues_TotalMatchingShortPagePasses(t *testing.T) {
+	c, _ := newReadsClientWithTotal(t, func(r *http.Request) (int, int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return pageSize + 3, 200, issuesPage(t, 1, pageSize)
+		case "2":
+			return pageSize + 3, 200, issuesPage(t, 1+pageSize, 3)
+		default:
+			return 0, 500, `{"message":"unexpected page"}`
+		}
+	})
+	issues, err := c.ListIssues(context.Background(), "owner/repo", "open", "", true)
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != pageSize+3 {
+		t.Fatalf("issues = %d, want %d", len(issues), pageSize+3)
+	}
+}
+
+// Exactly maxListPages×pageSize entries: the last allowed page comes back
+// full, but the total says the set is complete — the pager must return it
+// instead of demanding one empty page beyond the cap and erroring.
+func TestListIssues_TotalReachedOnFullFinalPagePasses(t *testing.T) {
+	const exact = maxListPages * pageSize
+	c, seen := newReadsClientWithTotal(t, func(r *http.Request) (int, int, string) {
+		page, _ := strconv.Atoi(r.URL.Query().Get("page"))
+		if page < 1 || page > maxListPages {
+			return 0, 500, `{"message":"page out of range"}`
+		}
+		return exact, 200, issuesPage(t, (page-1)*pageSize+1, pageSize)
+	})
+	issues, err := c.ListIssues(context.Background(), "owner/repo", "open", "", true)
+	if err != nil {
+		t.Fatalf("ListIssues at exactly the cap boundary: %v", err)
+	}
+	if len(issues) != exact {
+		t.Fatalf("issues = %d, want %d", len(issues), exact)
+	}
+	if len(*seen) != maxListPages {
+		t.Fatalf("requests = %d, want exactly %d (no empty page beyond the cap)", len(*seen), maxListPages)
+	}
+}
+
 func TestListIssues_FirstPageOnlyWhenAllPagesFalse(t *testing.T) {
 	c, seen := newReadsClient(t, func(*http.Request) (int, string) {
 		return 200, issuesPage(t, 1, pageSize)

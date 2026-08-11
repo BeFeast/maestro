@@ -64,6 +64,59 @@ func TestNewReadSourceServesWarmMirror(t *testing.T) {
 	}
 }
 
+// TestNewReadSourceNilOnForgejoRow: the mirror store is GitHub-webhook-fed and
+// keyed by bare owner/name, so a forgejo row must never read it — even with a
+// mirror open and a (config-validation-rejected, but belt-and-braces)
+// mirror-first source, the flow reads its own forge directly (#1172 M2).
+func TestNewReadSourceNilOnForgejoRow(t *testing.T) {
+	mirror, err := mirrorstore.Open(filepath.Join(t.TempDir(), "maestro.db"))
+	if err != nil {
+		t.Fatalf("open mirror: %v", err)
+	}
+	defer mirror.Close()
+
+	d := &Daemon{mirror: mirror, mirrorHorizon: mirrorstore.DefaultStaleHorizon}
+	getCfg := func() *config.Config {
+		return &config.Config{
+			Repo:         "o/r",
+			Forge:        config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+			GitHubMirror: config.GitHubMirrorConfig{Source: config.GitHubSourceMirrorFirst},
+		}
+	}
+	if src := d.newReadSource("o/r", getCfg); src != nil {
+		t.Fatal("newReadSource must be nil on a forgejo row — the mirror holds the GitHub mirror's state")
+	}
+}
+
+// TestRunMirrorReconcileSkipsForgejoRow: reconciling a forgejo row would write
+// Forgejo-read rows into the GitHub-webhook-fed store under the same owner/name
+// key — the loop must exit before its first pass (#1172 M2).
+func TestRunMirrorReconcileSkipsForgejoRow(t *testing.T) {
+	mirror, err := mirrorstore.Open(filepath.Join(t.TempDir(), "maestro.db"))
+	if err != nil {
+		t.Fatalf("open mirror: %v", err)
+	}
+	defer mirror.Close()
+
+	d := &Daemon{mirror: mirror}
+	getCfg := func() *config.Config {
+		return &config.Config{
+			Repo:  "o/r",
+			Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+		}
+	}
+	done := make(chan struct{})
+	go func() {
+		d.runMirrorReconcile(context.Background(), "flow", "o/r", getCfg)
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("runMirrorReconcile should return immediately on a forgejo row")
+	}
+}
+
 // TestReconcileIntervalReadsConfig: the reconcile cadence comes from the flow's
 // live config, defaulting when it is momentarily unavailable (#827).
 func TestReconcileIntervalReadsConfig(t *testing.T) {

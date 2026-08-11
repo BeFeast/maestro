@@ -1389,6 +1389,17 @@ var deliveryFreshnessCheckerFactory = func(cfg *config.Config) approver.Delivery
 	if cfg == nil {
 		return nil
 	}
+	if cfg.Forge.IsForgejo() {
+		// Delivery freshness is GitHub-anchored end to end: RevisionContains
+		// proves merge ancestry against https://github.com/<repo>.git, which on
+		// a forgejo row is the MIRROR, not the original — a stale mirror could
+		// flip the verdict with no error (#1172 M2). Fail loud instead: the
+		// executor treats any checker error as unverified and runs no side
+		// effect. Forge-aware delivery lands with the M3/M4 slices.
+		return approver.DeliveryFreshnessFunc(func(context.Context, *state.DeliveryPayload) error {
+			return fmt.Errorf("delivery freshness is GitHub-anchored: %w", github.ErrForgejoNotSupported)
+		})
+	}
 	return approver.NewGitHubDeliveryFreshnessChecker(github.New(cfg.Repo, cfg.Forge), cfg.Repo, cfg.LocalPath)
 }
 

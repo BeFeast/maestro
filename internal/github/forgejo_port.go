@@ -18,7 +18,9 @@
 //     PRMergeInfo's 40-hex assert holds;
 //   - mergeable is a plain bool on the wire (true observed even on merged
 //     pulls — NOT GitHub's tri-state), carried as *bool so
-//     mergeableFromRESTPull takes the bool branch when present;
+//     mergeableFromRESTPull takes the bool branch when present; it is the
+//     server's Mergeable() predicate, forced false on drafts and during the
+//     async conflict re-check — see fjPullToREST for the parity mapping;
 //   - mergeable_state has NO Forgejo equivalent: restPull.MergeableState is
 //     always "" here, which is why PRMergeStatus keeps an explicit
 //     NOT-ported guard (an empty raw state reads as "don't know, proceed");
@@ -80,15 +82,32 @@ func fjIssueToREST(is forgejo.Issue) restIssue {
 
 // fjPullToREST maps a Forgejo pull into the gh-wire restPull. MergeableState
 // is always "" — Forgejo has no equivalent field (see the package comment).
+//
+// Mergeable parity (live-verified on a Forgejo 16.0 instance, 41/41 draft
+// pulls): Forgejo's wire mergeable is the server-side Mergeable() predicate,
+// which is false while the async conflict re-check runs AND on every
+// draft/WIP pull regardless of conflicts. GitHub's bool answers only "can a
+// merge commit be created" (null while computing, true on clean drafts), so a
+// draft's false carries zero conflict information here — mapping it through
+// would turn EVERY draft PR into "CONFLICTING" and e.g. openPRNeedsRepair
+// would authorize repair on it each cycle. Drop the draft-contaminated false
+// to nil so mergeableFromRESTPull answers "UNKNOWN", exactly GitHub's
+// not-computed state. The non-draft checking-window false (seconds after a
+// push, indistinguishable from a real conflict on the wire) remains an
+// accepted transient until the M4 merge-semantics slice.
 func fjPullToREST(p forgejo.Pull) restPull {
 	body := p.Body
+	mergeable := p.Mergeable
+	if p.Draft && mergeable != nil && !*mergeable {
+		mergeable = nil
+	}
 	rp := restPull{
 		Number:         p.Number,
 		Title:          p.Title,
 		Body:           &body,
 		State:          p.State,
 		Draft:          p.Draft,
-		Mergeable:      p.Mergeable,
+		Mergeable:      mergeable,
 		MergeableState: "",
 		MergedAt:       p.MergedAt,
 		MergeCommitSHA: p.MergeCommitSHA,
