@@ -55,6 +55,62 @@ func TestIdentityChangedIgnoresProjectMetadata(t *testing.T) {
 	}
 }
 
+// Flipping a live row between forges (#1172) rebinds the transport the flow was
+// built on at startup, so an EFFECTIVE forge-identity change is an identity
+// change. Spelling out a default (kind: github, token_env: FORGEJO_TOKEN) is
+// NOT a change — comparing the raw struct there would freeze hot reload for
+// every unrelated edit on the row.
+func TestIdentityChangedFlagsForgeChange(t *testing.T) {
+	base := &config.Config{
+		Repo:          "owner/svc",
+		StateDir:      "/state/svc",
+		SessionPrefix: "svc",
+	}
+
+	// Absent block vs an explicitly spelled-out GitHub default: no change.
+	explicitGitHub := *base
+	explicitGitHub.Forge = config.ForgeConfig{Kind: "github"}
+	if identityChanged(base, &explicitGitHub) {
+		t.Fatalf("spelling out kind: github (== the default) must stay hot-reloadable")
+	}
+
+	// A real kind flip to forgejo requires a restart.
+	moved := *base
+	moved.Forge = config.ForgeConfig{Kind: "forgejo", BaseURL: "https://forge.example.com"}
+	if !identityChanged(base, &moved) {
+		t.Fatalf("flipping a row from the GitHub default to forgejo must require a restart")
+	}
+
+	// Identical populated forge blocks on both sides are not a change.
+	a := *base
+	a.Forge = config.ForgeConfig{Kind: "forgejo", BaseURL: "https://forge.example.com", TokenEnv: "FORGEJO_TOKEN"}
+	b := a
+	if identityChanged(&a, &b) {
+		t.Fatalf("equal forge blocks must not be flagged as an identity change")
+	}
+
+	// Spelling out the token_env default vs leaving it empty: no change.
+	implicitToken := a
+	implicitToken.Forge.TokenEnv = ""
+	if identityChanged(&a, &implicitToken) {
+		t.Fatalf("token_env: FORGEJO_TOKEN (== the default) vs empty must stay hot-reloadable")
+	}
+
+	// Re-pointing base_url rebinds the transport target.
+	rehomed := a
+	rehomed.Forge.BaseURL = "https://other.example.com"
+	if !identityChanged(&a, &rehomed) {
+		t.Fatalf("a forge.base_url change must require a restart")
+	}
+
+	// Re-pointing token_env to a NON-default name rebinds credentials.
+	c := b
+	c.Forge.TokenEnv = "OTHER_TOKEN"
+	if !identityChanged(&b, &c) {
+		t.Fatalf("a forge.token_env change to a non-default name must require a restart")
+	}
+}
+
 // A real store-watch metadata edit must reach the live Fleet API without
 // restarting the flow. This covers the full store -> watcher -> holder/dashboard
 // path, not only the identityChanged predicate.

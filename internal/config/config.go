@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/url"
 	"os"
 	pathpkg "path"
 	"path/filepath"
@@ -489,6 +490,59 @@ type VersioningConfig struct {
 type GitHubProjectsConfig struct {
 	Enabled       bool `yaml:"enabled"`
 	ProjectNumber int  `yaml:"project_number"` // GitHub Project number (auto-detect from repo)
+}
+
+// Forge kinds enumerate the supported code forges (#1172). parse() rejects any
+// other value so a typo cannot silently fall back to the GitHub default.
+const (
+	ForgeKindGitHub  = "github"
+	ForgeKindForgejo = "forgejo"
+)
+
+// ForgeConfig selects which code forge hosts the project repo (#1172 M1).
+// Absent block or empty kind means GitHub (the historical default); kind
+// "forgejo" routes the transport to a Forgejo instance (M2+) and requires
+// base_url. The token is env-only (*_env indirection, never the value) and the
+// config package never reads the environment itself — consumers resolve the
+// named variable at use time, same as the review_producer *_env pattern.
+type ForgeConfig struct {
+	Kind     string `yaml:"kind,omitempty"`      // "github" (default) | "forgejo"
+	BaseURL  string `yaml:"base_url,omitempty"`  // forgejo only: instance root, e.g. https://git.oklabs.uk (no /api/v1)
+	TokenEnv string `yaml:"token_env,omitempty"` // forgejo only: NAME of the env var holding the PAT (never the value)
+}
+
+// EffectiveKind returns the configured forge kind, defaulting to GitHub when
+// the block is absent or kind is empty (every legacy row).
+func (f ForgeConfig) EffectiveKind() string {
+	if f.Kind == "" {
+		return ForgeKindGitHub
+	}
+	return f.Kind
+}
+
+// IsForgejo reports whether the project routes its transport to Forgejo.
+func (f ForgeConfig) IsForgejo() bool {
+	return f.EffectiveKind() == ForgeKindForgejo
+}
+
+// EffectiveTokenEnv returns the NAME of the env var holding the Forgejo PAT,
+// defaulting to FORGEJO_TOKEN. It never reads the environment — the consumer
+// (M2 transport) resolves the variable at use time.
+func (f ForgeConfig) EffectiveTokenEnv() string {
+	if strings.TrimSpace(f.TokenEnv) == "" {
+		return "FORGEJO_TOKEN"
+	}
+	return strings.TrimSpace(f.TokenEnv)
+}
+
+// APIRoot returns the Forgejo API root derived from the instance base_url
+// (the shape internal/forgejo.New expects, e.g. https://host/api/v1), or the
+// empty string for the GitHub kind.
+func (f ForgeConfig) APIRoot() string {
+	if !f.IsForgejo() {
+		return ""
+	}
+	return strings.TrimRight(f.BaseURL, "/") + "/api/v1"
 }
 
 // GitHubAppConfig holds credentials for authenticating as a GitHub App
@@ -2259,6 +2313,76 @@ func windowsDriveAbsPath(p string) bool {
 	return len(p) >= 3 && ((p[0] >= 'a' && p[0] <= 'z') || (p[0] >= 'A' && p[0] <= 'Z')) && p[1] == ':' && p[2] == '/'
 }
 
+// validateForge enforces the forge block contract (#1172 M1), fail-loud: an
+// exact-match kind enum, forgejo-only fields rejected on the GitHub default, a
+// clean instance-root base_url for forgejo (scheme http/https, host, no query
+// or fragment, no /api/v1 suffix — the API root is derived), an env-var-NAME
+// token_env, and no GitHub Projects integration on forgejo rows (the queue is
+// labels; there is no Forgejo equivalent). An absent block validates trivially
+// so every legacy config is unaffected.
+func validateForge(cfg *Config) error {
+	f := cfg.Forge
+	switch f.Kind {
+	case "", ForgeKindGitHub, ForgeKindForgejo:
+		// supported (exact match, no case folding)
+	default:
+		return fmt.Errorf("config: forge.kind %q is not supported (want %q, %q, or empty for the GitHub default)", f.Kind, ForgeKindGitHub, ForgeKindForgejo)
+	}
+	if !f.IsForgejo() {
+		if f.BaseURL != "" {
+			return fmt.Errorf("config: forge.base_url is only valid with forge.kind %q", ForgeKindForgejo)
+		}
+		if f.TokenEnv != "" {
+			return fmt.Errorf("config: forge.token_env is only valid with forge.kind %q", ForgeKindForgejo)
+		}
+		return nil
+	}
+	if strings.TrimSpace(f.BaseURL) == "" {
+		return fmt.Errorf("config: forge.base_url is required when forge.kind is %q", ForgeKindForgejo)
+	}
+	u, err := url.Parse(f.BaseURL)
+	if err != nil {
+		return fmt.Errorf("config: forge.base_url %q is not a valid URL: %v", f.BaseURL, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("config: forge.base_url %q must use an http or https scheme", f.BaseURL)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("config: forge.base_url %q must include a host", f.BaseURL)
+	}
+	if u.User != nil {
+		return fmt.Errorf("config: forge.base_url %q must not contain userinfo — credentials belong in forge.token_env (an env var NAME), never in base_url", f.BaseURL)
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("config: forge.base_url %q must not contain a query or fragment", f.BaseURL)
+	}
+	// Reject '.'/'..' path segments outright: a dot-segment like
+	// /api/v1/x/.. would defeat the /api/v1 suffix guard below once a client
+	// normalizes the path. Segment-wise check, not path.Clean, so a bare
+	// trailing slash is not a false positive.
+	for _, seg := range strings.Split(u.Path, "/") {
+		if seg == "." || seg == ".." {
+			return fmt.Errorf("config: forge.base_url %q must not contain '.' or '..' path segments", f.BaseURL)
+		}
+	}
+	if strings.HasSuffix(strings.TrimRight(u.Path, "/"), "/api/v1") {
+		return fmt.Errorf("config: forge.base_url %q must be the Forgejo instance root (e.g. https://forge.example.com) — /api/v1 is appended automatically", f.BaseURL)
+	}
+	if f.TokenEnv != "" {
+		env := strings.TrimSpace(f.TokenEnv)
+		if env == "" {
+			return fmt.Errorf("config: forge.token_env must be non-empty when set (omit it for the FORGEJO_TOKEN default)")
+		}
+		if containsControlOrSpace(env) || strings.Contains(env, "=") {
+			return fmt.Errorf("config: forge.token_env %q must be an env var NAME (no whitespace or '=' characters), never a token value", f.TokenEnv)
+		}
+	}
+	if cfg.GitHubProjects.Enabled {
+		return fmt.Errorf("config: github_projects.enabled is not supported with forge.kind %q — the GitHub Projects integration has no Forgejo equivalent (the queue is labels); set github_projects.enabled: false or drop the block", ForgeKindForgejo)
+	}
+	return nil
+}
+
 // RemoteRunnerConfig is the deliberately small, project-scoped SSH adapter
 // used by the remote-worker spike (#1058). The control plane still owns issue
 // selection, durable state, the local tmux/process lease, and a lightweight
@@ -2472,7 +2596,8 @@ type Config struct {
 	Telegram                        TelegramConfig                `yaml:"telegram"`
 	Notify                          NotifyConfig                  `yaml:"notify"` // #1018: ntfy push transport + alert-class routing
 	Versioning                      VersioningConfig              `yaml:"versioning"`
-	SelfDeploy                      SelfDeployConfig              `yaml:"self_deploy"` // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
+	SelfDeploy                      SelfDeployConfig              `yaml:"self_deploy"`     // #698: opt-in post-merge self-deploy of the maestro binary (default OFF)
+	Forge                           ForgeConfig                   `yaml:"forge,omitempty"` // #1172: code forge selection (absent/github = historical default; forgejo requires base_url)
 	GitHubProjects                  GitHubProjectsConfig          `yaml:"github_projects"`
 	GitHubApp                       GitHubAppConfig               `yaml:"github_app"`                 // #823: GitHub App auth (app_id + private_key_path + installation_id)
 	GitHubMirror                    GitHubMirrorConfig            `yaml:"github_mirror"`              // #826: mirror-first vs api-direct supervisor/orchestrator reads
@@ -2699,6 +2824,12 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateManagementHome(cfg.ManagementHome); err != nil {
+		return nil, err
+	}
+	// #1172 M1: forge selection. An absent block (every legacy row) is the
+	// GitHub default and validates trivially; a present block is checked
+	// fail-loud so a typo can never silently route to the wrong forge.
+	if err := validateForge(cfg); err != nil {
 		return nil, err
 	}
 	if err := validateWorkerRuntime(cfg.WorkerRuntime); err != nil {

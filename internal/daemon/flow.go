@@ -330,7 +330,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 				continue
 			}
 			// Identity / restart-required fields (repo, state_dir, session_prefix,
-			// local_path) cannot be hot-applied: the orchestrator, supervisor,
+			// local_path, forge) cannot be hot-applied: the orchestrator, supervisor,
 			// watchdog, and the
 			// supervisor's GitHub client were all built from the flow's STARTUP
 			// identity. Storing a changed identity in the holder would make
@@ -340,7 +340,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			// the diff-loop handles as a fresh flow); hot-reloadable edits still
 			// apply (#768, Codex).
 			if identityChanged(flow.cfg, newCfg) {
-				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path) changed — restart required, live reload skipped", flow.name)
+				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path/forge) changed — restart required, live reload skipped", flow.name)
 				continue
 			}
 			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
@@ -387,12 +387,35 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 // session_prefix names worker sessions. LocalPath is also part of the delivery
 // approval digest and selects the supervisor/executor checkout. Applying it to
 // only one reader would make every newly minted delivery approval fail closed
-// with a config mismatch. A change here therefore needs one atomic flow restart.
+// with a config mismatch. The forge block (#1172) is likewise identity: the
+// transport client is built once at startup, so flipping a live row between
+// forges (or re-pointing base_url/token_env) must not apply live. A change
+// here therefore needs one atomic flow restart.
 func identityChanged(a, b *config.Config) bool {
 	if a == nil || b == nil {
 		return a != b
 	}
-	return a.Repo != b.Repo || a.StateDir != b.StateDir || a.SessionPrefix != b.SessionPrefix || a.LocalPath != b.LocalPath
+	return a.Repo != b.Repo || a.StateDir != b.StateDir || a.SessionPrefix != b.SessionPrefix || a.LocalPath != b.LocalPath ||
+		effectiveForgeIdentity(a.Forge) != effectiveForgeIdentity(b.Forge)
+}
+
+// forgeIdentity is the comparable EFFECTIVE transport identity of a forge
+// block. identityChanged compares this instead of the raw struct so that an
+// operator spelling out a default on a live row (kind: github, or token_env:
+// FORGEJO_TOKEN) is not mistaken for a restart-required change — that would
+// freeze hot reload for every unrelated edit on the row.
+type forgeIdentity struct {
+	kind     string
+	apiRoot  string
+	tokenEnv string
+}
+
+func effectiveForgeIdentity(f config.ForgeConfig) forgeIdentity {
+	return forgeIdentity{
+		kind:     f.EffectiveKind(),
+		apiRoot:  f.APIRoot(),
+		tokenEnv: f.EffectiveTokenEnv(),
+	}
 }
 
 // runOrchestrator is the production run loop for one flow. It mirrors the

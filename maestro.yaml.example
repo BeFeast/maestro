@@ -7,6 +7,18 @@
 repo: YOUR_ORG/YOUR_REPO
 local_path: /path/to/local/repo
 worktree_base: /path/to/worktrees/repo
+
+# Code forge selection (#1172). Omit the block (or use kind: github) for the
+# GitHub default. kind: forgejo routes the project's transport to a Forgejo
+# instance and requires base_url — the instance ROOT (no /api/v1; the API root
+# is derived automatically). token_env is the NAME of the env var holding the
+# Forgejo PAT (default: FORGEJO_TOKEN) — never the token value itself.
+# Note: github_projects must stay disabled on forgejo rows — the GitHub
+# Projects integration has no Forgejo equivalent (the queue is labels).
+# forge:
+#   kind: forgejo
+#   base_url: https://forge.example.com
+#   token_env: FORGEJO_TOKEN
 max_parallel: 5
 max_runtime_minutes: 120           # hard timeout per worker (default: 120)
 worker_runtime:
