@@ -165,8 +165,9 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 	if cfg.TokenBudget > 0 {
 		// codex exec's public JSONL reports usage only at turn completion. The
 		// native rollout budget is enforced inside the agent loop after every
-		// provider response, including sub-agent work, so it is the enforceable
-		// live proxy for the configured Maestro ceiling. Codex 0.144 changed
+		// provider response, including sub-agent work — but since #1156 only
+		// its OUTPUT component counts (see the prefill note below), so it is
+		// the in-loop backstop, not the full ceiling. Codex 0.144 changed
 		// rollout_budget from a boolean feature to a configured feature object:
 		// `--enable rollout_budget` now replaces that object and discards its
 		// limit. Set the object's enabled field directly and provide the required
@@ -178,12 +179,23 @@ func (codexBackend) BuildCmd(cfg BackendConfig, promptFile, worktree string) (*e
 				reminders = append(reminders, strconv.Itoa(threshold))
 			}
 		}
+		// prefill_token_weight is 0: prefill in an agent loop is almost
+		// entirely replayed (cached) context, and the rollout feature cannot
+		// tell cached from fresh — at weight 1.0 every provider call
+		// re-charged the whole context and a 400k budget died in minutes of
+		// productive work (#1156). Fresh-input spend on the MAIN thread is
+		// enforced by Maestro's live monitor (#952 uncached measure via
+		// cached_input_tokens); sub-agent threads write their own rollout
+		// files the monitor does not read, so their fresh input is bounded
+		// only indirectly through sampled output — a deliberate trade: the
+		// weight-1.0 alternative false-killed every productive worker in
+		// minutes, the sub-agent input-heavy tail is the smaller risk.
 		args = append(args,
 			"-c", "features.rollout_budget.enabled=true",
 			"-c", fmt.Sprintf("features.rollout_budget.limit_tokens=%d", cfg.TokenBudget),
 			"-c", fmt.Sprintf("features.rollout_budget.reminder_at_remaining_tokens=[%s]", strings.Join(reminders, ",")),
 			"-c", "features.rollout_budget.sampling_token_weight=1.0",
-			"-c", "features.rollout_budget.prefill_token_weight=1.0",
+			"-c", "features.rollout_budget.prefill_token_weight=0.0",
 		)
 	}
 	args = append(args, "-")

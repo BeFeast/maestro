@@ -162,7 +162,11 @@ func TestLiveTokenMonitor_BackendEvents(t *testing.T) {
 	}
 }
 
-func TestLiveTokenMonitor_CodexReadsCumulativeRolloutUsage(t *testing.T) {
+func TestLiveTokenMonitor_CodexRolloutExcludesCachedInput(t *testing.T) {
+	// The #1156 incident shape: total_token_usage grows by the whole replayed
+	// context each turn (441k "observed" in 4 minutes of productive work).
+	// The budget must charge only uncached spend — cache-heavy growth stays
+	// under the ceiling, genuine spend still kills.
 	home := t.TempDir()
 	t.Setenv("CODEX_HOME", home)
 	threadID := "019abcde-1234-7000-8000-000000000906"
@@ -170,16 +174,46 @@ func TestLiveTokenMonitor_CodexReadsCumulativeRolloutUsage(t *testing.T) {
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	rollout := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":83000,"cached_input_tokens":70000,"output_tokens":2000,"reasoning_output_tokens":1000,"total_tokens":85000}}}}` + "\n"
-	if err := os.WriteFile(dir+"/rollout-test-"+threadID+".jsonl", []byte(rollout), 0o644); err != nil {
+	path := dir + "/rollout-test-" + threadID + ".jsonl"
+	rollout := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":83000,"cached_input_tokens":70000,"output_tokens":2000,"reasoning_output_tokens":1000,"total_tokens":85000}}}}` + "\n" +
+		`{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":420000,"cached_input_tokens":405000,"output_tokens":21000,"reasoning_output_tokens":4000,"total_tokens":441000}}}}` + "\n"
+	if err := os.WriteFile(path, []byte(rollout), 0o644); err != nil {
 		t.Fatal(err)
 	}
 
 	monitor := newLiveTokenMonitor("codex", 80_000)
 	monitor.observe(`{"type":"thread.started","thread_id":"` + threadID + `"}`)
 	observed, exceeded := monitor.observe(`{"type":"item.started","item":{"type":"command_execution"}}`)
-	if !exceeded || observed != 85_000 {
-		t.Fatalf("observe = %d,%t, want 85000,true", observed, exceeded)
+	// 441k total is 405k cache replay: uncached = 36k, well under the 80k cap.
+	if exceeded || observed != 36_000 {
+		t.Fatalf("observe = %d,%t, want 36000,false — cache replay must not kill the worker", observed, exceeded)
+	}
+
+	// Genuine spend past the cap still kills: 100k uncached input.
+	more := `{"type":"event_msg","payload":{"type":"token_count","info":{"total_token_usage":{"input_tokens":520000,"cached_input_tokens":405000,"output_tokens":30000,"reasoning_output_tokens":4000,"total_tokens":550000}}}}` + "\n"
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(more); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	observed, exceeded = monitor.observe(`{"type":"item.started","item":{"type":"command_execution"}}`)
+	if !exceeded || observed != 145_000 {
+		t.Fatalf("observe = %d,%t, want 145000,true — genuine spend must still enforce", observed, exceeded)
+	}
+}
+
+func TestLiveTokenMonitor_CodexTurnCompletedExcludesCachedInput(t *testing.T) {
+	monitor := newLiveTokenMonitor("codex", 80_000)
+	observed, exceeded := monitor.observe(`{"type":"turn.completed","usage":{"input_tokens":420000,"cached_input_tokens":400000,"output_tokens":15000}}`)
+	if exceeded || observed != 35_000 {
+		t.Fatalf("observe = %d,%t, want 35000,false", observed, exceeded)
+	}
+	observed, exceeded = monitor.observe(`{"type":"turn.completed","usage":{"input_tokens":600000,"cached_input_tokens":480000,"output_tokens":25000}}`)
+	if !exceeded || observed != 145_000 {
+		t.Fatalf("observe = %d,%t, want 145000,true", observed, exceeded)
 	}
 }
 
@@ -211,7 +245,11 @@ func TestBuildWorkerCmd_TokenBudgetFailClosedAndCodexProxy(t *testing.T) {
 			t.Fatal(err)
 		}
 		joined := strings.Join(cmd.Args, " ")
-		for _, want := range []string{"--json", "features.rollout_budget.enabled=true", "features.rollout_budget.limit_tokens=80000", "features.rollout_budget.reminder_at_remaining_tokens=[16000,8000]", "sampling_token_weight=1.0", "prefill_token_weight=1.0"} {
+		// prefill weight 0: the native budget cannot tell cached from fresh
+		// prefill, and weight 1.0 re-charged the whole context every call
+		// (#1156). Fresh input is enforced by the live monitor's uncached
+		// measure instead.
+		for _, want := range []string{"--json", "features.rollout_budget.enabled=true", "features.rollout_budget.limit_tokens=80000", "features.rollout_budget.reminder_at_remaining_tokens=[16000,8000]", "sampling_token_weight=1.0", "prefill_token_weight=0.0"} {
 			if !strings.Contains(joined, want) {
 				t.Errorf("codex args missing %q: %s", want, joined)
 			}
