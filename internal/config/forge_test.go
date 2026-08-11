@@ -224,3 +224,50 @@ func TestParseStrict_AcceptsForgeBlock(t *testing.T) {
 		t.Fatalf("strict decode should name the misspelled forge child key, got: %v", err)
 	}
 }
+
+// #1172 M3 — the forge-aware web-URL helpers. GitHub and Forgejo diverge on
+// the PR path segment (/pull/N vs /pulls/N), which is exactly why human links
+// must come from these helpers instead of hardcoded github.com shapes.
+func TestForgeConfigWebURLs(t *testing.T) {
+	cases := []struct {
+		name      string
+		fc        ForgeConfig
+		wantIssue string
+		wantPR    string
+	}{
+		{
+			name:      "zero config (github default)",
+			fc:        ForgeConfig{},
+			wantIssue: "https://github.com/o/r/issues/7",
+			wantPR:    "https://github.com/o/r/pull/7",
+		},
+		{
+			name:      "explicit github kind",
+			fc:        ForgeConfig{Kind: ForgeKindGitHub},
+			wantIssue: "https://github.com/o/r/issues/7",
+			wantPR:    "https://github.com/o/r/pull/7",
+		},
+		{
+			name:      "forgejo",
+			fc:        ForgeConfig{Kind: ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+			wantIssue: "https://forge.example.com/o/r/issues/7",
+			wantPR:    "https://forge.example.com/o/r/pulls/7",
+		},
+		{
+			name:      "forgejo trailing slash trimmed",
+			fc:        ForgeConfig{Kind: ForgeKindForgejo, BaseURL: "https://forge.example.com/"},
+			wantIssue: "https://forge.example.com/o/r/issues/7",
+			wantPR:    "https://forge.example.com/o/r/pulls/7",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := tc.fc.IssueWebURL("o/r", 7); got != tc.wantIssue {
+				t.Errorf("IssueWebURL = %q, want %q", got, tc.wantIssue)
+			}
+			if got := tc.fc.PRWebURL("o/r", 7); got != tc.wantPR {
+				t.Errorf("PRWebURL = %q, want %q", got, tc.wantPR)
+			}
+		})
+	}
+}

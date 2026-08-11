@@ -71,9 +71,10 @@ func TestForgejoModeFailsLoud(t *testing.T) {
 		{"RateLimit", func() error { _, err := c.RateLimit(); return err }},
 		// github.go — c.ghAPIWithArgs funnel.
 		{"checkRunsForSHA", func() error { _, err := c.checkRunsForSHA("59e99c49c27d3e2f73bae1657f07cd2f9a15f926"); return err }},
-		// github.go — c.ghExec funnel (writes).
-		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }},
-		{"CreateRelease", func() error { return c.CreateRelease("v0.0.1", "t") }},
+		// github.go — c.ghExec funnel: the writes are ported in M3, so the one
+		// remaining write-shaped guard is MarkPRReady (EditPullRequestOption
+		// has no draft toggle on 16.0.1 — explicit guard until M7).
+		{"MarkPRReady", func() error { return c.MarkPRReady(1) }},
 		// github_projects.go — c.ghOutputContext funnel (GraphQL Projects).
 		{"DiscoverProject", func() error { _, err := c.DiscoverProject(1); return err }},
 		// review_threads.go — GraphQL through c.ghExec.
@@ -126,8 +127,11 @@ func TestForgejoModeEmptyTokenSurfacesForgeErr(t *testing.T) {
 		{"GetIssue", func() error { _, err := c.GetIssue(1); return err }, false},
 		{"ListOpenPRs", func() error { _, err := c.ListOpenPRs(); return err }, false},
 		{"BranchHeadSHA", func() error { _, err := c.BranchHeadSHA("main"); return err }, false},
+		// Ported write (M3): same contract as the reads — the token fault
+		// without the sentinel.
+		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }, false},
 		// Unported write: sentinel, with the token fault in the message.
-		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }, true},
+		{"MarkPRReady", func() error { return c.MarkPRReady(1) }, true},
 	}
 	for _, s := range samples {
 		err := s.call()

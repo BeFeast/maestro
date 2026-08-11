@@ -8302,7 +8302,10 @@ func (o *Orchestrator) mergeReadyPRAtExpectedHead(s *state.State, slotName strin
 		// up, or the local rebase fails) fall back to server-side
 		// update-branch (#551) so a behind PR still converges to merge
 		// instead of dead-ending as an unresolvable conflict.
-		if strings.Contains(err.Error(), "not up to date") && o.cfg.AutoRebase {
+		// Belt and braces (#1172 M3): the sentinel is the typed contract both
+		// transports wrap (gh needle match / Forgejo out-of-date refusal); the
+		// legacy text match stays for error paths that predate it.
+		if (errors.Is(err, github.ErrMergeNotUpToDate) || strings.Contains(err.Error(), "not up to date")) && o.cfg.AutoRebase {
 			log.Printf("[orch] PR #%d branch is behind main, updating %s", pr.Number, slotName)
 			rebased := false
 			if strings.TrimSpace(sess.Worktree) != "" {

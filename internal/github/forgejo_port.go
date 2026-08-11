@@ -384,3 +384,277 @@ func (c *Client) fjPRChangedFiles(prNumber int) ([]string, error) {
 	}
 	return files, nil
 }
+
+// ---------------------------------------------------------------------------
+// Writes (#1172 M3). Same dispatch shape as the reads above: the exported
+// github.go method branches into the fj* sibling, REST specifics live in
+// internal/forgejo. The semantic contracts preserved here — comment-then-close
+// abort, number-from-response-JSON, label-name resolution, EnsureLabel upsert
+// — are pinned by the forgejo-mode write tests. MarkPRReady is the one write
+// with NO forgejo sibling: EditPullRequestOption has no draft toggle on
+// 16.0.1, so it keeps the fail-loud guard in github.go.
+// ---------------------------------------------------------------------------
+
+// fjCreatePR returns the new PR number from the response JSON `number` —
+// never scraped from a URL: gh output carries /pull/N where Forgejo web URLs
+// are /pulls/N, so URL scraping would break on exactly this forge.
+func (c *Client) fjCreatePR(title, body, base, head string) (int, error) {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	n, err := fj.CreatePull(ctx, c.Repo, title, body, base, head)
+	if err != nil {
+		return 0, fmt.Errorf("create PR: %w", err)
+	}
+	return n, nil
+}
+
+func (c *Client) fjUpdatePRBody(prNumber int, body string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	if err := fj.EditPull(ctx, c.Repo, prNumber, forgejo.Edit{Body: &body}); err != nil {
+		return fmt.Errorf("update PR %d body: %w", prNumber, err)
+	}
+	return nil
+}
+
+// fjClosePR preserves the gh path's comment-then-close contract: a non-empty
+// comment is posted FIRST and its failure aborts the close (the PR stays open
+// so the explanation is never lost); an empty comment skips the comment step
+// entirely. Pulls share the issue number space, so the comment goes through
+// the issue-comments route.
+func (c *Client) fjClosePR(prNumber int, comment string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	if comment != "" {
+		if err := fj.CreateComment(ctx, c.Repo, prNumber, comment); err != nil {
+			return fmt.Errorf("comment PR %d: %w", prNumber, err)
+		}
+	}
+	if err := fj.EditPull(ctx, c.Repo, prNumber, forgejo.Edit{State: "closed"}); err != nil {
+		return fmt.Errorf("close PR %d: %w", prNumber, err)
+	}
+	return nil
+}
+
+// fjMergePRAtHead is the squash + delete-branch + head-bound merge —
+// `gh pr merge --squash --delete-branch --match-head-commit` parity via
+// MergePullRequestOption. The empty-SHA pre-flight already ran in
+// MergePRAtHead (shared with the gh path). A refusal the transport classified
+// as out-of-date/head-mismatch (forgejo.ErrMergeOutOfDate) is re-wrapped with
+// the package sentinel so the orchestrator's AutoRebase branch matches it via
+// errors.Is; every other failure surfaces raw and loud.
+func (c *Client) fjMergePRAtHead(prNumber int, expectedHeadSHA string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	err = fj.MergePull(ctx, c.Repo, prNumber, forgejo.MergeOptions{
+		Do:                     "squash",
+		HeadCommitID:           expectedHeadSHA,
+		DeleteBranchAfterMerge: true,
+	})
+	if err != nil {
+		if errors.Is(err, forgejo.ErrMergeOutOfDate) {
+			return fmt.Errorf("merge PR %d at head %s: %w: %w", prNumber, expectedHeadSHA, ErrMergeNotUpToDate, err)
+		}
+		return fmt.Errorf("merge PR %d at head %s: %w", prNumber, expectedHeadSHA, err)
+	}
+	return nil
+}
+
+// fjUpdateBranch merges base into the PR head server-side, style=merge — the
+// gh `pr update-branch` default. The #547 contract carries over: the head SHA
+// moves, so callers must not merge in the same pass.
+func (c *Client) fjUpdateBranch(prNumber int) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	if err := fj.UpdatePullBranch(ctx, c.Repo, prNumber); err != nil {
+		return fmt.Errorf("update branch of PR %d: %w", prNumber, err)
+	}
+	return nil
+}
+
+// fjCloseIssue mirrors fjClosePR's comment-then-close contract on the issue
+// PATCH route.
+func (c *Client) fjCloseIssue(number int, comment string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	if comment != "" {
+		if err := fj.CreateComment(ctx, c.Repo, number, comment); err != nil {
+			return fmt.Errorf("comment issue %d: %w", number, err)
+		}
+	}
+	if err := fj.EditIssue(ctx, c.Repo, number, forgejo.Edit{State: "closed"}); err != nil {
+		return fmt.Errorf("close issue %d: %w", number, err)
+	}
+	return nil
+}
+
+// fjCreateIssue returns the new issue number from the response JSON. Label
+// names are resolved to ids inside the transport (CreateIssueOption.labels is
+// []int64); an unknown label name aborts loudly BEFORE the issue is created —
+// gh parity, and outcome_repair calls EnsureLabel first so a miss here is a
+// genuinely unknown label.
+func (c *Client) fjCreateIssue(title, body string, labels []string) (int, error) {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return 0, err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.CreateIssue(ctx, c.Repo, title, body, labels)
+}
+
+func (c *Client) fjEditIssueBody(number int, body string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	if err := fj.EditIssue(ctx, c.Repo, number, forgejo.Edit{Body: &body}); err != nil {
+		return fmt.Errorf("edit issue %d body: %w", number, err)
+	}
+	return nil
+}
+
+// fjAddIssueLabel passes the NAME verbatim — IssueLabelsOption accepts label
+// names on this instance (contract §6), so no id resolution happens; adding
+// an already-present label is a server-side no-op (idempotent-safe). Known
+// gap flagged as a #1172 follow-up: the server silently drops unknown names
+// (see forgejo.AddIssueLabels).
+func (c *Client) fjAddIssueLabel(issueNumber int, label string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.AddIssueLabels(ctx, c.Repo, issueNumber, []string{label})
+}
+
+// fjRemoveIssueLabel removes by NAME (the DELETE path param is name-or-id).
+// gh-parity split, riding on the server's own status codes: a label the issue
+// does not carry answers 204 (no-op success); a label missing from the repo
+// entirely answers non-2xx and stays a loud error.
+func (c *Client) fjRemoveIssueLabel(issueNumber int, label string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.RemoveIssueLabel(ctx, c.Repo, issueNumber, label)
+}
+
+// fjEnsureLabelDefaultColor is sent when the caller provided no color for a
+// label that must be CREATED — CreateLabelOption requires one (the gh path
+// can omit --color because gh picks a color itself). Forgejo accepts both
+// "#rrggbb" and bare "rrggbb" and stores bare.
+const fjEnsureLabelDefaultColor = "#ededed"
+
+// fjEnsureLabel is the upsert (`gh label create --force` parity). The name is
+// already trimmed/non-empty (shared pre-flight in EnsureLabel). Existing label
+// (exact name match first, then case-insensitive — same order as the
+// transport's findLabelID, because Forgejo does not enforce name uniqueness
+// under case folding): PATCH only the provided fields, skipping the call when
+// there is nothing to update. Missing: POST with the default color when the
+// caller omitted one. The caller's color goes on the wire verbatim, leading
+// '#' intact, where the gh path strips it (gh wants bare rrggbb) — Forgejo
+// accepts both forms and stores bare, so only the wire differs, not the
+// outcome. Its only consumer (outcome_repair) tolerates failure, so errors
+// stay informative rather than swallowed.
+func (c *Client) fjEnsureLabel(name, color, description string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	color = strings.TrimSpace(color)
+	description = strings.TrimSpace(description)
+	labels, err := fj.ListRepoLabels(ctx, c.Repo)
+	if err != nil {
+		return fmt.Errorf("ensure label %q: %w", name, err)
+	}
+	if l, ok := fjFindRepoLabel(labels, name); ok {
+		if color == "" && description == "" {
+			return nil // exists, nothing to update — a field-less PATCH is banned
+		}
+		if err := fj.EditLabel(ctx, c.Repo, l.ID, color, description); err != nil {
+			return fmt.Errorf("ensure label %q: %w", name, err)
+		}
+		return nil
+	}
+	if color == "" {
+		color = fjEnsureLabelDefaultColor
+	}
+	if err := fj.CreateLabel(ctx, c.Repo, name, color, description); err != nil {
+		return fmt.Errorf("ensure label %q: %w", name, err)
+	}
+	return nil
+}
+
+// fjFindRepoLabel returns the repo label matching name; an exact match wins
+// over a case-insensitive one (mirrors the transport's findLabelID), so a repo
+// carrying both "Bug" and "bug" gets the exact one PATCHed.
+func fjFindRepoLabel(labels []forgejo.RepoLabel, name string) (forgejo.RepoLabel, bool) {
+	for _, l := range labels {
+		if l.Name == name {
+			return l, true
+		}
+	}
+	for _, l := range labels {
+		if strings.EqualFold(l.Name, name) {
+			return l, true
+		}
+	}
+	return forgejo.RepoLabel{}, false
+}
+
+// fjComment serves CommentIssue AND CommentPR — pulls share the issue number
+// space, so one comments route covers both (contract §9).
+func (c *Client) fjComment(number int, body string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.CreateComment(ctx, c.Repo, number, body)
+}
+
+// fjCreateRelease anchors the release to the already-pushed tag. Divergence
+// from the gh path, documented: Forgejo has no --generate-notes equivalent
+// anywhere in its swagger, so the release body stays empty.
+func (c *Client) fjCreateRelease(tag, title string) error {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.CreateRelease(ctx, c.Repo, tag, title)
+}

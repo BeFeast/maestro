@@ -3,6 +3,7 @@ package orchestrator
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -3804,6 +3805,64 @@ func TestMergeReadyPR_BehindMainTriggersRebase(t *testing.T) {
 	}
 	if !sess.RebaseAttempted {
 		t.Error("RebaseAttempted should be true after successful rebase")
+	}
+}
+
+// mergeNotUpToDateSentinelOnly wraps github.ErrMergeNotUpToDate WITHOUT the
+// legacy "not up to date" text in its own message — isolating the errors.Is
+// arm of the classification from the string-matching belt (#1172 M3): the
+// sentinel's message contains the needle, so a plain %w-wrapped error can
+// never reach the errors.Is branch alone.
+type mergeNotUpToDateSentinelOnly struct{}
+
+func (mergeNotUpToDateSentinelOnly) Error() string {
+	return "merge PR 10 at head aaa: HTTP 409: head_commit_id mismatch"
+}
+func (mergeNotUpToDateSentinelOnly) Unwrap() error { return github.ErrMergeNotUpToDate }
+
+// #1172 M3 — the AutoRebase branch must classify on the typed sentinel via
+// errors.Is, not only on the legacy gh stderr text: a Forgejo merge refusal
+// carries no gh phrasing of its own.
+func TestMergeReadyPR_SentinelWithoutLegacyTextTriggersRebase(t *testing.T) {
+	if !errors.Is(mergeNotUpToDateSentinelOnly{}, github.ErrMergeNotUpToDate) {
+		t.Fatal("test double must wrap the sentinel")
+	}
+	if strings.Contains(mergeNotUpToDateSentinelOnly{}.Error(), "not up to date") {
+		t.Fatal("test double must NOT carry the legacy needle — it isolates the errors.Is arm")
+	}
+	rebased := false
+	o := &Orchestrator{
+		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
+		notifier: &notify.Notifier{},
+		ghMergePRFn: func(prNumber int) error {
+			return mergeNotUpToDateSentinelOnly{}
+		},
+		rebaseWorktreeFn: func(worktreePath, branch string, autoResolveFiles, autoRestoreFiles []string) error {
+			rebased = true
+			return nil
+		},
+	}
+
+	sess := &state.Session{
+		IssueNumber: 100,
+		IssueTitle:  "test issue",
+		Branch:      "feat/a",
+		Worktree:    "/var/tmp/wt",
+		Status:      state.StatusPROpen,
+		PRNumber:    10,
+	}
+	pr := github.PR{Number: 10, HeadRefName: "feat/a"}
+
+	result := o.mergeReadyPR(state.NewState(), "slot-0", sess, pr)
+
+	if result {
+		t.Fatal("mergeReadyPR should return false when merge fails")
+	}
+	if !rebased {
+		t.Fatal("a sentinel-classified merge refusal must trigger the AutoRebase path via errors.Is")
+	}
+	if sess.Status != state.StatusQueued {
+		t.Errorf("session status = %q, want %q", sess.Status, state.StatusQueued)
 	}
 }
 

@@ -545,6 +545,27 @@ func (f ForgeConfig) APIRoot() string {
 	return strings.TrimRight(f.BaseURL, "/") + "/api/v1"
 }
 
+// IssueWebURL returns the human-facing web URL of one issue on this forge
+// (#1172 M3): https://github.com/{repo}/issues/{n} for the GitHub/zero kind,
+// {base_url}/{repo}/issues/{n} for Forgejo. Human-link consumers must use
+// these helpers instead of hardcoding the github.com shape.
+func (f ForgeConfig) IssueWebURL(repo string, n int) string {
+	if f.IsForgejo() {
+		return fmt.Sprintf("%s/%s/issues/%d", strings.TrimRight(f.BaseURL, "/"), repo, n)
+	}
+	return fmt.Sprintf("https://github.com/%s/issues/%d", repo, n)
+}
+
+// PRWebURL is IssueWebURL's pull-request sibling. The path segment DIVERGES
+// between the forges: GitHub uses /pull/{n} (singular), Forgejo /pulls/{n}
+// (plural) — the same divergence that bans scraping PR numbers from URLs.
+func (f ForgeConfig) PRWebURL(repo string, n int) string {
+	if f.IsForgejo() {
+		return fmt.Sprintf("%s/%s/pulls/%d", strings.TrimRight(f.BaseURL, "/"), repo, n)
+	}
+	return fmt.Sprintf("https://github.com/%s/pull/%d", repo, n)
+}
+
 // GitHubAppConfig holds credentials for authenticating as a GitHub App
 // installation instead of a personal access token (#823). When populated the
 // daemon signs a JWT with the App's private key, exchanges it for a

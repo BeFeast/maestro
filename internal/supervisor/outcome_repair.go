@@ -181,7 +181,7 @@ func dispatchFutileOutcomeRecovery(cfg *config.Config, now time.Time) {
 		Fingerprint: fingerprint,
 		Attempts:    attempts,
 		Issue:       issue,
-		IssueLink:   outcomeRepairIssueLink(cfg.Repo, issue),
+		IssueLink:   outcomeRepairIssueLink(cfg.Forge, cfg.Repo, issue),
 	}
 	if err := notifyFutileRecovery(cfg, event); err != nil {
 		log.Printf("[outcome/recovery] futile_recovery alert failed for %s: %v", gate, err)
@@ -459,9 +459,12 @@ func shortOutcomeFingerprint(fingerprint string) string {
 	return outcomeRepairFingerprintID(fingerprint)
 }
 
-func outcomeRepairIssueLink(repo string, number int) string {
+// outcomeRepairIssueLink builds the human-facing issue link for the
+// futile_recovery alert on whichever forge hosts the repo (#1172 M3); the
+// `#%d` fallback shape is preserved for a missing repo/number.
+func outcomeRepairIssueLink(forge config.ForgeConfig, repo string, number int) string {
 	if repo = strings.TrimSpace(repo); repo != "" && number > 0 {
-		return fmt.Sprintf("https://github.com/%s/issues/%d", repo, number)
+		return forge.IssueWebURL(repo, number)
 	}
 	return fmt.Sprintf("#%d", number)
 }
