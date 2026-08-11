@@ -542,7 +542,9 @@ func (c *Client) fjEditIssueBody(number int, body string) error {
 
 // fjAddIssueLabel passes the NAME verbatim — IssueLabelsOption accepts label
 // names on this instance (contract §6), so no id resolution happens; adding
-// an already-present label is a server-side no-op (idempotent-safe).
+// an already-present label is a server-side no-op (idempotent-safe). Known
+// gap flagged as a #1172 follow-up: the server silently drops unknown names
+// (see forgejo.AddIssueLabels).
 func (c *Client) fjAddIssueLabel(issueNumber int, label string) error {
 	fj, err := c.fjTransport()
 	if err != nil {
@@ -575,11 +577,15 @@ const fjEnsureLabelDefaultColor = "#ededed"
 
 // fjEnsureLabel is the upsert (`gh label create --force` parity). The name is
 // already trimmed/non-empty (shared pre-flight in EnsureLabel). Existing label
-// (matched case-insensitively, like the forge's own label semantics): PATCH
-// only the provided fields, skipping the call when there is nothing to update.
-// Missing: POST with the default color when the caller omitted one. Its only
-// consumer (outcome_repair) tolerates failure, so errors stay informative
-// rather than swallowed.
+// (exact name match first, then case-insensitive — same order as the
+// transport's findLabelID, because Forgejo does not enforce name uniqueness
+// under case folding): PATCH only the provided fields, skipping the call when
+// there is nothing to update. Missing: POST with the default color when the
+// caller omitted one. The caller's color goes on the wire verbatim, leading
+// '#' intact, where the gh path strips it (gh wants bare rrggbb) — Forgejo
+// accepts both forms and stores bare, so only the wire differs, not the
+// outcome. Its only consumer (outcome_repair) tolerates failure, so errors
+// stay informative rather than swallowed.
 func (c *Client) fjEnsureLabel(name, color, description string) error {
 	fj, err := c.fjTransport()
 	if err != nil {
@@ -593,10 +599,7 @@ func (c *Client) fjEnsureLabel(name, color, description string) error {
 	if err != nil {
 		return fmt.Errorf("ensure label %q: %w", name, err)
 	}
-	for _, l := range labels {
-		if !strings.EqualFold(l.Name, name) {
-			continue
-		}
+	if l, ok := fjFindRepoLabel(labels, name); ok {
 		if color == "" && description == "" {
 			return nil // exists, nothing to update — a field-less PATCH is banned
 		}
@@ -612,6 +615,23 @@ func (c *Client) fjEnsureLabel(name, color, description string) error {
 		return fmt.Errorf("ensure label %q: %w", name, err)
 	}
 	return nil
+}
+
+// fjFindRepoLabel returns the repo label matching name; an exact match wins
+// over a case-insensitive one (mirrors the transport's findLabelID), so a repo
+// carrying both "Bug" and "bug" gets the exact one PATCHed.
+func fjFindRepoLabel(labels []forgejo.RepoLabel, name string) (forgejo.RepoLabel, bool) {
+	for _, l := range labels {
+		if l.Name == name {
+			return l, true
+		}
+	}
+	for _, l := range labels {
+		if strings.EqualFold(l.Name, name) {
+			return l, true
+		}
+	}
+	return forgejo.RepoLabel{}, false
 }
 
 // fjComment serves CommentIssue AND CommentPR — pulls share the issue number

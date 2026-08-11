@@ -287,8 +287,17 @@ func (c *Client) CreateIssue(ctx context.Context, repo, title, body string, labe
 
 // AddIssueLabels adds labels to an issue/PR by NAME — IssueLabelsOption
 // accepts "a list of strings representing label names" on this instance, so
-// no id resolution happens here. Adding an already-present label is a server-
-// side no-op (the response is the resulting label list, discarded).
+// no id resolution happens here (spec-pinned for #1172 M3). Adding an
+// already-present label is a server-side no-op (the response is the resulting
+// label list, discarded).
+//
+// KNOWN GAP (flagged #1172 follow-up, not fixable without leaving the spec's
+// pass-the-name contract): the Gitea 1.22 lineage resolves names server-side
+// and silently DROPS names that do not resolve, answering 200 with the
+// unchanged list — so adding a renamed/deleted label reports success without
+// applying anything, where the gh path fails loud on the same input. Client-
+// side ResolveLabelIDs would restore loud parity at the cost of a read per
+// add; carried as a follow-up decision, not smuggled into M3.
 func (c *Client) AddIssueLabels(ctx context.Context, repo string, index int, names []string) error {
 	if len(names) == 0 {
 		return fmt.Errorf("add labels on %s#%d: no label names given", repo, index)

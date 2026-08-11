@@ -135,6 +135,37 @@ func TestGitHubModeWriteArgsUnchanged(t *testing.T) {
 	}
 }
 
+// TestGitHubModeCloseCommentFailureAborts pins the gh-path half of the
+// comment-then-close contract (the forgejo-mode tests pin the other half): a
+// failed comment ABORTS the close — no close invocation follows, so the
+// PR/issue stays open and the explanation is never lost.
+func TestGitHubModeCloseCommentFailureAborts(t *testing.T) {
+	t.Run("ClosePR", func(t *testing.T) {
+		readInvocations := stubGHArgvRecorder(t, "boom", 1)
+		c := New("owner/repo", config.ForgeConfig{})
+		err := c.ClosePR(7, "why closed")
+		if err == nil || !strings.Contains(err.Error(), "gh pr comment 7") {
+			t.Fatalf("err = %v, want the comment failure surfaced", err)
+		}
+		got := readInvocations()
+		if len(got) != 1 || !reflect.DeepEqual(got[0][:2], []string{"pr", "comment"}) {
+			t.Fatalf("gh invocations = %q, want the comment attempt only (close aborted)", got)
+		}
+	})
+	t.Run("CloseIssue", func(t *testing.T) {
+		readInvocations := stubGHArgvRecorder(t, "boom", 1)
+		c := New("owner/repo", config.ForgeConfig{})
+		err := c.CloseIssue(9, "done")
+		if err == nil || !strings.Contains(err.Error(), "gh issue comment 9") {
+			t.Fatalf("err = %v, want the comment failure surfaced", err)
+		}
+		got := readInvocations()
+		if len(got) != 1 || !reflect.DeepEqual(got[0][:2], []string{"issue", "comment"}) {
+			t.Fatalf("gh invocations = %q, want the comment attempt only (close aborted)", got)
+		}
+	})
+}
+
 // TestGitHubModeMergeNotUpToDateWrapsSentinel pins the gh-path half of the
 // merge error contract: the historical "not up to date" stderr needle now
 // also wraps ErrMergeNotUpToDate (errors.Is-matchable) while keeping the full

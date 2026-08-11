@@ -467,6 +467,22 @@ func TestForgejoWriteEnsureLabelUpsert(t *testing.T) {
 			"description": "now blocking",
 		})
 	})
+	t.Run("exact name match wins over a case-insensitive one", func(t *testing.T) {
+		// Forgejo does not enforce name uniqueness under case folding: with
+		// "Blocked" (id 7) listed BEFORE "blocked" (id 23), a fold-first
+		// matcher would PATCH id 7 — the exact match must win.
+		both := `[{"id":7,"name":"Blocked","color":"cccccc","description":""},{"id":23,"name":"blocked","color":"cccccc","description":""}]`
+		c, seen, _ := newForgejoWriteClient(t, fjWriteRoute(t, map[string]fjWriteResp{
+			"GET /repos/" + fjTestRepo + "/labels":      {200, both},
+			"PATCH /repos/" + fjTestRepo + "/labels/23": {200, `{}`},
+		}))
+		if err := c.EnsureLabel("blocked", "d93f0b", ""); err != nil {
+			t.Fatalf("EnsureLabel: %v", err)
+		}
+		assertWrite(t, seen, 1, http.MethodPatch, "/repos/"+fjTestRepo+"/labels/23", map[string]any{
+			"color": "d93f0b",
+		})
+	})
 	t.Run("existing label with nothing to update makes no write", func(t *testing.T) {
 		c, seen, _ := newForgejoWriteClient(t, fjWriteRoute(t, map[string]fjWriteResp{
 			"GET /repos/" + fjTestRepo + "/labels": {200, existing},
