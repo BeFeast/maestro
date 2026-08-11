@@ -120,9 +120,29 @@ func (c *Client) doHeader(ctx context.Context, method, path string, payload any)
 		if len(excerpt) > 512 {
 			excerpt = excerpt[:512]
 		}
-		return nil, nil, fmt.Errorf("%s %s: HTTP %d: %s", method, path, resp.StatusCode, excerpt)
+		return nil, nil, &StatusError{Method: method, Path: path, StatusCode: resp.StatusCode, Body: excerpt}
 	}
 	return out, resp.Header, nil
+}
+
+// StatusError is the typed non-2xx transport error. Its text is identical to
+// the fmt.Errorf form it replaced; the type exists so callers that must
+// branch on the response (MergePull's out-of-date classification, the github
+// layer's refusal mapping) reach the status code and body via errors.As
+// through the identity-preserving wrap chains instead of string-matching
+// their own error rendering.
+type StatusError struct {
+	Method     string
+	Path       string
+	StatusCode int
+	// Body is the trimmed response-body excerpt, bounded at 512 bytes.
+	// Forgejo errors are APIError {message, url} JSON — short, and exactly
+	// what body-text classification inspects.
+	Body string
+}
+
+func (e *StatusError) Error() string {
+	return fmt.Sprintf("%s %s: HTTP %d: %s", e.Method, e.Path, e.StatusCode, e.Body)
 }
 
 // GetPR returns the PR metadata. An empty head SHA is rejected per the
