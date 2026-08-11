@@ -42,6 +42,15 @@ const pageSize = 50
 // set".
 const maxListPages = 100
 
+// boundedWindow is the item budget of a bounded (allPages=false) read: 100,
+// matching the gh transport's single-page per_page=100 calls. The server
+// clamps pages at 50 (pageSize), so a first-page-only bounded read would see
+// HALF the window the gh path sees — a consumer scanning the bounded open-PR
+// list (e.g. HasOpenPRForIssue on supervisor dispatch) would miss a linked PR
+// sitting at position 51 and re-dispatch the issue. The pager keeps fetching
+// clamped pages until the window is filled or the set ends.
+const boundedWindow = 100
+
 // Label is one issue/PR label. Only the name matters to callers.
 type Label struct {
 	Name string `json:"name"`
@@ -141,9 +150,12 @@ func (wp wirePull) pull() Pull {
 
 // listPages fetches a JSON-array list endpoint page by page. path carries the
 // caller's query already encoded (or none); the pager appends page/limit.
-// allPages=false bounds the read to the first page (50 entries). More than
-// maxListPages full pages is an explicit error — silent truncation would let
-// e.g. a merged-PR scan miss the PR it was looking for and re-dispatch work.
+// allPages=false bounds the read to a boundedWindow (100) item window —
+// clamped pages are fetched until the window fills or a short page ends the
+// set — so bounded reads see the same window as the gh transport's
+// single-page per_page=100 calls. More than maxListPages full pages is an
+// explicit error — silent truncation would let e.g. a merged-PR scan miss the
+// PR it was looking for and re-dispatch work.
 //
 // The x-total-count header (live-verified present and filter-consistent on
 // every paged endpoint here) is a truncation belt: pageSize hardcodes THIS
@@ -152,10 +164,14 @@ func (wp wirePull) pull() Pull {
 // and an authoritative read (e.g. the #827 reconcile open-issue set) would
 // silently truncate — downstream would stamp still-open issues closed. A
 // short final page that leaves the accumulated count below the server's own
-// total is therefore an explicit error. The total is re-read on every page so
-// a set that legitimately shrinks mid-scan does not false-alarm, and reaching
-// the total on a full page ends the loop without demanding one empty page
-// (which at exactly maxListPages×pageSize entries would trip the cap error).
+// total is therefore an explicit error. Reaching the bounded window with more
+// entries outstanding on the server is NOT truncation — it is the window's
+// contract — so the bounded stop returns before the belt is consulted; the
+// belt still fires when a short page strands a bounded read below BOTH the
+// window and the server total. The total is re-read on every page so a set
+// that legitimately shrinks mid-scan does not false-alarm, and reaching the
+// total on a full page ends the loop without demanding one empty page (which
+// at exactly maxListPages×pageSize entries would trip the cap error).
 func listPages[T any](ctx context.Context, c *Client, path string, allPages bool) ([]T, error) {
 	sep := "?"
 	if strings.Contains(path, "?") {
@@ -182,8 +198,11 @@ func listPages[T any](ctx context.Context, c *Client, path string, allPages bool
 			return nil, fmt.Errorf("parse GET %s: %w", paged, err)
 		}
 		all = append(all, items...)
-		if !allPages {
-			return all, nil
+		if !allPages && len(all) >= boundedWindow {
+			// Intentional bounded stop: the window is full, anything beyond it
+			// is out of contract (gh parity), so the truncation belt below
+			// must not see this as a short set.
+			return all[:boundedWindow], nil
 		}
 		if len(items) < pageSize {
 			if total >= 0 && len(all) < total {

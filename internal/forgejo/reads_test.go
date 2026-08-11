@@ -246,19 +246,81 @@ func TestListIssues_TotalReachedOnFullFinalPagePasses(t *testing.T) {
 	}
 }
 
-func TestListIssues_FirstPageOnlyWhenAllPagesFalse(t *testing.T) {
-	c, seen := newReadsClient(t, func(*http.Request) (int, string) {
-		return 200, issuesPage(t, 1, pageSize)
+// A bounded read must see the same 100-item window as the gh transport's
+// per_page=100 single-page calls: with 120 entries on the server it assembles
+// two clamped pages, stops at exactly boundedWindow, and the truncation belt
+// must NOT fire even though x-total-count says more entries exist — stopping
+// at the window is the contract, not truncation.
+func TestListIssues_BoundedWindowStopsAtHundred(t *testing.T) {
+	c, seen := newReadsClientWithTotal(t, func(r *http.Request) (int, int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 120, 200, issuesPage(t, 1, pageSize)
+		case "2":
+			return 120, 200, issuesPage(t, 1+pageSize, pageSize)
+		default:
+			return 0, 500, `{"message":"page beyond the bounded window"}`
+		}
 	})
 	issues, err := c.ListIssues(context.Background(), "owner/repo", "open", "", false)
 	if err != nil {
 		t.Fatalf("ListIssues: %v", err)
 	}
-	if len(issues) != pageSize {
-		t.Fatalf("issues = %d, want %d", len(issues), pageSize)
+	if len(issues) != boundedWindow {
+		t.Fatalf("issues = %d, want the %d-item bounded window", len(issues), boundedWindow)
+	}
+	if issues[0].Number != 1 || issues[boundedWindow-1].Number != boundedWindow {
+		t.Fatalf("window broken: first=%d last=%d", issues[0].Number, issues[boundedWindow-1].Number)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("requests = %d, want 2 (two clamped pages fill the window)", len(*seen))
+	}
+}
+
+// A bounded read over a set smaller than the window returns the whole set —
+// the short final page ends the loop, and the total-matching count keeps the
+// truncation belt quiet.
+func TestListIssues_BoundedReturnsAllWhenSetSmallerThanWindow(t *testing.T) {
+	c, seen := newReadsClientWithTotal(t, func(r *http.Request) (int, int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 80, 200, issuesPage(t, 1, pageSize)
+		case "2":
+			return 80, 200, issuesPage(t, 1+pageSize, 80-pageSize)
+		default:
+			return 0, 500, `{"message":"unexpected page"}`
+		}
+	})
+	issues, err := c.ListIssues(context.Background(), "owner/repo", "open", "", false)
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(issues) != 80 {
+		t.Fatalf("issues = %d, want all 80 (set smaller than the window)", len(issues))
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*seen))
+	}
+}
+
+// Genuine truncation must still fail loud in bounded mode: a server clamped
+// below pageSize answers a short first page, leaving the read below BOTH the
+// window and the server's own total — returning that silently would hand a
+// consumer (HasOpenPRForIssue et al.) a fraction of the window it believes it
+// scanned.
+func TestListIssues_BoundedLowerServerClampFailsLoud(t *testing.T) {
+	c, seen := newReadsClientWithTotal(t, func(*http.Request) (int, int, string) {
+		return 120, 200, issuesPage(t, 1, 25) // clamp 25 < pageSize, 120 total
+	})
+	_, err := c.ListIssues(context.Background(), "owner/repo", "open", "", false)
+	if err == nil {
+		t.Fatal("a short page below both window and total must error, not truncate silently")
+	}
+	if !strings.Contains(err.Error(), "refusing to truncate") {
+		t.Fatalf("error should name the truncation, got: %v", err)
 	}
 	if len(*seen) != 1 {
-		t.Fatalf("requests = %d, want 1 — allPages=false is a bounded read", len(*seen))
+		t.Fatalf("requests = %d, want 1", len(*seen))
 	}
 }
 
@@ -655,20 +717,32 @@ func TestListPullFiles(t *testing.T) {
 	}
 }
 
-func TestListPullFiles_FirstPageOnlyWhenAllPagesFalse(t *testing.T) {
-	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
-		items := make([]string, 0, pageSize)
-		for i := 0; i < pageSize; i++ {
-			items = append(items, fmt.Sprintf(`{"filename":"f%d.go"}`, i))
+// The bounded window applies to every paged list read: two full clamped pages
+// fill it, a third is never requested.
+func TestListPullFiles_BoundedWindowWhenAllPagesFalse(t *testing.T) {
+	filesPage := func(from, n int) string {
+		items := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			items = append(items, fmt.Sprintf(`{"filename":"f%d.go"}`, from+i))
 		}
-		return 200, "[" + strings.Join(items, ",") + "]"
+		return "[" + strings.Join(items, ",") + "]"
+	}
+	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 200, filesPage(0, pageSize)
+		case "2":
+			return 200, filesPage(pageSize, pageSize)
+		default:
+			return 500, `{"message":"page beyond the bounded window"}`
+		}
 	})
 	files, err := c.ListPullFiles(context.Background(), "owner/repo", 1, false)
 	if err != nil {
 		t.Fatalf("ListPullFiles: %v", err)
 	}
-	if len(files) != pageSize || len(*seen) != 1 {
-		t.Fatalf("files = %d requests = %d, want one full page and no follow-up", len(files), len(*seen))
+	if len(files) != boundedWindow || len(*seen) != 2 {
+		t.Fatalf("files = %d requests = %d, want the %d-item window from exactly 2 pages", len(files), len(*seen), boundedWindow)
 	}
 }
 

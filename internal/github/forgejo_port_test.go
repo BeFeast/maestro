@@ -8,6 +8,7 @@ package github
 // mirrored on github.com, so a leaked read would consult the GitHub mirror.
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -17,6 +18,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/config"
 )
@@ -186,13 +188,19 @@ func TestForgejoPortListAllOpenIssuesPaginates(t *testing.T) {
 	if len(*seen) != 2 {
 		t.Fatalf("requests = %d, want 2 (page 2 is short and ends the loop)", len(*seen))
 	}
-	// The single-page variant must NOT paginate.
+	// The bounded variant assembles the gh-parity 100-item window from
+	// clamped pages: page 1 is full so page 2 is fetched, the short page ends
+	// the read below the window, and nothing beyond is requested.
 	*seen = nil
-	if _, err := c.ListOpenIssues(nil); err != nil {
+	bounded, err := c.ListOpenIssues(nil)
+	if err != nil {
 		t.Fatalf("ListOpenIssues: %v", err)
 	}
-	if len(*seen) != 1 {
-		t.Fatalf("single-page read made %d requests, want 1", len(*seen))
+	if len(bounded) != 53 {
+		t.Fatalf("bounded issues = %d, want all 53 (set smaller than the 100-item window)", len(bounded))
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("bounded read made %d requests, want 2 (full page then short page)", len(*seen))
 	}
 }
 
@@ -728,5 +736,78 @@ func TestGitHubModeCoreReadsUnchanged(t *testing.T) {
 		if !strings.Contains(endpoints[i], want) {
 			t.Fatalf("gh call %d = %q, want it to contain %q", i, endpoints[i], want)
 		}
+	}
+}
+
+// --- shutdown-aware call contexts (#797 parity for ctx-less fj adapters) -----
+
+// forgejoCallContext must mirror the gh path's drain semantics: alive before
+// BeginShutdown, canceled by it mid-flight, and born canceled after it.
+func TestForgejoCallContextFollowsShutdown(t *testing.T) {
+	resetShutdownForTest()
+	t.Cleanup(resetShutdownForTest)
+
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	select {
+	case <-ctx.Done():
+		t.Fatal("call context done before shutdown began")
+	default:
+	}
+
+	BeginShutdown()
+	select {
+	case <-ctx.Done():
+	case <-time.After(2 * time.Second):
+		t.Fatal("BeginShutdown did not cancel an already-issued forgejo call context")
+	}
+
+	post, postCancel := forgejoCallContext()
+	defer postCancel()
+	select {
+	case <-post.Done():
+	default:
+		t.Fatal("a call context minted after BeginShutdown must start canceled")
+	}
+}
+
+// A ctx-less legacy method (GetIssue) whose Forgejo read is in flight against
+// a hanging server must return promptly with a context error once shutdown
+// begins — not ride out the transport's 30s timeout (the pre-fix behavior:
+// context.Background() made daemon drain wait on every hung read).
+func TestForgejoPortShutdownCancelsInFlightRead(t *testing.T) {
+	resetShutdownForTest()
+	t.Cleanup(resetShutdownForTest)
+
+	reached := make(chan struct{})
+	c, _, _ := newForgejoPortClient(t, func(r *http.Request) (int, string) {
+		close(reached)
+		<-r.Context().Done() // hang until the canceled client tears the request down
+		return 500, `{"message":"too late"}`
+	})
+
+	errCh := make(chan error, 1)
+	go func() {
+		_, err := c.GetIssue(41)
+		errCh <- err
+	}()
+
+	select {
+	case <-reached:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fixture server never saw the read")
+	}
+	BeginShutdown()
+
+	select {
+	case err := <-errCh:
+		if err == nil {
+			t.Fatal("read must fail once shutdown cancels its context")
+		}
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %v, want context.Canceled through the adapter chain", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("read still in flight 5s after BeginShutdown — forgejo calls are not shutdown-aware")
 	}
 }

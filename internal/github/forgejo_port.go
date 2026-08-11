@@ -58,6 +58,39 @@ func (c *Client) fjTransport() (*forgejo.Client, error) {
 	return c.fj, nil
 }
 
+// forgejoCallContext is the context for fj* adapter calls made from ctx-less
+// legacy Client methods. It derives from a context canceled the moment the gh
+// transport's shutdown fail-fast fires (BeginShutdown, #797), giving the
+// forgejo path the same drain semantics the gh path already has: once
+// shutdown begins, an in-flight or newly issued Forgejo HTTP request fails
+// promptly instead of riding out the transport's 30s timeout. Full caller-ctx
+// propagation through the ~80 ctx-less Client method signatures is deferred
+// to the signature modernization; methods that already take a ctx
+// (RepositoryDefaultBranch, LatestMergedPRGenerations) pass the caller's ctx
+// straight through and do not use this.
+//
+// The caller must defer cancel() — it releases the shutdown watcher.
+func forgejoCallContext() (context.Context, context.CancelFunc) {
+	ctx, cancel := context.WithCancel(context.Background())
+	shutdown := ghShutdownChan()
+	select {
+	case <-shutdown:
+		// Shutdown already begun: hand out an already-canceled context so the
+		// transport fails fast without even dialing.
+		cancel()
+		return ctx, cancel
+	default:
+	}
+	go func() {
+		select {
+		case <-shutdown:
+			cancel()
+		case <-ctx.Done():
+		}
+	}()
+	return ctx, cancel
+}
+
 // fjIssueToREST maps a Forgejo issue into the gh-wire restIssue, preserving
 // the pull_request marker (issues and pulls share one index space on both
 // forges, so the parseRESTIssues belt semantics carry over).
@@ -129,7 +162,9 @@ func (c *Client) fjListOpenIssuesByLabel(label string, allPages bool) ([]Issue, 
 	if err != nil {
 		return nil, err
 	}
-	fjIssues, err := fj.ListIssues(context.Background(), c.Repo, "open", label, allPages)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	fjIssues, err := fj.ListIssues(ctx, c.Repo, "open", label, allPages)
 	if err != nil {
 		return nil, fmt.Errorf("list open issues: %w", err)
 	}
@@ -149,7 +184,9 @@ func (c *Client) fjGetIssue(number int) (Issue, error) {
 	if err != nil {
 		return Issue{}, err
 	}
-	is, err := fj.GetIssue(context.Background(), c.Repo, number)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	is, err := fj.GetIssue(ctx, c.Repo, number)
 	if err != nil {
 		return Issue{}, fmt.Errorf("get issue %d: %w", number, err)
 	}
@@ -163,16 +200,19 @@ func (c *Client) fjIsIssueClosed(number int) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	is, err := fj.GetIssue(context.Background(), c.Repo, number)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	is, err := fj.GetIssue(ctx, c.Repo, number)
 	if err != nil {
 		return false, fmt.Errorf("get issue %d: %w", number, err)
 	}
 	return restIssueStateClosed(is.State), nil
 }
 
-// fjListPulls backs ListOpenPRs/listClosedPRs (allPages=false — first page,
-// like the gh single-page reads; Forgejo's server clamp makes that 50 entries
-// vs gh's 100, fine at homelab scale) and ListAllOpenPRs (allPages=true).
+// fjListPulls backs ListOpenPRs/listClosedPRs (allPages=false — a bounded
+// 100-item window assembled from clamped 50-item pages, matching the gh
+// single-page per_page=100 reads item for item) and ListAllOpenPRs
+// (allPages=true).
 // forgejo.ListPulls always sends sort=recentupdate, giving the same
 // newest-updated-first order as the gh path's sort=updated&direction=desc —
 // listClosedPRs/MergedPRNumberForIssue semantics depend on it.
@@ -181,7 +221,9 @@ func (c *Client) fjListPulls(state string, allPages bool) ([]PR, error) {
 	if err != nil {
 		return nil, err
 	}
-	pulls, err := fj.ListPulls(context.Background(), c.Repo, state, allPages)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	pulls, err := fj.ListPulls(ctx, c.Repo, state, allPages)
 	if err != nil {
 		return nil, fmt.Errorf("list %s PRs: %w", state, err)
 	}
@@ -197,7 +239,9 @@ func (c *Client) fjGetRESTPull(prNumber int) (restPull, error) {
 	if err != nil {
 		return restPull{}, err
 	}
-	p, err := fj.GetPull(context.Background(), c.Repo, prNumber)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	p, err := fj.GetPull(ctx, c.Repo, prNumber)
 	if err != nil {
 		return restPull{}, err
 	}
@@ -253,7 +297,9 @@ func (c *Client) fjBranchHeadSHA(branch string) (string, error) {
 	if err != nil {
 		return "", err
 	}
-	return fj.BranchHeadSHA(context.Background(), c.Repo, branch)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	return fj.BranchHeadSHA(ctx, c.Repo, branch)
 }
 
 func (c *Client) fjListIssueComments(issueNumber int) ([]IssueComment, error) {
@@ -261,7 +307,9 @@ func (c *Client) fjListIssueComments(issueNumber int) ([]IssueComment, error) {
 	if err != nil {
 		return nil, err
 	}
-	fjComments, err := fj.ListIssueComments(context.Background(), c.Repo, issueNumber)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	fjComments, err := fj.ListIssueComments(ctx, c.Repo, issueNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list issue comments for #%d: %w", issueNumber, err)
 	}
@@ -282,7 +330,9 @@ func (c *Client) fjPRLabels(prNumber int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	names, err := fj.IssueLabels(context.Background(), c.Repo, prNumber)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	names, err := fj.IssueLabels(ctx, c.Repo, prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d labels: %w", prNumber, err)
 	}
@@ -297,7 +347,9 @@ func (c *Client) fjPRCommits(prNumber int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	commits, err := fj.ListPullCommits(context.Background(), c.Repo, prNumber, true)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	commits, err := fj.ListPullCommits(ctx, c.Repo, prNumber, true)
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d commits: %w", prNumber, err)
 	}
@@ -318,7 +370,9 @@ func (c *Client) fjPRChangedFiles(prNumber int) ([]string, error) {
 	if err != nil {
 		return nil, err
 	}
-	names, err := fj.ListPullFiles(context.Background(), c.Repo, prNumber, true)
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	names, err := fj.ListPullFiles(ctx, c.Repo, prNumber, true)
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d files: %w", prNumber, err)
 	}
