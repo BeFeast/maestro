@@ -646,7 +646,12 @@ func TestForgejoPortHTTPErrorSurfaces(t *testing.T) {
 // TestForgejoPortGuardsMakeNoRequests pins the explicit NOT-ported guards: the
 // methods that would half-work now that their underlying funnels are ported
 // must fail with the sentinel BEFORE any Forgejo request — a half-executed
-// read would waste quota and, worse, look like partial support.
+// read would waste quota and, worse, look like partial support. M4 flipped
+// the check-runs/status + review-gate + merge-state family to ported (their
+// forgejo-mode coverage lives in forgejo_port_m4_test.go); what remains
+// guarded is the greptile-only family — every read they'd make IS ported, so
+// each would otherwise half-work forever ("pending"/"no findings" on a
+// reviewer that never posts on forgejo).
 func TestForgejoPortGuardsMakeNoRequests(t *testing.T) {
 	c, seen, ghCalls := newForgejoPortClient(t, func(*http.Request) (int, string) {
 		return 200, `{}`
@@ -655,12 +660,10 @@ func TestForgejoPortGuardsMakeNoRequests(t *testing.T) {
 		name string
 		call func() error
 	}{
-		{"PRMergeStatus", func() error { _, _, err := c.PRMergeStatus(1); return err }},
-		{"PRCheckRollup", func() error { _, err := c.PRCheckRollup(1); return err }},
-		{"PRCIStatus", func() error { _, err := c.PRCIStatus(1); return err }},
-		{"PRChecksOutput", func() error { _, err := c.PRChecksOutput(1); return err }},
-		{"CIFailureSummary", func() error { _, err := c.CIFailureSummary(1); return err }},
-		{"CollectPRReviewFeedback", func() error { _, err := c.CollectPRReviewFeedback(1, nil); return err }},
+		{"PRGreptileApproved", func() error { _, _, err := c.PRGreptileApproved(1); return err }},
+		{"prGreptileReviewStreamVerdict", func() error { _, err := c.prGreptileReviewStreamVerdict(1); return err }},
+		{"greptileReviewStreamVerdict", func() error { _, err := c.greptileReviewStreamVerdict(1); return err }},
+		{"PRHighSeverityReviewOnHead", func() error { _, _, _, err := c.PRHighSeverityReviewOnHead(1); return err }},
 	}
 	for _, g := range guards {
 		err := g.call()

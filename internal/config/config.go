@@ -2408,6 +2408,20 @@ func validateForge(cfg *Config) error {
 		// orchestrator reads from the GitHub MIRROR's state (#1172 M2).
 		return fmt.Errorf("config: github_mirror.source %q is not supported with forge.kind %q — the mirror store is fed by GitHub webhooks, so mirror-first reads would serve the GitHub mirror's state instead of the Forgejo original; set github_mirror.source: %q or drop the block", GitHubSourceMirrorFirst, ForgeKindForgejo, GitHubSourceAPI)
 	}
+	// #1172 M4: reject review streams that cannot observe a forgejo row.
+	// Greptile and the simplicity lens are GitHub-integrated reviewers (check
+	// runs / GitHub App webhooks) and never post on a Forgejo instance — a
+	// forgejo row gated on them would wait forever on a reviewer that cannot
+	// appear. This validates the EFFECTIVE streams, so the silent default is
+	// caught too: review_gate's absent default is "greptile", meaning a
+	// forgejo row MUST set review_gate: llm-review (or none), or list only
+	// llm-review streams in review_gate_streams.
+	for _, stream := range cfg.EffectiveReviewGateStreams() {
+		switch stream {
+		case "greptile", "simplicity":
+			return fmt.Errorf("config: review stream %q is not available with forge.kind %q (GitHub-only reviewer — it would leave the review gate unobserved forever); set review_gate: llm-review or review_gate: none, or list only llm-review streams in review_gate_streams", stream, ForgeKindForgejo)
+		}
+	}
 	return nil
 }
 

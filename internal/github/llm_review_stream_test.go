@@ -144,12 +144,7 @@ func TestNamedCheckDecision_LLMReviewCheckNames(t *testing.T) {
 
 func TestNamedStatusDecision_CommitStatusStates(t *testing.T) {
 	var combined combinedStatusResponse
-	combined.Statuses = []struct {
-		Context     string `json:"context"`
-		State       string `json:"state"`
-		Description string `json:"description"`
-		TargetURL   string `json:"target_url"`
-	}{
+	combined.Statuses = []combinedStatusEntry{
 		{Context: "llm-review-opus", State: "success"},
 		{Context: "llm-review-terra", State: "failure"},
 		{Context: "ci/build", State: "pending"},

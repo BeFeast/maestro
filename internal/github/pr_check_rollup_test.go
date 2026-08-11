@@ -8,12 +8,7 @@ func TestCICheckRollupFingerprint_IsOrderStableAndSemantic(t *testing.T) {
 		{ID: 20, Name: "test", Status: "in_progress"},
 	}
 	combined := combinedStatusResponse{State: "pending"}
-	combined.Statuses = append(combined.Statuses, struct {
-		Context     string `json:"context"`
-		State       string `json:"state"`
-		Description string `json:"description"`
-		TargetURL   string `json:"target_url"`
-	}{Context: "legacy", State: "pending", Description: "private detail", TargetURL: "https://private.invalid"})
+	combined.Statuses = append(combined.Statuses, combinedStatusEntry{Context: "legacy", State: "pending", Description: "private detail", TargetURL: "https://private.invalid"})
 
 	first := ciCheckRollupFingerprint(checks, combined)
 	reordered := ciCheckRollupFingerprint([]greptileCheckRun{checks[1], checks[0]}, combined)
@@ -50,12 +45,7 @@ func TestCICheckRollupFingerprintIgnoresSupersededAttemptHistory(t *testing.T) {
 func TestCICheckRollupSignals_CarriesNonSecretCheckIdentity(t *testing.T) {
 	checks := []greptileCheckRun{{ID: 10, Name: "Android SDK license acceptance gate", Status: "completed", Conclusion: "failure"}}
 	combined := combinedStatusResponse{State: "failure"}
-	combined.Statuses = append(combined.Statuses, struct {
-		Context     string `json:"context"`
-		State       string `json:"state"`
-		Description string `json:"description"`
-		TargetURL   string `json:"target_url"`
-	}{Context: "legacy/legal-gate", State: "pending", Description: "private detail", TargetURL: "https://private.invalid"})
+	combined.Statuses = append(combined.Statuses, combinedStatusEntry{Context: "legacy/legal-gate", State: "pending", Description: "private detail", TargetURL: "https://private.invalid"})
 
 	signals := ciCheckRollupSignals(checks, combined)
 	if len(signals) != 2 {

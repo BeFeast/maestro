@@ -22,8 +22,9 @@
 //     server's Mergeable() predicate, forced false on drafts and during the
 //     async conflict re-check — see fjPullToREST for the parity mapping;
 //   - mergeable_state has NO Forgejo equivalent: restPull.MergeableState is
-//     always "" here, which is why PRMergeStatus keeps an explicit
-//     NOT-ported guard (an empty raw state reads as "don't know, proceed");
+//     always "" here; PRMergeStatus instead SYNTHESIZES its vocabulary in
+//     fjPRMergeStatus (#1172 M4) — "behind" / "dirty" / "" only, never
+//     "clean" / "unstable";
 //   - draft is a plain bool.
 //
 // Methods that stay UNPORTED keep failing loud with ErrForgejoNotSupported
@@ -657,4 +658,334 @@ func (c *Client) fjCreateRelease(tag, title string) error {
 	ctx, cancel := forgejoCallContext()
 	defer cancel()
 	return fj.CreateRelease(ctx, c.Repo, tag, title)
+}
+
+// ---------------------------------------------------------------------------
+// CI/status rollup + review-gate reads + merge-state synthesis (#1172 M4).
+// Forgejo has NO check-runs API, NO mergeable_state, and NO review-thread
+// resolution API — the siblings below map what DOES exist (commit statuses,
+// reviews + review comments, merge_base) onto the existing internal shapes so
+// the shared aggregation/decision helpers (ciStatusFromREST,
+// formatChecksOverview, namedStatusDecision, filterStreamFindings, ...) run
+// unchanged on both forges.
+// ---------------------------------------------------------------------------
+
+// fjCombinedStatusForSHA maps forgejo's combined commit status onto the
+// gh-wire combinedStatusResponse. Two live-pinned gotchas are already
+// normalized by the transport: the per-status state arrives in the wire
+// `.status` field (NOT `.state`), and the no-signal shape is
+// {"state":"","total_count":0,"statuses":null} — which maps to State "" plus
+// nil Statuses here, exactly the no-signal shape ciStatusFromREST treats as
+// carrying no signal. CreatedAt is threaded through (RFC3339 verbatim) so the
+// rollup fingerprint advances on a status re-run — forgejo has no check-run
+// IDs to do that job.
+func (c *Client) fjCombinedStatusForSHA(sha string) (combinedStatusResponse, error) {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return combinedStatusResponse{}, err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	combined, err := fj.CombinedStatus(ctx, c.Repo, sha)
+	if err != nil {
+		return combinedStatusResponse{}, err
+	}
+	out := combinedStatusResponse{State: combined.State}
+	for _, st := range combined.Statuses {
+		out.Statuses = append(out.Statuses, combinedStatusEntry{
+			Context:     st.Context,
+			State:       st.State,
+			Description: st.Description,
+			TargetURL:   st.TargetURL,
+			CreatedAt:   st.CreatedAt,
+		})
+	}
+	return out, nil
+}
+
+// fjPRCheckRollup is the statuses-only rollup: check-runs do not exist on
+// forgejo, so Verdict is ciStatusFromREST(nil, combined) and
+// PendingCheckRuns stays false (it means "a check-RUN is live"; a pending
+// commit status surfaces as Verdict "pending" and as a pending commit_status
+// signal instead — which is exactly why the supervisor's #425 escape must be
+// disabled on forgejo rows: here statuses ARE the CI).
+//
+// NO-SIGNAL PARITY — DOCUMENTED LOUDLY, READ BEFORE RELYING ON IT: a head
+// with ZERO commit statuses rolls up as Verdict "success", byte-identical to
+// the GitHub no-signal behavior (a repo with no CI at all must not deadlock
+// every PR). On the canary forgejo row the producer posts pending-first
+// statuses (the llm-review pair) so a real head is never signal-free for
+// long; CI statuses proper arrive with the Actions runner (M4-ops). Until
+// then a PR whose producer never posts anything would read green — the
+// review gate (default llm-review pair, pending until observed) is what
+// still blocks its merge.
+func (c *Client) fjPRCheckRollup(prNumber int) (PRCheckRollup, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return PRCheckRollup{Verdict: "unknown"}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	combined, err := c.fjCombinedStatusForSHA(sha)
+	if err != nil {
+		// Identity-wrapped (%w), unlike the gh path's joint %v formatting:
+		// there is only one CI source here and its transport faults (token
+		// env, *forgejo.StatusError) must stay errors.Is/As-matchable.
+		return PRCheckRollup{HeadSHA: sha, Verdict: "unknown"}, fmt.Errorf("get statuses for PR %d: %w", prNumber, err)
+	}
+	rollup := PRCheckRollup{
+		HeadSHA:          sha,
+		Verdict:          ciStatusFromREST(nil, combined),
+		Complete:         true,
+		PendingCheckRuns: false,
+	}
+	rollup.Fingerprint = ciCheckRollupFingerprint(nil, combined)
+	rollup.Signals = ciCheckRollupSignals(nil, combined)
+	return rollup, nil
+}
+
+// fjPRChecksOutput renders the statuses-only overview through the shared
+// formatter (name, state, description columns; "no checks\n" when empty).
+func (c *Client) fjPRChecksOutput(prNumber int) (string, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return "", fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	combined, err := c.fjCombinedStatusForSHA(sha)
+	if err != nil {
+		return "", fmt.Errorf("get statuses for PR %d: %w", prNumber, err)
+	}
+	return formatChecksOverview(nil, combined), nil
+}
+
+// fjFailingStatusState reports whether a commit-status state is a hard CI
+// failure. ONLY "failure" and "error" qualify — "warning" and "skipped" are
+// real Forgejo per-status states (live-verified) and must never be classified
+// as failing, mirroring how ciStatusFromREST's aggregate arm only hardens on
+// failure/error.
+func fjFailingStatusState(state string) bool {
+	switch strings.ToLower(strings.TrimSpace(state)) {
+	case "failure", "error":
+		return true
+	}
+	return false
+}
+
+// fjPRFailingChecks maps failing commit statuses onto FailingCheck. The
+// status Description is the only actionable text a forgejo status carries
+// (no check-run output, no annotations), so it is threaded through as the
+// excerpt — empty descriptions degrade to name + conclusion, same contract
+// as the gh path (#857).
+func (c *Client) fjPRFailingChecks(prNumber int) ([]FailingCheck, error) {
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil {
+		return nil, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
+	}
+	combined, err := c.fjCombinedStatusForSHA(sha)
+	if err != nil {
+		return nil, fmt.Errorf("get statuses for PR %d: %w", prNumber, err)
+	}
+	var failing []FailingCheck
+	for _, st := range combined.Statuses {
+		if !fjFailingStatusState(st.State) {
+			continue
+		}
+		failing = append(failing, FailingCheck{
+			Name:       st.Context,
+			Conclusion: st.State,
+			Excerpt:    strings.TrimSpace(st.Description),
+		})
+	}
+	return failing, nil
+}
+
+// fjCIFailureSummary mirrors the gh CIFailureSummary shape — overview, then a
+// section per failed status — with the status description standing in for the
+// check-run output (nothing else exists on forgejo) and the same 8000-byte
+// cap. Downstream errors are swallowed exactly like the gh path: the summary
+// degrades to the overview, and the overview itself degrades to the error
+// text, because this string feeds a retry-worker prompt and must never abort
+// the retry.
+func (c *Client) fjCIFailureSummary(prNumber int) (string, error) {
+	overview, err := c.fjPRChecksOutput(prNumber)
+	if err != nil {
+		overview = err.Error()
+	}
+	sha, err := c.pullHeadSHA(prNumber)
+	if err != nil || sha == "" {
+		return overview, nil
+	}
+	combined, err := c.fjCombinedStatusForSHA(sha)
+	if err != nil {
+		return overview, nil
+	}
+	var failed []combinedStatusEntry
+	for _, st := range combined.Statuses {
+		if fjFailingStatusState(st.State) {
+			failed = append(failed, st)
+		}
+	}
+	if len(failed) == 0 {
+		return overview, nil
+	}
+
+	var result strings.Builder
+	result.WriteString("CI Check Overview:\n")
+	result.WriteString(overview)
+	result.WriteString("\n\n")
+	for _, st := range failed {
+		result.WriteString(fmt.Sprintf("=== Failed check: %s ===\n", st.Context))
+		if desc := strings.TrimSpace(st.Description); desc != "" {
+			result.WriteString(desc)
+			result.WriteString("\n")
+		}
+		if st.TargetURL != "" {
+			result.WriteString("Details: ")
+			result.WriteString(st.TargetURL)
+			result.WriteString("\n")
+		}
+		result.WriteString("\n")
+	}
+	s := result.String()
+	if len(s) > 8000 {
+		s = s[:8000] + "\n... (truncated)"
+	}
+	return s, nil
+}
+
+// fjPRMergeStatus synthesizes the mergeable_state vocabulary forgejo does not
+// have (#1172 M4 D3). The mergeable verdict is the shared
+// mergeableFromRESTPull over fjPullToREST (draft-contaminated false → nil →
+// "UNKNOWN" rule included). The synthesized mergeStateStatus is:
+//
+//   - "dirty"  — non-draft wire mergeable == false (a real conflict, or the
+//     seconds-long async re-check window — same accepted transient as
+//     PRMergeable's CONFLICTING). Checked FIRST: GitHub reports a conflicting
+//     PR as dirty even when it is also behind, and the conflict routing
+//     (approver execution_failed on CONFLICTING) is the stronger signal.
+//   - "behind" — the pull's merge_base differs from the CURRENT base-branch
+//     head (BranchHeadSHA(BaseRef), a second read — never base.sha from the
+//     same payload, which moves after merges and would mask "behind").
+//     This revives the approver's behind→UpdateBranch routing on forgejo.
+//   - ""       — everything else: callers read it as "not computed, proceed".
+//
+// "clean" and "unstable" are DELIBERATELY never synthesized. Both unlock
+// GitHub-semantics escapes that assert "every required check passed", which
+// has no forgejo equivalent until branch protection + Actions land:
+//
+//   - the #424 pending→success promotion (orchestrator
+//     pr_gate_progress.go observePRGateCI) requires "clean" — permanently
+//     inert on forgejo rows;
+//   - mergeStateAllowsMerge (supervisor #425 escape and review_repair's
+//     CI-pending arm) requires "clean"/"unstable" — both arms permanently
+//     inert on forgejo rows (M7 observation item; the supervisor
+//     additionally hard-gates the #425 escape on !IsForgejo so the
+//     inertness is double-guarded).
+//
+// An error from the base-branch head read fails the whole call (identity-
+// wrapped): callers treat a PRMergeStatus error as "no signal" and stay on
+// their conservative paths.
+func (c *Client) fjPRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error) {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return "", "", err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	p, err := fj.GetPull(ctx, c.Repo, prNumber)
+	if err != nil {
+		return "", "", fmt.Errorf("get pull %d: %w", prNumber, err)
+	}
+	mergeable = mergeableFromRESTPull(fjPullToREST(p))
+	if !p.Draft && p.Mergeable != nil && !*p.Mergeable {
+		return mergeable, "dirty", nil
+	}
+	mergeBase := strings.TrimSpace(p.MergeBase)
+	baseRef := strings.TrimSpace(p.BaseRef)
+	if mergeBase == "" || baseRef == "" {
+		// merge_base absent on the wire: "behind" cannot be determined, and
+		// "" is the honest "not computed" answer — never a guess.
+		return mergeable, "", nil
+	}
+	baseHead, err := fj.BranchHeadSHA(ctx, c.Repo, baseRef)
+	if err != nil {
+		return "", "", fmt.Errorf("get base branch %q head for PR %d: %w", baseRef, prNumber, err)
+	}
+	if !strings.EqualFold(mergeBase, strings.TrimSpace(baseHead)) {
+		return mergeable, "behind", nil
+	}
+	return mergeable, "", nil
+}
+
+// fjReviewComments is the forgejo arm of greptileReviewComments (the generic
+// inline-comment reader): reviews list + per-review comments, flattened into
+// the gh review-comment shape.
+//
+// CommitID head-anchoring contract (D4): the REVIEW's commit_id is the
+// primary anchor — the llm-review producer writes one-comment COMMENT reviews
+// anchored to the head it reviewed, and without that anchor
+// reviewCommentTargetsHead degenerates to "matches every head" and historical
+// findings leak across pushes. A review-level commit_id can legitimately be
+// "" (live-proven on migrated reviews), so the per-comment commit_id — always
+// populated — is the fallback. OriginalCommitID is deliberately left empty:
+// reviewCommentTargetsHead consults it FIRST when non-empty, and forgejo's
+// original_commit_id semantics across force-pushes are unpinned — the
+// review-anchored CommitID is the reliable head test.
+//
+// Body-only reviews (CommentsCount == 0) skip the per-review round trip.
+func (c *Client) fjReviewComments(prNumber int) ([]greptileReviewComment, error) {
+	fj, err := c.fjTransport()
+	if err != nil {
+		return nil, err
+	}
+	ctx, cancel := forgejoCallContext()
+	defer cancel()
+	reviews, err := fj.ListPullReviews(ctx, c.Repo, prNumber, true)
+	if err != nil {
+		return nil, fmt.Errorf("list PR %d reviews: %w", prNumber, err)
+	}
+	var comments []greptileReviewComment
+	for _, review := range reviews {
+		if review.CommentsCount == 0 {
+			continue
+		}
+		rcs, err := fj.ListPullReviewComments(ctx, c.Repo, prNumber, review.ID)
+		if err != nil {
+			return nil, fmt.Errorf("list PR %d review %d comments: %w", prNumber, review.ID, err)
+		}
+		for _, rc := range rcs {
+			commitID := strings.TrimSpace(review.CommitID)
+			if commitID == "" {
+				commitID = strings.TrimSpace(rc.CommitID)
+			}
+			cm := greptileReviewComment{
+				Body: rc.Body,
+				Path: rc.Path,
+				// Line ← the wire `position` field (transport PullReviewComment
+				// .Line), which on the forgejo READ side is the NEW-file line
+				// number (x-go-name LineNum) — NOT a diff offset; there is no
+				// `line`/`new_position` on reads (stage-A live pin).
+				Line:     int(rc.Line),
+				CommitID: commitID,
+			}
+			cm.User.Login = rc.Author
+			comments = append(comments, cm)
+		}
+	}
+	return comments, nil
+}
+
+// fjUnresolvedReviewThreadsOnHead is the D5 mergegate shim: forgejo has no
+// unresolved-conversations API, so it answers "no unresolved threads" while
+// still providing the boundary's second independent head read from the ported
+// pull read. An empty head refuses loudly — the same refusal the gh GraphQL
+// parse enforces — so the compare/claim boundary never anchors to "".
+func (c *Client) fjUnresolvedReviewThreadsOnHead(prNumber int) (string, []ReviewThread, error) {
+	rp, err := c.fjGetRESTPull(prNumber)
+	if err != nil {
+		return "", nil, fmt.Errorf("read review threads for PR %d: %w", prNumber, err)
+	}
+	head := strings.TrimSpace(rp.Head.SHA)
+	if head == "" {
+		return "", nil, fmt.Errorf("read review threads for PR %d: pull request head SHA is empty", prNumber)
+	}
+	return head, nil, nil
 }

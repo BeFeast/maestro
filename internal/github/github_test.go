@@ -252,26 +252,16 @@ func TestCIStatusFromREST(t *testing.T) {
 			want:     "success",
 		},
 		{
-			name:   "combined pending wins when a status entry is pending",
-			checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
-			combined: combinedStatusResponse{State: "pending", Statuses: []struct {
-				Context     string `json:"context"`
-				State       string `json:"state"`
-				Description string `json:"description"`
-				TargetURL   string `json:"target_url"`
-			}{{Context: "ci/build", State: "pending"}}},
-			want: "pending",
+			name:     "combined pending wins when a status entry is pending",
+			checks:   []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
+			combined: combinedStatusResponse{State: "pending", Statuses: []combinedStatusEntry{{Context: "ci/build", State: "pending"}}},
+			want:     "pending",
 		},
 		{
-			name:   "combined failure wins when a status entry failed",
-			checks: []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
-			combined: combinedStatusResponse{State: "failure", Statuses: []struct {
-				Context     string `json:"context"`
-				State       string `json:"state"`
-				Description string `json:"description"`
-				TargetURL   string `json:"target_url"`
-			}{{Context: "ci/build", State: "failure"}}},
-			want: "failure",
+			name:     "combined failure wins when a status entry failed",
+			checks:   []greptileCheckRun{{Name: "test", Status: "completed", Conclusion: "success"}},
+			combined: combinedStatusResponse{State: "failure", Statuses: []combinedStatusEntry{{Context: "ci/build", State: "failure"}}},
+			want:     "failure",
 		},
 	}
 

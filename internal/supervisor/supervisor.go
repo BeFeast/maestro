@@ -3280,6 +3280,18 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
+		// #1172 M4: the #425 escape below is DISABLED on forgejo rows. It
+		// exists for GitHub repos where commit statuses are legacy noise next
+		// to check-runs; on forgejo commit statuses ARE the CI — including
+		// the pending llm-review producer statuses — so a "status-only
+		// pending" head is a genuinely pending head, and the escape would
+		// merge PRs with review still pending. (Belt: fjPRMergeStatus never
+		// synthesizes "clean"/"unstable", so mergeStateAllowsMerge could not
+		// pass anyway — this gate makes the intent explicit and survivable
+		// against future synthesis changes.)
+		if e.cfg != nil && e.cfg.Forge.IsForgejo() {
+			return false, "", nil
+		}
 		if pendingCheckRuns || !legacyStatusOnlyPending(rollup) {
 			return false, "", nil
 		}
