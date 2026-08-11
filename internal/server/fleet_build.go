@@ -22,7 +22,7 @@ func WireFleetProjectGitHub(proj *FleetProject) {
 	if cfg == nil {
 		return
 	}
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 	proj.SetActionGH(gh)
 	if cfg.GitHubProjects.Enabled && cfg.GitHubProjects.ProjectNumber > 0 {
 		proj.SetBoardClient(gh, cfg.GitHubProjects.ProjectNumber)

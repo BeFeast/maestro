@@ -4,6 +4,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
@@ -57,7 +58,7 @@ func TestMergedIssueLookupsShareOneClosedPRSnapshotPerCycle(t *testing.T) {
 				{Number: 12, State: "closed", MergedAt: "2026-07-18T00:01:00Z", Body: "Fixes #102", HeadRefName: "fix/102"},
 			}, nil
 		},
-		gh: github.New("BeFeast/maestro"),
+		gh: github.New("BeFeast/maestro", config.ForgeConfig{}),
 	}
 	o.beginCycle()
 	defer o.endCycle()

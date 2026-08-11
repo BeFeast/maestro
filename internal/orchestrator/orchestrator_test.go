@@ -3811,7 +3811,7 @@ func TestMergeReadyPR_BehindMainRebaseFailsMarksConflict(t *testing.T) {
 	o := &Orchestrator{
 		cfg:      &config.Config{Repo: "owner/repo", AutoRebase: true},
 		notifier: &notify.Notifier{},
-		gh:       github.New("owner/repo"),
+		gh:       github.New("owner/repo", config.ForgeConfig{}),
 		ghMergePRFn: func(prNumber int) error {
 			return fmt.Errorf("gh pr merge 10: the head branch is not up to date with the base branch")
 		},
@@ -8643,7 +8643,7 @@ func TestSyncProject_DisabledByDefault(t *testing.T) {
 	// When github_projects is not enabled, syncProject should be a no-op (not panic)
 	o := &Orchestrator{
 		cfg: &config.Config{Repo: "owner/repo"},
-		gh:  github.New("owner/repo"),
+		gh:  github.New("owner/repo", config.ForgeConfig{}),
 	}
 	// Should not panic or make any API calls
 	o.syncProject(42, github.ProjectStatusInProgress)
@@ -8658,7 +8658,7 @@ func TestSyncProject_DisabledWhenNoProjectNumber(t *testing.T) {
 				ProjectNumber: 0, // not set
 			},
 		},
-		gh: github.New("owner/repo"),
+		gh: github.New("owner/repo", config.ForgeConfig{}),
 	}
 	// Should not panic or make any API calls
 	o.syncProject(42, github.ProjectStatusInProgress)
@@ -8827,7 +8827,7 @@ func TestRunOncePersistsProjectStatusSyncAfterReconcile(t *testing.T) {
 	syncCalls := 0
 	o := &Orchestrator{
 		cfg:      cfg,
-		gh:       github.New(cfg.Repo),
+		gh:       github.New(cfg.Repo, cfg.Forge),
 		notifier: &notify.Notifier{},
 		router:   router.New(cfg),
 		repo:     cfg.Repo,

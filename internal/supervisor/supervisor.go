@@ -208,7 +208,7 @@ type Engine struct {
 
 func NewEngine(cfg *config.Config, reader Reader) *Engine {
 	if reader == nil {
-		reader = github.New(cfg.Repo)
+		reader = github.New(cfg.Repo, cfg.Forge)
 	}
 	eng := &Engine{
 		cfg:               cfg,
@@ -347,7 +347,7 @@ func RunOnce(ctx context.Context, cfg *config.Config, reader Reader, opts ...Run
 		fmt.Fprintf(os.Stderr, "[supervisor] migrated %d unstamped approval(s) to repo=%s (#489)\n", migrated, cfg.Repo)
 	}
 	if reader == nil {
-		reader = github.New(cfg.Repo)
+		reader = github.New(cfg.Repo, cfg.Forge)
 	}
 	// NOTE: approval execution must NOT run in dry-run mode (greptile
 	// P1 on #480) — the side effects are real GH/fs operations and the
@@ -4924,7 +4924,7 @@ func executeApprovedDeliveries(cfg *config.Config, st *state.State, reader Reade
 		// The normal supervisor reader may be mirror-first and intentionally
 		// omit this freshness-only API. Execution must consult GitHub directly;
 		// a cached mirror is not authoritative for a just-landed merge.
-		latestReader = github.New(cfg.Repo)
+		latestReader = github.New(cfg.Repo, cfg.Forge)
 	}
 	var checkout approver.CheckoutPreparer
 	if provider, ok := reader.(interface {
@@ -5000,12 +5000,12 @@ func executeApprovedApprovals(cfg *config.Config, st *state.State, reader Reader
 	// Reader (the broader supervisor surface) is satisfied by *github.Client,
 	// which also satisfies approver.GitHubClient. We assert the narrower
 	// interface — when it fails (mocks/tests/Mutator-only), we still try to
-	// fall back to a fresh github.New(cfg.Repo).
+	// fall back to a fresh github.New(cfg.Repo, cfg.Forge).
 	var gh approver.GitHubClient
 	if candidate, ok := reader.(approver.GitHubClient); ok {
 		gh = candidate
 	} else {
-		gh = github.New(cfg.Repo)
+		gh = github.New(cfg.Repo, cfg.Forge)
 	}
 	ex := &approver.Executor{
 		GH:        gh,

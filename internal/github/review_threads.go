@@ -94,7 +94,7 @@ func (c *Client) PRUnresolvedReviewThreadsOnHead(prNumber int) (string, []Review
   }
 }`, strconv.Quote(owner), strconv.Quote(name), prNumber, after)
 
-		out, err := ghCommand("api", "graphql", "-f", "query="+query).CombinedOutput()
+		out, err := c.ghExec("api", "graphql", "-f", "query="+query)
 		if err != nil {
 			return "", nil, fmt.Errorf("read review threads for PR %d: %w\n%s", prNumber, err, out)
 		}

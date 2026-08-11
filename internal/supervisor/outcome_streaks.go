@@ -141,7 +141,7 @@ func defaultGateFailStreakIntake(cfg *config.Config, event outcome.GateStreakEve
 	if cfg == nil || strings.TrimSpace(cfg.Repo) == "" {
 		return 0, fmt.Errorf("gate-fail-streak intake: no repo configured")
 	}
-	client := github.New(cfg.Repo)
+	client := github.New(cfg.Repo, cfg.Forge)
 	title := fmt.Sprintf("gate failure streak: %s failing %d consecutive scheduled runs", event.Gate, event.ConsecutiveFailures)
 	return client.CreateIssue(title, gateFailStreakIssueBody(event), nil)
 }

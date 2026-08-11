@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -12,6 +13,7 @@ import (
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -128,6 +130,26 @@ func TestExecuteApprovedDeliveryCLIUsesConfiguredDBAndMirrorsResult(t *testing.T
 	}
 	if _, err := os.Stat(approvalstore.DefaultDBPath()); !os.IsNotExist(err) {
 		t.Fatalf("default approvals DB was touched despite custom path: err=%v", err)
+	}
+}
+
+// Delivery freshness is GitHub-anchored end to end (RevisionContains proves
+// ancestry against https://github.com/<repo>.git — the MIRROR of a forgejo
+// row). The factory must fail loud on forgejo rows so no delivery ever
+// validates Forgejo merge SHAs against a possibly-stale GitHub mirror
+// (#1172 M2; forge-aware delivery lands in M3/M4).
+func TestDeliveryFreshnessCheckerFactoryFailsLoudOnForgejo(t *testing.T) {
+	cfg := &config.Config{
+		Repo:  "o/r",
+		Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+	}
+	checker := deliveryFreshnessCheckerFactory(cfg)
+	if checker == nil {
+		t.Fatal("factory must return a fail-loud checker on forgejo rows, not nil")
+	}
+	err := checker.CheckDeliveryFreshness(context.Background(), &state.DeliveryPayload{})
+	if !errors.Is(err, github.ErrForgejoNotSupported) {
+		t.Fatalf("forgejo delivery freshness = %v; want errors.Is ErrForgejoNotSupported", err)
 	}
 }
 

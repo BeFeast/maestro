@@ -22,7 +22,7 @@ func produceRecorder(o *Orchestrator) (*[]producedCall, *sync.WaitGroup) {
 	var mu sync.Mutex
 	var calls []producedCall
 	var wg sync.WaitGroup
-	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig) {
+	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
 		mu.Lock()
 		calls = append(calls, producedCall{pr: pr, head: head, streams: streams})
 		mu.Unlock()
@@ -93,7 +93,7 @@ func TestMaybeProduceMissingReview_InFlightDedup(t *testing.T) {
 	started := 0
 	release := make(chan struct{})
 	done := make(chan struct{}, 2)
-	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig) {
+	o.reviewProduceFn = func(pr int, head string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
 		mu.Lock()
 		started++
 		mu.Unlock()

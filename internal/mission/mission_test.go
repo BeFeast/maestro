@@ -194,7 +194,7 @@ func TestProcessMissions_DecomposeAndTrack(t *testing.T) {
 		},
 	}
 
-	gh := github.New("owner/repo")
+	gh := github.New("owner/repo", config.ForgeConfig{})
 	proc := NewProcessor(cfg, gh)
 
 	childCounter := 100
@@ -259,7 +259,7 @@ func TestProcessMissions_SkipAlreadyTracked(t *testing.T) {
 		},
 	}
 
-	gh := github.New("owner/repo")
+	gh := github.New("owner/repo", config.ForgeConfig{})
 	proc := NewProcessor(cfg, gh)
 
 	createCalled := false
@@ -304,7 +304,7 @@ func TestProcessMissions_MaxChildrenCap(t *testing.T) {
 		},
 	}
 
-	gh := github.New("owner/repo")
+	gh := github.New("owner/repo", config.ForgeConfig{})
 	proc := NewProcessor(cfg, gh)
 
 	childCounter := 200
@@ -354,7 +354,7 @@ func TestProcessMissions_AllChildrenClosed(t *testing.T) {
 		},
 	}
 
-	gh := github.New("owner/repo")
+	gh := github.New("owner/repo", config.ForgeConfig{})
 	proc := NewProcessor(cfg, gh)
 
 	proc.IsIssueClosedFn = func(number int) (bool, error) {
@@ -389,7 +389,7 @@ func TestProcessMissions_Disabled(t *testing.T) {
 		},
 	}
 
-	gh := github.New("owner/repo")
+	gh := github.New("owner/repo", config.ForgeConfig{})
 	proc := NewProcessor(cfg, gh)
 
 	s := state.NewState()

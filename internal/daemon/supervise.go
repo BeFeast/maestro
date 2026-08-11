@@ -86,7 +86,8 @@ func runSupervise(ctx context.Context, name string, getCfg func() *config.Config
 	// falling back to the API on a miss/stale. A nil reader (mirror disabled)
 	// falls back to a plain client, byte-identical to pre-#826 behavior.
 	if reader == nil {
-		reader = github.New(getCfg().Repo)
+		cfg := getCfg()
+		reader = github.New(cfg.Repo, cfg.Forge)
 	}
 	// Capture and log each cycle's SupervisorDecision. The daemon still acts
 	// (label/comment/approve), but without this the structural "why did the

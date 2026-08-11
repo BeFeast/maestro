@@ -128,7 +128,7 @@ func loadDigestProjects(fleetPath string, configs multiFlag, storePath, storePro
 			log.Printf("warn: load state for %s: %v (sections from state will be empty)", cfg.Repo, err)
 			st = nil
 		}
-		p := digest.ProjectFromConfig(entry.name, cfg, st, github.New(cfg.Repo))
+		p := digest.ProjectFromConfig(entry.name, cfg, st, github.New(cfg.Repo, cfg.Forge))
 		projects = append(projects, p)
 		if notifierCfg == nil && strings.TrimSpace(cfg.Telegram.Target) != "" {
 			notifierCfg = cfg

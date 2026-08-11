@@ -157,6 +157,14 @@ func TestParse_ForgeValidation(t *testing.T) {
 			yaml:    "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_projects:\n  enabled: true\n",
 			wantSub: "no Forgejo equivalent",
 		},
+		{
+			// #1172 M2: the mirror store is fed by GitHub webhooks and keyed by
+			// bare owner/name — on a mirrored repo, mirror-first reads on a
+			// forgejo row would silently serve the GitHub mirror's state.
+			name:    "forgejo with mirror-first github_mirror",
+			yaml:    "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_mirror:\n  source: mirror-first\n",
+			wantSub: "fed by GitHub webhooks",
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -190,6 +198,17 @@ func TestParse_ForgejoWithDisabledGitHubProjectsAccepted(t *testing.T) {
 	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_projects:\n  enabled: false\n"
 	if _, err := Parse([]byte(yamlDoc)); err != nil {
 		t.Fatalf("forgejo with explicitly disabled github_projects should parse: %v", err)
+	}
+}
+
+// The mirror-first rejection is scoped to the SOURCE selector: a forgejo row
+// with an explicit api-direct source (or a bare github_mirror block tuning
+// reconcile cadence) must keep parsing — only mirror-served reads are the
+// cross-forge hazard.
+func TestParse_ForgejoWithAPIDirectMirrorAccepted(t *testing.T) {
+	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_mirror:\n  source: api\n"
+	if _, err := Parse([]byte(yamlDoc)); err != nil {
+		t.Fatalf("forgejo with api-direct github_mirror should parse: %v", err)
 	}
 }
 

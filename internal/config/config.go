@@ -2380,6 +2380,13 @@ func validateForge(cfg *Config) error {
 	if cfg.GitHubProjects.Enabled {
 		return fmt.Errorf("config: github_projects.enabled is not supported with forge.kind %q — the GitHub Projects integration has no Forgejo equivalent (the queue is labels); set github_projects.enabled: false or drop the block", ForgeKindForgejo)
 	}
+	if cfg.GitHubMirror.MirrorFirst() {
+		// The mirror store is fed by GITHUB webhooks and keyed by bare
+		// owner/name — the same key the repo has on both forges of a mirrored
+		// pair. Serving it to a forgejo row would silently answer supervisor/
+		// orchestrator reads from the GitHub MIRROR's state (#1172 M2).
+		return fmt.Errorf("config: github_mirror.source %q is not supported with forge.kind %q — the mirror store is fed by GitHub webhooks, so mirror-first reads would serve the GitHub mirror's state instead of the Forgejo original; set github_mirror.source: %q or drop the block", GitHubSourceMirrorFirst, ForgeKindForgejo, GitHubSourceAPI)
+	}
 	return nil
 }
 

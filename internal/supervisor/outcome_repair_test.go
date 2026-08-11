@@ -124,7 +124,7 @@ func installOutcomeRepairStubs(t *testing.T, client *fakeOutcomeRepairClient, no
 		newOutcomeRepairIssueClient = originalClient
 		newFutileRecoveryNotifier = originalNotifier
 	})
-	newOutcomeRepairIssueClient = func(string) outcomeRepairIssueClient { return client }
+	newOutcomeRepairIssueClient = func(string, config.ForgeConfig) outcomeRepairIssueClient { return client }
 	newFutileRecoveryNotifier = func(*config.Config) futileRecoveryNotifier { return notifier }
 }
 
