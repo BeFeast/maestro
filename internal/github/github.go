@@ -2330,6 +2330,9 @@ func (c *Client) combinedStatusForSHA(sha string) (combinedStatusResponse, error
 
 // CreatePR opens a pull request and returns its number.
 func (c *Client) CreatePR(title, body, base, head string) (int, error) {
+	if c.isForgejo() {
+		return c.fjCreatePR(title, body, base, head)
+	}
 	args := []string{
 		"pr", "create",
 		"--repo", c.Repo,
@@ -2357,6 +2360,9 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 
 // UpdatePRBody replaces a pull request body.
 func (c *Client) UpdatePRBody(prNumber int, body string) error {
+	if c.isForgejo() {
+		return c.fjUpdatePRBody(prNumber, body)
+	}
 	out, err := c.ghExec(
 		"pr", "edit", strconv.Itoa(prNumber),
 		"--repo", c.Repo,
@@ -3155,7 +3161,12 @@ func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, 
 }
 
 // ClosePR closes a PR without merging and leaves a comment explaining why.
+// Comment-then-close: a failed comment ABORTS the close (the PR stays open)
+// and an empty comment skips the comment step — callers rely on both.
 func (c *Client) ClosePR(prNumber int, comment string) error {
+	if c.isForgejo() {
+		return c.fjClosePR(prNumber, comment)
+	}
 	if comment != "" {
 		out, err := c.ghExec("pr", "comment",
 			fmt.Sprint(prNumber),
@@ -3408,13 +3419,34 @@ func formatFailureAnnotations(anns []checkAnnotation) string {
 	return strings.Join(lines, "\n")
 }
 
+// ErrMergeNotUpToDate marks a merge refusal caused by the PR head/base moving
+// since the caller's read: the branch is BEHIND (not conflicting), so
+// update-branch/rebase converges it — the AutoRebase branch keys off this via
+// errors.Is instead of string-matching gh stderr (#1172 M3). Both transports
+// wrap it: the gh path when the CLI output carries the "not up to date"
+// needle, the forgejo path when the REST refusal maps onto
+// forgejo.ErrMergeOutOfDate. The sentinel text deliberately contains the
+// legacy needle so pre-existing strings.Contains consumers keep matching.
+var ErrMergeNotUpToDate = errors.New("pr head/base is not up to date for merge")
+
+// mergeNotUpToDateNeedle is the historical gh stderr fragment ("the head
+// branch is not up to date with the base branch") the orchestrator classified
+// on before the sentinel existed; the gh path still detects on it verbatim.
+const mergeNotUpToDateNeedle = "not up to date"
+
 // MergePRAtHead squash-merges a PR only when its current head still matches
 // expectedHeadSHA. GitHub enforces the comparison atomically with the merge,
 // closing the force-push race between a gate/approval read and execution.
+// The empty-SHA pre-flight is shared by both transports so the fail-loud
+// message stays identical; a refusal meaning "head/base moved" comes back
+// errors.Is-matchable against ErrMergeNotUpToDate on both.
 func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
 	expectedHeadSHA = strings.TrimSpace(expectedHeadSHA)
 	if expectedHeadSHA == "" {
 		return fmt.Errorf("merge PR %d: expected head SHA is required", prNumber)
+	}
+	if c.isForgejo() {
+		return c.fjMergePRAtHead(prNumber, expectedHeadSHA)
 	}
 	out, err := c.ghExec("pr", "merge",
 		fmt.Sprint(prNumber),
@@ -3423,7 +3455,11 @@ func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
 		"--delete-branch",
 		"--match-head-commit", expectedHeadSHA)
 	if err != nil {
-		return fmt.Errorf("gh pr merge %d at head %s: %w\n%s", prNumber, expectedHeadSHA, err, out)
+		wrapped := fmt.Errorf("gh pr merge %d at head %s: %w\n%s", prNumber, expectedHeadSHA, err, out)
+		if strings.Contains(string(out), mergeNotUpToDateNeedle) {
+			return fmt.Errorf("%w: %w", ErrMergeNotUpToDate, wrapped)
+		}
+		return wrapped
 	}
 	return nil
 }
@@ -3432,6 +3468,14 @@ func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
 // `gh pr ready`). `gh pr merge` on a draft fails with "still a draft", so
 // the orchestrator readies a green draft PR before merging it (#697).
 func (c *Client) MarkPRReady(prNumber int) error {
+	if c.isForgejo() {
+		// NOT ported in M3, guarded explicitly: EditPullRequestOption on
+		// Forgejo 16.0.1 carries NO draft/wip toggle of any kind
+		// (swagger-verified, M3 stage A), and emulating it by rewriting a
+		// "WIP:" title prefix is not acceptable. Draft semantics for the
+		// Forgejo worker flow land with the M7 worker-flow decisions.
+		return c.forgejoUnsupported("MarkPRReady (no draft toggle in EditPullRequestOption; M7)")
+	}
 	out, err := c.ghExec("pr", "ready",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo)
@@ -3452,6 +3496,9 @@ func (c *Client) MarkPRReady(prNumber int) error {
 // same pass; they should let the next supervisor cycle re-validate and
 // re-mint against the new state (#547).
 func (c *Client) UpdateBranch(prNumber int) error {
+	if c.isForgejo() {
+		return c.fjUpdateBranch(prNumber)
+	}
 	out, err := c.ghExec("pr", "update-branch",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo)
@@ -3461,8 +3508,13 @@ func (c *Client) UpdateBranch(prNumber int) error {
 	return nil
 }
 
-// CloseIssue closes a GitHub issue and leaves a comment explaining why
+// CloseIssue closes an issue and leaves a comment explaining why.
+// Comment-then-close: a failed comment ABORTS the close (the issue stays
+// open) and an empty comment skips the comment step — callers rely on both.
 func (c *Client) CloseIssue(number int, comment string) error {
+	if c.isForgejo() {
+		return c.fjCloseIssue(number, comment)
+	}
 	if comment != "" {
 		out, err := c.ghExec("issue", "comment",
 			fmt.Sprint(number),
@@ -3483,6 +3535,9 @@ func (c *Client) CloseIssue(number int, comment string) error {
 
 // AddIssueLabel adds a label to an issue.
 func (c *Client) AddIssueLabel(issueNumber int, label string) error {
+	if c.isForgejo() {
+		return c.fjAddIssueLabel(issueNumber, label)
+	}
 	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
@@ -3502,6 +3557,9 @@ func (c *Client) EnsureLabel(name, color, description string) error {
 	if name == "" {
 		return fmt.Errorf("ensure label: empty name")
 	}
+	if c.isForgejo() {
+		return c.fjEnsureLabel(name, color, description)
+	}
 	args := []string{"label", "create", name, "--repo", c.Repo, "--force"}
 	if color = strings.TrimPrefix(strings.TrimSpace(color), "#"); color != "" {
 		args = append(args, "--color", color)
@@ -3516,8 +3574,13 @@ func (c *Client) EnsureLabel(name, color, description string) error {
 	return nil
 }
 
-// RemoveIssueLabel removes a label from an issue.
+// RemoveIssueLabel removes a label from an issue. Removing a label the issue
+// does not carry is a no-op success; removing a label that does not exist on
+// the repo at all is a loud error (gh parity on both forges).
 func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
+	if c.isForgejo() {
+		return c.fjRemoveIssueLabel(issueNumber, label)
+	}
 	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
@@ -3531,6 +3594,9 @@ func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
 
 // CommentIssue leaves a comment on an issue.
 func (c *Client) CommentIssue(issueNumber int, body string) error {
+	if c.isForgejo() {
+		return c.fjComment(issueNumber, body)
+	}
 	out, err := c.ghExec("issue", "comment",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
@@ -3578,8 +3644,12 @@ func (c *Client) ListIssueComments(issueNumber int) ([]IssueComment, error) {
 	return comments, nil
 }
 
-// CommentPR leaves a comment on a pull request.
+// CommentPR leaves a comment on a pull request. On Forgejo pulls share the
+// issue number space, so the same comment route serves both.
 func (c *Client) CommentPR(prNumber int, body string) error {
+	if c.isForgejo() {
+		return c.fjComment(prNumber, body)
+	}
 	out, err := c.ghExec("pr", "comment",
 		strconv.Itoa(prNumber),
 		"--repo", c.Repo,
@@ -3623,8 +3693,14 @@ func (c *Client) PRCommits(prNumber int) ([]string, error) {
 	return msgs, nil
 }
 
-// CreateRelease creates a GitHub release for the given tag.
+// CreateRelease creates a release for the given tag (already pushed by
+// CommitAndTag). The gh path generates release notes (--generate-notes);
+// Forgejo has no notes-generation equivalent, so there the release body stays
+// empty — a documented divergence, not a bug.
 func (c *Client) CreateRelease(tag, title string) error {
+	if c.isForgejo() {
+		return c.fjCreateRelease(tag, title)
+	}
 	out, err := c.ghExec("release", "create",
 		tag,
 		"--repo", c.Repo,
@@ -3940,8 +4016,11 @@ func FindBlockers(body string, patterns []string) []int {
 	return blockers
 }
 
-// CreateIssue creates a new GitHub issue and returns its number.
+// CreateIssue creates a new issue and returns its number.
 func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
+	if c.isForgejo() {
+		return c.fjCreateIssue(title, body, labels)
+	}
 	args := []string{
 		"issue", "create",
 		"--repo", c.Repo,
@@ -3970,8 +4049,11 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 	return n, nil
 }
 
-// EditIssueBody updates the body of a GitHub issue.
+// EditIssueBody updates the body of an issue (full replace).
 func (c *Client) EditIssueBody(number int, body string) error {
+	if c.isForgejo() {
+		return c.fjEditIssueBody(number, body)
+	}
 	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(number),
 		"--repo", c.Repo,

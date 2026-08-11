@@ -442,3 +442,22 @@ func containsStringFold(values []string, want string) bool {
 	}
 	return false
 }
+
+// #1172 M3 — the futile_recovery issue link must follow the configured forge;
+// the `#%d` fallback shape survives a missing repo or number.
+func TestOutcomeRepairIssueLinkForgeAware(t *testing.T) {
+	gh := config.ForgeConfig{}
+	fj := config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com/"}
+	if got := outcomeRepairIssueLink(gh, "o/r", 12); got != "https://github.com/o/r/issues/12" {
+		t.Errorf("github link = %q", got)
+	}
+	if got := outcomeRepairIssueLink(fj, "o/r", 12); got != "https://forge.example.com/o/r/issues/12" {
+		t.Errorf("forgejo link = %q (trailing base_url slash must be trimmed)", got)
+	}
+	if got := outcomeRepairIssueLink(fj, "   ", 12); got != "#12" {
+		t.Errorf("missing repo fallback = %q, want #12", got)
+	}
+	if got := outcomeRepairIssueLink(gh, "o/r", 0); got != "#0" {
+		t.Errorf("missing number fallback = %q, want #0", got)
+	}
+}
