@@ -213,7 +213,7 @@ func (m *liveTokenMonitor) observe(line string) (int, bool) {
 			}
 		}
 		if fr.Type == "turn.completed" && fr.Usage != nil {
-			if total := fr.Usage.InputTokens + fr.Usage.OutputTokens; total > m.totalTokens {
+			if total := codexBudgetUsage(fr.Usage); total > m.totalTokens {
 				m.totalTokens = total
 			}
 		}
@@ -287,9 +287,10 @@ func readCodexLiveUsage(threadID string) (int, bool) {
 				Type string `json:"type"`
 				Info *struct {
 					Total *struct {
-						InputTokens  int `json:"input_tokens"`
-						OutputTokens int `json:"output_tokens"`
-						TotalTokens  int `json:"total_tokens"`
+						InputTokens       int `json:"input_tokens"`
+						CachedInputTokens int `json:"cached_input_tokens"`
+						OutputTokens      int `json:"output_tokens"`
+						TotalTokens       int `json:"total_tokens"`
 					} `json:"total_token_usage"`
 				} `json:"info"`
 			} `json:"payload"`
@@ -297,9 +298,18 @@ func readCodexLiveUsage(threadID string) (int, bool) {
 		if json.Unmarshal([]byte(line), &event) != nil || event.Type != "event_msg" || event.Payload == nil || event.Payload.Type != "token_count" || event.Payload.Info == nil || event.Payload.Info.Total == nil {
 			continue
 		}
-		total := event.Payload.Info.Total.TotalTokens
+		// #1156: total_token_usage counts cached (replayed) input 1:1, so it
+		// grows by the whole context on every turn — 441k "observed" in four
+		// minutes of productive work. The budget charges only uncached spend,
+		// the same #952 semantics the claude measure uses.
+		usage := event.Payload.Info.Total
+		total := usage.TotalTokens
 		if total <= 0 {
-			total = event.Payload.Info.Total.InputTokens + event.Payload.Info.Total.OutputTokens
+			total = usage.InputTokens + usage.OutputTokens
+		}
+		total -= usage.CachedInputTokens
+		if total < 0 {
+			total = 0
 		}
 		if total > maxTokens {
 			maxTokens = total
@@ -339,4 +349,19 @@ func piBudgetUsage(usage *piUsageBlock) int {
 		return 0
 	}
 	return usage.Input + usage.Output + usage.CacheWrite
+}
+
+// codexBudgetUsage is claudeBudgetUsage's codex sibling (#1156): cached input
+// is replayed context and must not re-charge the ceiling on every turn. Codex
+// reports the cached subset explicitly, so the ceiling counts uncached input
+// plus output (reasoning is already inside output_tokens).
+func codexBudgetUsage(usage *codexUsageBlock) int {
+	if usage == nil {
+		return 0
+	}
+	uncachedInput := usage.InputTokens - usage.CachedInputTokens
+	if uncachedInput < 0 {
+		uncachedInput = 0
+	}
+	return uncachedInput + usage.OutputTokens
 }
