@@ -12,12 +12,13 @@
 # Config files with secrets
 *.yaml
 *.yml
-# But keep CI workflows and composite actions
+# But keep CI workflows and composite actions, on both forges
 !.github/workflows/*.yml
 !.github/dependabot.yml
 !.github/ISSUE_TEMPLATE/*.yml
 !.github/actions/**/*.yml
 !.github/actions/**/*.yaml
+!.forgejo/workflows/*.yml
 .claude/
 
 # Frontend build
