@@ -53,8 +53,8 @@ type futileRecoveryEvent struct {
 }
 
 var (
-	newOutcomeRepairIssueClient = func(repo string) outcomeRepairIssueClient {
-		return github.New(repo)
+	newOutcomeRepairIssueClient = func(repo string, fc config.ForgeConfig) outcomeRepairIssueClient {
+		return github.New(repo, fc)
 	}
 	newFutileRecoveryNotifier = func(cfg *config.Config) futileRecoveryNotifier {
 		n := notify.NewWithToken(cfg.Telegram.Token(), cfg.Telegram.Target, cfg.Telegram.Mode, cfg.Telegram.OpenclawURL)
@@ -117,7 +117,7 @@ func dispatchFutileOutcomeRecovery(cfg *config.Config, now time.Time) {
 			return
 		}
 
-		client := newOutcomeRepairIssueClient(cfg.Repo)
+		client := newOutcomeRepairIssueClient(cfg.Repo, cfg.Forge)
 		title := fmt.Sprintf("Outcome recovery blocked: %s is failing — repair delivery infrastructure", gate)
 		body := outcomeRepairIssueBody(gate, fingerprint, attempts, *health)
 		labels := outcomeRepairLabels(client, cfg)

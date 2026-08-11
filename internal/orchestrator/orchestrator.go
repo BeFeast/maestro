@@ -90,7 +90,7 @@ type Orchestrator struct {
 	reviewProduceMu       sync.Mutex
 	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
-	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig)
+	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -257,7 +257,7 @@ func New(cfg *config.Config) *Orchestrator {
 		n.SetDigestMode(true)
 		log.Printf("[orch] digest mode enabled — notifications will be batched per cycle")
 	}
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 	o := &Orchestrator{
 		cfg:      cfg,
 		notifier: n,

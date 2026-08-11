@@ -2,12 +2,15 @@ package orchestrator
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"os"
 	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/forge"
+	"github.com/befeast/maestro/internal/forgejo"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/review"
 )
@@ -64,13 +67,14 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 	// this call and the hot-reload writes, so reading o.cfg here is
 	// race-free, while the spawned goroutine below must never touch it.
 	rp := o.cfg.ReviewProducer
+	fc := o.cfg.Forge
 	go func() {
 		defer func() {
 			o.reviewProduceMu.Lock()
 			delete(o.reviewProduceInFlight, prNumber)
 			o.reviewProduceMu.Unlock()
 		}()
-		produce(prNumber, headSHA, missing, rp)
+		produce(prNumber, headSHA, missing, rp, fc)
 	}()
 }
 
@@ -115,17 +119,40 @@ func reviewLenses(streams []string, rp config.ReviewProducerConfig) []review.Len
 	return lenses
 }
 
-// produceReviewStreams runs the producer for one PR head. The forge is the
-// GitHub client for now; per-project forge selection (Forgejo) arrives with
-// the Forgejo project wiring — the producer itself is already forge-agnostic.
-// Runs on the producer goroutine: everything it needs arrives by value.
-func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig) {
+// reviewForge selects the producer's forge client per row (#1172): a forgejo
+// row gets a Forgejo REST client built from the row's forge config, every
+// other row keeps the GitHub gh-CLI forge. The PAT resolves from the
+// environment HERE, at use time (config never reads env); an empty token is an
+// explicit error — fail closed rather than silently reviewing the GitHub
+// mirror of a Forgejo repo. fc travels by value: this runs on the producer
+// goroutine, which must not read o.cfg (hot-reloaded without a lock).
+func reviewForge(fc config.ForgeConfig) (forge.Client, error) {
+	if !fc.IsForgejo() {
+		return github.NewForge(), nil
+	}
+	token := strings.TrimSpace(os.Getenv(fc.EffectiveTokenEnv()))
+	if token == "" {
+		return nil, fmt.Errorf("forge token env %s is empty; export it in the daemon environment", fc.EffectiveTokenEnv())
+	}
+	return forgejo.New(fc.APIRoot(), token), nil
+}
+
+// produceReviewStreams runs the producer for one PR head. The forge is
+// selected per row from the snapshotted forge config (#1172); the producer
+// itself is forge-agnostic. Runs on the producer goroutine: everything it
+// needs arrives by value.
+func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
 	lenses := reviewLenses(streams, rp)
 	if len(lenses) == 0 {
 		return
 	}
+	fg, err := reviewForge(fc)
+	if err != nil {
+		log.Printf("[orch] PR #%d: llm-review producer: %v", prNumber, err)
+		return
+	}
 	p := &review.Producer{
-		Forge:             github.NewForge(),
+		Forge:             fg,
 		Repo:              o.repo,
 		Lenses:            lenses,
 		PendingStaleAfter: rp.EffectivePendingStale(),

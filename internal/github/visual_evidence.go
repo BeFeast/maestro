@@ -14,7 +14,7 @@ import (
 
 // PRChangedFiles returns the repo-relative paths changed by a PR.
 func (c *Client) PRChangedFiles(prNumber int) ([]string, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", c.Repo, prNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/files?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d files: %w", prNumber, err)
 	}
@@ -53,7 +53,7 @@ func (c *Client) PRVisualEvidenceAttached(prNumber int) (bool, error) {
 		return true, nil
 	}
 
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return false, fmt.Errorf("list PR %d comments: %w", prNumber, err)
 	}

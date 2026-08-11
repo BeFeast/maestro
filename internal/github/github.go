@@ -21,6 +21,9 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/forgejo"
 )
 
 type greptileCheckRun struct {
@@ -130,6 +133,21 @@ type PR struct {
 
 type Client struct {
 	Repo string
+
+	// forgeKind routes the transport (#1172): "github" (the zero value's
+	// effective meaning and the historical default) keeps every method on the
+	// gh CLI path; "forgejo" routes ported methods to fj and makes EVERY
+	// unported method fail loud with ErrForgejoNotSupported. It must never be
+	// possible for a forgejo-mode client to fall through to gh: the repo is
+	// mirrored on github.com, so a silent fallback would read/write the GitHub
+	// mirror instead of the Forgejo original.
+	forgeKind string
+	// fj is the Forgejo REST client; non-nil only in forgejo mode with a
+	// resolvable token.
+	fj *forgejo.Client
+	// forgeErr records a construction-time fault (empty token env) surfaced on
+	// every call instead of at construction, keeping New infallible.
+	forgeErr error
 }
 
 type RateLimitBucket struct {
@@ -218,8 +236,100 @@ func (rp restPull) pr() PR {
 	}
 }
 
-func New(repo string) *Client {
-	return &Client{Repo: repo}
+// New builds the client for one repo on one forge (#1172). A zero
+// config.ForgeConfig (or kind "github") yields the historical GitHub client,
+// byte-identical in behavior. Kind "forgejo" resolves the PAT from the
+// configured token env NOW (config never reads the environment itself); an
+// empty token becomes forgeErr — surfaced loudly on every call — rather than a
+// construction failure, so all existing call sites stay infallible.
+func New(repo string, fc config.ForgeConfig) *Client {
+	c := &Client{Repo: repo, forgeKind: fc.EffectiveKind()}
+	if fc.IsForgejo() {
+		token := strings.TrimSpace(os.Getenv(fc.EffectiveTokenEnv()))
+		if token == "" {
+			c.forgeErr = fmt.Errorf("forge token env %s is empty; export it in the daemon environment", fc.EffectiveTokenEnv())
+		} else {
+			c.fj = forgejo.New(fc.APIRoot(), token)
+		}
+	}
+	return c
+}
+
+// ErrForgejoNotSupported marks a Client method that has no Forgejo transport
+// yet. Every forgejo-mode error for an unported method is errors.Is-matchable
+// against it, so callers can distinguish "this operation does not exist on
+// this forge yet" from a transport failure.
+var ErrForgejoNotSupported = errors.New("not supported on forgejo yet (#1172)")
+
+// isForgejo reports whether this client routes to Forgejo. The zero Client
+// (and every github/empty-kind construction) answers false.
+func (c *Client) isForgejo() bool {
+	return c.forgeKind == config.ForgeKindForgejo
+}
+
+// forgejoUnsupported builds the fail-loud error for an unported method on a
+// forgejo-mode client. It always wraps ErrForgejoNotSupported; when the client
+// also failed to resolve its token at construction, that more actionable fault
+// is surfaced in the same message.
+func (c *Client) forgejoUnsupported(what string) error {
+	if c.forgeErr != nil {
+		return fmt.Errorf("%s: repo %s: %v: %w", what, c.Repo, c.forgeErr, ErrForgejoNotSupported)
+	}
+	return fmt.Errorf("%s: repo %s: %w", what, c.Repo, ErrForgejoNotSupported)
+}
+
+// ---------------------------------------------------------------------------
+// Receiver chokes (#1172). The repo is MIRRORED: it exists on github.com AND
+// on the Forgejo instance, so any receiver method that reaches the gh CLI on a
+// forgejo-mode client silently reads/writes the GitHub mirror instead of the
+// Forgejo original. Every receiver-method body in this package MUST therefore
+// call these chokes instead of the package-level gh functions; the package
+// functions remain only for the chokes themselves, package-level (non-Client)
+// code, and the forge.go Forge adapter (github-only by construction). Enforced
+// by TestForgejoModeFailsLoud and the grep check in the M2 spec.
+// ---------------------------------------------------------------------------
+
+// ghAPI is the receiver-bound choke over the package ghAPI.
+func (c *Client) ghAPI(endpoint string) ([]byte, error) {
+	if c.isForgejo() {
+		return nil, c.forgejoUnsupported("gh api " + endpoint)
+	}
+	return ghAPI(endpoint)
+}
+
+// ghAPIWithArgs is the receiver-bound choke over the package ghAPIWithArgs.
+func (c *Client) ghAPIWithArgs(endpoint string, args ...string) ([]byte, error) {
+	if c.isForgejo() {
+		return nil, c.forgejoUnsupported(strings.TrimSpace("gh api " + endpoint + " " + strings.Join(args, " ")))
+	}
+	return ghAPIWithArgs(endpoint, args...)
+}
+
+// ghAPIWithArgsContext is the receiver-bound choke over the package
+// ghAPIWithArgsContext.
+func (c *Client) ghAPIWithArgsContext(ctx context.Context, endpoint string, args ...string) ([]byte, error) {
+	if c.isForgejo() {
+		return nil, c.forgejoUnsupported(strings.TrimSpace("gh api " + endpoint + " " + strings.Join(args, " ")))
+	}
+	return ghAPIWithArgsContext(ctx, endpoint, args...)
+}
+
+// ghExec is the receiver-bound choke for the ghCommand(...).CombinedOutput()
+// call shape (gh subcommands: pr/issue/release/api graphql).
+func (c *Client) ghExec(args ...string) ([]byte, error) {
+	if c.isForgejo() {
+		return nil, c.forgejoUnsupported("gh " + strings.Join(args, " "))
+	}
+	return ghCommand(args...).CombinedOutput()
+}
+
+// ghOutputContext is the receiver-bound choke for the
+// ghCommandContext(ctx, ...).Output() call shape (the GraphQL Projects reads).
+func (c *Client) ghOutputContext(ctx context.Context, args ...string) ([]byte, error) {
+	if c.isForgejo() {
+		return nil, c.forgejoUnsupported("gh " + strings.Join(args, " "))
+	}
+	return ghCommandContext(ctx, args...).Output()
 }
 
 func ghAPI(endpoint string) ([]byte, error) {
@@ -1370,7 +1480,7 @@ func parseRateLimitStatus(out []byte) (RateLimitStatus, error) {
 }
 
 func (c *Client) RateLimit() (RateLimitStatus, error) {
-	out, err := ghAPI("rate_limit")
+	out, err := c.ghAPI("rate_limit")
 	if err != nil {
 		return RateLimitStatus{}, err
 	}
@@ -1815,7 +1925,7 @@ func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
 		endpoint += "&labels=" + url.QueryEscape(label)
 	}
 
-	out, err := ghAPI(endpoint)
+	out, err := c.ghAPI(endpoint)
 	if err != nil {
 		return nil, fmt.Errorf("list open issues: %w", err)
 	}
@@ -1867,7 +1977,7 @@ func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
 		endpoint += "&labels=" + url.QueryEscape(label)
 	}
 
-	out, err := ghAPIWithArgs(endpoint, "--paginate")
+	out, err := c.ghAPIWithArgs(endpoint, "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list all open issues: %w", err)
 	}
@@ -1885,7 +1995,7 @@ func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
 
 // GetIssue fetches a single issue by number
 func (c *Client) GetIssue(number int) (Issue, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
 		return Issue{}, fmt.Errorf("get issue %d: %w", number, err)
 	}
@@ -1910,7 +2020,7 @@ func (c *Client) IssueBody(number int) (string, error) {
 
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
 		return false, fmt.Errorf("get issue %d: %w", number, err)
 	}
@@ -1925,7 +2035,7 @@ func (c *Client) IsIssueClosed(number int) (bool, error) {
 
 // ListOpenPRs returns all open PRs
 func (c *Client) ListOpenPRs() ([]PR, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo))
 	if err != nil {
 		return nil, fmt.Errorf("list open PRs: %w", err)
 	}
@@ -1941,7 +2051,7 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 // for why the reconciliation loop (#827) needs the full open set rather than
 // page one before it uses absence as a close signal.
 func (c *Client) ListAllOpenPRs() ([]PR, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list all open PRs: %w", err)
 	}
@@ -1958,7 +2068,7 @@ func (c *Client) ListAllOpenPRs() ([]PR, error) {
 }
 
 func (c *Client) listClosedPRs() ([]PR, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls?state=closed&per_page=100&sort=updated&direction=desc", c.Repo))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls?state=closed&per_page=100&sort=updated&direction=desc", c.Repo))
 	if err != nil {
 		return nil, fmt.Errorf("list closed PRs: %w", err)
 	}
@@ -1977,7 +2087,7 @@ func (c *Client) ListClosedPRs() ([]PR, error) {
 }
 
 func (c *Client) getRESTPull(prNumber int) (restPull, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber))
 	if err != nil {
 		return restPull{}, err
 	}
@@ -2055,7 +2165,7 @@ func (c *Client) LatestMergedPRGenerations(ctx context.Context) ([]PRMergeInfo, 
 	if err != nil {
 		return nil, err
 	}
-	out, err := ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s/pulls?state=closed&base=%s&per_page=100&sort=updated&direction=desc", c.Repo, url.QueryEscape(deliveryBase)), "--paginate")
+	out, err := c.ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s/pulls?state=closed&base=%s&per_page=100&sort=updated&direction=desc", c.Repo, url.QueryEscape(deliveryBase)), "--paginate")
 	if err != nil {
 		return nil, errors.New("list merged delivery generations failed")
 	}
@@ -2074,7 +2184,7 @@ func (c *Client) LatestMergedPRGenerations(ctx context.Context) ([]PRMergeInfo, 
 // Repositories using trunk/master are supported, and a newer merge into an
 // unrelated release/feature branch cannot supersede a default-branch delivery.
 func (c *Client) RepositoryDefaultBranch(ctx context.Context) (string, error) {
-	out, err := ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s", c.Repo))
+	out, err := c.ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s", c.Repo))
 	if err != nil {
 		return "", errors.New("read repository delivery branch failed")
 	}
@@ -2142,7 +2252,7 @@ func (c *Client) BranchHeadSHA(branch string) (string, error) {
 	if branch == "" {
 		return "", fmt.Errorf("empty branch")
 	}
-	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, url.PathEscape(branch)))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, url.PathEscape(branch)))
 	if err != nil {
 		return "", err
 	}
@@ -2160,7 +2270,7 @@ func (c *Client) BranchHeadSHA(branch string) (string, error) {
 }
 
 func (c *Client) checkRunsForSHA(sha string) ([]greptileCheckRun, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=100", c.Repo, sha), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/commits/%s/check-runs?per_page=100", c.Repo, sha), "--paginate")
 	if err != nil {
 		return nil, err
 	}
@@ -2172,7 +2282,7 @@ func (c *Client) checkRunsForSHA(sha string) ([]greptileCheckRun, error) {
 }
 
 func (c *Client) combinedStatusForSHA(sha string) (combinedStatusResponse, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s/status", c.Repo, sha))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/commits/%s/status", c.Repo, sha))
 	if err != nil {
 		return combinedStatusResponse{}, err
 	}
@@ -2193,7 +2303,7 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 		"--base", base,
 		"--head", head,
 	}
-	out, err := ghCommand(args...).CombinedOutput()
+	out, err := c.ghExec(args...)
 	if err != nil {
 		return 0, fmt.Errorf("gh pr create: %w\n%s", err, out)
 	}
@@ -2212,11 +2322,11 @@ func (c *Client) CreatePR(title, body, base, head string) (int, error) {
 
 // UpdatePRBody replaces a pull request body.
 func (c *Client) UpdatePRBody(prNumber int, body string) error {
-	out, err := ghCommand(
+	out, err := c.ghExec(
 		"pr", "edit", strconv.Itoa(prNumber),
 		"--repo", c.Repo,
 		"--body", body,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh pr edit %d --body: %w\n%s", prNumber, err, out)
 	}
@@ -2512,7 +2622,7 @@ func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdic
 
 commentFallback:
 	// --- 3. Fallback: check PR comments (legacy Greptile comment-mode) ---
-	commentsOut, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
+	commentsOut, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return ReviewStreamVerdict{}, fmt.Errorf("list issue comments for PR %d: %w", prNumber, err)
 	}
@@ -2608,7 +2718,7 @@ func (c *Client) commentScopedToHead(comment issueComment, sha string) (scoped b
 // review comment-fallback path calls it, which runs when no review check run
 // exists at all.
 func (c *Client) commitCommittedAt(sha string) (time.Time, error) {
-	out, err := ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, sha))
+	out, err := c.ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, sha))
 	if err != nil {
 		return time.Time{}, err
 	}
@@ -2982,7 +3092,7 @@ func (c *Client) PRHighSeverityReviewOnHead(prNumber int) (sha string, findings 
 func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
 	// Routed through the shared wrapper (#797) so this per-cycle read gets the
 	// rate-limit backoff, the conditional-request cache, and usage accounting.
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, err
 	}
@@ -2996,17 +3106,17 @@ func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, 
 // ClosePR closes a PR without merging and leaves a comment explaining why.
 func (c *Client) ClosePR(prNumber int, comment string) error {
 	if comment != "" {
-		out, err := ghCommand("pr", "comment",
+		out, err := c.ghExec("pr", "comment",
 			fmt.Sprint(prNumber),
 			"--repo", c.Repo,
-			"--body", comment).CombinedOutput()
+			"--body", comment)
 		if err != nil {
 			return fmt.Errorf("gh pr comment %d: %w\n%s", prNumber, err, out)
 		}
 	}
-	out, err := ghCommand("pr", "close",
+	out, err := c.ghExec("pr", "close",
 		fmt.Sprint(prNumber),
-		"--repo", c.Repo).CombinedOutput()
+		"--repo", c.Repo)
 	if err != nil {
 		return fmt.Errorf("gh pr close %d: %w\n%s", prNumber, err, out)
 	}
@@ -3097,7 +3207,7 @@ type checkAnnotation struct {
 }
 
 func (c *Client) checkRunAnnotations(id int64) ([]checkAnnotation, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", c.Repo, id), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/check-runs/%d/annotations?per_page=100", c.Repo, id), "--paginate")
 	if err != nil {
 		return nil, err
 	}
@@ -3249,12 +3359,12 @@ func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
 	if expectedHeadSHA == "" {
 		return fmt.Errorf("merge PR %d: expected head SHA is required", prNumber)
 	}
-	out, err := ghCommand("pr", "merge",
+	out, err := c.ghExec("pr", "merge",
 		fmt.Sprint(prNumber),
 		"--repo", c.Repo,
 		"--squash",
 		"--delete-branch",
-		"--match-head-commit", expectedHeadSHA).CombinedOutput()
+		"--match-head-commit", expectedHeadSHA)
 	if err != nil {
 		return fmt.Errorf("gh pr merge %d at head %s: %w\n%s", prNumber, expectedHeadSHA, err, out)
 	}
@@ -3265,9 +3375,9 @@ func (c *Client) MergePRAtHead(prNumber int, expectedHeadSHA string) error {
 // `gh pr ready`). `gh pr merge` on a draft fails with "still a draft", so
 // the orchestrator readies a green draft PR before merging it (#697).
 func (c *Client) MarkPRReady(prNumber int) error {
-	out, err := ghCommand("pr", "ready",
+	out, err := c.ghExec("pr", "ready",
 		fmt.Sprint(prNumber),
-		"--repo", c.Repo).CombinedOutput()
+		"--repo", c.Repo)
 	if err != nil {
 		return fmt.Errorf("gh pr ready %d: %w\n%s", prNumber, err, out)
 	}
@@ -3285,9 +3395,9 @@ func (c *Client) MarkPRReady(prNumber int) error {
 // same pass; they should let the next supervisor cycle re-validate and
 // re-mint against the new state (#547).
 func (c *Client) UpdateBranch(prNumber int) error {
-	out, err := ghCommand("pr", "update-branch",
+	out, err := c.ghExec("pr", "update-branch",
 		fmt.Sprint(prNumber),
-		"--repo", c.Repo).CombinedOutput()
+		"--repo", c.Repo)
 	if err != nil {
 		return fmt.Errorf("gh pr update-branch %d: %w\n%s", prNumber, err, out)
 	}
@@ -3297,17 +3407,17 @@ func (c *Client) UpdateBranch(prNumber int) error {
 // CloseIssue closes a GitHub issue and leaves a comment explaining why
 func (c *Client) CloseIssue(number int, comment string) error {
 	if comment != "" {
-		out, err := ghCommand("issue", "comment",
+		out, err := c.ghExec("issue", "comment",
 			fmt.Sprint(number),
 			"--repo", c.Repo,
-			"--body", comment).CombinedOutput()
+			"--body", comment)
 		if err != nil {
 			return fmt.Errorf("gh issue comment %d: %w\n%s", number, err, out)
 		}
 	}
-	out, err := ghCommand("issue", "close",
+	out, err := c.ghExec("issue", "close",
 		fmt.Sprint(number),
-		"--repo", c.Repo).CombinedOutput()
+		"--repo", c.Repo)
 	if err != nil {
 		return fmt.Errorf("gh issue close %d: %w\n%s", number, err, out)
 	}
@@ -3316,11 +3426,11 @@ func (c *Client) CloseIssue(number int, comment string) error {
 
 // AddIssueLabel adds a label to an issue.
 func (c *Client) AddIssueLabel(issueNumber int, label string) error {
-	out, err := ghCommand("issue", "edit",
+	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--add-label", label,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh issue edit --add-label: %w\n%s", err, out)
 	}
@@ -3342,7 +3452,7 @@ func (c *Client) EnsureLabel(name, color, description string) error {
 	if description = strings.TrimSpace(description); description != "" {
 		args = append(args, "--description", description)
 	}
-	out, err := ghCommand(args...).CombinedOutput()
+	out, err := c.ghExec(args...)
 	if err != nil {
 		return fmt.Errorf("gh label create %q: %w\n%s", name, err, out)
 	}
@@ -3351,11 +3461,11 @@ func (c *Client) EnsureLabel(name, color, description string) error {
 
 // RemoveIssueLabel removes a label from an issue.
 func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
-	out, err := ghCommand("issue", "edit",
+	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--remove-label", label,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh issue edit --remove-label: %w\n%s", err, out)
 	}
@@ -3364,11 +3474,11 @@ func (c *Client) RemoveIssueLabel(issueNumber int, label string) error {
 
 // CommentIssue leaves a comment on an issue.
 func (c *Client) CommentIssue(issueNumber int, body string) error {
-	out, err := ghCommand("issue", "comment",
+	out, err := c.ghExec("issue", "comment",
 		strconv.Itoa(issueNumber),
 		"--repo", c.Repo,
 		"--body", body,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh issue comment: %w\n%s", err, out)
 	}
@@ -3381,7 +3491,7 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 // without a webhook dependency. GitHub treats PRs as issues, so this also
 // works for PR numbers, but the supervisor only calls it for issues.
 func (c *Client) ListIssueComments(issueNumber int) ([]IssueComment, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, issueNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, issueNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list issue comments for #%d: %w", issueNumber, err)
 	}
@@ -3410,11 +3520,11 @@ func (c *Client) ListIssueComments(issueNumber int) ([]IssueComment, error) {
 
 // CommentPR leaves a comment on a pull request.
 func (c *Client) CommentPR(prNumber int, body string) error {
-	out, err := ghCommand("pr", "comment",
+	out, err := c.ghExec("pr", "comment",
 		strconv.Itoa(prNumber),
 		"--repo", c.Repo,
 		"--body", body,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh pr comment: %w\n%s", err, out)
 	}
@@ -3423,7 +3533,7 @@ func (c *Client) CommentPR(prNumber int, body string) error {
 
 // PRLabels returns the labels on a PR.
 func (c *Client) PRLabels(prNumber int) ([]string, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/labels?per_page=100", c.Repo, prNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/labels?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d labels: %w", prNumber, err)
 	}
@@ -3436,7 +3546,7 @@ func (c *Client) PRLabels(prNumber int) ([]string, error) {
 
 // PRCommits returns commit messages for a PR.
 func (c *Client) PRCommits(prNumber int) ([]string, error) {
-	out, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", c.Repo, prNumber), "--paginate")
+	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d commits: %w", prNumber, err)
 	}
@@ -3449,11 +3559,11 @@ func (c *Client) PRCommits(prNumber int) ([]string, error) {
 
 // CreateRelease creates a GitHub release for the given tag.
 func (c *Client) CreateRelease(tag, title string) error {
-	out, err := ghCommand("release", "create",
+	out, err := c.ghExec("release", "create",
 		tag,
 		"--repo", c.Repo,
 		"--title", title,
-		"--generate-notes").CombinedOutput()
+		"--generate-notes")
 	if err != nil {
 		return fmt.Errorf("gh release create %s: %w\n%s", tag, err, out)
 	}
@@ -3776,7 +3886,7 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 		args = append(args, "--label", l)
 	}
 
-	out, err := ghCommand(args...).CombinedOutput()
+	out, err := c.ghExec(args...)
 	if err != nil {
 		return 0, fmt.Errorf("gh issue create: %w\n%s", err, out)
 	}
@@ -3796,11 +3906,11 @@ func (c *Client) CreateIssue(title, body string, labels []string) (int, error) {
 
 // EditIssueBody updates the body of a GitHub issue.
 func (c *Client) EditIssueBody(number int, body string) error {
-	out, err := ghCommand("issue", "edit",
+	out, err := c.ghExec("issue", "edit",
 		strconv.Itoa(number),
 		"--repo", c.Repo,
 		"--body", body,
-	).CombinedOutput()
+	)
 	if err != nil {
 		return fmt.Errorf("gh issue edit %d --body: %w\n%s", number, err, out)
 	}
@@ -4443,7 +4553,7 @@ func (c *Client) CollectPRReviewFeedback(prNumber int, streams []string) (string
 
 	// 1. Fetch issue-level comments (Greptile summary with confidence score),
 	// via the shared wrapper (#797) for backoff + conditional caching.
-	issueCommentsOut, err := ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
+	issueCommentsOut, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
 	if err == nil {
 		var comments []struct {
 			Body string `json:"body"`

@@ -854,7 +854,7 @@ func runCmd(args []string) {
 		// Start HTTP server if configured
 		if cfg.Server.Port > 0 {
 			srv := server.New(cfg, refreshCh)
-			srv.SetActionDeps(github.New(cfg.Repo), nil)
+			srv.SetActionDeps(github.New(cfg.Repo, cfg.Forge), nil)
 			if err := srv.SetApprovalStore(approvalsMode, *approvalsDB); err != nil {
 				log.Fatalf("run: open approvals store: %v", err)
 			}
@@ -917,7 +917,7 @@ func runCmd(args []string) {
 			// Start HTTP server if configured
 			if c.Server.Port > 0 {
 				srv := server.New(c, refreshCh)
-				srv.SetActionDeps(github.New(c.Repo), nil)
+				srv.SetActionDeps(github.New(c.Repo, c.Forge), nil)
 				if err := srv.SetApprovalStore(approvalsMode, *approvalsDB); err != nil {
 					log.Fatalf("[%s] run: open approvals store: %v", c.SessionPrefix, err)
 				}
@@ -993,7 +993,7 @@ func superviseCmd(args []string) {
 	if *dryRun {
 		cfg.Supervisor.DryRun = true
 	}
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 	// The cycle is context-aware (#1119): a cancelled ctx stops it at the next
 	// phase boundary. SIGINT/SIGTERM cancel it for the looping command below;
 	// --once inherits the same ctx and cancels it on return.
@@ -1187,7 +1187,7 @@ func superviseApprovalCmd(action string, args []string, defaultConfigPath string
 	// Execute the now-approved approval. Synchronous and blocking; the
 	// caller (operator) sees the result on stdout and via exit code.
 	ex := &approver.Executor{
-		GH:        github.New(cfg.Repo),
+		GH:        github.New(cfg.Repo, cfg.Forge),
 		Worktrees: approver.WorktreeRemoverFunc(worker.RemoveWorktree),
 		Cfg:       cfg,
 		Sessions:  approver.SessionLookupFunc(st.SessionAt),
@@ -1389,7 +1389,7 @@ var deliveryFreshnessCheckerFactory = func(cfg *config.Config) approver.Delivery
 	if cfg == nil {
 		return nil
 	}
-	return approver.NewGitHubDeliveryFreshnessChecker(github.New(cfg.Repo), cfg.Repo, cfg.LocalPath)
+	return approver.NewGitHubDeliveryFreshnessChecker(github.New(cfg.Repo, cfg.Forge), cfg.Repo, cfg.LocalPath)
 }
 
 var deliveryCheckoutPreparerFactory = func(*config.Config) approver.CheckoutPreparer { return nil }
@@ -1743,7 +1743,7 @@ func serveCmd(args []string) {
 	refreshCh := make(chan struct{}, 1)
 	log.Printf("serving dashboard — repo=%s addr=%s:%d read_only=%v", cfg.Repo, cfg.Server.Host, cfg.Server.Port, cfg.Server.ReadOnly)
 	srv := server.New(cfg, refreshCh)
-	srv.SetActionDeps(github.New(cfg.Repo), nil)
+	srv.SetActionDeps(github.New(cfg.Repo, cfg.Forge), nil)
 	if err := srv.Start(ctx); err != nil {
 		log.Fatalf("serve: %v", err)
 	}
@@ -1952,7 +1952,7 @@ func showProjectStatus(cfg *config.Config, jsonOutput bool) {
 	})
 
 	// Fetch CI status for pr_open sessions
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 	ciStatuses := make(map[string]string) // session name → CI display string
 	for _, name := range names {
 		sess := s.Sessions[name]
@@ -2575,7 +2575,7 @@ func spawnCmd(args []string) {
 	}
 
 	// Fetch issue details via gh CLI
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 	issues, err := gh.ListOpenIssues(nil)
 	if err != nil {
 		log.Fatalf("fetch issues: %v", err)
@@ -3093,7 +3093,7 @@ func versionBumpCmd(args []string) {
 	}
 
 	cfg := loadConfig(*configPath)
-	gh := github.New(cfg.Repo)
+	gh := github.New(cfg.Repo, cfg.Forge)
 
 	if *sinceLastTag {
 		result, err := versioning.RunSinceLastTag(cfg, gh)

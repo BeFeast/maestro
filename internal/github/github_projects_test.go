@@ -5,10 +5,12 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/befeast/maestro/internal/config"
 )
 
 func TestDiscoverProject_RequiresOrg(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	// DiscoverProject makes real API calls; just verify it doesn't panic
 	_ = c
 }
@@ -66,13 +68,13 @@ func TestParseDiscoverProjectResponse_UserOwner(t *testing.T) {
 }
 
 func TestSyncIssueStatus_NilProjectField(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	// A nil ProjectField should be a no-op (not panic)
 	c.SyncIssueStatus(nil, 1, "Todo")
 }
 
 func TestListNonDoneProjectItems_NilProjectField(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	_, err := c.ListNonDoneProjectItems(nil)
 	if err == nil {
 		t.Error("expected error for nil ProjectField")
@@ -356,12 +358,12 @@ func TestResolveProjectStatusOption(t *testing.T) {
 }
 
 func TestSyncIssueStatusOneOf_NilProjectField(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	c.SyncIssueStatusOneOf(nil, 1, "In Review", "Review", "In Progress")
 }
 
 func TestTrySyncIssueStatusOneOf_NilProjectField(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	if c.TrySyncIssueStatusOneOf(nil, 1, "In Review") {
 		t.Fatal("TrySyncIssueStatusOneOf should report false for nil project field")
 	}
@@ -495,7 +497,7 @@ func TestParseProjectItemStatusCountsResponse_SurfacesGraphQLErrors(t *testing.T
 }
 
 func TestListProjectItemStatusCounts_NilProjectField(t *testing.T) {
-	c := New("owner/repo")
+	c := New("owner/repo", config.ForgeConfig{})
 	if _, _, err := c.ListProjectItemStatusCounts(nil); err == nil {
 		t.Fatal("expected error for nil ProjectField")
 	}

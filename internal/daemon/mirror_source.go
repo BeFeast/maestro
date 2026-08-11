@@ -27,10 +27,12 @@ func (d *Daemon) newReadSource(repo string, getCfg func() *config.Config) *mirro
 		return nil
 	}
 	horizon := d.mirrorHorizon
+	var fc config.ForgeConfig
 	if cfg := getCfg(); cfg != nil {
 		horizon = cfg.GitHubMirror.StaleHorizon()
+		fc = cfg.Forge
 	}
-	return mirrorstore.NewSource(github.New(repo), d.mirror, repo, mirrorstore.SourceOptions{
+	return mirrorstore.NewSource(github.New(repo, fc), d.mirror, repo, mirrorstore.SourceOptions{
 		Horizon: horizon,
 		APIDirect: func() bool {
 			cfg := getCfg()
@@ -59,7 +61,11 @@ func (d *Daemon) runMirrorReconcile(ctx context.Context, name, repo string, getC
 	if d.mirror == nil {
 		return
 	}
-	rec := mirrorstore.NewReconciler(d.mirror, github.New(repo), repo)
+	var fc config.ForgeConfig
+	if cfg := getCfg(); cfg != nil {
+		fc = cfg.Forge
+	}
+	rec := mirrorstore.NewReconciler(d.mirror, github.New(repo, fc), repo)
 	interval := reconcileInterval(getCfg)
 	log.Printf("[%s] mirror reconcile loop started — repo=%s cadence=%s", name, repo, interval)
 	timer := time.NewTimer(interval)

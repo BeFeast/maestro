@@ -85,7 +85,7 @@ func (c *Client) DiscoverProject(projectNumber int) (*ProjectField, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", "graphql", "-f", "query="+query).Output()
+	out, err := c.ghOutputContext(ctx, "api", "graphql", "-f", "query="+query)
 	if err != nil {
 		return nil, fmt.Errorf("discover project %d: %w", projectNumber, err)
 	}
@@ -288,7 +288,7 @@ func (c *Client) fetchProjectItemsPage(projectID, cursor string) ([]byte, error)
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", "graphql", "-f", "query="+query).Output()
+	out, err := c.ghOutputContext(ctx, "api", "graphql", "-f", "query="+query)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, fmt.Errorf("graphql project items: %w\nstderr: %s", err, exitErr.Stderr)
@@ -406,7 +406,7 @@ func (c *Client) ListProjectItemStatusCounts(pf *ProjectField) ([]ProjectBoardCo
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", "graphql", "-f", "query="+query).Output()
+	out, err := c.ghOutputContext(ctx, "api", "graphql", "-f", "query="+query)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return nil, 0, fmt.Errorf("graphql project status counts: %w\nstderr: %s", err, exitErr.Stderr)
@@ -534,7 +534,7 @@ func (c *Client) TrySyncIssueStatusOneOf(pf *ProjectField, issueNumber int, cand
 func (c *Client) getIssueNodeID(issueNumber int) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", fmt.Sprintf("repos/%s/issues/%d", c.Repo, issueNumber)).Output()
+	out, err := c.ghOutputContext(ctx, "api", fmt.Sprintf("repos/%s/issues/%d", c.Repo, issueNumber))
 	if err != nil {
 		return "", fmt.Errorf("gh api issue %d: %w", issueNumber, err)
 	}
@@ -568,7 +568,7 @@ func (c *Client) addToProject(projectID, contentID string) (string, error) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", "graphql", "-f", "query="+query).Output()
+	out, err := c.ghOutputContext(ctx, "api", "graphql", "-f", "query="+query)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return "", fmt.Errorf("graphql addProjectV2ItemById: %w\nstderr: %s\nstdout: %s", err, exitErr.Stderr, out)
@@ -618,7 +618,7 @@ func (c *Client) setProjectItemStatus(projectID, itemID, fieldID, optionID strin
 
 	ctx, cancel := context.WithTimeout(context.Background(), ghTimeout)
 	defer cancel()
-	out, err := ghCommandContext(ctx, "api", "graphql", "-f", "query="+query).Output()
+	out, err := c.ghOutputContext(ctx, "api", "graphql", "-f", "query="+query)
 	if err != nil {
 		if exitErr, ok := err.(*exec.ExitError); ok {
 			return fmt.Errorf("graphql updateProjectV2ItemFieldValue: %w\nstderr: %s\nstdout: %s", err, exitErr.Stderr, out)
