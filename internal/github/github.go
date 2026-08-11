@@ -1920,6 +1920,9 @@ func (c *Client) ListOpenIssues(labels []string) ([]Issue, error) {
 }
 
 func (c *Client) listOpenIssuesByLabel(label string) ([]Issue, error) {
+	if c.isForgejo() {
+		return c.fjListOpenIssuesByLabel(label, false)
+	}
 	endpoint := fmt.Sprintf("repos/%s/issues?state=open&per_page=100", c.Repo)
 	if label != "" {
 		endpoint += "&labels=" + url.QueryEscape(label)
@@ -1972,6 +1975,9 @@ func (c *Client) ListAllOpenIssues(labels []string) ([]Issue, error) {
 }
 
 func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
+	if c.isForgejo() {
+		return c.fjListOpenIssuesByLabel(label, true)
+	}
 	endpoint := fmt.Sprintf("repos/%s/issues?state=open&per_page=100", c.Repo)
 	if label != "" {
 		endpoint += "&labels=" + url.QueryEscape(label)
@@ -1995,6 +2001,9 @@ func (c *Client) listAllOpenIssuesByLabel(label string) ([]Issue, error) {
 
 // GetIssue fetches a single issue by number
 func (c *Client) GetIssue(number int) (Issue, error) {
+	if c.isForgejo() {
+		return c.fjGetIssue(number)
+	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
 		return Issue{}, fmt.Errorf("get issue %d: %w", number, err)
@@ -2020,6 +2029,9 @@ func (c *Client) IssueBody(number int) (string, error) {
 
 // IsIssueClosed returns true if the issue is closed
 func (c *Client) IsIssueClosed(number int) (bool, error) {
+	if c.isForgejo() {
+		return c.fjIsIssueClosed(number)
+	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/issues/%d", c.Repo, number))
 	if err != nil {
 		return false, fmt.Errorf("get issue %d: %w", number, err)
@@ -2035,6 +2047,9 @@ func (c *Client) IsIssueClosed(number int) (bool, error) {
 
 // ListOpenPRs returns all open PRs
 func (c *Client) ListOpenPRs() ([]PR, error) {
+	if c.isForgejo() {
+		return c.fjListPulls("open", false)
+	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo))
 	if err != nil {
 		return nil, fmt.Errorf("list open PRs: %w", err)
@@ -2051,6 +2066,9 @@ func (c *Client) ListOpenPRs() ([]PR, error) {
 // for why the reconciliation loop (#827) needs the full open set rather than
 // page one before it uses absence as a close signal.
 func (c *Client) ListAllOpenPRs() ([]PR, error) {
+	if c.isForgejo() {
+		return c.fjListPulls("open", true)
+	}
 	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls?state=open&per_page=100", c.Repo), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list all open PRs: %w", err)
@@ -2068,6 +2086,11 @@ func (c *Client) ListAllOpenPRs() ([]PR, error) {
 }
 
 func (c *Client) listClosedPRs() ([]PR, error) {
+	if c.isForgejo() {
+		// forgejo.ListPulls sorts recentupdate — same newest-updated-first
+		// contract as this endpoint's sort=updated&direction=desc.
+		return c.fjListPulls("closed", false)
+	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls?state=closed&per_page=100&sort=updated&direction=desc", c.Repo))
 	if err != nil {
 		return nil, fmt.Errorf("list closed PRs: %w", err)
@@ -2087,6 +2110,9 @@ func (c *Client) ListClosedPRs() ([]PR, error) {
 }
 
 func (c *Client) getRESTPull(prNumber int) (restPull, error) {
+	if c.isForgejo() {
+		return c.fjGetRESTPull(prNumber)
+	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/pulls/%d", c.Repo, prNumber))
 	if err != nil {
 		return restPull{}, err
@@ -2161,6 +2187,9 @@ func (c *Client) PRMergeInfo(prNumber int) (PRMergeInfo, error) {
 // delivery executor resolves a tie with canonical-remote commit ancestry and
 // otherwise fails closed.
 func (c *Client) LatestMergedPRGenerations(ctx context.Context) ([]PRMergeInfo, error) {
+	if c.isForgejo() {
+		return c.fjLatestMergedPRGenerations(ctx)
+	}
 	deliveryBase, err := c.RepositoryDefaultBranch(ctx)
 	if err != nil {
 		return nil, err
@@ -2184,6 +2213,9 @@ func (c *Client) LatestMergedPRGenerations(ctx context.Context) ([]PRMergeInfo, 
 // Repositories using trunk/master are supported, and a newer merge into an
 // unrelated release/feature branch cannot supersede a default-branch delivery.
 func (c *Client) RepositoryDefaultBranch(ctx context.Context) (string, error) {
+	if c.isForgejo() {
+		return c.fjRepositoryDefaultBranch(ctx)
+	}
 	out, err := c.ghAPIWithArgsContext(ctx, fmt.Sprintf("repos/%s", c.Repo))
 	if err != nil {
 		return "", errors.New("read repository delivery branch failed")
@@ -2251,6 +2283,9 @@ func (c *Client) BranchHeadSHA(branch string) (string, error) {
 	branch = strings.TrimSpace(branch)
 	if branch == "" {
 		return "", fmt.Errorf("empty branch")
+	}
+	if c.isForgejo() {
+		return c.fjBranchHeadSHA(branch)
 	}
 	out, err := c.ghAPI(fmt.Sprintf("repos/%s/commits/%s", c.Repo, url.PathEscape(branch)))
 	if err != nil {
@@ -2425,6 +2460,13 @@ type PRCheckSignal struct {
 // the source that did answer, but Complete=false and Fingerprint is absent so a
 // partial poll cannot fabricate material progress.
 func (c *Client) PRCheckRollup(prNumber int) (PRCheckRollup, error) {
+	if c.isForgejo() {
+		// NOT ported in M2 (status rollup is M4), guarded explicitly: the
+		// head-SHA read below is ported and would succeed, and the joint
+		// check-runs/status failure after it formats with %v — which would
+		// strip errors.Is matchability from the sentinel.
+		return PRCheckRollup{Verdict: "unknown"}, c.forgejoUnsupported("PRCheckRollup (check-runs/status rollup; M4)")
+	}
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
 		return PRCheckRollup{Verdict: "unknown"}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
@@ -2535,6 +2577,15 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 // mergeStateStatus is lower-cased and trimmed; "" means GitHub has not
 // computed it yet (caller should treat that as "don't know, proceed").
 func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error) {
+	if c.isForgejo() {
+		// NOT ported in M2, guarded explicitly: getRESTPull IS ported, so
+		// without this the method would "work" — returning the mergeable
+		// verdict plus a permanently-empty mergeable_state, which callers
+		// read as "GitHub has not computed it yet, proceed". Forgejo has no
+		// mergeable_state equivalent; the behind-vs-conflict semantics land
+		// in M4. PRMergeable (the bool verdict alone) IS ported.
+		return "", "", c.forgejoUnsupported("PRMergeStatus (no mergeable_state equivalent on forgejo; M4)")
+	}
 	pr, err := c.getRESTPull(prNumber)
 	if err != nil {
 		return "", "", fmt.Errorf("get pull %d: %w", prNumber, err)
@@ -3126,6 +3177,12 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 // PRChecksOutput returns a REST-derived check overview for a PR, useful for
 // capturing CI failure details to pass to retry workers.
 func (c *Client) PRChecksOutput(prNumber int) (string, error) {
+	if c.isForgejo() {
+		// NOT ported in M2, guarded explicitly: same %v-formatting hazard as
+		// PRCheckRollup — the ported head-SHA read would succeed and the
+		// joint failure below would lose the sentinel.
+		return "", c.forgejoUnsupported("PRChecksOutput (check-runs/status rollup; M4)")
+	}
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
 		return "", fmt.Errorf("get pull %d head sha: %w", prNumber, err)
@@ -3491,6 +3548,9 @@ func (c *Client) CommentIssue(issueNumber int, body string) error {
 // without a webhook dependency. GitHub treats PRs as issues, so this also
 // works for PR numbers, but the supervisor only calls it for issues.
 func (c *Client) ListIssueComments(issueNumber int) ([]IssueComment, error) {
+	if c.isForgejo() {
+		return c.fjListIssueComments(issueNumber)
+	}
 	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, issueNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list issue comments for #%d: %w", issueNumber, err)
@@ -3533,6 +3593,9 @@ func (c *Client) CommentPR(prNumber int, body string) error {
 
 // PRLabels returns the labels on a PR.
 func (c *Client) PRLabels(prNumber int) ([]string, error) {
+	if c.isForgejo() {
+		return c.fjPRLabels(prNumber)
+	}
 	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/labels?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d labels: %w", prNumber, err)
@@ -3546,6 +3609,9 @@ func (c *Client) PRLabels(prNumber int) ([]string, error) {
 
 // PRCommits returns commit messages for a PR.
 func (c *Client) PRCommits(prNumber int) ([]string, error) {
+	if c.isForgejo() {
+		return c.fjPRCommits(prNumber)
+	}
 	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/commits?per_page=100", c.Repo, prNumber), "--paginate")
 	if err != nil {
 		return nil, fmt.Errorf("list PR %d commits: %w", prNumber, err)
@@ -4481,6 +4547,13 @@ func FormatReviewFeedback(comments []ReviewComment) string {
 
 // CIFailureSummary gets the CI check run failure summary for a PR.
 func (c *Client) CIFailureSummary(prNumber int) (string, error) {
+	if c.isForgejo() {
+		// NOT ported in M2, guarded explicitly: every downstream error here
+		// is deliberately swallowed (the summary degrades to the overview),
+		// so without a guard forgejo mode would return an error STRING as a
+		// nil-error "summary" and feed it into a retry-worker prompt.
+		return "", c.forgejoUnsupported("CIFailureSummary (check-runs; M4)")
+	}
 	// 1. Get check overview
 	overview, err := c.PRChecksOutput(prNumber)
 	if err != nil {
@@ -4549,6 +4622,13 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 // into a worker prompt, or empty string if no actionable review feedback
 // exists.
 func (c *Client) CollectPRReviewFeedback(prNumber int, streams []string) (string, error) {
+	if c.isForgejo() {
+		// NOT ported in M2 (review-gate family is M4), guarded explicitly:
+		// both reads below swallow errors by design ("no feedback" degrades
+		// to empty), so forgejo mode would silently report "no review
+		// feedback" with a nil error instead of failing loud.
+		return "", c.forgejoUnsupported("CollectPRReviewFeedback (review-gate family; M4)")
+	}
 	var sections []string
 
 	// 1. Fetch issue-level comments (Greptile summary with confidence score),

@@ -33,11 +33,12 @@ func stubGHNeverCalled(t *testing.T) *atomic.Int64 {
 	return &calls
 }
 
-// TestForgejoModeFailsLoud pins the M2 stage-C invariant: on a forgejo-mode
-// client EVERY unported receiver method fails with ErrForgejoNotSupported and
-// the gh CLI is never touched. One sample method per receiver-choke shape and
-// per file (github.go, github_projects.go, review_threads.go,
-// visual_evidence.go).
+// TestForgejoModeFailsLoud pins the M2 invariant: on a forgejo-mode client
+// EVERY still-unported receiver method fails with ErrForgejoNotSupported and
+// the gh CLI is never touched — one sample per receiver-choke shape, plus one
+// per explicit early guard (the methods that would otherwise half-work now
+// that the core-read funnels are ported). visual_evidence.go no longer
+// contributes a sample: both of its methods are ported.
 func TestForgejoModeFailsLoud(t *testing.T) {
 	t.Setenv("TEST_FORGEJO_TOKEN", "x")
 	calls := stubGHNeverCalled(t)
@@ -58,12 +59,18 @@ func TestForgejoModeFailsLoud(t *testing.T) {
 		name string
 		call func() error
 	}{
-		// github.go — c.ghAPI funnel (getRESTPull under PRCIStatus/PRMergeStatus).
+		// github.go — explicit early guards (their first transport touch is a
+		// ported read, or they swallow downstream errors by design; without
+		// the guard they would half-work — see the M2 spec's NOT-ported list).
 		{"PRCIStatus", func() error { _, err := c.PRCIStatus(1); return err }},
 		{"PRMergeStatus", func() error { _, _, err := c.PRMergeStatus(1); return err }},
-		{"GetIssue", func() error { _, err := c.GetIssue(1); return err }},
+		{"PRChecksOutput", func() error { _, err := c.PRChecksOutput(1); return err }},
+		{"CIFailureSummary", func() error { _, err := c.CIFailureSummary(1); return err }},
+		{"CollectPRReviewFeedback", func() error { _, err := c.CollectPRReviewFeedback(1, nil); return err }},
+		// github.go — c.ghAPI funnel.
+		{"RateLimit", func() error { _, err := c.RateLimit(); return err }},
 		// github.go — c.ghAPIWithArgs funnel.
-		{"ListAllOpenPRs", func() error { _, err := c.ListAllOpenPRs(); return err }},
+		{"checkRunsForSHA", func() error { _, err := c.checkRunsForSHA("59e99c49c27d3e2f73bae1657f07cd2f9a15f926"); return err }},
 		// github.go — c.ghExec funnel (writes).
 		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }},
 		{"CreateRelease", func() error { return c.CreateRelease("v0.0.1", "t") }},
@@ -71,8 +78,6 @@ func TestForgejoModeFailsLoud(t *testing.T) {
 		{"DiscoverProject", func() error { _, err := c.DiscoverProject(1); return err }},
 		// review_threads.go — GraphQL through c.ghExec.
 		{"PRUnresolvedReviewThreadsOnHead", func() error { _, _, err := c.PRUnresolvedReviewThreadsOnHead(1); return err }},
-		// visual_evidence.go — c.ghAPIWithArgs funnel.
-		{"PRChangedFiles", func() error { _, err := c.PRChangedFiles(1); return err }},
 	}
 	for _, s := range samples {
 		err := s.call()
@@ -91,8 +96,11 @@ func TestForgejoModeFailsLoud(t *testing.T) {
 
 // TestForgejoModeEmptyTokenSurfacesForgeErr pins the construction contract: an
 // empty (or whitespace) token env leaves fj nil and every call surfaces the
-// token fault loudly — naming the env var to export — while staying
-// errors.Is-matchable against the sentinel.
+// token fault loudly, naming the env var to export. PORTED methods surface it
+// as a plain error WITHOUT the sentinel — the operation is supported, the
+// configuration is broken, and a caller branching on ErrForgejoNotSupported
+// to mean "feature absent on this forge" must not confuse the two. Unported
+// methods keep wrapping the sentinel (with the token fault in the message).
 func TestForgejoModeEmptyTokenSurfacesForgeErr(t *testing.T) {
 	t.Setenv("TEST_FORGEJO_TOKEN", "   ")
 	calls := stubGHNeverCalled(t)
@@ -110,12 +118,16 @@ func TestForgejoModeEmptyTokenSurfacesForgeErr(t *testing.T) {
 	}
 
 	samples := []struct {
-		name string
-		call func() error
+		name         string
+		call         func() error
+		wantSentinel bool
 	}{
-		{"GetIssue", func() error { _, err := c.GetIssue(1); return err }},
-		{"ListOpenPRs", func() error { _, err := c.ListOpenPRs(); return err }},
-		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }},
+		// Ported reads: the token fault, no sentinel.
+		{"GetIssue", func() error { _, err := c.GetIssue(1); return err }, false},
+		{"ListOpenPRs", func() error { _, err := c.ListOpenPRs(); return err }, false},
+		{"BranchHeadSHA", func() error { _, err := c.BranchHeadSHA("main"); return err }, false},
+		// Unported write: sentinel, with the token fault in the message.
+		{"CreatePR", func() error { _, err := c.CreatePR("t", "b", "main", "head"); return err }, true},
 	}
 	for _, s := range samples {
 		err := s.call()
@@ -126,8 +138,8 @@ func TestForgejoModeEmptyTokenSurfacesForgeErr(t *testing.T) {
 		if !strings.Contains(err.Error(), "TEST_FORGEJO_TOKEN") {
 			t.Errorf("%s: err = %v, want the empty token env named", s.name, err)
 		}
-		if !errors.Is(err, ErrForgejoNotSupported) {
-			t.Errorf("%s: err = %v, not errors.Is-matchable against ErrForgejoNotSupported", s.name, err)
+		if got := errors.Is(err, ErrForgejoNotSupported); got != s.wantSentinel {
+			t.Errorf("%s: errors.Is(err, ErrForgejoNotSupported) = %v, want %v (err = %v)", s.name, got, s.wantSentinel, err)
 		}
 	}
 	if n := calls.Load(); n != 0 {

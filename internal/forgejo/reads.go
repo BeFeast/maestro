@@ -315,6 +315,52 @@ func (c *Client) GetPull(ctx context.Context, repo string, index int) (Pull, err
 	return wp.pull(), nil
 }
 
+// PullCommit is one commit on a pull request: the sha plus the full commit
+// message verbatim (the wire message carries a trailing newline; headline
+// extraction is the caller's job, mirroring the gh layer's parsePRCommits).
+type PullCommit struct {
+	SHA     string
+	Message string
+}
+
+// ListPullCommits returns the commits on one pull request in server order.
+// Unlike the comments/labels endpoints this one IS paginated (page/limit
+// accepted, x-total-count + Link observed live), so it goes through the pager.
+func (c *Client) ListPullCommits(ctx context.Context, repo string, index int, allPages bool) ([]PullCommit, error) {
+	type wireCommit struct {
+		SHA    string `json:"sha"`
+		Commit struct {
+			Message string `json:"message"`
+		} `json:"commit"`
+	}
+	wires, err := listPages[wireCommit](ctx, c, fmt.Sprintf("/repos/%s/pulls/%d/commits", repo, index), allPages)
+	if err != nil {
+		return nil, fmt.Errorf("list pull commits %s#%d: %w", repo, index, err)
+	}
+	commits := make([]PullCommit, 0, len(wires))
+	for _, w := range wires {
+		commits = append(commits, PullCommit{SHA: w.SHA, Message: w.Commit.Message})
+	}
+	return commits, nil
+}
+
+// ListPullFiles returns the repo-relative paths changed by one pull request.
+// Paginated like the commits list.
+func (c *Client) ListPullFiles(ctx context.Context, repo string, index int, allPages bool) ([]string, error) {
+	type wireFile struct {
+		Filename string `json:"filename"`
+	}
+	wires, err := listPages[wireFile](ctx, c, fmt.Sprintf("/repos/%s/pulls/%d/files", repo, index), allPages)
+	if err != nil {
+		return nil, fmt.Errorf("list pull files %s#%d: %w", repo, index, err)
+	}
+	files := make([]string, 0, len(wires))
+	for _, w := range wires {
+		files = append(files, w.Filename)
+	}
+	return files, nil
+}
+
 // DefaultBranch returns the repository's default branch. Empty is an error —
 // every caller anchors base-branch logic to it.
 func (c *Client) DefaultBranch(ctx context.Context, repo string) (string, error) {

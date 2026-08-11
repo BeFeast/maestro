@@ -483,6 +483,113 @@ func TestBranchHeadSHA_HTTPError(t *testing.T) {
 	}
 }
 
+func TestListPullCommits(t *testing.T) {
+	// commit.message carries a trailing "\n" on the wire (live-verified);
+	// it must survive verbatim — headline extraction is the gh layer's job.
+	c, seen := staticReads(t, 200,
+		`[{"sha":"59e99c49c27d3e2f73bae1657f07cd2f9a15f926","commit":{"message":"feat: first\n\nbody\n"}},
+		  {"sha":"dfc9446cb6a16c60075286299cd07d2cb655769a","commit":{"message":"fix: second\n"}}]`)
+	commits, err := c.ListPullCommits(context.Background(), "owner/repo", 1, true)
+	if err != nil {
+		t.Fatalf("ListPullCommits: %v", err)
+	}
+	if len(commits) != 2 {
+		t.Fatalf("commits = %+v", commits)
+	}
+	if commits[0].SHA != "59e99c49c27d3e2f73bae1657f07cd2f9a15f926" || commits[0].Message != "feat: first\n\nbody\n" {
+		t.Fatalf("first commit = %+v, want the message verbatim incl. trailing newline", commits[0])
+	}
+	req := (*seen)[0]
+	if req.Path != "/repos/owner/repo/pulls/1/commits" {
+		t.Fatalf("path = %s", req.Path)
+	}
+	if req.Query.Get("limit") != strconv.Itoa(pageSize) || req.Query.Get("page") != "1" {
+		t.Fatalf("commits list must be paginated, query = %v", req.Query)
+	}
+}
+
+func TestListPullCommits_Pagination(t *testing.T) {
+	commit := `{"sha":"%040d","commit":{"message":"c %d\n"}}`
+	page := func(from, n int) string {
+		items := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			items = append(items, fmt.Sprintf(commit, from+i, from+i))
+		}
+		return "[" + strings.Join(items, ",") + "]"
+	}
+	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 200, page(1, pageSize)
+		case "2":
+			return 200, page(1+pageSize, 2)
+		default:
+			return 200, "[]"
+		}
+	})
+	commits, err := c.ListPullCommits(context.Background(), "owner/repo", 1, true)
+	if err != nil {
+		t.Fatalf("ListPullCommits: %v", err)
+	}
+	if len(commits) != pageSize+2 {
+		t.Fatalf("commits = %d, want %d", len(commits), pageSize+2)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*seen))
+	}
+}
+
+func TestListPullCommits_HTTPError(t *testing.T) {
+	c, _ := staticReads(t, 500, `{"message":"boom"}`)
+	if _, err := c.ListPullCommits(context.Background(), "owner/repo", 1, true); err == nil {
+		t.Fatal("a 500 must surface as an error")
+	}
+}
+
+func TestListPullFiles(t *testing.T) {
+	c, seen := staticReads(t, 200,
+		`[{"filename":"cmd/main.go","status":"modified","additions":1,"deletions":0},
+		  {"filename":"web/app.css","status":"added","additions":9,"deletions":0}]`)
+	files, err := c.ListPullFiles(context.Background(), "owner/repo", 1, true)
+	if err != nil {
+		t.Fatalf("ListPullFiles: %v", err)
+	}
+	if len(files) != 2 || files[0] != "cmd/main.go" || files[1] != "web/app.css" {
+		t.Fatalf("files = %v", files)
+	}
+	req := (*seen)[0]
+	if req.Path != "/repos/owner/repo/pulls/1/files" {
+		t.Fatalf("path = %s", req.Path)
+	}
+	if req.Query.Get("limit") != strconv.Itoa(pageSize) || req.Query.Get("page") != "1" {
+		t.Fatalf("files list must be paginated, query = %v", req.Query)
+	}
+}
+
+func TestListPullFiles_FirstPageOnlyWhenAllPagesFalse(t *testing.T) {
+	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
+		items := make([]string, 0, pageSize)
+		for i := 0; i < pageSize; i++ {
+			items = append(items, fmt.Sprintf(`{"filename":"f%d.go"}`, i))
+		}
+		return 200, "[" + strings.Join(items, ",") + "]"
+	})
+	files, err := c.ListPullFiles(context.Background(), "owner/repo", 1, false)
+	if err != nil {
+		t.Fatalf("ListPullFiles: %v", err)
+	}
+	if len(files) != pageSize || len(*seen) != 1 {
+		t.Fatalf("files = %d requests = %d, want one full page and no follow-up", len(files), len(*seen))
+	}
+}
+
+func TestListPullFiles_HTTPError(t *testing.T) {
+	c, _ := staticReads(t, 404, `{"message":"not found"}`)
+	if _, err := c.ListPullFiles(context.Background(), "owner/repo", 9, true); err == nil {
+		t.Fatal("a 404 must surface as an error")
+	}
+}
+
 func TestReads_ContextCanceled(t *testing.T) {
 	c, seen := staticReads(t, 200, `[]`)
 	ctx, cancel := context.WithCancel(context.Background())
