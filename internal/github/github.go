@@ -2849,13 +2849,35 @@ func isCriticalSeverity(body string) bool {
 	return hasSeverityMarker(body, "p0")
 }
 
+// leadingSeverityMarker matches an explicit bracketed severity opening the
+// comment body — the format every llm-review producer emits (#1148).
+var leadingSeverityMarker = regexp.MustCompile(`^\s*\[(p[0-3])\]`)
+
+// explicitSeverityLevel returns the level ("p0"..."p3") of the body's leading
+// [Px] marker, or "" when the body does not open with one.
+func explicitSeverityLevel(lower string) string {
+	m := leadingSeverityMarker.FindStringSubmatch(lower)
+	if m == nil {
+		return ""
+	}
+	return m[1]
+}
+
 // hasSeverityMarker reports whether the comment body carries the given
 // severity level ("p0"/"p1"/...) in any of the recognized encodings:
 // Greptile badge markup (alt="P0", shields "badge/P0", ".../P0"), or the
 // plain-text forms "[P0]" and "severity: P0" that a simple glue script can
 // emit without any HTML (#1148).
+//
+// An explicit leading [Px] marker is authoritative (#1168): the substring
+// needles below exist for badge markup and prose, and without precedence the
+// "/p1" needle promoted any advisory whose MESSAGE merely quoted "P0/P1"
+// (e.g. a [P3] citing the severity contract) into a merge-blocking finding.
 func hasSeverityMarker(body, level string) bool {
 	lower := strings.ToLower(body)
+	if explicit := explicitSeverityLevel(lower); explicit != "" {
+		return explicit == level
+	}
 	if strings.Contains(lower, "alt=\""+level+"\"") {
 		return true
 	}
