@@ -34,7 +34,9 @@ func TestParse_ForgeExplicitGitHubKindAccepted(t *testing.T) {
 }
 
 func TestParse_ForgejoValidBlockAccepted(t *testing.T) {
-	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com/\n"
+	// review_gate: llm-review is REQUIRED on forgejo rows since M4 — the
+	// defaulted greptile gate is rejected (see TestParse_ForgeValidation).
+	yamlDoc := "repo: o/r\nreview_gate: llm-review\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com/\n"
 	cfg, err := Parse([]byte(yamlDoc))
 	if err != nil {
 		t.Fatalf("valid forgejo block should parse: %v", err)
@@ -51,7 +53,7 @@ func TestParse_ForgejoValidBlockAccepted(t *testing.T) {
 }
 
 func TestParse_ForgejoTokenEnvOverride(t *testing.T) {
-	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n  token_env: MY_FORGE_PAT\n"
+	yamlDoc := "repo: o/r\nreview_gate: llm-review\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n  token_env: MY_FORGE_PAT\n"
 	cfg, err := Parse([]byte(yamlDoc))
 	if err != nil {
 		t.Fatalf("forgejo block with token_env should parse: %v", err)
@@ -165,6 +167,29 @@ func TestParse_ForgeValidation(t *testing.T) {
 			yaml:    "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_mirror:\n  source: mirror-first\n",
 			wantSub: "fed by GitHub webhooks",
 		},
+		{
+			// #1172 M4: review_gate's absent default is "greptile" — a
+			// GitHub-only reviewer that never posts on forgejo, so the
+			// DEFAULTED gate is rejected too, not just an explicit one.
+			name:    "forgejo with defaulted greptile review gate",
+			yaml:    "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n",
+			wantSub: `review stream "greptile" is not available`,
+		},
+		{
+			name:    "forgejo with explicit greptile review gate",
+			yaml:    "repo: o/r\nreview_gate: greptile\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n",
+			wantSub: `review stream "greptile" is not available`,
+		},
+		{
+			name:    "forgejo with greptile in review_gate_streams",
+			yaml:    "repo: o/r\nreview_gate: llm-review\nreview_gate_streams: [greptile]\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n",
+			wantSub: `review stream "greptile" is not available`,
+		},
+		{
+			name:    "forgejo with simplicity in review_gate_streams",
+			yaml:    "repo: o/r\nreview_gate: llm-review\nreview_gate_streams: [llm-review, simplicity]\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n",
+			wantSub: `review stream "simplicity" is not available`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -195,7 +220,7 @@ func TestParse_GitHubProjectsEnabledWithoutForgeBlockAccepted(t *testing.T) {
 }
 
 func TestParse_ForgejoWithDisabledGitHubProjectsAccepted(t *testing.T) {
-	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_projects:\n  enabled: false\n"
+	yamlDoc := "repo: o/r\nreview_gate: llm-review\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_projects:\n  enabled: false\n"
 	if _, err := Parse([]byte(yamlDoc)); err != nil {
 		t.Fatalf("forgejo with explicitly disabled github_projects should parse: %v", err)
 	}
@@ -206,16 +231,30 @@ func TestParse_ForgejoWithDisabledGitHubProjectsAccepted(t *testing.T) {
 // reconcile cadence) must keep parsing — only mirror-served reads are the
 // cross-forge hazard.
 func TestParse_ForgejoWithAPIDirectMirrorAccepted(t *testing.T) {
-	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_mirror:\n  source: api\n"
+	yamlDoc := "repo: o/r\nreview_gate: llm-review\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\ngithub_mirror:\n  source: api\n"
 	if _, err := Parse([]byte(yamlDoc)); err != nil {
 		t.Fatalf("forgejo with api-direct github_mirror should parse: %v", err)
+	}
+}
+
+// #1172 M4: review_gate: none disables the gate entirely — nil effective
+// streams — and must stay valid on forgejo rows (some projects merge on CI +
+// human approval alone).
+func TestParse_ForgejoWithReviewGateNoneAccepted(t *testing.T) {
+	yamlDoc := "repo: o/r\nreview_gate: none\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n"
+	cfg, err := Parse([]byte(yamlDoc))
+	if err != nil {
+		t.Fatalf("forgejo with review_gate none should parse: %v", err)
+	}
+	if streams := cfg.EffectiveReviewGateStreams(); len(streams) != 0 {
+		t.Fatalf("EffectiveReviewGateStreams() = %v, want empty for review_gate none", streams)
 	}
 }
 
 // The strict write path must accept the new forge block by name (KnownFields),
 // while still rejecting a misspelled child key inside it.
 func TestParseStrict_AcceptsForgeBlock(t *testing.T) {
-	yamlDoc := "repo: o/r\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n  token_env: FORGEJO_TOKEN\n"
+	yamlDoc := "repo: o/r\nreview_gate: llm-review\nforge:\n  kind: forgejo\n  base_url: https://forge.example.com\n  token_env: FORGEJO_TOKEN\n"
 	if _, err := ParseStrict([]byte(yamlDoc)); err != nil {
 		t.Fatalf("strict decode of a valid forge block should pass: %v", err)
 	}

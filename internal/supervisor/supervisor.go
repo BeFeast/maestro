@@ -3280,6 +3280,18 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 
 	ciLower := strings.ToLower(strings.TrimSpace(ciStatus))
 	if ciLower != "success" {
+		// #1172 M4: the #425 escape below is DISABLED on forgejo rows. It
+		// exists for GitHub repos where commit statuses are legacy noise next
+		// to check-runs; on forgejo commit statuses ARE the CI — including
+		// the pending llm-review producer statuses — so a "status-only
+		// pending" head is a genuinely pending head, and the escape would
+		// merge PRs with review still pending. (Belt: fjPRMergeStatus never
+		// synthesizes "clean"/"unstable", so mergeStateAllowsMerge could not
+		// pass anyway — this gate makes the intent explicit and survivable
+		// against future synthesis changes.)
+		if e.cfg != nil && e.cfg.Forge.IsForgejo() {
+			return false, "", nil
+		}
 		if pendingCheckRuns || !legacyStatusOnlyPending(rollup) {
 			return false, "", nil
 		}
@@ -3302,6 +3314,7 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 	// before merge_pr executes). For the stream-based llm-review gate
 	// (#1148) the aggregate verdict is the signal; the historical
 	// greptile-only setup keeps the Greptile read.
+	forgejoGreptileSkipReason := ""
 	if e.cfg != nil && e.cfg.ReviewGate == "llm-review" {
 		if reviewReader, ok := e.reader.(prReviewGateVerdictReader); ok {
 			verdict, err := reviewReader.PRReviewGateVerdict(pr.Number, e.cfg.EffectiveReviewGateStreams())
@@ -3309,6 +3322,20 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 				return false, "", nil
 			}
 		}
+	} else if e.cfg != nil && e.cfg.Forge.IsForgejo() {
+		// #1172 M4: the Greptile arm is SKIPPED on forgejo rows (same gating
+		// style as the #425 escape above). Greptile is a GitHub-integrated
+		// reviewer that never posts on a Forgejo instance, so
+		// PRGreptileApproved returns the ErrForgejoNotSupported sentinel there
+		// — the arm below would take the err branch and pin the row at
+		// permanently not-ready with NO reason recorded, while the
+		// orchestrator treats the same `review_gate: none` row as
+		// gate-passes. Fail-closed, but asymmetric and silent. Config
+		// validation already rejects greptile/simplicity as EFFECTIVE streams
+		// on a forgejo row, so reaching here means the row has no
+		// GitHub-only review gate to consult at all; skip it and record why.
+		// GitHub rows never enter this arm and are byte-identical.
+		forgejoGreptileSkipReason = fmt.Sprintf("PR #%d Greptile review gate skipped on forgejo (GitHub-only reviewer; review_gate=%q)", pr.Number, e.cfg.ReviewGate)
 	} else if greptileReader, ok := e.reader.(prGreptileReader); ok {
 		approved, pending, err := greptileReader.PRGreptileApproved(pr.Number)
 		if err != nil {
@@ -3349,7 +3376,9 @@ func (e *Engine) openPRReadyToMerge(slot string, sess *state.Session, pr github.
 			fmt.Sprintf("PR #%d aggregate CI status=%s; mergeable_state confirms required checks passed", pr.Number, ciStatus),
 		)
 	}
-	if _, ok := e.reader.(prGreptileReader); ok {
+	if forgejoGreptileSkipReason != "" {
+		reasons = append(reasons, forgejoGreptileSkipReason)
+	} else if _, ok := e.reader.(prGreptileReader); ok {
 		reasons = append(reasons, fmt.Sprintf("PR #%d Greptile review approved", pr.Number))
 	}
 	return true, rollupHeadSHA, reasons

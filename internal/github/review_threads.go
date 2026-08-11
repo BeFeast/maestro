@@ -55,6 +55,17 @@ type reviewThreadsGraphQLResponse struct {
 // head. Aggregate review/check conclusions are deliberately not consulted:
 // thread resolution is its own live merge gate.
 func (c *Client) PRUnresolvedReviewThreadsOnHead(prNumber int) (string, []ReviewThread, error) {
+	if c.isForgejo() {
+		// #1172 M4 shim: Forgejo has NO unresolved-conversations API (no
+		// GraphQL, no REST thread-resolution surface on 16.0.1), so the
+		// `review-thread:*` refusal class simply does not exist on forgejo
+		// rows. The mergegate boundary's REAL safety — the double head read
+		// this call provides, the claim, and the head-changed refusals — is
+		// fully preserved: the shim returns the pull's current head from the
+		// ported read (empty head refuses loudly, same as the gh parse path).
+		// Carried flag: revisit if Forgejo grows a thread-resolution API.
+		return c.fjUnresolvedReviewThreadsOnHead(prNumber)
+	}
 	owner, name, ok := strings.Cut(strings.TrimSpace(c.Repo), "/")
 	if !ok || strings.TrimSpace(owner) == "" || strings.TrimSpace(name) == "" {
 		return "", nil, fmt.Errorf("read review threads for PR %d: invalid repo %q", prNumber, c.Repo)

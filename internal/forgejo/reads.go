@@ -18,6 +18,17 @@
 //     updated-first requires an explicit sort=recentupdate;
 //   - issue comments and issue labels have NO page/limit params and return
 //     everything in one response — they must not go through the pager.
+//
+// M4 additions (#1172, contract pinned by the stage-A live probe):
+//
+//   - the combined-status aggregate lives in the top-level `state` field while
+//     each per-status state lives in `.status` (never `.state`); a SHA with
+//     zero statuses answers 200 {"state":"","total_count":0,"statuses":null} —
+//     EMPTY-STRING aggregate plus null statuses is the no-signal shape;
+//   - review-comment reads report the new-file line number in `position`
+//     (x-go-name LineNum) — there is NO `line` and NO `new_position` on the
+//     read side — and the per-review comments endpoint has no page/limit
+//     params, so it must not go through the pager.
 package forgejo
 
 import (
@@ -111,6 +122,13 @@ type Pull struct {
 	HeadRef        string
 	HeadSHA        string
 	BaseRef        string
+	// MergeBase is the merge-base SHA between head and base (wire
+	// `merge_base`, 40-hex; live-verified present on both open and merged
+	// pulls). On an up-to-date open pull it equals the base branch head; after
+	// a merge base.sha moves on while merge_base stays — so "behind" synthesis
+	// must compare it against BranchHeadSHA(BaseRef), never against base.sha
+	// from the same payload. Carried verbatim; empty when the wire omits it.
+	MergeBase string
 }
 
 // wirePull is the nested wire shape of GET /repos/{repo}/pulls[/{index}].
@@ -123,6 +141,7 @@ type wirePull struct {
 	Mergeable      *bool   `json:"mergeable"`
 	MergedAt       *string `json:"merged_at"`
 	MergeCommitSHA string  `json:"merge_commit_sha"`
+	MergeBase      string  `json:"merge_base"`
 	Head           struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
@@ -142,6 +161,7 @@ func (wp wirePull) pull() Pull {
 		Mergeable:      wp.Mergeable,
 		MergedAt:       wp.MergedAt,
 		MergeCommitSHA: wp.MergeCommitSHA,
+		MergeBase:      wp.MergeBase,
 		HeadRef:        wp.Head.Ref,
 		HeadSHA:        wp.Head.SHA,
 		BaseRef:        wp.Base.Ref,
@@ -454,4 +474,225 @@ func (c *Client) BranchHeadSHA(ctx context.Context, repo, branch string) (string
 		return "", fmt.Errorf("branch %s@%s has an empty head sha", repo, branch)
 	}
 	return sha, nil
+}
+
+// CommitStatus is one per-context row of the combined-status read. State is
+// decoded from Forgejo's per-status `.status` wire field — NOT `.state`, which
+// does not exist per status here (the live-verified 16.0.1 gotcha the
+// forge.Client CommitStatuses already normalizes). The vocabulary (swagger
+// CommitStatusState) is pending|success|error|failure|warning|skipped, carried
+// lowercased but otherwise verbatim: "warning" and "skipped" are real values
+// (skipped live-verified) and must reach the gh layer undamaged so its failure
+// mapping never miscounts them. CreatedAt is the RFC3339 wire string
+// byte-for-byte — the gh layer mixes it into the CI rollup fingerprint
+// (`status:<context>:<state>:<created_at>`), so it must not round-trip through
+// time.Time.
+type CommitStatus struct {
+	Context     string
+	State       string
+	Description string
+	TargetURL   string
+	CreatedAt   string
+}
+
+// CombinedStatus is the aggregate view of one SHA's commit statuses: the
+// server-computed rollup over the latest status per context, plus the rows.
+//
+// NO-SIGNAL SHAPE (live-verified): a SHA with zero statuses answers HTTP 200
+// {"state":"","total_count":0,"statuses":null} — State is the EMPTY STRING and
+// Statuses is nil (JSON null, not []). Both together mean "no signal"; neither
+// is an error and neither may be read as an unknown state.
+type CombinedStatus struct {
+	State    string
+	Statuses []CommitStatus
+}
+
+// CombinedStatus returns one SHA's combined status. forge.Client's
+// CommitStatuses stays untouched as the producer surface (it drops the
+// aggregate); this is the transport-switch sibling exposing BOTH the top-level
+// aggregate and the per-context rows.
+//
+// The statuses array is paginated (swagger page/limit; not exercisable live —
+// no probe SHA carries >1 page), so the loop cannot go through listPages (the
+// payload is an object, not a bare array) and cannot lean on x-total-count
+// header semantics that were never pinned for this endpoint. Instead the belt
+// uses the payload's own `total_count` (live-pinned: 0 on the no-signal shape,
+// equal to len(statuses) on gate-test PR#2's head — the across-pages total,
+// GitHub-shape parity): a short page that strands the accumulated set below
+// the server total (a server paging clamp below pageSize) is an explicit
+// error, never a silently truncated set fed to the verdict/fingerprint. The
+// maxListPages cap stays: on a server that ignored the page param, a
+// >=pageSize set would keep answering full pages and hit the cap as an
+// explicit error — never a silently duplicated set. The aggregate is taken
+// from page 1; total is re-read each page so a set that legitimately shrinks
+// mid-scan does not false-alarm, and reaching the total on a full page ends
+// the loop without demanding one empty page.
+func (c *Client) CombinedStatus(ctx context.Context, repo, sha string) (CombinedStatus, error) {
+	var combined CombinedStatus
+	total := -1 // -1: total_count absent, truncation belt disabled
+	for page := 1; ; page++ {
+		if page > maxListPages {
+			return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: more than %d pages (%d statuses so far); refusing to truncate silently", repo, sha, maxListPages, len(combined.Statuses))
+		}
+		path := fmt.Sprintf("/repos/%s/commits/%s/status?limit=%d&page=%d", repo, sha, pageSize, page)
+		out, err := c.do(ctx, http.MethodGet, path, nil)
+		if err != nil {
+			return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: %w", repo, sha, err)
+		}
+		var wire struct {
+			State      string `json:"state"`
+			TotalCount *int   `json:"total_count"`
+			Statuses   []struct {
+				Context     string `json:"context"`
+				Status      string `json:"status"`
+				Description string `json:"description"`
+				TargetURL   string `json:"target_url"`
+				CreatedAt   string `json:"created_at"`
+			} `json:"statuses"`
+		}
+		if err := json.Unmarshal(out, &wire); err != nil {
+			return CombinedStatus{}, fmt.Errorf("parse combined status for %s@%s: %w", repo, sha, err)
+		}
+		if page == 1 {
+			combined.State = strings.ToLower(strings.TrimSpace(wire.State))
+		}
+		if wire.TotalCount != nil && *wire.TotalCount >= 0 {
+			total = *wire.TotalCount
+		}
+		for _, st := range wire.Statuses {
+			combined.Statuses = append(combined.Statuses, CommitStatus{
+				Context:     st.Context,
+				State:       strings.ToLower(strings.TrimSpace(st.Status)),
+				Description: st.Description,
+				TargetURL:   st.TargetURL,
+				CreatedAt:   strings.TrimSpace(st.CreatedAt),
+			})
+		}
+		if len(wire.Statuses) < pageSize {
+			if total >= 0 && len(combined.Statuses) < total {
+				return CombinedStatus{}, fmt.Errorf("combined status for %s@%s: page %d came back short at %d items with only %d of %d total statuses accumulated (server page clamp below %d?); refusing to truncate silently", repo, sha, page, len(wire.Statuses), len(combined.Statuses), total, pageSize)
+			}
+			return combined, nil
+		}
+		if total >= 0 && len(combined.Statuses) >= total {
+			return combined, nil
+		}
+	}
+}
+
+// PullReview is one review on a pull request, flattened to what the gh layer
+// maps. State is the ReviewStateType VERBATIM — uppercase "APPROVED" /
+// "COMMENT" / "REQUEST_CHANGES" / "PENDING" / "REQUEST_REVIEW" — vocabulary
+// mapping is the gh layer's job, and the full set is not enumerated in
+// swagger, so nothing is normalized or filtered here. CommitID can
+// legitimately be "" (live-proven on GitHub-migrated reviews); the per-comment
+// commit_id IS populated in that case, so head-anchoring callers must fall
+// back review CommitID -> comment CommitID.
+type PullReview struct {
+	ID          int64
+	User        string // user.login; "" when the wire user is null
+	State       string
+	Body        string
+	CommitID    string
+	SubmittedAt string // RFC3339 verbatim
+	// CommentsCount is the wire comments_count (x-go-name CodeCommentsCount):
+	// the number of inline code comments in this review — lets callers skip
+	// the per-review comments round trip for body-only reviews.
+	CommentsCount int64
+}
+
+// ListPullReviews returns the reviews on one pull request in server order
+// (ascending by id/submitted_at, live-verified). Paginated (page/limit +
+// x-total-count live-verified; past-the-end pages answer 200 []), so it goes
+// through the pager.
+func (c *Client) ListPullReviews(ctx context.Context, repo string, index int, allPages bool) ([]PullReview, error) {
+	type wireReview struct {
+		ID   int64 `json:"id"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		State         string `json:"state"`
+		Body          string `json:"body"`
+		CommitID      string `json:"commit_id"`
+		SubmittedAt   string `json:"submitted_at"`
+		CommentsCount int64  `json:"comments_count"`
+	}
+	wires, err := listPages[wireReview](ctx, c, fmt.Sprintf("/repos/%s/pulls/%d/reviews", repo, index), allPages)
+	if err != nil {
+		return nil, fmt.Errorf("list reviews %s#%d: %w", repo, index, err)
+	}
+	reviews := make([]PullReview, 0, len(wires))
+	for _, w := range wires {
+		reviews = append(reviews, PullReview{
+			ID:            w.ID,
+			User:          w.User.Login,
+			State:         w.State,
+			Body:          w.Body,
+			CommitID:      w.CommitID,
+			SubmittedAt:   w.SubmittedAt,
+			CommentsCount: w.CommentsCount,
+		})
+	}
+	return reviews, nil
+}
+
+// PullReviewComment is one inline comment of a review. THE LINE FIELD
+// (live-pinned, the one most likely to be mis-mapped): the read side has NO
+// `line` and NO `new_position` — the write-side new_position comes back as
+// `position` (x-go-name LineNum), the NEW-file LINE NUMBER, not a diff
+// offset; `original_position` (OldLineNum) carries the old-file line, 0 when
+// the comment targets the new side. Line/OldLine map them 1:1. CommitID is
+// populated even when the parent review's commit_id is "" — it is the
+// reliable head anchor.
+type PullReviewComment struct {
+	ID               int64
+	Body             string
+	Author           string // user.login
+	Path             string
+	CommitID         string
+	OriginalCommitID string
+	Line             int64  // wire `position`: new-file line number
+	OldLine          int64  // wire `original_position`: old-file line number
+	CreatedAt        string // RFC3339 verbatim
+}
+
+// ListPullReviewComments returns all inline comments of one review. The
+// endpoint has NO page/limit params (swagger: only owner/repo/index/id) and
+// returns everything in one response — it must not go through the pager.
+func (c *Client) ListPullReviewComments(ctx context.Context, repo string, index int, reviewID int64) ([]PullReviewComment, error) {
+	out, err := c.do(ctx, http.MethodGet, fmt.Sprintf("/repos/%s/pulls/%d/reviews/%d/comments", repo, index, reviewID), nil)
+	if err != nil {
+		return nil, fmt.Errorf("list review comments %s#%d review %d: %w", repo, index, reviewID, err)
+	}
+	var wire []struct {
+		ID   int64  `json:"id"`
+		Body string `json:"body"`
+		User struct {
+			Login string `json:"login"`
+		} `json:"user"`
+		Path             string `json:"path"`
+		CommitID         string `json:"commit_id"`
+		OriginalCommitID string `json:"original_commit_id"`
+		Position         int64  `json:"position"`
+		OriginalPosition int64  `json:"original_position"`
+		CreatedAt        string `json:"created_at"`
+	}
+	if err := json.Unmarshal(out, &wire); err != nil {
+		return nil, fmt.Errorf("parse review comments %s#%d review %d: %w", repo, index, reviewID, err)
+	}
+	comments := make([]PullReviewComment, 0, len(wire))
+	for _, wc := range wire {
+		comments = append(comments, PullReviewComment{
+			ID:               wc.ID,
+			Body:             wc.Body,
+			Author:           wc.User.Login,
+			Path:             wc.Path,
+			CommitID:         wc.CommitID,
+			OriginalCommitID: wc.OriginalCommitID,
+			Line:             wc.Position,
+			OldLine:          wc.OriginalPosition,
+			CreatedAt:        wc.CreatedAt,
+		})
+	}
+	return comments, nil
 }

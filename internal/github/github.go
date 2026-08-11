@@ -51,14 +51,23 @@ type checkRunsResponse struct {
 	CheckRuns []greptileCheckRun `json:"check_runs"`
 }
 
+// combinedStatusEntry is one per-context row of a combined commit status.
+// CreatedAt is deliberately json:"-": it is populated ONLY by the forgejo
+// mapping (fjCombinedStatusForSHA). Forgejo has no check-run IDs, so a
+// status's created_at is what advances the CI rollup fingerprint on a re-run;
+// on the gh path the field stays empty (GitHub's wire created_at is NOT
+// decoded), keeping GitHub fingerprints byte-identical to their pre-M4 form.
+type combinedStatusEntry struct {
+	Context     string `json:"context"`
+	State       string `json:"state"`
+	Description string `json:"description"`
+	TargetURL   string `json:"target_url"`
+	CreatedAt   string `json:"-"`
+}
+
 type combinedStatusResponse struct {
-	State    string `json:"state"`
-	Statuses []struct {
-		Context     string `json:"context"`
-		State       string `json:"state"`
-		Description string `json:"description"`
-		TargetURL   string `json:"target_url"`
-	} `json:"statuses"`
+	State    string                `json:"state"`
+	Statuses []combinedStatusEntry `json:"statuses"`
 }
 
 type greptileReviewComment struct {
@@ -1775,6 +1784,35 @@ func ciStatusFromREST(checks []greptileCheckRun, combined combinedStatusResponse
 	// An empty combined status carries no signal and must not override the
 	// check-runs verdict; only honor pending/failure when statuses exist.
 	if len(combined.Statuses) > 0 {
+		// Per-status scan FIRST, server aggregate second. On GitHub the two
+		// are equivalent by construction (aggregate = failure iff any context
+		// is failure/error, else pending iff any context is pending), so the
+		// scan changes nothing there. On Forgejo they are NOT equivalent: its
+		// worst-wins priorities rank "warning" BELOW "pending"
+		// (error < failure < warning < pending < success < skipped, verified
+		// against v16.0.1 modules/structs/commit_status.go), so a coexisting
+		// warning context MASKS a pending one — {ci: pending, lint: warning}
+		// aggregates to "warning", which the aggregate arms below ignore, and
+		// a mid-run head would roll up "success". failure/error can never be
+		// masked (nothing ranks below them but each other); the scan hardens
+		// on them too so any aggregate-ordering surprise fails closed.
+		hasFailing, hasPending := false, false
+		for _, st := range combined.Statuses {
+			switch strings.ToLower(strings.TrimSpace(st.State)) {
+			case "failure", "error":
+				hasFailing = true
+			case "pending":
+				hasPending = true
+			}
+		}
+		if hasFailing {
+			return "failure"
+		}
+		if hasPending {
+			return "pending"
+		}
+		// Aggregate belt: a pending/failing server aggregate over per-status
+		// vocabulary the scan does not know still blocks.
 		if strings.EqualFold(combined.State, "pending") {
 			return "pending"
 		}
@@ -2467,11 +2505,10 @@ type PRCheckSignal struct {
 // partial poll cannot fabricate material progress.
 func (c *Client) PRCheckRollup(prNumber int) (PRCheckRollup, error) {
 	if c.isForgejo() {
-		// NOT ported in M2 (status rollup is M4), guarded explicitly: the
-		// head-SHA read below is ported and would succeed, and the joint
-		// check-runs/status failure after it formats with %v — which would
-		// strip errors.Is matchability from the sentinel.
-		return PRCheckRollup{Verdict: "unknown"}, c.forgejoUnsupported("PRCheckRollup (check-runs/status rollup; M4)")
+		// #1172 M4: statuses-only rollup — Forgejo has no check-runs API, so
+		// the combined commit status IS the whole CI signal (see
+		// fjPRCheckRollup for the no-signal parity contract).
+		return c.fjPRCheckRollup(prNumber)
 	}
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
@@ -2522,8 +2559,18 @@ func ciCheckRollupFingerprint(checks []greptileCheckRun, combined combinedStatus
 			check.ID, strings.TrimSpace(check.Name), strings.ToLower(strings.TrimSpace(check.Status)), strings.ToLower(strings.TrimSpace(check.Conclusion))))
 	}
 	for _, status := range combined.Statuses {
-		parts = append(parts, fmt.Sprintf("status:%s:%s",
-			strings.TrimSpace(status.Context), strings.ToLower(strings.TrimSpace(status.State))))
+		part := fmt.Sprintf("status:%s:%s",
+			strings.TrimSpace(status.Context), strings.ToLower(strings.TrimSpace(status.State)))
+		// Forgejo (#1172 M4): statuses are the ONLY CI signal — there are no
+		// check-run IDs to advance the fingerprint on a re-run, so each
+		// status's created_at (RFC3339, verbatim wire string) is mixed in and
+		// a re-posted status with an unchanged state still advances material
+		// progress. Empty on the gh path (see combinedStatusEntry), where the
+		// part format therefore stays exactly `status:<context>:<state>`.
+		if createdAt := strings.TrimSpace(status.CreatedAt); createdAt != "" {
+			part += ":" + createdAt
+		}
+		parts = append(parts, part)
 	}
 	sort.Strings(parts)
 	h := sha256.New()
@@ -2584,13 +2631,11 @@ func (c *Client) PRMergeable(prNumber int) (string, error) {
 // computed it yet (caller should treat that as "don't know, proceed").
 func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus string, err error) {
 	if c.isForgejo() {
-		// NOT ported in M2, guarded explicitly: getRESTPull IS ported, so
-		// without this the method would "work" — returning the mergeable
-		// verdict plus a permanently-empty mergeable_state, which callers
-		// read as "GitHub has not computed it yet, proceed". Forgejo has no
-		// mergeable_state equivalent; the behind-vs-conflict semantics land
-		// in M4. PRMergeable (the bool verdict alone) IS ported.
-		return "", "", c.forgejoUnsupported("PRMergeStatus (no mergeable_state equivalent on forgejo; M4)")
+		// #1172 M4: forgejo has no mergeable_state — fjPRMergeStatus
+		// SYNTHESIZES the vocabulary from merge_base + the wire mergeable
+		// bool ("behind" / "dirty" / ""), and deliberately NEVER "clean" or
+		// "unstable" — see fjPRMergeStatus for the full consequence map.
+		return c.fjPRMergeStatus(prNumber)
 	}
 	pr, err := c.getRESTPull(prNumber)
 	if err != nil {
@@ -2615,6 +2660,13 @@ func (c *Client) PRMergeStatus(prNumber int) (mergeable string, mergeStateStatus
 //   - comment found but not approving → approved=false, pending=false
 //   - no greptile signal at all → pending=true
 func (c *Client) PRGreptileApproved(prNumber int) (approved bool, pending bool, err error) {
+	if c.isForgejo() {
+		// Greptile is a GitHub-integrated product and never posts on a
+		// Forgejo instance — a forgejo row consulting this gate would wait
+		// forever on a reviewer that cannot appear. Explicit sentinel guard
+		// (#1172 M4); forgejo rows use the llm-review streams instead.
+		return false, false, c.forgejoUnsupported("PRGreptileApproved (greptile is GitHub-only)")
+	}
 	verdict, err := c.prGreptileReviewStreamVerdict(prNumber)
 	if err != nil {
 		return false, false, err
@@ -2645,6 +2697,14 @@ var (
 )
 
 func (c *Client) prGreptileReviewStreamVerdict(prNumber int) (ReviewStreamVerdict, error) {
+	if c.isForgejo() {
+		// Explicit sentinel guard (#1172 M4): the head-SHA and comment reads
+		// below are ported, so without it this greptile-only verdict would
+		// half-work — permanently "pending, unobserved" on a reviewer that
+		// never posts on forgejo. The commitCommittedAt comment fallback stays
+		// github-only behind this guard (unreachable on forgejo).
+		return ReviewStreamVerdict{}, c.forgejoUnsupported("greptile review stream verdict (greptile is GitHub-only)")
+	}
 	// checkLookupFailed marks a degraded read: absence of a signal below then
 	// means "unknown", not "the reviewer is silent".
 	var checkLookupFailed bool
@@ -3118,6 +3178,14 @@ func (c *Client) PRHasCriticalReviewOnHead(prNumber int, streams []string) (bool
 // path takes over) and a non-nil error only when the upstream lookups
 // fail — never use error as a "no findings" signal.
 func (c *Client) PRHighSeverityReviewOnHead(prNumber int) (sha string, findings []ReviewComment, hasFindings bool, err error) {
+	if c.isForgejo() {
+		// Explicit sentinel guard (#1172 M4): both reads below are ported, so
+		// this greptile-only scan (isGreptileLogin filter) would half-work on
+		// forgejo — always hasFindings=false with a nil error, silently
+		// disabling the repair scope. llm-review findings flow through
+		// PRBlockingReviewFindingsOnHead, which IS live on forgejo.
+		return "", nil, false, c.forgejoUnsupported("PRHighSeverityReviewOnHead (greptile is GitHub-only)")
+	}
 	sha, err = c.pullHeadSHA(prNumber)
 	if err != nil {
 		return "", nil, false, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
@@ -3147,6 +3215,13 @@ func (c *Client) PRHighSeverityReviewOnHead(prNumber int) (sha string, findings 
 }
 
 func (c *Client) greptileReviewComments(prNumber int) ([]greptileReviewComment, error) {
+	if c.isForgejo() {
+		// #1172 M4: the generic inline-comment reader (despite the name) —
+		// forgejo has no flat pulls/{n}/comments endpoint, so this walks
+		// reviews + per-review comments. See fjReviewComments for the
+		// CommitID head-anchoring contract.
+		return c.fjReviewComments(prNumber)
+	}
 	// Routed through the shared wrapper (#797) so this per-cycle read gets the
 	// rate-limit backoff, the conditional-request cache, and usage accounting.
 	out, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/pulls/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
@@ -3189,10 +3264,8 @@ func (c *Client) ClosePR(prNumber int, comment string) error {
 // capturing CI failure details to pass to retry workers.
 func (c *Client) PRChecksOutput(prNumber int) (string, error) {
 	if c.isForgejo() {
-		// NOT ported in M2, guarded explicitly: same %v-formatting hazard as
-		// PRCheckRollup — the ported head-SHA read would succeed and the
-		// joint failure below would lose the sentinel.
-		return "", c.forgejoUnsupported("PRChecksOutput (check-runs/status rollup; M4)")
+		// #1172 M4: statuses-only overview (no check-runs exist on forgejo).
+		return c.fjPRChecksOutput(prNumber)
 	}
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
@@ -3225,6 +3298,12 @@ type FailingCheck struct {
 // failing leaves the excerpt empty rather than erroring, so the caller still
 // names the check. A nil slice means no check is failing.
 func (c *Client) PRFailingChecks(prNumber int) ([]FailingCheck, error) {
+	if c.isForgejo() {
+		// #1172 M4: on forgejo the failing "checks" are commit statuses in
+		// state failure/error, and the status Description is the only
+		// actionable text (there are no check-run outputs or annotations).
+		return c.fjPRFailingChecks(prNumber)
+	}
 	sha, err := c.pullHeadSHA(prNumber)
 	if err != nil {
 		return nil, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
@@ -4196,6 +4275,21 @@ func (c *Client) CollectReviewFeedback(prNumber int, streams []string) ([]Review
 }
 
 func (c *Client) PRReviewGateVerdict(prNumber int, streams []string) (ReviewGateVerdict, error) {
+	if c.isForgejo() && len(streams) == 0 {
+		// #1172 M4: normalizeReviewStreams's empty default is ["greptile"],
+		// but Greptile dies with GitHub — a forgejo row falling into that
+		// default would sit unobserved forever (the bot never posts there).
+		// Forgejo-mode clients default to the llm-review pair instead; config
+		// validation independently rejects greptile/simplicity streams on
+		// forgejo rows, so this belt only catches callers passing no streams.
+		// NOTE: today no production caller reaches here with empty streams
+		// (orchestrator short-circuits len(streams)==0 before calling; the
+		// supervisor only calls under review_gate "llm-review"), so a future
+		// caller passing nil for a review_gate:"none" forgejo row gets a
+		// FORCED llm-review gate here where the orchestrator treats "none" as
+		// gate-passes — fail-closed by design; revisit if such a caller lands.
+		streams = []string{"llm-review-opus", "llm-review-terra"}
+	}
 	normalized := normalizeReviewStreams(streams)
 	verdict := ReviewGateVerdict{Passed: true}
 	if len(normalized) == 0 {
@@ -4319,25 +4413,56 @@ func (c *Client) namedReviewStreamVerdict(prNumber int, spec reviewStreamSpec) (
 	if err != nil {
 		return ReviewStreamVerdict{}, fmt.Errorf("get pull %d head sha: %w", prNumber, err)
 	}
-	checks, checkErr := c.checkRunsForSHA(sha)
-	var checkFound, checkPassed, checkPending bool
-	if checkErr == nil {
-		checkFound, checkPassed, checkPending = namedCheckDecision(checks, spec.CheckContains)
-	}
-	// The llm-review glue posts plain commit statuses (a normal token cannot
-	// create check runs — those need a GitHub App). When no check run spoke
-	// for this stream, look at the combined status for the same needles.
-	var statusErr error
-	if spec.AllowCommitStatus && !checkFound {
-		var combined combinedStatusResponse
-		combined, statusErr = c.combinedStatusForSHA(sha)
-		if statusErr == nil {
-			checkFound, checkPassed, checkPending = namedStatusDecision(combined, spec.CheckContains)
+	var (
+		checkFound, checkPassed, checkPending bool
+		checkErr, statusErr                   error
+	)
+	if c.isForgejo() {
+		// #1172 M4: forgejo has NO check-runs API — the check-runs read is
+		// skipped entirely and a stream's external verdict can only arrive as
+		// a commit status. Streams without AllowCommitStatus (simplicity)
+		// therefore have no external verdict source on forgejo and stay
+		// unobserved unless they post inline findings — deliberate: the
+		// missing-review policy handles the silent gate, it must not hang.
+		// Note namedStatusDecision maps state "error" to found-not-passed
+		// (hard rejection, the #1148 creds-missing escape), never pending.
+		if spec.AllowCommitStatus {
+			var combined combinedStatusResponse
+			combined, statusErr = c.fjCombinedStatusForSHA(sha)
+			if statusErr == nil {
+				checkFound, checkPassed, checkPending = namedStatusDecision(combined, spec.CheckContains)
+			}
+		}
+	} else {
+		var checks []greptileCheckRun
+		checks, checkErr = c.checkRunsForSHA(sha)
+		if checkErr == nil {
+			checkFound, checkPassed, checkPending = namedCheckDecision(checks, spec.CheckContains)
+		}
+		// The llm-review glue posts plain commit statuses (a normal token cannot
+		// create check runs — those need a GitHub App). When no check run spoke
+		// for this stream, look at the combined status for the same needles.
+		if spec.AllowCommitStatus && !checkFound {
+			var combined combinedStatusResponse
+			combined, statusErr = c.combinedStatusForSHA(sha)
+			if statusErr == nil {
+				checkFound, checkPassed, checkPending = namedStatusDecision(combined, spec.CheckContains)
+			}
 		}
 	}
 	findings, commentsErr := c.reviewFindingsForStream(prNumber, sha, spec)
-	if commentsErr != nil && checkErr != nil {
-		return ReviewStreamVerdict{}, commentsErr
+	if commentsErr != nil {
+		if checkErr != nil {
+			return ReviewStreamVerdict{}, commentsErr
+		}
+		// Forgejo: comments are one of only two evidence sources (no check
+		// runs exist). When the status read also failed — or was never
+		// attempted because the stream cannot post statuses — nothing was
+		// read at all, so fail loud like the gh joint-failure arm above
+		// instead of returning a verdict built on zero evidence.
+		if c.isForgejo() && (statusErr != nil || !spec.AllowCommitStatus) {
+			return ReviewStreamVerdict{}, commentsErr
+		}
 	}
 	sv := ReviewStreamVerdict{Name: spec.Name, Passed: false, Pending: false, Findings: findings}
 	// A check run in any state, or an inline finding, means the reviewer spoke
@@ -4396,7 +4521,15 @@ func namedStatusDecision(combined combinedStatusResponse, needles []string) (fou
 			return true, true, false
 		case "pending":
 			return true, false, true
-		default: // "failure", "error"
+		default:
+			// "failure"/"error" on both forges, plus the forgejo-only
+			// "warning"/"skipped": all read as found-NOT-passed (hard
+			// rejection). Deliberate — the producer contract is
+			// pending/success/error only, and this mirrors gh-mode
+			// namedCheckDecision, whose fall-through hard-rejects a "skipped"
+			// check-run the same way. A review lens that did not actually run
+			// must fail loud with the named finding, never silently pass or
+			// hold the PR as unobserved-pending forever.
 			return true, false, false
 		}
 	}
@@ -4630,11 +4763,10 @@ func FormatReviewFeedback(comments []ReviewComment) string {
 // CIFailureSummary gets the CI check run failure summary for a PR.
 func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 	if c.isForgejo() {
-		// NOT ported in M2, guarded explicitly: every downstream error here
-		// is deliberately swallowed (the summary degrades to the overview),
-		// so without a guard forgejo mode would return an error STRING as a
-		// nil-error "summary" and feed it into a retry-worker prompt.
-		return "", c.forgejoUnsupported("CIFailureSummary (check-runs; M4)")
+		// #1172 M4: overview + per-failed-status description (no check-run
+		// Output/annotations exist on forgejo), same 8000-byte cap and the
+		// same error-swallowing degradation semantics as the gh path.
+		return c.fjCIFailureSummary(prNumber)
 	}
 	// 1. Get check overview
 	overview, err := c.PRChecksOutput(prNumber)
@@ -4704,19 +4836,22 @@ func (c *Client) CIFailureSummary(prNumber int) (string, error) {
 // into a worker prompt, or empty string if no actionable review feedback
 // exists.
 func (c *Client) CollectPRReviewFeedback(prNumber int, streams []string) (string, error) {
-	if c.isForgejo() {
-		// NOT ported in M2 (review-gate family is M4), guarded explicitly:
-		// both reads below swallow errors by design ("no feedback" degrades
-		// to empty), so forgejo mode would silently report "no review
-		// feedback" with a nil error instead of failing loud.
-		return "", c.forgejoUnsupported("CollectPRReviewFeedback (review-gate family; M4)")
-	}
 	var sections []string
 
-	// 1. Fetch issue-level comments (Greptile summary with confidence score),
-	// via the shared wrapper (#797) for backoff + conditional caching.
-	issueCommentsOut, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate")
-	if err == nil {
+	// 1. Fetch issue-level summary comments. Forgejo (#1172 M4): via the
+	// ported issue-comments read (pulls share the issue number space); gh: via
+	// the shared wrapper (#797) for backoff + conditional caching. Both arms
+	// keep the historical error-swallowing semantics — a failed comments read
+	// degrades to "no summary sections", never an error.
+	if c.isForgejo() {
+		if comments, err := c.fjListIssueComments(prNumber); err == nil {
+			for _, cm := range comments {
+				if isCollectableReviewFeedbackLogin(cm.Author, streams) && isActionableReviewSummary(cm.Body) {
+					sections = append(sections, cm.Body)
+				}
+			}
+		}
+	} else if issueCommentsOut, err := c.ghAPIWithArgs(fmt.Sprintf("repos/%s/issues/%d/comments?per_page=100", c.Repo, prNumber), "--paginate"); err == nil {
 		var comments []struct {
 			Body string `json:"body"`
 			User struct {

@@ -59,26 +59,42 @@ func TestForgejoModeFailsLoud(t *testing.T) {
 		name string
 		call func() error
 	}{
-		// github.go — explicit early guards (their first transport touch is a
-		// ported read, or they swallow downstream errors by design; without
-		// the guard they would half-work — see the M2 spec's NOT-ported list).
-		{"PRCIStatus", func() error { _, err := c.PRCIStatus(1); return err }},
-		{"PRMergeStatus", func() error { _, _, err := c.PRMergeStatus(1); return err }},
-		{"PRChecksOutput", func() error { _, err := c.PRChecksOutput(1); return err }},
-		{"CIFailureSummary", func() error { _, err := c.CIFailureSummary(1); return err }},
-		{"CollectPRReviewFeedback", func() error { _, err := c.CollectPRReviewFeedback(1, nil); return err }},
+		// M4 flip note (#1172): the check-runs/status consumer family moved
+		// OUT of this list — PRCIStatus, PRCheckRollup, PRMergeStatus,
+		// PRChecksOutput, PRFailingChecks, CIFailureSummary,
+		// CollectPRReviewFeedback, greptileReviewComments,
+		// PRReviewGateVerdict/namedReviewStreamVerdict,
+		// PRHasCriticalReviewOnHead, CollectReviewFeedback,
+		// PRBlockingReviewFindingsOnHead, and PRUnresolvedReviewThreadsOnHead
+		// are ported (forgejo-mode httptest coverage lives in
+		// forgejo_port_m4_test.go). What stays guarded below is the
+		// greptile-only family (new explicit guards), the raw check-run /
+		// commit reads that have no forgejo equivalent (funnel chokes), and
+		// the unported write + Projects surface.
+
+		// github.go — NEW explicit greptile-only guards (M4): their reads are
+		// all ported now, so without the guard each would half-work — forever
+		// "pending"/"no findings" on a reviewer that never posts on forgejo.
+		{"PRGreptileApproved", func() error { _, _, err := c.PRGreptileApproved(1); return err }},
+		{"prGreptileReviewStreamVerdict", func() error { _, err := c.prGreptileReviewStreamVerdict(1); return err }},
+		{"PRHighSeverityReviewOnHead", func() error { _, _, _, err := c.PRHighSeverityReviewOnHead(1); return err }},
 		// github.go — c.ghAPI funnel.
 		{"RateLimit", func() error { _, err := c.RateLimit(); return err }},
-		// github.go — c.ghAPIWithArgs funnel.
+		// github.go — c.ghAPI funnel: commit timestamp read, only reachable
+		// from the greptile comment fallback (behind the guard above), kept
+		// loud in its own right.
+		{"commitCommittedAt", func() error { _, err := c.commitCommittedAt("59e99c49c27d3e2f73bae1657f07cd2f9a15f926"); return err }},
+		// github.go — c.ghAPIWithArgs funnel: the raw check-run reads. No
+		// check-runs API exists on forgejo; the M4 rollup consumers dispatch
+		// to statuses-only siblings BEFORE ever reaching these.
 		{"checkRunsForSHA", func() error { _, err := c.checkRunsForSHA("59e99c49c27d3e2f73bae1657f07cd2f9a15f926"); return err }},
+		{"checkRunAnnotations", func() error { _, err := c.checkRunAnnotations(1); return err }},
 		// github.go — c.ghExec funnel: the writes are ported in M3, so the one
 		// remaining write-shaped guard is MarkPRReady (EditPullRequestOption
 		// has no draft toggle on 16.0.1 — explicit guard until M7).
 		{"MarkPRReady", func() error { return c.MarkPRReady(1) }},
 		// github_projects.go — c.ghOutputContext funnel (GraphQL Projects).
 		{"DiscoverProject", func() error { _, err := c.DiscoverProject(1); return err }},
-		// review_threads.go — GraphQL through c.ghExec.
-		{"PRUnresolvedReviewThreadsOnHead", func() error { _, _, err := c.PRUnresolvedReviewThreadsOnHead(1); return err }},
 	}
 	for _, s := range samples {
 		err := s.call()
