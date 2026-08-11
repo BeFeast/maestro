@@ -223,7 +223,9 @@ func TestFilterStreamFindings_IgnoresOtherLoginsAndOldHeads(t *testing.T) {
 }
 
 func TestIsLLMReviewBotLogin(t *testing.T) {
-	for _, login := range []string{"okbot", "OKBot", "llm-review-bot", "acme-llm-review"} {
+	// "oklabs-bot" is the Forgejo fleet bot — it does not contain "okbot", so
+	// it must match on its own entry, not incidentally.
+	for _, login := range []string{"okbot", "OKBot", "oklabs-bot", "OkLabs-Bot", "llm-review-bot", "acme-llm-review"} {
 		if !isLLMReviewBotLogin(login) {
 			t.Errorf("isLLMReviewBotLogin(%q) = false, want true", login)
 		}
