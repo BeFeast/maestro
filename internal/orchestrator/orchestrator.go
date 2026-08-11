@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/befeast/maestro/internal/approvalstore"
@@ -84,6 +85,12 @@ type Orchestrator struct {
 	// missingReviewNotified remembers PRs already reported as merged past an
 	// absent review gate, so the alert fires once per PR.
 	missingReviewNotified map[int]bool
+	// reviewProduceInFlight guards one llm-review producer run per PR in this
+	// process (#1162 S5); cross-process dedup is the posted statuses.
+	reviewProduceMu       sync.Mutex
+	reviewProduceInFlight map[int]bool
+	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
+	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -3772,6 +3779,10 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		changed = append(changed, "review_retrigger")
 		o.cfg.ReviewRetrigger = newCfg.ReviewRetrigger
 	}
+	if !reflect.DeepEqual(newCfg.ReviewProducer, old.ReviewProducer) {
+		changed = append(changed, "review_producer")
+		o.cfg.ReviewProducer = newCfg.ReviewProducer
+	}
 	if newCfg.AutoRetryReviewFeedback != old.AutoRetryReviewFeedback {
 		changed = append(changed, fmt.Sprintf("auto_retry_review_feedback: %v→%v", old.AutoRetryReviewFeedback, newCfg.AutoRetryReviewFeedback))
 		o.cfg.AutoRetryReviewFeedback = newCfg.AutoRetryReviewFeedback
@@ -5839,6 +5850,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 			o.trackReviewGateHead(sess, o.reviewClockHead(pr, gateTransition.HeadSHA), reviewVerdict, now)
 			if reviewVerdict.Pending {
 				o.maybeRetriggerStalePendingReview(sess, pr, reviewVerdict)
+				// #1162 S5: an expected llm-review-* stream with no signal on
+				// this head is ours to produce, not to wait for.
+				o.maybeProduceMissingReview(pr.Number, gateTransition.HeadSHA, reviewVerdict)
 				// A gate that never produced any signal is not "reviewing" —
 				// it is absent. Past the configured grace the PR proceeds on
 				// its own merits (CI is already green here) instead of waiting
