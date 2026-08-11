@@ -520,8 +520,9 @@ func TestGetPull_Merged(t *testing.T) {
 		`{"number":2,"title":"gate","body":"pr body","state":"closed","draft":false,
 		  "mergeable":true,"merged":true,"merged_at":"2026-07-31T21:55:11Z",
 		  "merge_commit_sha":"dfc9446cb6a16c60075286299cd07d2cb655769a",
+		  "merge_base":"63d046eb546c32ca4492c724ac6371f04507b18d",
 		  "head":{"ref":"canary/llm-review-e2e","sha":"59e99c49c27d3e2f73bae1657f07cd2f9a15f926"},
-		  "base":{"ref":"main"}}`)
+		  "base":{"ref":"main","sha":"0000000000000000000000000000000000000bad"}}`)
 	p, err := c.GetPull(context.Background(), "owner/repo", 2)
 	if err != nil {
 		t.Fatalf("GetPull: %v", err)
@@ -543,6 +544,13 @@ func TestGetPull_Merged(t *testing.T) {
 	}
 	if p.HeadRef != "canary/llm-review-e2e" || p.BaseRef != "main" {
 		t.Fatalf("refs = %q / %q — slashes must survive verbatim", p.HeadRef, p.BaseRef)
+	}
+	// merge_base survives verbatim and is NOT the payload's base.sha decoy:
+	// base.sha moves on after a merge (live-verified on the gate-test merged
+	// pull), so "behind" synthesis compares MergeBase against a fresh
+	// BranchHeadSHA read — the transport must carry the wire field untouched.
+	if p.MergeBase != "63d046eb546c32ca4492c724ac6371f04507b18d" {
+		t.Fatalf("merge_base = %q, want the wire merge_base verbatim", p.MergeBase)
 	}
 	req := (*seen)[0]
 	if req.Path != "/repos/owner/repo/pulls/2" {
@@ -567,6 +575,9 @@ func TestGetPull_Unmerged(t *testing.T) {
 	}
 	if p.Body != "" {
 		t.Fatalf("a null body must decode to empty, got %q", p.Body)
+	}
+	if p.MergeBase != "" {
+		t.Fatalf("an absent merge_base must decode to empty, got %q", p.MergeBase)
 	}
 }
 
@@ -765,5 +776,321 @@ func TestReads_ContextCanceled(t *testing.T) {
 	}
 	if len(*seen) != 0 {
 		t.Fatalf("a canceled context must not reach the API, saw %v", *seen)
+	}
+}
+
+func TestCombinedStatus(t *testing.T) {
+	// The live-verified shape: aggregate in top-level `state`, per-status state
+	// in `.status`. Each row plants a contradictory `.state` decoy so a
+	// regression to the GitHub per-status field name fails loudly.
+	c, seen := staticReads(t, 200, `{"state":"SUCCESS","total_count":2,"statuses":[
+		{"context":"llm-review","status":"success","state":"failure","description":"smoke",
+		 "target_url":"","created_at":"2026-07-31T21:55:09Z","id":1},
+		{"context":"ci/build","status":"PENDING","state":"failure","description":"",
+		 "target_url":"https://x/run/7","created_at":"2026-08-10T12:00:00Z","id":1}]}`)
+	combined, err := c.CombinedStatus(context.Background(), "owner/repo", "fjsha1")
+	if err != nil {
+		t.Fatalf("CombinedStatus: %v", err)
+	}
+	if combined.State != "success" {
+		t.Fatalf("aggregate = %q, want top-level state normalized lowercase", combined.State)
+	}
+	if len(combined.Statuses) != 2 {
+		t.Fatalf("statuses = %+v, want 2", combined.Statuses)
+	}
+	first := combined.Statuses[0]
+	if first.State != "success" {
+		t.Fatalf("first state = %q — the impl must read Forgejo's .status, never .state", first.State)
+	}
+	if first.Context != "llm-review" || first.Description != "smoke" || first.TargetURL != "" {
+		t.Fatalf("first status = %+v", first)
+	}
+	if first.CreatedAt != "2026-07-31T21:55:09Z" {
+		t.Fatalf("first created_at = %q, want the RFC3339 wire string verbatim (fingerprint input)", first.CreatedAt)
+	}
+	if second := combined.Statuses[1]; second.State != "pending" || second.TargetURL != "https://x/run/7" {
+		t.Fatalf("second status = %+v", second)
+	}
+	req := (*seen)[0]
+	if req.Method != http.MethodGet || req.Path != "/repos/owner/repo/commits/fjsha1/status" {
+		t.Fatalf("request = %s %s", req.Method, req.Path)
+	}
+	if req.Query.Get("limit") != strconv.Itoa(pageSize) || req.Query.Get("page") != "1" {
+		t.Fatalf("the statuses array is paginated — query = %v", req.Query)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("requests = %d, want 1 (a short statuses page ends the loop)", len(*seen))
+	}
+}
+
+func TestCombinedStatus_NoSignalShape(t *testing.T) {
+	// Live-verified: zero statuses answer 200 with an EMPTY-STRING aggregate
+	// and a null statuses array. Both must survive as-is — empty state + nil
+	// slice is the no-signal shape downstream parity logic keys on.
+	c, _ := staticReads(t, 200, `{"state":"","total_count":0,"statuses":null}`)
+	combined, err := c.CombinedStatus(context.Background(), "owner/repo", "dfc9446cb6a16c60075286299cd07d2cb655769a")
+	if err != nil {
+		t.Fatalf("CombinedStatus: %v", err)
+	}
+	if combined.State != "" {
+		t.Fatalf("aggregate = %q, want empty string on a no-signal SHA", combined.State)
+	}
+	if combined.Statuses != nil {
+		t.Fatalf("statuses = %#v, want nil (wire null must not become an invented row)", combined.Statuses)
+	}
+}
+
+func TestCombinedStatus_WarningAndSkippedSurviveVerbatim(t *testing.T) {
+	// "warning" and "skipped" are real CommitStatusState values (skipped
+	// live-verified from Actions-sourced statuses) — they must reach the
+	// caller verbatim, never collapsed into the four-state write vocabulary.
+	c, _ := staticReads(t, 200, `{"state":"pending","total_count":2,"statuses":[
+		{"context":"a","status":"warning","created_at":"2026-08-10T12:00:00Z"},
+		{"context":"b","status":"skipped","created_at":"2026-08-10T12:00:01Z"}]}`)
+	combined, err := c.CombinedStatus(context.Background(), "owner/repo", "sha")
+	if err != nil {
+		t.Fatalf("CombinedStatus: %v", err)
+	}
+	if len(combined.Statuses) != 2 ||
+		combined.Statuses[0].State != "warning" || combined.Statuses[1].State != "skipped" {
+		t.Fatalf("statuses = %+v, want warning and skipped verbatim", combined.Statuses)
+	}
+}
+
+func TestCombinedStatus_Pagination(t *testing.T) {
+	statusRow := func(i int) string {
+		return fmt.Sprintf(`{"context":"ctx-%d","status":"success","created_at":"2026-08-10T12:00:00Z"}`, i)
+	}
+	statusPage := func(state string, from, n int) string {
+		rows := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			rows = append(rows, statusRow(from+i))
+		}
+		return fmt.Sprintf(`{"state":%q,"total_count":%d,"statuses":[%s]}`, state, pageSize+2, strings.Join(rows, ","))
+	}
+	// Page 2 reports a contradictory aggregate: the result must carry page 1's
+	// (deterministic page-1-wins, both pages describe the same rollup live).
+	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 200, statusPage("pending", 1, pageSize)
+		case "2":
+			return 200, statusPage("success", 1+pageSize, 2)
+		default:
+			return 500, `{"message":"unexpected page"}`
+		}
+	})
+	combined, err := c.CombinedStatus(context.Background(), "owner/repo", "sha")
+	if err != nil {
+		t.Fatalf("CombinedStatus: %v", err)
+	}
+	if combined.State != "pending" {
+		t.Fatalf("aggregate = %q, want page 1's", combined.State)
+	}
+	if len(combined.Statuses) != pageSize+2 {
+		t.Fatalf("statuses = %d, want %d", len(combined.Statuses), pageSize+2)
+	}
+	if combined.Statuses[0].Context != "ctx-1" || combined.Statuses[pageSize+1].Context != fmt.Sprintf("ctx-%d", pageSize+2) {
+		t.Fatalf("order broken: first=%q last=%q", combined.Statuses[0].Context, combined.Statuses[pageSize+1].Context)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*seen))
+	}
+}
+
+func TestCombinedStatus_PageCapFailsLoud(t *testing.T) {
+	// Every page full — including on a server that ignores the page param and
+	// re-serves the same clamped page forever — must end at the cap with a
+	// loud error, never a silently duplicated or truncated set.
+	full := make([]string, pageSize)
+	for i := range full {
+		full[i] = fmt.Sprintf(`{"context":"ctx-%d","status":"success","created_at":"2026-08-10T12:00:00Z"}`, i)
+	}
+	c, seen := staticReads(t, 200,
+		fmt.Sprintf(`{"state":"success","statuses":[%s]}`, strings.Join(full, ",")))
+	_, err := c.CombinedStatus(context.Background(), "owner/repo", "sha")
+	if err == nil {
+		t.Fatal("an over-cap statuses listing must error")
+	}
+	if !strings.Contains(err.Error(), "refusing to truncate") {
+		t.Fatalf("error should name the cap, got: %v", err)
+	}
+	if len(*seen) != maxListPages {
+		t.Fatalf("requests = %d, want exactly %d", len(*seen), maxListPages)
+	}
+}
+
+func TestCombinedStatus_HTTPError(t *testing.T) {
+	c, _ := staticReads(t, 500, `{"message":"boom"}`)
+	if _, err := c.CombinedStatus(context.Background(), "owner/repo", "sha"); err == nil {
+		t.Fatal("a non-2xx combined read must surface as an error, not a no-signal shape")
+	}
+}
+
+func TestListPullReviews(t *testing.T) {
+	// Row 1 is the live migrated shape (Ghost user, EMPTY commit_id); row 2 a
+	// native-style review. State must stay VERBATIM uppercase — vocabulary
+	// mapping is the gh layer's job.
+	c, seen := staticReads(t, 200, `[
+		{"id":45,"user":{"id":-1,"login":"Ghost"},"team":null,"state":"COMMENT","body":"migrated",
+		 "commit_id":"","stale":false,"official":false,"dismissed":false,"comments_count":3,
+		 "submitted_at":"2026-07-30T10:00:00Z","updated_at":"2026-07-30T10:00:00Z"},
+		{"id":46,"user":{"id":7,"login":"maestro-bot"},"team":null,"state":"APPROVED","body":"lgtm",
+		 "commit_id":"64b09cb367f467272a86ba1c7fd08becae54981c","stale":false,"official":true,
+		 "dismissed":false,"comments_count":0,"submitted_at":"2026-07-31T11:00:00Z"}]`)
+	reviews, err := c.ListPullReviews(context.Background(), "owner/repo", 42, true)
+	if err != nil {
+		t.Fatalf("ListPullReviews: %v", err)
+	}
+	if len(reviews) != 2 {
+		t.Fatalf("reviews = %+v, want 2 in server order", reviews)
+	}
+	first := reviews[0]
+	if first.ID != 45 || first.User != "Ghost" || first.Body != "migrated" {
+		t.Fatalf("first review = %+v", first)
+	}
+	if first.State != "COMMENT" {
+		t.Fatalf("state = %q, want the ReviewStateType verbatim (uppercase)", first.State)
+	}
+	if first.CommitID != "" {
+		t.Fatalf("commit_id = %q — an empty review-level commit_id is legitimate (migrated reviews) and must survive as empty for the per-comment fallback", first.CommitID)
+	}
+	if first.SubmittedAt != "2026-07-30T10:00:00Z" || first.CommentsCount != 3 {
+		t.Fatalf("first review = %+v", first)
+	}
+	second := reviews[1]
+	if second.State != "APPROVED" || second.CommitID != "64b09cb367f467272a86ba1c7fd08becae54981c" {
+		t.Fatalf("second review = %+v", second)
+	}
+	req := (*seen)[0]
+	if req.Method != http.MethodGet || req.Path != "/repos/owner/repo/pulls/42/reviews" {
+		t.Fatalf("request = %s %s", req.Method, req.Path)
+	}
+	if req.Query.Get("limit") != strconv.Itoa(pageSize) || req.Query.Get("page") != "1" {
+		t.Fatalf("reviews list must be paginated, query = %v", req.Query)
+	}
+}
+
+func TestListPullReviews_NullUserMapsToEmpty(t *testing.T) {
+	// creator/user can be null (live-proven on Actions-sourced statuses; the
+	// reviews contract does not promise non-null either) — a null user must
+	// decode to an empty login, not error.
+	c, _ := staticReads(t, 200,
+		`[{"id":9,"user":null,"state":"COMMENT","body":"b","commit_id":"","comments_count":0,
+		   "submitted_at":"2026-07-30T10:00:00Z"}]`)
+	reviews, err := c.ListPullReviews(context.Background(), "owner/repo", 1, true)
+	if err != nil {
+		t.Fatalf("ListPullReviews: %v", err)
+	}
+	if len(reviews) != 1 || reviews[0].User != "" {
+		t.Fatalf("reviews = %+v, want one review with empty User", reviews)
+	}
+}
+
+func TestListPullReviews_Pagination(t *testing.T) {
+	reviewsPage := func(from, n int) string {
+		rows := make([]string, 0, n)
+		for i := 0; i < n; i++ {
+			rows = append(rows, fmt.Sprintf(
+				`{"id":%d,"user":{"login":"u"},"state":"COMMENT","body":"b","commit_id":"","comments_count":1,"submitted_at":"2026-07-30T10:00:00Z"}`,
+				from+i))
+		}
+		return "[" + strings.Join(rows, ",") + "]"
+	}
+	c, seen := newReadsClient(t, func(r *http.Request) (int, string) {
+		switch r.URL.Query().Get("page") {
+		case "1":
+			return 200, reviewsPage(1, pageSize)
+		case "2":
+			return 200, reviewsPage(1+pageSize, 2)
+		default:
+			return 200, "[]" // past-the-end pages answer 200 [] live
+		}
+	})
+	reviews, err := c.ListPullReviews(context.Background(), "owner/repo", 42, true)
+	if err != nil {
+		t.Fatalf("ListPullReviews: %v", err)
+	}
+	if len(reviews) != pageSize+2 {
+		t.Fatalf("reviews = %d, want %d", len(reviews), pageSize+2)
+	}
+	if reviews[0].ID != 1 || reviews[pageSize+1].ID != int64(pageSize+2) {
+		t.Fatalf("order broken: first=%d last=%d", reviews[0].ID, reviews[pageSize+1].ID)
+	}
+	if len(*seen) != 2 {
+		t.Fatalf("requests = %d, want 2", len(*seen))
+	}
+}
+
+func TestListPullReviews_HTTPError(t *testing.T) {
+	c, _ := staticReads(t, 404, `{"message":"not found"}`)
+	if _, err := c.ListPullReviews(context.Background(), "owner/repo", 999, true); err == nil {
+		t.Fatal("a 404 must surface as an error")
+	}
+}
+
+func TestListPullReviewComments(t *testing.T) {
+	// The live tx10-clock shape. THE LINE TRAP: the read side has no `line` /
+	// `new_position` — the new-file line number is `position`. The fixture
+	// plants both GitHub-style decoys so a regression to either field name
+	// fails loudly. commit_id is populated per comment even when the parent
+	// review's is empty (the head-anchor fallback).
+	c, seen := staticReads(t, 200, `[
+		{"id":70,"body":"finding one","user":{"id":-1,"login":"Ghost"},"resolver":null,
+		 "pull_request_review_id":45,"path":"cmd/main.go",
+		 "commit_id":"64b09cb367f467272a86ba1c7fd08becae54981c","original_commit_id":"",
+		 "position":609,"original_position":0,"line":999,"new_position":888,
+		 "diff_hunk":"@@ -0,0 +1,1758 @@","extra_lines_count":0,
+		 "created_at":"2026-07-30T10:00:00Z","updated_at":"2026-07-30T10:00:00Z"},
+		{"id":71,"body":"old-side note","user":{"id":7,"login":"maestro-bot"},
+		 "pull_request_review_id":45,"path":"web/app.css",
+		 "commit_id":"64b09cb367f467272a86ba1c7fd08becae54981c",
+		 "original_commit_id":"63d046eb546c32ca4492c724ac6371f04507b18d",
+		 "position":0,"original_position":12,
+		 "created_at":"2026-07-30T10:01:00Z"}]`)
+	comments, err := c.ListPullReviewComments(context.Background(), "owner/repo", 42, 45)
+	if err != nil {
+		t.Fatalf("ListPullReviewComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("comments = %+v, want 2", comments)
+	}
+	first := comments[0]
+	if first.Line != 609 {
+		t.Fatalf("Line = %d, want 609 from `position` — never from the `line`/`new_position` decoys", first.Line)
+	}
+	if first.OldLine != 0 {
+		t.Fatalf("OldLine = %d, want 0 (new-side comment)", first.OldLine)
+	}
+	if first.ID != 70 || first.Body != "finding one" || first.Author != "Ghost" || first.Path != "cmd/main.go" {
+		t.Fatalf("first comment = %+v", first)
+	}
+	if first.CommitID != "64b09cb367f467272a86ba1c7fd08becae54981c" || first.OriginalCommitID != "" {
+		t.Fatalf("commit ids = %q / %q", first.CommitID, first.OriginalCommitID)
+	}
+	if first.CreatedAt != "2026-07-30T10:00:00Z" {
+		t.Fatalf("created_at = %q, want verbatim", first.CreatedAt)
+	}
+	if second := comments[1]; second.Line != 0 || second.OldLine != 12 {
+		t.Fatalf("second comment lines = %d/%d, want 0/12 (old-side comment)", second.Line, second.OldLine)
+	}
+	req := (*seen)[0]
+	if req.Method != http.MethodGet || req.Path != "/repos/owner/repo/pulls/42/reviews/45/comments" {
+		t.Fatalf("request = %s %s", req.Method, req.Path)
+	}
+	// No page/limit params exist on this endpoint — sending them would be dead
+	// weight at best and a behavior change on a future server at worst.
+	if req.Query.Get("page") != "" || req.Query.Get("limit") != "" {
+		t.Fatalf("review comments must not be paginated, query = %v", req.Query)
+	}
+	if len(*seen) != 1 {
+		t.Fatalf("requests = %d, want 1 (single-response endpoint)", len(*seen))
+	}
+}
+
+func TestListPullReviewComments_HTTPError(t *testing.T) {
+	c, _ := staticReads(t, 500, `{"message":"boom"}`)
+	if _, err := c.ListPullReviewComments(context.Background(), "owner/repo", 42, 45); err == nil {
+		t.Fatal("a 500 must surface as an error, not an empty comment set")
 	}
 }
