@@ -30,20 +30,32 @@ func TestGiteaOriginDetectorsEachHeaderAlone(t *testing.T) {
 		"X-Gogs-Delivery",
 		"X-Gogs-Signature",
 	}
-	have := make(map[string]bool, len(GiteaOriginHeaders))
-	for _, name := range GiteaOriginHeaders {
+	detectors := GiteaOriginHeaderNames()
+	have := make(map[string]bool, len(detectors))
+	for _, name := range detectors {
 		have[name] = true
 	}
 	for _, name := range want {
 		if !have[name] {
-			t.Errorf("GiteaOriginHeaders is missing detector %q", name)
+			t.Errorf("detector list is missing %q", name)
 		}
 	}
-	if len(GiteaOriginHeaders) != len(want) {
-		t.Errorf("GiteaOriginHeaders = %d entries, want %d: %v", len(GiteaOriginHeaders), len(want), GiteaOriginHeaders)
+	if len(detectors) != len(want) {
+		t.Errorf("detector list = %d entries, want %d: %v", len(detectors), len(want), detectors)
 	}
 
-	for _, name := range GiteaOriginHeaders {
+	// The accessor hands back a copy: mutating it must not disarm the guard.
+	if len(detectors) > 0 {
+		detectors[0] = "X-Not-A-Detector"
+		h := http.Header{}
+		h.Set(HeaderForgejoEvent, "push")
+		if _, ok := GiteaOriginHeader(h); !ok {
+			t.Fatal("mutating the returned detector list disarmed the guard — accessor must return a copy")
+		}
+		detectors = GiteaOriginHeaderNames()
+	}
+
+	for _, name := range detectors {
 		t.Run(name, func(t *testing.T) {
 			h := http.Header{}
 			// Every delivery also carries the GitHub-aliased headers; the detector
@@ -90,11 +102,12 @@ func TestGiteaOriginIgnoresGitHubOnlyDelivery(t *testing.T) {
 	}
 }
 
-// TestGiteaOriginHeaderLookupIsCaseInsensitive covers http.Header.Get semantics:
-// net/textproto canonicalises header names on the wire, and Gitea writes some of
-// its GitHub-compat headers into the map without canonicalising, so the detector
-// must not depend on the caller's capitalisation. A present-but-empty header is
-// not a detector.
+// TestGiteaOriginHeaderLookupIsCaseInsensitive pins http.Header.Get semantics:
+// both Set and Get canonicalise the name they are given, so however a caller
+// spells the header the detector still fires. This is a property of the map
+// accessors, not of the wire: a header parsed off a real request is already
+// canonical, whatever capitalisation Forgejo/Gitea put on the wire. A
+// present-but-empty header is not a detector.
 func TestGiteaOriginHeaderLookupIsCaseInsensitive(t *testing.T) {
 	for _, spelling := range []string{"x-gitea-event", "X-GITEA-EVENT", "X-Gitea-Event"} {
 		h := http.Header{}
@@ -102,6 +115,16 @@ func TestGiteaOriginHeaderLookupIsCaseInsensitive(t *testing.T) {
 		if _, ok := GiteaOriginHeader(h); !ok {
 			t.Errorf("spelling %q not detected", spelling)
 		}
+	}
+
+	// Documented limit of Get-based lookup: a map key written RAW (bypassing Set)
+	// in non-canonical form is invisible to Get. Unreachable on the ingest path —
+	// net/http canonicalises every header it parses, so r.Header never holds such
+	// a key — but pinned here so nobody reads the case-insensitivity above as a
+	// promise about hand-built maps.
+	raw := http.Header{"x-gitea-event": {"push"}}
+	if _, ok := GiteaOriginHeader(raw); ok {
+		t.Fatal("raw non-canonical map key detected — behaviour changed; update this test and the ingest-path reasoning")
 	}
 
 	blank := http.Header{}

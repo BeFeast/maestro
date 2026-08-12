@@ -1470,11 +1470,15 @@ type fleetProjectState struct {
 	Name string `json:"name"`
 	Repo string `json:"repo"`
 	// Forge is the row's effective code forge kind — "github" (every legacy row)
-	// or "forgejo" (#1172). WebhooksApplicable reports whether the fleet-global
-	// `webhooks` block says anything about THIS row: forgejo rows are poll-only by
-	// design (the endpoint rejects Gitea-origin deliveries with 422), so a healthy
-	// global webhook block must not be read as covering them. Both are always
-	// present so the SPA never has to infer poll-only from a missing field.
+	// or "forgejo" (#1172). WebhooksApplicable reports whether this row's forge
+	// kind supports webhook ingestion at all: forgejo rows are poll-only by design
+	// (the endpoint rejects Gitea-origin deliveries with 422), so a healthy global
+	// `webhooks` block must not be read as covering them. It is a property of the
+	// forge kind, NOT a statement that ingestion is switched on — the fleet-global
+	// block is absent entirely when the daemon runs without a webhook secret, and
+	// github rows still report true there. It is also false when the config failed
+	// to resolve, where coverage is unknowable. Both fields are always present so
+	// the SPA never has to infer poll-only from a missing field.
 	Forge              string `json:"forge"`
 	WebhooksApplicable bool   `json:"webhooks_applicable"`
 	// ProjectID is the project's stable UUID identity (#869), omitted for legacy
@@ -4507,6 +4511,14 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		WebhooksApplicable: true,
 	}
 	if cfg == nil {
+		// Config did not resolve, so the row's forge is a fallback, not a fact —
+		// do NOT also claim webhook coverage for it. A forgejo row with a broken
+		// config would otherwise render as {"forge":"github","webhooks_applicable":
+		// true}: the exact "global webhook health covers this row" misreading the
+		// per-row fields exist to prevent, on the one row an operator is already
+		// worried about. `error` is set alongside, so false here reads as "cannot
+		// say", which is the honest answer.
+		item.WebhooksApplicable = false
 		item.Error = "missing resolved project config"
 		item.OperatorState = buildFleetProjectOperatorState(item)
 		return item, nil

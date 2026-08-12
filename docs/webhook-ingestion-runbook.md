@@ -151,6 +151,28 @@ journal lines `[webhook] rejected delivery: gitea/forgejo-origin (…) — forge
 rows are poll-only`. Delete the webhook from the Forgejo repository. Retrying
 cannot help; nothing about the delivery is salvageable here.
 
+**Cleaning up deliveries accepted before the guard existed.** The guard is
+ingest-side only: a Forgejo hook that was pointed here *before* #1172 M5 was
+accepted (`202`) and projected, so removing the hook stops new contamination but
+does not undo the old. Spot it by comparing the mirror rows for the mirrored
+`owner/name` against GitHub — Forgejo-derived rows carry Forgejo's id space
+(issue/PR numbers and ids that do not exist on the GitHub side):
+
+```
+sqlite3 ~/.maestro/maestro.db \
+  "SELECT received_at, event_type, repo, sender FROM webhook_deliveries
+     WHERE repo = 'owner/name' ORDER BY received_at DESC LIMIT 20;"
+```
+
+No manual repair is required for the read model: the GitHub row's phase-E
+`runMirrorReconcile` loop snapshots the authoritative GitHub open-issue and
+open-PR sets and rewrites whatever diverged, so the mirror converges on its next
+pass (`mirror reconcile repaired N row(s)` in the journal). Only the mirror
+converges, though — the raw rows in `webhook_deliveries` are kept verbatim and
+are never pruned (see the delivery table note below), so a historical
+Forgejo-origin payload stays queryable there. It is inert: nothing re-projects a
+stored delivery.
+
 **Reading fleet health for a forgejo row.** The top-level `webhooks` block is
 fleet-global and says nothing about a poll-only project. Each entry in
 `projects[]` carries `forge` (`"github"` | `"forgejo"`) and
@@ -200,3 +222,9 @@ sqlite3 ~/.maestro/maestro.db \
 
 The `webhook_deliveries` table is disjoint from the approvals / state tables
 that share the same `maestro.db`.
+
+It has **no retention or pruning** of any kind: every accepted delivery is kept
+with its full payload forever, so the table grows without bound on a busy repo.
+Pre-existing and forge-independent; deleting old rows by `received_at` is safe
+(nothing re-reads a stored delivery — the mirror is fed at accept time and
+repaired by reconciliation), but there is no automation for it yet.

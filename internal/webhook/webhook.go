@@ -35,12 +35,16 @@ const (
 // GitHub-keyed mirror tables under the bare owner/name key. These headers are
 // the unambiguous discriminators: GitHub never sends any of them.
 //
-// Verified against source, not guessed:
-//   - Forgejo services/webhook/shared/payloader.go sends X-Forgejo-{Delivery,
-//     Event,Event-Type,Signature}, X-Gitea-{Delivery,Event,Event-Type,Signature}
-//     and X-Gogs-{Delivery,Event,Event-Type,Signature} on EVERY delivery.
-//   - Gitea services/webhook/deliver.go (addDefaultHeaders) sends the same set
-//     plus X-Gitea-Hook-Installation-Target-Type.
+// Verified against source, not guessed. The two forges emit OVERLAPPING but not
+// identical sets, so the list is their union — do not trim it on the assumption
+// that both send all thirteen:
+//   - Forgejo services/webhook/shared/payloader.go (AddDefaultHeaders) sends
+//     X-Forgejo-{Delivery,Event,Event-Type,Signature},
+//     X-Gitea-{Delivery,Event,Event-Type,Signature} and
+//     X-Gogs-{Delivery,Event,Event-Type,Signature} on EVERY delivery.
+//   - Gitea services/webhook/deliver.go (addDefaultHeaders) sends the X-Gitea-*
+//     and X-Gogs-* quartets plus X-Gitea-Hook-Installation-Target-Type, and
+//     NO X-Forgejo-* header at all (that prefix is Forgejo-only).
 //
 // Deliberately NOT detectors: X-Hub-Signature (sha1) and X-GitHub-Event-Type —
 // the first is a real historical GitHub header, and the second is GitHub-prefixed,
@@ -63,10 +67,13 @@ const (
 	HeaderGogsSignature    = "X-Gogs-Signature"
 )
 
-// GiteaOriginHeaders is the exact detector list. Exposed (rather than inlined as
+// giteaOriginHeaders is the exact detector list. Named (rather than inlined as
 // string literals at the call site) so tests and any future diagnostic enumerate
-// the same set the handler enforces.
-var GiteaOriginHeaders = []string{
+// the same set the handler enforces. Deliberately UNexported and read only
+// through GiteaOriginHeaderNames: an exported slice is mutable package state, so
+// any importer could disable the write-side guard with a single assignment and
+// no test would fail.
+var giteaOriginHeaders = []string{
 	HeaderForgejoEvent,
 	HeaderForgejoEventType,
 	HeaderForgejoDelivery,
@@ -82,16 +89,26 @@ var GiteaOriginHeaders = []string{
 	HeaderGogsSignature,
 }
 
+// GiteaOriginHeaderNames returns a copy of the detector list for tests and
+// diagnostics. A copy, not the backing slice, so a caller cannot mutate what the
+// handler enforces.
+func GiteaOriginHeaderNames() []string {
+	out := make([]string, len(giteaOriginHeaders))
+	copy(out, giteaOriginHeaders)
+	return out
+}
+
 // GiteaOriginHeader returns the first detector header present on h and whether
-// the delivery is Gitea/Forgejo-origin. Lookup goes through http.Header.Get, so
-// it is header-name case-insensitive (net/textproto canonicalises on parse) and
-// a header present but empty does NOT count as a detector — Gitea/Forgejo always
-// populate these with a non-empty event name, UUID or digest.
+// the delivery is Gitea/Forgejo-origin. Lookup goes through http.Header.Get,
+// which canonicalises the name it is given, so the caller's capitalisation of
+// the constants does not matter. A header present but empty does NOT count as a
+// detector — Gitea/Forgejo always populate these with a non-empty event name,
+// UUID or digest.
 func GiteaOriginHeader(h http.Header) (string, bool) {
 	if h == nil {
 		return "", false
 	}
-	for _, name := range GiteaOriginHeaders {
+	for _, name := range giteaOriginHeaders {
 		if strings.TrimSpace(h.Get(name)) != "" {
 			return name, true
 		}

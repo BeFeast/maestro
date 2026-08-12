@@ -85,6 +85,29 @@ func TestProjectSnapshotGitHubRowShapeUnchanged(t *testing.T) {
 	}
 }
 
+// A row whose config failed to resolve must not ASSERT webhook coverage: the
+// forge kind is a display fallback there, so claiming webhooks_applicable would
+// be a guess presented as fact on the one row an operator is already worried
+// about (a broken forgejo row would render as github + covered).
+func TestProjectSnapshotUnresolvedConfigDoesNotClaimWebhookCoverage(t *testing.T) {
+	proj := NewFleetProject("broken", "", "", nil)
+	fleet := NewFleet([]FleetProject{proj}, "127.0.0.1", 0, false)
+
+	item, workers := fleet.projectSnapshot(proj, time.Now())
+	if workers != nil {
+		t.Fatalf("workers = %v, want nil for an unresolved row", workers)
+	}
+	if item.Error == "" {
+		t.Fatal("unresolved row has no error field")
+	}
+	if item.WebhooksApplicable {
+		t.Fatal("webhooks_applicable = true for a row with no resolved config, want false (coverage unknowable)")
+	}
+	if item.Forge == "" {
+		t.Fatal("forge is empty — the field must always be present")
+	}
+}
+
 // forgeRejectedStore is the minimal webhook.Store the ingestor needs; the
 // rejection path never touches it, which the zero counts assert.
 type forgeRejectedStore struct{}
