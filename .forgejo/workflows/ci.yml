@@ -1,0 +1,88 @@
+# Forgejo Actions port of .github/workflows/ci.yml (#1172 M4-ops).
+#
+# Both trees coexist until the repo cuts over to Forgejo (#1172 M8): GitHub only
+# reads .github/workflows and Forgejo only reads .forgejo/workflows, so the two
+# files are maintained in parallel and must be kept in sync by hand.
+#
+# Deltas from the GitHub original, and why:
+#
+#   - runs-on: blacksmith-4vcpu-ubuntu-2404 -> ubuntu-latest. The BeFeast
+#     org-scoped runner maps the `ubuntu-latest` label to
+#     ghcr.io/catthehacker/ubuntu:act-24.04.
+#
+#   - added an explicit ripgrep install. scripts/check-design-tokens.sh and
+#     scripts/check-design-recipes.sh shell out to `rg`, which the act-24.04
+#     image does not ship (its package set is ssh/gawk/curl/jq/wget/sudo/... —
+#     no ripgrep) whereas the GitHub-shaped Blacksmith image does. Both guards
+#     wrap the call as `HITS=$(rg ... || true)`, so a missing `rg` yields exit
+#     127, an empty HITS and a cheerful "OK" — the guard would pass without
+#     having checked anything. Installing the tool keeps the guard real.
+#
+#   - `uses:` strings are unchanged. The instance sets no DEFAULT_ACTIONS_URL,
+#     so actions resolve against code.forgejo.org, which mirrors
+#     actions/checkout@v7, actions/setup-go@v7 and oven-sh/setup-bun@v2 at
+#     exactly these versions.
+#
+# Everything else (job graph, `needs` ordering, step order, the design-token and
+# recipe guards, the committed-bundle staleness check and its ::error::
+# annotation, and the permissions block) is byte-identical to the original.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  frontend-build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Install ripgrep (design guards depend on it)
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ripgrep
+          rg --version
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.14
+      - name: Install MC deps
+        working-directory: internal/server/web/mc
+        run: bun install --frozen-lockfile
+      - name: Design token guard
+        run: bash scripts/check-design-tokens.sh
+      - name: Design recipe guard
+        run: bash scripts/check-design-recipes.sh
+      - name: Design recipe nesting guard
+        run: bash scripts/check-design-recipe-nesting.sh
+      - name: Test MC frontend
+        working-directory: internal/server/web/mc
+        run: bun test
+      - name: Build MC bundle
+        working-directory: internal/server/web/mc
+        run: bun run build
+      - name: Verify committed bundle matches build
+        run: |
+          if ! git diff --quiet -- internal/server/web/static/mc; then
+            echo "::error::Committed MC bundle is stale. Run 'bun run build' in internal/server/web/mc and commit the result."
+            git diff --stat -- internal/server/web/static/mc
+            exit 1
+          fi
+
+  build:
+    needs: frontend-build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+      - name: Build
+        run: go build ./...
+      - name: Vet
+        run: go vet ./...
+      - name: Test
+        run: go test ./...

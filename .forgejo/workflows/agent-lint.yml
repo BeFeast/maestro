@@ -1,0 +1,64 @@
+# Forgejo Actions port of .github/workflows/agent-lint.yml (#1172 M4-ops).
+#
+# Deltas from the GitHub original, and why:
+#
+#   - the lint job runs .github/actions/agent-lint/agent-lint.sh directly
+#     instead of `uses: ./.github/actions/agent-lint`. The script, not the
+#     composite action, is the shared unit; calling it directly avoids relying
+#     on local-composite-action resolution and on whether `github.token`
+#     renders inside a composite input default on Forgejo. The env block below
+#     reproduces exactly the contract .github/actions/agent-lint/action.yml
+#     passes on GitHub (GH_TOKEN / AGENT_LINT_PR / AGENT_LINT_REPO); the
+#     allowlist and override-label inputs are omitted because the workflow uses
+#     their defaults and the script defaults are identical.
+#
+#   - AGENT_LINT_FORGE=forgejo selects the script's Forgejo fetch arm by an
+#     explicit signal. The script can also auto-detect from GITHUB_API_URL, but
+#     CI should not depend on sniffing.
+#
+#   - `ready_for_review` and `converted_to_draft` are NOT in `types`. Forgejo
+#     never emits those pull_request actions — modules/actions/workflows.go
+#     lists both as unsupported — so keeping them would be inert entries that
+#     look like coverage. KNOWN GAP: the draft check (warn-only on GitHub) is
+#     not re-run at the moment a PR flips draft state; it still runs on the
+#     next opened/edited/reopened/synchronize/labeled/unlabeled event, which
+#     covers the practical cases. The remaining six types map 1:1 (Forgejo
+#     translates its internal synchronized/label_updated/label_cleared hook
+#     actions to synchronize/labeled/unlabeled before matching).
+name: agent-lint
+
+on:
+  pull_request:
+    types:
+      - opened
+      - edited
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  # Lint the actual PR (closing keywords, artifacts, secrets, draft warning).
+  agent-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: agent-lint
+        env:
+          AGENT_LINT_FORGE: forgejo
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          AGENT_LINT_PR: ${{ github.event.pull_request.number }}
+          AGENT_LINT_REPO: ${{ github.repository }}
+        run: bash .github/actions/agent-lint/agent-lint.sh
+
+  # Continuously prove the fixtures still trip each check (acceptance criterion 1).
+  self-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Fixture self-test
+        run: bash .github/actions/agent-lint/agent-lint.sh --self-test
