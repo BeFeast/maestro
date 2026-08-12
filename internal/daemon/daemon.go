@@ -1076,6 +1076,15 @@ func (d *Daemon) refreshPRGateFromWebhook(eventType, repo string) {
 		if flow == nil || flow.cfg == nil || flow.refreshCh == nil || !strings.EqualFold(strings.TrimSpace(flow.cfg.Repo), repo) {
 			continue
 		}
+		// Forgejo rows are poll-only (#1172 M5): they never receive webhook
+		// deliveries, and the repo match above is on the bare owner/name — which a
+		// mirrored GitHub/Forgejo pair SHARES. Without this guard a GitHub check_run
+		// event wakes the forgejo flow too, making it look webhook-driven while its
+		// actual gate state still only ever comes from polling. GitHub flows are
+		// unaffected.
+		if flow.cfg.Forge.IsForgejo() {
+			continue
+		}
 		channels = append(channels, flow.refreshCh)
 	}
 	d.mu.Unlock()

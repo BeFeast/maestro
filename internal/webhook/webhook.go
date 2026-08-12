@@ -14,6 +14,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"net/http"
 	"strings"
 )
 
@@ -25,6 +26,101 @@ const (
 	HeaderSignature = "X-Hub-Signature-256"
 	HeaderHookID    = "X-GitHub-Hook-ID"
 )
+
+// Gitea/Forgejo-origin delivery header names (#1172 M5). Forgejo and Gitea
+// deliver GitHub-ALIASED headers — X-GitHub-Event, X-GitHub-Delivery and
+// X-Hub-Signature-256 with the identical "sha256="+hex HMAC scheme — so a
+// Forgejo hook pointed at this endpoint with the same secret is otherwise
+// indistinguishable from GitHub and would be stored and projected into the
+// GitHub-keyed mirror tables under the bare owner/name key. These headers are
+// the unambiguous discriminators: GitHub never sends any of them.
+//
+// Verified against source, not guessed. The two forges emit OVERLAPPING but not
+// identical sets, so the list is their union — do not trim it on the assumption
+// that both send all thirteen:
+//   - Forgejo services/webhook/shared/payloader.go (AddDefaultHeaders) sends
+//     X-Forgejo-{Delivery,Event,Event-Type,Signature},
+//     X-Gitea-{Delivery,Event,Event-Type,Signature} and
+//     X-Gogs-{Delivery,Event,Event-Type,Signature} on EVERY delivery.
+//   - Gitea services/webhook/deliver.go (addDefaultHeaders) sends the X-Gitea-*
+//     and X-Gogs-* quartets plus X-Gitea-Hook-Installation-Target-Type, and
+//     NO X-Forgejo-* header at all (that prefix is Forgejo-only).
+//
+// Deliberately NOT detectors: X-Hub-Signature (sha1) and X-GitHub-Event-Type —
+// the first is a real historical GitHub header, and the second is GitHub-prefixed,
+// so treating either as Gitea-origin risks rejecting genuine GitHub traffic. The
+// list errs toward MORE detectors only where the header prefix makes the origin
+// unambiguous.
+const (
+	HeaderForgejoEvent     = "X-Forgejo-Event"
+	HeaderForgejoEventType = "X-Forgejo-Event-Type"
+	HeaderForgejoDelivery  = "X-Forgejo-Delivery"
+	HeaderForgejoSignature = "X-Forgejo-Signature"
+	HeaderGiteaEvent       = "X-Gitea-Event"
+	HeaderGiteaEventType   = "X-Gitea-Event-Type"
+	HeaderGiteaDelivery    = "X-Gitea-Delivery"
+	HeaderGiteaSignature   = "X-Gitea-Signature"
+	HeaderGiteaHookTarget  = "X-Gitea-Hook-Installation-Target-Type"
+	HeaderGogsEvent        = "X-Gogs-Event"
+	HeaderGogsEventType    = "X-Gogs-Event-Type"
+	HeaderGogsDelivery     = "X-Gogs-Delivery"
+	HeaderGogsSignature    = "X-Gogs-Signature"
+)
+
+// giteaOriginHeaders is the exact detector list. Named (rather than inlined as
+// string literals at the call site) so tests and any future diagnostic enumerate
+// the same set the handler enforces. Deliberately UNexported and read only
+// through GiteaOriginHeaderNames: an exported slice is mutable package state, so
+// any importer could disable the write-side guard with a single assignment and
+// no test would fail.
+var giteaOriginHeaders = []string{
+	HeaderForgejoEvent,
+	HeaderForgejoEventType,
+	HeaderForgejoDelivery,
+	HeaderForgejoSignature,
+	HeaderGiteaEvent,
+	HeaderGiteaEventType,
+	HeaderGiteaDelivery,
+	HeaderGiteaSignature,
+	HeaderGiteaHookTarget,
+	HeaderGogsEvent,
+	HeaderGogsEventType,
+	HeaderGogsDelivery,
+	HeaderGogsSignature,
+}
+
+// GiteaOriginHeaderNames returns a copy of the detector list for tests and
+// diagnostics. A copy, not the backing slice, so a caller cannot mutate what the
+// handler enforces.
+func GiteaOriginHeaderNames() []string {
+	out := make([]string, len(giteaOriginHeaders))
+	copy(out, giteaOriginHeaders)
+	return out
+}
+
+// GiteaOriginHeader returns the first detector header present on h and whether
+// the delivery is Gitea/Forgejo-origin. Lookup goes through http.Header.Get,
+// which canonicalises the name it is given, so the caller's capitalisation of
+// the constants does not matter. A header present but empty does NOT count as a
+// detector — Gitea/Forgejo always populate these with a non-empty event name,
+// UUID or digest.
+func GiteaOriginHeader(h http.Header) (string, bool) {
+	if h == nil {
+		return "", false
+	}
+	for _, name := range giteaOriginHeaders {
+		if strings.TrimSpace(h.Get(name)) != "" {
+			return name, true
+		}
+	}
+	return "", false
+}
+
+// IsGiteaOrigin reports whether h carries any Gitea/Forgejo-origin marker.
+func IsGiteaOrigin(h http.Header) bool {
+	_, ok := GiteaOriginHeader(h)
+	return ok
+}
 
 // signaturePrefix is the algorithm tag GitHub prepends to the hex digest in the
 // X-Hub-Signature-256 header ("sha256=<hexdigest>"). The older X-Hub-Signature

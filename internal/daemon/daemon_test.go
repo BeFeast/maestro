@@ -172,6 +172,62 @@ func TestCheckWebhookRefreshesOnlyMatchingProjectFlow(t *testing.T) {
 	}
 }
 
+// TestCheckWebhookSkipsForgejoFlows covers the mirrored-pair case (#1172 M5):
+// a GitHub repo mirrored to Forgejo shares the bare owner/name, so matching on
+// the repo alone woke the forgejo flow off a GitHub CI event — making a
+// poll-only row look webhook-driven. The forgejo flow must be skipped while the
+// github flow with the SAME repo name still gets its wake-up.
+func TestCheckWebhookSkipsForgejoFlows(t *testing.T) {
+	d := New(fakeLoader{}, Options{Port: 0})
+	gh := &projectFlow{
+		cfg:       &config.Config{Repo: "BeFeast/maestro"},
+		refreshCh: make(chan struct{}, 1),
+	}
+	fj := &projectFlow{
+		cfg: &config.Config{
+			Repo:  "BeFeast/maestro",
+			Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+		},
+		refreshCh: make(chan struct{}, 1),
+	}
+	// An explicit kind: github row must behave exactly like the absent-block row.
+	ghExplicit := &projectFlow{
+		cfg: &config.Config{
+			Repo:  "BeFeast/maestro",
+			Forge: config.ForgeConfig{Kind: config.ForgeKindGitHub},
+		},
+		refreshCh: make(chan struct{}, 1),
+	}
+	d.flows = map[string]*projectFlow{"gh": gh, "fj": fj, "gh-explicit": ghExplicit}
+
+	d.refreshPRGateFromWebhook("check_run", "BeFeast/maestro")
+
+	if got := len(gh.refreshCh); got != 1 {
+		t.Fatalf("github flow refreshes = %d, want 1 (behaviour must be unchanged)", got)
+	}
+	if got := len(ghExplicit.refreshCh); got != 1 {
+		t.Fatalf("explicit-github flow refreshes = %d, want 1", got)
+	}
+	if got := len(fj.refreshCh); got != 0 {
+		t.Fatalf("forgejo flow refreshes = %d, want 0 — forgejo rows are poll-only", got)
+	}
+
+	// Same for the other gate event types.
+	<-gh.refreshCh
+	<-ghExplicit.refreshCh
+	for _, event := range []string{"check_suite", "status"} {
+		d.refreshPRGateFromWebhook(event, "BeFeast/maestro")
+		if got := len(fj.refreshCh); got != 0 {
+			t.Fatalf("forgejo flow refreshes after %q = %d, want 0", event, got)
+		}
+		if got := len(gh.refreshCh); got != 1 {
+			t.Fatalf("github flow refreshes after %q = %d, want 1", event, got)
+		}
+		<-gh.refreshCh
+		<-ghExplicit.refreshCh
+	}
+}
+
 func TestRunSkipsDuplicateFlowIdentity(t *testing.T) {
 	// Two configs that resolve to the same flow identity (same StateDir) are a
 	// true duplicate — the second must be skipped, not silently overwrite the
