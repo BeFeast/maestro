@@ -1116,6 +1116,10 @@ type fleetWebhookStats struct {
 	Duplicates        int64            `json:"duplicates"`
 	SignatureFailures int64            `json:"signature_failures"`
 	BadRequests       int64            `json:"bad_requests"`
+	// ForgeRejected counts Gitea/Forgejo-origin deliveries refused with 422
+	// (#1172 M5). Non-zero means a Forgejo webhook is pointed at the GitHub
+	// endpoint — forgejo rows are poll-only, so the fix is to remove the hook.
+	ForgeRejected int64 `json:"forge_rejected"`
 }
 
 // webhookStatsSnapshot maps the ingestor's counters into the fleet response
@@ -1135,6 +1139,7 @@ func (s *FleetServer) webhookStatsSnapshot() *fleetWebhookStats {
 		Duplicates:        st.Duplicates,
 		SignatureFailures: st.SignatureFailures,
 		BadRequests:       st.BadRequests,
+		ForgeRejected:     st.ForgeRejected,
 	}
 	if !st.LastDeliveryAt.IsZero() {
 		out.LastDeliveryAt = formatFleetTime(st.LastDeliveryAt)
@@ -1464,6 +1469,14 @@ type fleetClosedIssueOutcome struct {
 type fleetProjectState struct {
 	Name string `json:"name"`
 	Repo string `json:"repo"`
+	// Forge is the row's effective code forge kind — "github" (every legacy row)
+	// or "forgejo" (#1172). WebhooksApplicable reports whether the fleet-global
+	// `webhooks` block says anything about THIS row: forgejo rows are poll-only by
+	// design (the endpoint rejects Gitea-origin deliveries with 422), so a healthy
+	// global webhook block must not be read as covering them. Both are always
+	// present so the SPA never has to infer poll-only from a missing field.
+	Forge              string `json:"forge"`
+	WebhooksApplicable bool   `json:"webhooks_applicable"`
 	// ProjectID is the project's stable UUID identity (#869), omitted for legacy
 	// rows that have none. Descriptive only — it never changes routing/display.
 	ProjectID string `json:"project_id,omitempty"`
@@ -4487,6 +4500,11 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		ConfigPath:   project.ConfigPath,
 		DashboardURL: project.DashboardURL,
 		Freshness:    newFleetProjectFreshness(),
+		// Default to the historical forge so a row whose config failed to resolve
+		// still reports a concrete kind rather than an empty string; overwritten
+		// from cfg.Forge below as soon as the config is known.
+		Forge:              config.ForgeKindGitHub,
+		WebhooksApplicable: true,
 	}
 	if cfg == nil {
 		item.Error = "missing resolved project config"
@@ -4494,6 +4512,10 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 		return item, nil
 	}
 	item.Repo = cfg.Repo
+	// #1172 M5: forgejo rows are poll-only — no webhook ingestion exists for them,
+	// so the fleet-global `webhooks` block says nothing about this project.
+	item.Forge = cfg.Forge.EffectiveKind()
+	item.WebhooksApplicable = !cfg.Forge.IsForgejo()
 	item.ProjectID = strings.TrimSpace(cfg.ProjectID)
 	item.ManagementHome = fleetManagementHomeFromConfig(cfg.ManagementHome)
 	item.StateDir = cfg.StateDir

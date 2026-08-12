@@ -76,9 +76,14 @@ type Ingestor struct {
 	duplicates        int64
 	signatureFailures int64
 	badRequests       int64
-	byEventType       map[string]int64
-	lastDeliveryAt    time.Time
-	lastEventType     string
+	// forgeRejected counts signed-but-Gitea/Forgejo-origin deliveries turned away
+	// with 422 (#1172 M5). Transient per-process like the other rejection counters
+	// — nothing is stored, so there is nothing durable to seed it from. A non-zero
+	// value means someone pointed a Forgejo hook at the GitHub endpoint.
+	forgeRejected  int64
+	byEventType    map[string]int64
+	lastDeliveryAt time.Time
+	lastEventType  string
 }
 
 // NewIngestor builds an Ingestor over store with the given webhook secret and
@@ -209,6 +214,34 @@ func (in *Ingestor) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Origin guard (#1172 M5): forgejo rows are poll-only by design. A Forgejo /
+	// Gitea hook aimed here with the right secret passes VerifySignature (identical
+	// sha256= HMAC scheme) and carries GitHub-aliased X-GitHub-* headers, so without
+	// this check it would be stored AND projected into mirror_* rows keyed by the
+	// bare owner/name — the same key the GitHub mirror uses for the mirrored repo.
+	//
+	// Placed AFTER the signature check on purpose: an unauthenticated prober must
+	// still get 401 and learn nothing about which forges this endpoint distinguishes.
+	//
+	// Rejected with 422 rather than 202-and-ignore: a stored-but-unprojected Gitea
+	// delivery would inflate webhooks.total_deliveries / by_event_type and read as
+	// healthy ingestion on the fleet snapshot, so the misconfiguration would be
+	// invisible exactly where an operator would look for it. 422 fails loud, never
+	// stores, never projects, and Forgejo surfaces the non-2xx in its hook delivery
+	// log. 4xx (not 5xx) because retrying unchanged cannot help.
+	if origin, ok := GiteaOriginHeader(r.Header); ok {
+		in.countForgeRejected()
+		log.Printf("[webhook] rejected delivery: gitea/forgejo-origin (%s present) — forgejo rows are poll-only (event=%q delivery=%q)",
+			origin, r.Header.Get(HeaderEvent), r.Header.Get(HeaderDelivery))
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{
+			"error":  "gitea/forgejo-origin delivery rejected",
+			"origin": origin,
+			"reason": "this endpoint ingests GitHub deliveries only; the mirror read model is keyed for GitHub, so a Forgejo delivery would contaminate the mirrored repo's rows",
+			"remedy": "forgejo rows are poll-only by design — remove this webhook from the Forgejo repository; see docs/webhook-ingestion-runbook.md",
+		})
+		return
+	}
+
 	deliveryID := strings.TrimSpace(r.Header.Get(HeaderDelivery))
 	if deliveryID == "" {
 		in.countBadRequest()
@@ -282,6 +315,12 @@ func (in *Ingestor) countSignatureFailure() {
 	in.mu.Unlock()
 }
 
+func (in *Ingestor) countForgeRejected() {
+	in.mu.Lock()
+	in.forgeRejected++
+	in.mu.Unlock()
+}
+
 func (in *Ingestor) countBadRequest() {
 	in.mu.Lock()
 	in.badRequests++
@@ -319,7 +358,11 @@ type Stats struct {
 	Duplicates        int64
 	SignatureFailures int64
 	BadRequests       int64
-	ByEventType       map[string]int64
+	// ForgeRejected is the count of Gitea/Forgejo-origin deliveries refused with
+	// 422 (#1172 M5). Surfaced so a misconfigured Forgejo hook is visible instead
+	// of silent.
+	ForgeRejected int64
+	ByEventType   map[string]int64
 }
 
 // Stats returns a snapshot of the observability counters.
@@ -337,6 +380,7 @@ func (in *Ingestor) Stats() Stats {
 		Duplicates:        in.duplicates,
 		SignatureFailures: in.signatureFailures,
 		BadRequests:       in.badRequests,
+		ForgeRejected:     in.forgeRejected,
 		ByEventType:       byType,
 	}
 }

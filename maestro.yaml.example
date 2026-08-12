@@ -18,6 +18,10 @@ worktree_base: /path/to/worktrees/repo
 # Note (#1172 M4): forgejo rows must also set review_gate: llm-review (or
 # none) — the default greptile gate is a GitHub-only reviewer and is rejected
 # at parse time on forgejo rows.
+# Note (#1172 M5): forgejo rows are poll-only — no webhook ingestion. The
+# /api/v1/webhooks/github endpoint rejects Gitea/Forgejo-origin deliveries with
+# 422 (the mirror read model is GitHub-keyed); see
+# docs/webhook-ingestion-runbook.md.
 # forge:
 #   kind: forgejo
 #   base_url: https://forge.example.com
