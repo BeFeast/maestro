@@ -354,7 +354,12 @@ func RunOnce(ctx context.Context, cfg *config.Config, reader Reader, opts ...Run
 	// state.Save that records the executed/failed transition lives
 	// inside the !DryRun guard below, so dry-run would also re-execute
 	// the same approvals on every cycle. We move the call there.
-	recordOutcomeHealth(cfg, st)
+	// EMERGENCY STOP: skip outcome/verify healthchecks (gradle/java/go/android
+	// scripts). Engaging the switch also SIGKILLs any already-running children;
+	// skipping here stops the supervise loop from immediately re-spawning them.
+	if !ro.emergencyLLMHalt {
+		recordOutcomeHealth(cfg, st)
+	}
 
 	if err := ctx.Err(); err != nil {
 		return state.SupervisorDecision{}, err
@@ -487,6 +492,16 @@ func supervisorDecisionQuiescent(decision state.SupervisorDecision) bool {
 	analysis := decision.QueueAnalysis
 	return analysis != nil && analysis.OpenIssues > 0 && analysis.EligibleCandidates == 0 &&
 		analysis.ExcludedIssues == analysis.OpenIssues
+}
+
+// StampHeartbeat refreshes state.LastRunOnceAt (and clears any SupervisorStuck
+// flag) without running a cycle. The daemon calls it while the EMERGENCY STOP
+// cycle-skip is active (#1150): the skip intentionally runs no supervise work,
+// but the #499 watchdog keys liveness off LastRunOnceAt, and without a stamp it
+// would flag every flow as stuck (and churn state.json with stuck markers) for
+// the whole duration of the stop.
+func StampHeartbeat(stateDir string) error {
+	return persistSupervisorHeartbeat(stateDir, time.Now().UTC())
 }
 
 func persistSupervisorHeartbeat(stateDir string, at time.Time) error {
