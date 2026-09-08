@@ -79,8 +79,8 @@ jobs:
     needs: frontend-build
     runs-on: ubuntu-latest
     env:
-      GOCACHE: ${{ runner.temp }}/maestro-go-build-cache
-      GOMODCACHE: ${{ runner.temp }}/maestro-go-mod-cache
+      GOCACHE: /var/tmp/maestro-go-build-cache
+      GOMODCACHE: /var/tmp/maestro-go-mod-cache
     steps:
       - uses: actions/checkout@v7
         with:
@@ -101,7 +101,7 @@ jobs:
       - name: Test
         run: |
           sudo useradd --create-home --shell /bin/bash maestro-ci
-          test_tmp=$(mktemp -d)
+          test_tmp=$(mktemp -d /var/tmp/maestro-go-test.XXXXXX)
           sudo chown -R maestro-ci:maestro-ci "$GITHUB_WORKSPACE" "$GOCACHE" "$GOMODCACHE" "$test_tmp"
           umask 077
           sudo tini -s -- runuser -u maestro-ci -- env \
