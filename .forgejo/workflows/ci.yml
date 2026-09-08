@@ -101,7 +101,7 @@ jobs:
       - name: Test
         run: |
           sudo useradd --create-home --shell /bin/bash maestro-ci
-          test_tmp=$(mktemp -d /var/tmp/maestro-go-test.XXXXXX)
+          test_tmp=$(mktemp -d /home/maestro-ci/go-test.XXXXXX)
           sudo chown -R maestro-ci:maestro-ci "$GITHUB_WORKSPACE" "$GOCACHE" "$GOMODCACHE" "$test_tmp"
           umask 077
           sudo tini -s -- runuser -u maestro-ci -- env \
