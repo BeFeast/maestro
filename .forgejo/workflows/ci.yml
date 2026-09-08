@@ -23,9 +23,12 @@
 #     actions/checkout@v7, actions/setup-go@v7 and oven-sh/setup-bun@v2 at
 #     exactly these versions.
 #
-# Everything else (job graph, `needs` ordering, step order, the design-token and
-# recipe guards, the committed-bundle staleness check and its ::error::
-# annotation, and the permissions block) is byte-identical to the original.
+#   - Go tests run as an unprivileged job-local user under a subreaper (#1189).
+#     The trusted-executable fixtures require non-root ownership, cancellation
+#     tests require orphan reaping, and worker guardrail tests require ripgrep.
+#     Build/vet and the complete test suite remain enabled.
+#
+# The frontend guards, bundle-staleness check and permissions remain unchanged.
 name: CI
 
 on:
@@ -75,14 +78,32 @@ jobs:
   build:
     needs: frontend-build
     runs-on: ubuntu-latest
+    env:
+      GOCACHE: ${{ runner.temp }}/maestro-go-build-cache
+      GOMODCACHE: ${{ runner.temp }}/maestro-go-mod-cache
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
+      - name: Install Go test prerequisites
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq --no-install-recommends ripgrep tini
+          rg --version
+          tini --version
       - name: Build
         run: go build ./...
       - name: Vet
         run: go vet ./...
       - name: Test
-        run: go test ./...
+        run: |
+          sudo useradd --create-home --shell /bin/bash maestro-ci
+          test_tmp=$(mktemp -d)
+          sudo chown -R maestro-ci:maestro-ci "$GITHUB_WORKSPACE" "$GOCACHE" "$GOMODCACHE" "$test_tmp"
+          umask 077
+          sudo tini -s -- runuser -u maestro-ci -- env \
+            PATH="$PATH" GOCACHE="$GOCACHE" GOMODCACHE="$GOMODCACHE" TMPDIR="$test_tmp" \
+            go test ./...
