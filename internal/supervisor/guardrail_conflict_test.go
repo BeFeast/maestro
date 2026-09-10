@@ -42,6 +42,9 @@ func TestDecideWithLLM_GuardrailConflictOnMutatingAction_HoldsNoOp(t *testing.T)
 		t.Run(name, func(t *testing.T) {
 			cfg := testConfig(t)
 			cfg.ReviewGate = "none"
+			// Keep this test on the model-disagreement path: a policy that
+			// excludes merge now short-circuits before consulting any model.
+			cfg.Supervisor.AllowedActions = append(defaultAllowedActions(), ActionMergePR)
 			reader := &fakeReader{
 				prs:        []github.PR{{Number: 137, HeadRefName: "feat/standoff", Mergeable: "MERGEABLE"}},
 				ciStatuses: map[int]string{137: "success"},
