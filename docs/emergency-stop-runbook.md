@@ -103,6 +103,13 @@ backend. That floor is deliberately low:
   allowed to *agree* with a `risk=safe` guardrail decision — any disagreement
   resolves back to the deterministic side — so the full-context call could only
   reword the summary, never change the outcome.
+- **Human gates and impossible policy decisions never call the LLM.** If the
+  selected session has an operator gate, or the deterministic action is excluded
+  from `supervisor.allowed_actions`, record an explicit held no-op before building
+  a prompt. A model cannot both agree with a prohibited action and obey policy.
+  This check uses current durable state every cycle; it survives process restarts
+  and stops as soon as the gate or policy changes. An unrelated session's gate
+  does not block a ready target. `always_consult_llm` does not bypass these gates.
 - **The LLM still runs where it adds value.** Mutating / approval-gated
   decisions (`spawn_worker`, `spawn_repair_worker`, `merge_pr`,
   `review_retry_exhausted`, and `label_issue_ready` when it plans a real label
@@ -121,8 +128,8 @@ remains the fast brake for anything the baseline does not cover.
 
 **Escape hatch.** Set `supervisor.always_consult_llm: true` (default `false`) to
 restore the pre-#837 behavior and force a full-context LLM call on every enabled
-cycle — use it only when you specifically want a second opinion on idle
-decisions and accept the token cost.
+cycle that is not blocked by an operator gate or policy exclusion — use it only
+when you specifically want a second opinion on idle decisions and accept the token cost.
 
 ## Relationship to `pause` / `drain`
 
