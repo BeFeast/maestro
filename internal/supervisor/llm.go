@@ -369,6 +369,13 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	}
 
 	policy := newSupervisorPolicy(e.cfg)
+	// A human gate or an action excluded from policy cannot be resolved by a
+	// model. Check before building a prompt or invoking a backend on every poll.
+	// This is derived from durable state, so rebuilding the engine (including
+	// after a daemon restart) does not reset the spending guard.
+	if held, ok := holdBlockedSupervisorDecision(st, deterministic, policy); ok {
+		return held, nil
+	}
 	packet, err := e.buildStatePacket(st, deterministic, policy)
 	if err != nil {
 		return state.SupervisorDecision{}, err
@@ -411,6 +418,42 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 	return decision, nil
+}
+
+// holdBlockedSupervisorDecision never bypasses an operator gate or changes
+// allowed actions. A fresh deterministic decision is evaluated each cycle, so
+// clearing the selected gate or changing policy immediately re-enables advice.
+func holdBlockedSupervisorDecision(st *state.State, decision state.SupervisorDecision, policy supervisorPolicy) (state.SupervisorDecision, bool) {
+	reason := ""
+	if decision.Target != nil && decision.Target.Session != "" {
+		if session := st.Sessions[decision.Target.Session]; session != nil && strings.TrimSpace(session.OperatorGateName) != "" {
+			reason = fmt.Sprintf("Supervisor LLM skipped: selected session is waiting on operator gate %q.", session.OperatorGateName)
+		}
+	}
+	if reason == "" && !policy.isAllowed(canonicalAction(decision.RecommendedAction)) {
+		reason = fmt.Sprintf("Supervisor LLM skipped: deterministic action %q is not allowed by supervisor policy; no model answer can satisfy both constraints.", decision.RecommendedAction)
+	}
+	if reason == "" {
+		return decision, false
+	}
+	log.Printf("[supervisor] %s", reason)
+	decision.StuckStates = appendStuck(decision.StuckStates, state.SupervisorStuckState{
+		Code:              state.StuckGuardrailConflict,
+		Severity:          SeverityWarning,
+		Summary:           reason,
+		Evidence:          []string{fmt.Sprintf("Deterministic action: %s; no model was consulted.", decision.RecommendedAction)},
+		RecommendedAction: "Review the selected operator gate or supervisor allowed actions. The supervisor will re-evaluate fresh state without spending tokens on this blocked decision.",
+		SupervisorCanAct:  false,
+		Target:            copyTarget(decision.Target),
+	})
+	decision.RecommendedAction = ActionNone
+	decision.Risk = RiskSafe
+	decision.RequiresApproval = false
+	decision.Mutations = nil
+	decision.Target = nil
+	decision.Reasons = append([]string{reason}, decision.Reasons...)
+	decision.Summary = "Supervisor is waiting for an operator gate or policy change; no model request was made."
+	return decision, true
 }
 
 func buildSupervisorPrompt(cfg *config.Config, packet supervisorStatePacket) (string, error) {
