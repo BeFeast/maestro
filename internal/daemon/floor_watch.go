@@ -52,6 +52,15 @@ func (d *Daemon) evaluateFloorBreach(breach *floorBreachState) {
 	if d == nil || d.spawnLimiter == nil || breach == nil {
 		return
 	}
+	// EMERGENCY STOP (#1150): engage now kills in-flight workers, so live<min
+	// is the intended state of a deliberate operator stop — not a hands-off
+	// fill failure. A CRITICAL "investigate spawn freezes" page here would be
+	// noise. Reset the debounce so a real breach after resume alerts cleanly.
+	if d.EmergencyState().Active() {
+		breach.streak = 0
+		breach.notified = false
+		return
+	}
 	live, min, max, below, err := d.spawnLimiter.FloorStatus()
 	if err != nil {
 		log.Printf("[daemon] floor watch: %v", err)
