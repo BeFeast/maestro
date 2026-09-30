@@ -35,6 +35,7 @@ type NativeContainmentProfile struct {
 	ForgejoIP            string                `json:"forgejo_ip"`
 	ForgejoRepository    string                `json:"forgejo_repository"`
 	ForgejoTokenSHA256   string                `json:"forgejo_token_sha256,omitempty"`
+	ForgejoCredential    FileProof             `json:"forgejo_credential"`
 	ForgejoAuthorization FileProof             `json:"forgejo_authorization"`
 	ClaimDir             string                `json:"claim_dir"`
 	WorktreeRoot         string                `json:"worktree_root"`
@@ -71,8 +72,15 @@ type nativeLaunchEnvelope struct {
 }
 
 type ContainedNativeCommand struct {
-	Cmd   *exec.Cmd
-	Lease tmuxsession.ProcessLease
+	Cmd              *exec.Cmd
+	Lease            tmuxsession.ProcessLease
+	redactionSecrets []string
+}
+
+// RedactionSecrets returns the exact profile-selected snapshot used in the
+// stdin envelope. Output filtering must not reread a rotated credential file.
+func (c *ContainedNativeCommand) RedactionSecrets() []string {
+	return append([]string(nil), c.redactionSecrets...)
 }
 
 func NativeAuxiliaryUnit(nativeID string) (string, error) {
@@ -171,8 +179,13 @@ func PrepareContainedNativeCommand(pin FileProof, projectID, role, nativeID stri
 	if p.ProjectID != projectID || p.UID != uint32(os.Getuid()) || original == nil || uuid.Validate(nativeID) != nil || lease.Manager != tmuxsession.ProcessLeaseManagerSystem || !strings.HasSuffix(lease.Unit, ".service") {
 		return nil, Held("containment_launch_binding_invalid")
 	}
+	forgejoToken := ""
 	if role != "supervisor" && role != "reviewer" {
 		if err := verifyNativeForgejoAuthorization(p); err != nil {
+			return nil, err
+		}
+		forgejoToken, err = readNativeForgejoCredential(p)
+		if err != nil {
 			return nil, err
 		}
 	}
@@ -218,7 +231,16 @@ func PrepareContainedNativeCommand(pin FileProof, projectID, role, nativeID stri
 	}
 	// The public child endpoint is separately observed as belonging to the
 	// same gateway PID; the host management observer remains loopback-only.
-	childInput := append([]string(nil), original.Env...)
+	childInput := make([]string, 0, len(original.Env)+1)
+	for _, entry := range original.Env {
+		if strings.HasPrefix(entry, "FORGEJO_TOKEN=") || strings.HasPrefix(entry, "MAESTRO_FORGEJO_REPOSITORY_TOKEN=") {
+			continue
+		}
+		childInput = append(childInput, entry)
+	}
+	if forgejoToken != "" {
+		childInput = append(childInput, "FORGEJO_TOKEN="+forgejoToken)
+	}
 	for i, entry := range childInput {
 		if strings.HasPrefix(entry, "ANTHROPIC_BASE_URL=") {
 			childInput[i] = "ANTHROPIC_BASE_URL=" + p.GatewayURL
@@ -244,7 +266,11 @@ func PrepareContainedNativeCommand(pin FileProof, projectID, role, nativeID stri
 		input = strings.NewReader("")
 	}
 	cmd.Stdin = io.MultiReader(bytes.NewReader(frame), input)
-	return &ContainedNativeCommand{Cmd: cmd, Lease: lease}, nil
+	contained := &ContainedNativeCommand{Cmd: cmd, Lease: lease}
+	if forgejoToken != "" {
+		contained.redactionSecrets = []string{forgejoToken}
+	}
+	return contained, nil
 }
 
 // This root-owned, hash-pinned attestation is supplied by the reviewed R9
@@ -418,10 +444,7 @@ func containedNativeEnvironment(p NativeContainmentProfile, original []string, r
 		out = append(out, key+"="+value)
 	}
 	if role != "supervisor" && role != "reviewer" {
-		token := values["MAESTRO_FORGEJO_REPOSITORY_TOKEN"]
-		if token == "" {
-			token = values["FORGEJO_TOKEN"]
-		}
+		token := values["FORGEJO_TOKEN"]
 		if !validDigest(p.ForgejoTokenSHA256) || digest([]byte("maestro-native-forgejo:v1\x00"+token)) != p.ForgejoTokenSHA256 || token == "" {
 			return nil, Held("containment_forgejo_credential_unverified")
 		}

@@ -1002,12 +1002,15 @@ func RunWorkerWithExecutionProof(credentialsFile, proofPath, proofSHA256 string,
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = workerExecEnvironment(os.Environ(), credentials)
 	cmd.Stdin = stdin
+	secrets := credentialSecretValues(credentials)
 	if proofPath != "" || proofSHA256 != "" {
 		contained, err := prepareContainedWorkerCommand(proofPath, proofSHA256, cmd)
 		if err != nil {
 			return err
 		}
 		cmd = contained.Cmd
+		secrets = append(secrets, contained.RedactionSecrets()...)
+		sort.Slice(secrets, func(i, j int) bool { return len(secrets[i]) > len(secrets[j]) })
 	}
 	reader, writer := io.Pipe()
 	cmd.Stdout = writer
@@ -1023,7 +1026,7 @@ func RunWorkerWithExecutionProof(credentialsFile, proofPath, proofSHA256 string,
 		_ = writer.Close()
 		waited <- err
 	}()
-	filterErr := redactCredentialStream(reader, stdout, credentialSecretValues(credentials))
+	filterErr := redactCredentialStream(reader, stdout, secrets)
 	if filterErr != nil {
 		_ = reader.CloseWithError(filterErr)
 	}

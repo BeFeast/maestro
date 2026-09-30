@@ -42,7 +42,7 @@ func readNativeOwnedFile(path string, uid uint32, max int64, mask os.FileMode) (
 			return nil, Held("containment_evidence_unsafe")
 		}
 	}
-	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS})
+	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK, Resolve: unix.RESOLVE_NO_SYMLINKS})
 	if err != nil {
 		return nil, err
 	}
@@ -53,7 +53,7 @@ func readNativeOwnedFile(path string, uid uint32, max int64, mask os.FileMode) (
 		return nil, err
 	}
 	s, ok := st.Sys().(*syscall.Stat_t)
-	if !ok || !st.Mode().IsRegular() || st.Mode().Perm()&mask != 0 || s.Uid != uid || st.Size() > max {
+	if !ok || !st.Mode().IsRegular() || st.Mode().Perm()&mask != 0 || s.Uid != uid || s.Nlink != 1 || st.Size() > max {
 		return nil, Held("containment_evidence_unsafe")
 	}
 	b, err := io.ReadAll(io.LimitReader(f, max+1))

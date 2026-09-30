@@ -84,7 +84,7 @@ func TestNativeToolsExcludeAgentsAndAuxiliaryTools(t *testing.T) {
 
 func TestNativeEnvironmentDoesNotInheritProviderOrHostCredentials(t *testing.T) {
 	p := NativeContainmentProfile{GatewayURL: "http://192.0.2.1:8317", ForgejoRepository: "BeFeast/maestro", ForgejoTokenSHA256: digest([]byte("maestro-native-forgejo:v1\x00scoped"))}
-	base := []string{"ANTHROPIC_AUTH_TOKEN=managed", "ANTHROPIC_BASE_URL=" + p.GatewayURL, "ANTHROPIC_API_KEY=unmanaged", "CLAUDE_CODE_OAUTH_TOKEN=unmanaged", "HTTP_PROXY=http://proxy", "SSH_AUTH_SOCK=/run/ssh", "GH_TOKEN=broad", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.fsmonitor", "GIT_CONFIG_VALUE_0=bad", "MAESTRO_FORGEJO_REPOSITORY_TOKEN=scoped"}
+	base := []string{"ANTHROPIC_AUTH_TOKEN=managed", "ANTHROPIC_BASE_URL=" + p.GatewayURL, "ANTHROPIC_API_KEY=unmanaged", "CLAUDE_CODE_OAUTH_TOKEN=unmanaged", "HTTP_PROXY=http://proxy", "SSH_AUTH_SOCK=/run/ssh", "GH_TOKEN=broad", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.fsmonitor", "GIT_CONFIG_VALUE_0=bad", "FORGEJO_TOKEN=scoped", "MAESTRO_FORGEJO_REPOSITORY_TOKEN=broad"}
 	for _, role := range []string{"implementer", "supervisor", "reviewer"} {
 		env, err := containedNativeEnvironment(p, base, role)
 		if err != nil {
