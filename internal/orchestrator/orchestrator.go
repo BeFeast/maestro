@@ -3718,6 +3718,11 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 	}
 
 	// Other hot-reloadable fields
+	if newCfg.AIExecution != old.AIExecution {
+		changed = append(changed, "ai_execution")
+		o.cfg.AIExecution = newCfg.AIExecution
+	}
+	o.cfg.RuntimeAuxiliaryLimiter = newCfg.RuntimeAuxiliaryLimiter
 	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
 		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
 		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes

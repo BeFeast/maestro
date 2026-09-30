@@ -3,6 +3,7 @@ package router
 import (
 	"encoding/json"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os/exec"
 	"strings"
@@ -124,6 +125,12 @@ func (r *Router) buildPrompt(issue github.Issue) string {
 
 // callModel executes the router model CLI and returns the raw output.
 func (r *Router) callModel(prompt string) (string, error) {
+	if err := r.cfg.AIExecution.CheckCurrent(); err != nil {
+		return "", err
+	}
+	if r.cfg.AIExecution.RequireVerifiedRoute {
+		return "", aiexecution.Held("router_transport_unsupported")
+	}
 	backendName := r.cfg.Routing.RouterModel
 	backend, ok := r.cfg.Model.Backends[backendName]
 	if !ok {

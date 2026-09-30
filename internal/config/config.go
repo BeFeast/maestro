@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/progress"
 	"gopkg.in/yaml.v3"
@@ -2043,6 +2044,10 @@ func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
 // (*_env indirection, never values); the chat lenses talk to CLIProxy — never
 // a direct provider login (the #1148 bash design defect this replaces).
 type ReviewProducerConfig struct {
+	// NativeOpus explicitly selects the registered native Claude runner, keeping OpusModel.
+	NativeOpus             bool               `yaml:"native_opus,omitempty"`
+	RuntimeExecutionPolicy aiexecution.Policy `yaml:"-" json:"-"`
+	RuntimeNativeConfig    *Config            `yaml:"-" json:"-"`
 	// MaxAttempts caps HTTP review attempts per exact head/lens; 0 defaults to 1.
 	// Values 2..5 opt into bounded retries supported by gateway evidence.
 	MaxAttempts int  `yaml:"max_attempts,omitempty"`
@@ -2653,9 +2658,11 @@ func containsControlOrSpace(value string) bool {
 }
 
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	Supervisor SupervisorConfig `yaml:"supervisor"`
-	Repo       string           `yaml:"repo"`
+	AIExecution             aiexecution.Policy           `yaml:"ai_execution" json:"ai_execution"`
+	RuntimeAuxiliaryLimiter aiexecution.AuxiliaryLimiter `yaml:"-" json:"-"`
+	Server                  ServerConfig                 `yaml:"server"`
+	Supervisor              SupervisorConfig             `yaml:"supervisor"`
+	Repo                    string                       `yaml:"repo"`
 	// ProjectID is the optional stable UUID identifying this project durably,
 	// independent of the mutable repo/state/store names (#869). Empty for legacy
 	// rows; validated as a canonical UUID when present and kept immutable across
@@ -2923,6 +2930,9 @@ func parse(data []byte) (*Config, error) {
 	}
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
+	}
+	if err := cfg.AIExecution.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
 	}
 	if cfg.Pipeline.AdvisorReviewRounds < 0 || cfg.Pipeline.AdvisorReviewRounds > MaxAdvisorReviewRounds {
 		return nil, fmt.Errorf("config: pipeline.advisor_review_rounds must be between 1 and %d when set (0 uses the default of %d)", MaxAdvisorReviewRounds, DefaultAdvisorReviewRounds)

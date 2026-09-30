@@ -2,6 +2,7 @@ package worker
 
 import (
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"strings"
 	"time"
 
@@ -30,6 +31,12 @@ const (
 func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, runnerPath string, generation uint64, previousPID int, reason string) (int, tmuxsession.ProcessLease, error) {
 	if cfg == nil {
 		return 0, tmuxsession.ProcessLease{}, fmt.Errorf("launch worker process lease: nil config")
+	}
+	if err := cfg.AIExecution.CheckCurrent(); err != nil {
+		return 0, tmuxsession.ProcessLease{}, err
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		return 0, tmuxsession.ProcessLease{}, aiexecution.Held("worker_route_proof_unavailable")
 	}
 	lease, err := workerProcessLease(cfg, slotName, generation)
 	if err != nil {

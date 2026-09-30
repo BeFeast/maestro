@@ -75,7 +75,7 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 	// Snapshot the config on this goroutine: the orchestrator loop owns both
 	// this call and the hot-reload writes, so reading o.cfg here is
 	// race-free, while the spawned goroutine below must never touch it.
-	rp := o.cfg.ReviewProducer
+	rp := snapshotReviewExecution(o.cfg, o.cfg.ReviewProducer)
 	fc := o.cfg.Forge
 	go func() {
 		defer func() {
@@ -85,6 +85,22 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 		}()
 		produce(prNumber, headSHA, missing, rp, fc)
 	}()
+}
+
+func snapshotReviewExecution(cfg *config.Config, rp config.ReviewProducerConfig) config.ReviewProducerConfig {
+	rp.RuntimeExecutionPolicy = cfg.AIExecution
+	nativeCfg := *cfg
+	nativeCfg.Model = cloneModelConfig(cfg.Model)
+	if cfg.Supervisor.NativeSessionRegistration != nil {
+		registration := *cfg.Supervisor.NativeSessionRegistration
+		if registration.AuthorityUID != nil {
+			uid := *registration.AuthorityUID
+			registration.AuthorityUID = &uid
+		}
+		nativeCfg.Supervisor.NativeSessionRegistration = &registration
+	}
+	rp.RuntimeNativeConfig = &nativeCfg
+	return rp
 }
 
 // reviewProducerRunTimeout bounds one full producer pass (all lenses on one
@@ -104,24 +120,32 @@ func reviewLenses(streams []string, rp config.ReviewProducerConfig) []review.Len
 	for _, stream := range streams {
 		switch stream {
 		case "llm-review-opus":
+			if rp.NativeOpus {
+				model := rp.EffectiveOpusModel()
+				lenses = append(lenses, review.NewNativeClaudeLens(stream, model, rp.RuntimeNativeConfig))
+				continue
+			}
 			lenses = append(lenses, &review.ChatLens{
-				Stream:  stream,
-				BaseURL: rp.ChatBaseURL,
-				APIKey:  os.Getenv(rp.EffectiveChatAPIKeyEnv()),
-				Model:   rp.EffectiveOpusModel(),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				BaseURL:         rp.ChatBaseURL,
+				APIKey:          os.Getenv(rp.EffectiveChatAPIKeyEnv()),
+				Model:           rp.EffectiveOpusModel(),
 			})
 		case "llm-review-terra":
 			lenses = append(lenses, &review.ChatLens{
-				Stream:  stream,
-				BaseURL: rp.ChatBaseURL,
-				APIKey:  os.Getenv(rp.EffectiveChatAPIKeyEnv()),
-				Model:   rp.EffectiveTerraModel(),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				BaseURL:         rp.ChatBaseURL,
+				APIKey:          os.Getenv(rp.EffectiveChatAPIKeyEnv()),
+				Model:           rp.EffectiveTerraModel(),
 			})
 		case "llm-review-cursor":
 			lenses = append(lenses, &review.CursorLens{
-				Stream: stream,
-				Model:  rp.EffectiveCursorModel(),
-				APIKey: os.Getenv(rp.EffectiveCursorAPIKeyEnv()),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				Model:           rp.EffectiveCursorModel(),
+				APIKey:          os.Getenv(rp.EffectiveCursorAPIKeyEnv()),
 			})
 		}
 	}
@@ -151,6 +175,7 @@ func reviewForge(fc config.ForgeConfig) (forge.Client, error) {
 // itself is forge-agnostic. Runs on the producer goroutine: everything it
 // needs arrives by value.
 func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
+	rp = snapshotReviewExecution(o.cfg, rp)
 	o.produceReviewStreamsWithState(prNumber, headSHA, streams, rp, fc, o.cfg.StateDir)
 }
 
@@ -165,6 +190,7 @@ func (o *Orchestrator) produceReviewStreamsWithState(prNumber int, headSHA strin
 		return
 	}
 	p := &review.Producer{
+		ExecutionPolicy:   rp.RuntimeExecutionPolicy,
 		Attempts:          &review.AttemptStore{StateDir: stateDir},
 		MaxAttempts:       rp.EffectiveMaxAttempts(),
 		Forge:             fg,

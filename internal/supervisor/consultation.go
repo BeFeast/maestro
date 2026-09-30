@@ -79,6 +79,7 @@ type CandidateReceipt struct {
 // InvocationReceipt represents a successfully started local process only. It is
 // not a token record, gateway logical request, or physical upstream attempt.
 type InvocationReceipt struct {
+	OutputCheckpoint    *NativeOutputCheckpoint           `json:"output_checkpoint,omitempty"`
 	NativeSession       *NativeSessionRegistrationReceipt `json:"native_session,omitempty"`
 	ID                  string                            `json:"id"`
 	Number              int                               `json:"number"`

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"sort"
 	"strings"
@@ -60,6 +61,13 @@ func (e *Engine) runSpecGroom(st *state.State, mutator Mutator) {
 	}
 	if mutator == nil {
 		// No safe write surface — cannot post comments; nothing to do.
+		return
+	}
+	if err := e.cfg.AIExecution.CheckCurrent(); err != nil {
+		return
+	}
+	if e.cfg.AIExecution.RequireVerifiedRoute {
+		log.Printf("[supervisor] spec-groom: %v", aiexecution.Held("specgroom_transport_unsupported"))
 		return
 	}
 	llm := e.llm

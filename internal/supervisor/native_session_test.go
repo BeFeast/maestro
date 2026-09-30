@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 )
 
@@ -133,7 +134,7 @@ func nativeCalls(t *testing.T, count string) int {
 	return strings.Count(string(b), "call")
 }
 
-func TestNativeRegistrationBeforeLaunchAndFallback(t *testing.T) {
+func TestNativeRegistrationBeforeLaunchAndNoFinanciallyBlindFallback(t *testing.T) {
 	cfg, count, fixture := nativeConfig(t)
 	// The executable independently checks that the echoed ack is on disk before
 	// accepting the exact owned argv. No model/provider participates in this test.
@@ -158,20 +159,18 @@ printf done
 	}
 	identity := newConsultationIdentity(cfg, "fixture-cycle")
 	result, err := NewBackendLLMClient(cfg).(*backendLLMClient).CompleteConsultation(identity, "synthetic prompt")
-	if err != nil || result.Output != "done" {
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || result.Output != "" {
 		t.Fatalf("result=%+v err=%v", result, err)
 	}
 	r := loadReceipt(t, cfg)
-	if nativeCalls(t, count) != 2 || len(r.Invocations) != 2 || r.Capability.Ready() {
+	if nativeCalls(t, count) != 1 || len(r.Invocations) != 1 || r.Capability.Ready() {
 		t.Fatalf("receipt=%+v", r)
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
-	if len(fixture.requests) != 2 || len(fixture.problems) != 0 {
+	if len(fixture.requests) != 1 || len(fixture.problems) != 0 {
 		t.Fatalf("requests=%+v problems=%v", fixture.requests, fixture.problems)
-	}
-	if fixture.requests[0].NativeSessionID == fixture.requests[1].NativeSessionID {
-		t.Fatal("fallback reused native identity")
 	}
 	for i, request := range fixture.requests {
 		if request.NativeSessionID != r.Invocations[i].ID || request.RunID != cfg.Supervisor.NativeSessionRegistration.BudgetRunID || request.RunID == identity.ID || r.Invocations[i].NativeSession.Acknowledgement == nil {
@@ -202,11 +201,10 @@ func TestNativeRegistrationLostReplyHoldsRestartAndReconcilesWithoutLaunch(t *te
 		t.Fatalf("requests=%+v problems=%v", fixture.requests, fixture.problems)
 	}
 	fixture.mu.Unlock()
-	if _, err := NewBackendLLMClient(cfg).Complete("later distinct consultation"); err != nil {
-		t.Fatal(err)
-	}
-	if nativeCalls(t, count) != 2 {
-		t.Fatal("later consultation did not launch normal fallback")
+	_, err = NewBackendLLMClient(cfg).Complete("later distinct consultation")
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || nativeCalls(t, count) != 1 {
+		t.Fatal("later consultation did not retain financial uncertainty", err)
 	}
 }
 

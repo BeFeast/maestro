@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"io"
 	"net/http"
 	"strings"
@@ -18,6 +19,7 @@ import (
 // bash producer's direct `claude -p` opus branch is being retired (#1162).
 // The caller injects the base URL and key from config (*_env indirection).
 type ChatLens struct {
+	ExecutionPolicy aiexecution.Policy
 	// Stream is the status context / stream name, e.g. "llm-review-opus".
 	Stream string
 	// BaseURL is the API root, e.g. "http://127.0.0.1:23020"; the lens posts
@@ -62,6 +64,12 @@ func (l *ChatLens) timeout() time.Duration {
 
 // Run posts one single-shot chat completion and returns the model's text.
 func (l *ChatLens) Run(ctx context.Context, prompt string) (string, error) {
+	if err := l.ExecutionPolicy.CheckCurrent(); err != nil {
+		return "", err
+	}
+	if l.ExecutionPolicy.RequireVerifiedRoute {
+		return "", aiexecution.Held("chat_transport_unsupported")
+	}
 	ctx, cancel := context.WithTimeout(ctx, l.timeout())
 	defer cancel()
 
