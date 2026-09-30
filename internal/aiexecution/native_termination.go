@@ -77,7 +77,9 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 		return nil, Held("containment_launch_proof_unavailable")
 	}
 	proof, err := read(".termination.json")
+	recovered := false
 	if os.IsNotExist(err) {
+		recovered = true
 		proof = launch
 		proof.LocalStatus = "local_output_unknown"
 		proof.ExitCode = -1
@@ -110,5 +112,11 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 		return nil, Held("containment_previous_cgroup_unresolved")
 	}
 	proof.Digest = nativeTerminationDigest(proof)
+	if recovered {
+		b, err := json.Marshal(proof)
+		if err != nil || replaceRevisionFile(filepath.Join(p.ClaimDir, nativeID+".termination.json"), b) != nil {
+			return nil, Held("containment_termination_persistence_failed")
+		}
+	}
 	return &proof, nil
 }
