@@ -343,7 +343,7 @@ func RunNativeEntry() error {
 		return Held("containment_entry_binary_drift")
 	}
 	status, err := os.ReadFile("/proc/self/status")
-	if err != nil || !strings.Contains(string(status), "NoNewPrivs:\t1\n") || !strings.Contains(string(status), "CapEff:\t0000000000000000\n") {
+	if err != nil || !strings.Contains(string(status), "NoNewPrivs:\t1\n") || !strings.Contains(string(status), "CapEff:\t0000000000000000\n") || !strings.Contains(string(status), "Seccomp:\t2\n") {
 		return Held("containment_privilege_drift")
 	}
 	args, err := containedNativeArguments(e.Arguments, e.NativeSessionID, e.Role)

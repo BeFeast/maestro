@@ -23,6 +23,10 @@ Claude bytes must match the manifest. Read-only bundles/caches must be staged
 as immutable reviewed R9 inputs; no arbitrary host home or credential directory
 is accepted as a mount target.
 
+The claim directory is canonical per runner UID:
+`/var/lib/maestro/native-claims/<uid>`. Profiles cannot choose another claim
+store for the same namespace and thereby bypass its existing lock.
+
 The inference listener is observed as belonging to the same gateway PID as the
 host loopback management endpoint. The active binding observer separately
 compares the exact configured finite credential/model inventory with

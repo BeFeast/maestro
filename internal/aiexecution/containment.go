@@ -84,10 +84,7 @@ func NativeAuxiliaryUnit(nativeID string) (string, error) {
 
 func readContainmentProfile(pin FileProof) (NativeContainmentProfile, error) {
 	var p NativeContainmentProfile
-	if err := verifyOwnedPath(pin.Path, 0, false); err != nil {
-		return p, Held("containment_profile_unsafe")
-	}
-	b, err := os.ReadFile(pin.Path)
+	b, err := readRootContainmentEvidence(pin)
 	if err != nil || len(b) > 128<<10 || digest(b) != pin.SHA256 || DecodeStrict(b, &p) != nil {
 		return p, Held("containment_profile_invalid")
 	}
@@ -103,6 +100,11 @@ func validateContainmentProfile(p NativeContainmentProfile) error {
 	}
 	if p.Version != 1 || p.ProjectID == "" || p.UID == 0 || p.GID == 0 || p.NamespaceIno == 0 || !validDigest(p.RulesSHA256) || p.MemoryMaxMB <= 0 {
 		return Held("containment_profile_invalid")
+	}
+	// Every project/profile for the runner UID shares this namespace-keyed
+	// claim store. A caller cannot bypass an occupied lock via a second path.
+	if p.ClaimDir != filepath.Join("/var/lib/maestro/native-claims", strconv.FormatUint(uint64(p.UID), 10)) {
+		return Held("containment_claim_store_invalid")
 	}
 	for _, path := range []string{p.Namespace, p.ClaimDir, p.WorktreeRoot, p.ScratchRoot} {
 		if !filepath.IsAbs(path) || filepath.Clean(path) != path || path == "/" {
