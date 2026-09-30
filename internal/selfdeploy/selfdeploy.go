@@ -44,6 +44,25 @@ import (
 // distinct from a real launcher failure (systemd-run rejected the unit).
 var ErrDebounced = errors.New("self-deploy: debounced (recent trigger within window)")
 
+// ErrExplicitPromotionRequired rejects an automatic request without launching
+// or consuming debounce state. Explicit promotion is a fence, not a launcher.
+var ErrExplicitPromotionRequired = errors.New("self-deploy: explicit promotion required; automatic trigger blocked")
+
+// CheckAutomaticPromotion validates the policy even for callers that construct
+// Config directly. Call it before any launch preparation or debounce mutation.
+func CheckAutomaticPromotion(cfg *config.Config) error {
+	if cfg == nil {
+		return fmt.Errorf("self-deploy: nil config")
+	}
+	if err := cfg.SelfDeploy.ValidatePromotionPolicy(); err != nil {
+		return err
+	}
+	if cfg.SelfDeploy.EffectivePromotionPolicy() == config.SelfDeployPromotionExplicit {
+		return ErrExplicitPromotionRequired
+	}
+	return nil
+}
+
 // Result statuses written by scripts/self-deploy.sh.
 const (
 	StatusDeployed   = "deployed"    // new binary live and verified
@@ -411,8 +430,8 @@ func stageOriginMainDeployScript(repoDir, dest string) error {
 // after the given merged PR. Split from Trigger so tests can assert the
 // argv without systemd.
 func TriggerCommand(cfg *config.Config, prNumber int, now time.Time) (string, []string, error) {
-	if cfg == nil {
-		return "", nil, fmt.Errorf("self-deploy: nil config")
+	if err := CheckAutomaticPromotion(cfg); err != nil {
+		return "", nil, err
 	}
 	localPath := strings.TrimSpace(cfg.LocalPath)
 	if localPath == "" {

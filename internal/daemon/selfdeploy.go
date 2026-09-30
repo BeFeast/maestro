@@ -34,8 +34,8 @@ import (
 // post-restart health probe is routed through the single fleet endpoint so
 // verify hits one :port, not a per-project server the daemon no longer runs.
 func (d *Daemon) RequestSelfDeploy(cfg *config.Config, prNumber int) error {
-	if cfg == nil {
-		return fmt.Errorf("self-deploy: nil config")
+	if err := selfdeploy.CheckAutomaticPromotion(cfg); err != nil {
+		return err
 	}
 
 	d.selfDeployMu.Lock()

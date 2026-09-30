@@ -6,9 +6,49 @@ change. Intended for the dogfood project, where merged maestro fixes should
 reach the runtime without an operator manually building, installing, and
 restarting units.
 
+## Promotion policy
+
+`self_deploy.promotion_policy` separates automatic self-deploy from an explicit
+promotion requirement (Refs #1190):
+
+| Value | Behavior when `enabled: true` |
+| --- | --- |
+| omitted or `automatic` | Existing post-merge and observed-main-advance triggers remain enabled. |
+| `explicit` | Both automatic triggers are no-ops; direct trigger APIs reject the request with `selfdeploy.ErrExplicitPromotionRequired`. |
+
+Values are trimmed and case-insensitive. Unknown values fail config parsing,
+including when self-deploy is disabled. Direct Go callers are also validated;
+an invalid programmatic config cannot activate automatic self-deploy.
+
+For a runtime that must retain its installed binary while candidate source
+advances, its configuration can declare:
+
+```yaml
+self_deploy:
+  enabled: true
+  promotion_policy: explicit
+```
+
+The policy is checked before head lookups, script staging, launchers, and
+debounce state changes in both the daemon and standalone orchestrator paths.
+Blocked requests neither consume the debounce window nor write trigger markers,
+and they cannot initiate the deploy script's drain, install, or restart steps.
+Existing automatic configurations retain their previous behavior. A deploy
+already launched before the policy changed is not cancelled.
+
+This is a bounded automatic-trigger fence, **not** a manual promotion command
+or complete stable/candidate isolation. It does not create separate databases,
+queues, ports, ownership fencing, candidate artifacts, or promotion receipts.
+Direct execution of `scripts/self-deploy.sh` is outside this config gate. An
+explicit operational promotion still requires its separately reviewed and
+authorized procedure; changing source or merging a candidate does not itself
+promote the running binary when this policy is active. A binary predating this
+field does not enforce it, so the fence must be present in the running binary
+before relying on the setting.
+
 ## How it works
 
-A self-deploy fires on either of two triggers:
+With automatic promotion enabled, a self-deploy fires on either of two triggers:
 
 - **Orchestrator merge** — after the orchestrator merges a PR (and after the
   optional version bump).
