@@ -14,6 +14,53 @@ import (
 type consultationStore struct{ dir string }
 
 func openConsultationStore(stateDir string) (*consultationStore, func(), error) {
+	s, unlock, err := lockConsultationStore(stateDir)
+	if err != nil {
+		return nil, nil, err
+	}
+	dir := s.dir
+	if _, err := os.Stat(filepath.Join(dir, "registration.json")); err == nil {
+		unlock()
+		return nil, nil, &ConsultationHold{Code: "unresolved_registration_intent"}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		unlock()
+		return nil, nil, err
+	}
+	b, err := os.ReadFile(filepath.Join(dir, "current.json"))
+	if errors.Is(err, os.ErrNotExist) {
+		return s, unlock, nil
+	}
+	if err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	var previous ConsultationReceipt
+	if err := json.Unmarshal(b, &previous); err != nil || previous.SchemaVersion != 1 || uuid.Validate(previous.Identity.ID) != nil {
+		unlock()
+		return nil, nil, &ConsultationHold{Code: "receipt_invalid"}
+	}
+	for _, c := range previous.Candidates {
+		if c.Status == "launch_intent" || c.Status == "registration_intent" {
+			unlock()
+			code := "unresolved_launch_intent"
+			if c.Status == "registration_intent" {
+				code = "unresolved_registration_intent"
+			}
+			return nil, nil, &ConsultationHold{Code: code}
+		}
+	}
+	// Archive the previous receipt before replacing current. A failure here
+	// prevents another launch; completed observations are never discarded.
+	if err := atomicReceiptWrite(dir, previous.Identity.ID+".json", b); err != nil {
+		unlock()
+		return nil, nil, err
+	}
+	return s, unlock, nil
+}
+
+// Reconciliation takes the same writer lock and may inspect pending registration,
+// but a launch marker always blocks it: registration cannot settle inference.
+func lockConsultationStore(stateDir string) (*consultationStore, func(), error) {
 	dir := filepath.Join(stateDir, "supervisor-consultations")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, nil, err
@@ -42,32 +89,25 @@ func openConsultationStore(stateDir string) (*consultationStore, func(), error) 
 		unlock()
 		return nil, nil, err
 	}
-	b, err := os.ReadFile(filepath.Join(dir, "current.json"))
-	if errors.Is(err, os.ErrNotExist) {
-		return s, unlock, nil
-	}
-	if err != nil {
-		unlock()
-		return nil, nil, err
-	}
-	var previous ConsultationReceipt
-	if err := json.Unmarshal(b, &previous); err != nil || previous.SchemaVersion != 1 || uuid.Validate(previous.Identity.ID) != nil {
-		unlock()
-		return nil, nil, &ConsultationHold{Code: "receipt_invalid"}
-	}
-	for _, c := range previous.Candidates {
-		if c.Status == "launch_intent" {
-			unlock()
-			return nil, nil, &ConsultationHold{Code: "unresolved_launch_intent"}
-		}
-	}
-	// Archive the previous receipt before replacing current. A failure here
-	// prevents another launch; completed observations are never discarded.
-	if err := atomicReceiptWrite(dir, previous.Identity.ID+".json", b); err != nil {
-		unlock()
-		return nil, nil, err
-	}
 	return s, unlock, nil
+}
+
+func (s *consultationStore) beginRegistration(identity ConsultationIdentity, registration *NativeSessionRegistrationReceipt) error {
+	b, err := json.Marshal(struct {
+		ConsultationID string                            `json:"consultation_id"`
+		Registration   *NativeSessionRegistrationReceipt `json:"registration"`
+	}{identity.ID, registration})
+	if err != nil {
+		return err
+	}
+	return atomicReceiptWrite(s.dir, "registration.json", b)
+}
+
+func (s *consultationStore) finishRegistration() error {
+	if err := os.Remove(filepath.Join(s.dir, "registration.json")); err != nil {
+		return err
+	}
+	return syncDirectory(s.dir)
 }
 
 func (s *consultationStore) beginLaunch(identity ConsultationIdentity, intent string) error {

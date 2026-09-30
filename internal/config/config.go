@@ -1059,8 +1059,22 @@ func normalizeDeliveryTimeout(min int) int {
 	return min
 }
 
+// NativeSessionRegistrationConfig selects an existing trusted control authority.
+// No socket, UID, fleet, policy, or lifetime budget scope is inferred.
+type NativeSessionRegistrationConfig struct {
+	ControlSocket         string  `yaml:"control_socket" json:"control_socket"`
+	AuthorityUID          *uint32 `yaml:"authority_uid" json:"authority_uid"`
+	ExpectedPolicyVersion int64   `yaml:"expected_policy_version" json:"expected_policy_version"`
+	FleetID               string  `yaml:"fleet_id" json:"fleet_id"`
+	GatewayScope          string  `yaml:"gateway_scope" json:"gateway_scope"`
+	BudgetRunID           string  `yaml:"budget_run_id" json:"budget_run_id"`
+	TTLSeconds            int64   `yaml:"ttl_seconds" json:"ttl_seconds"`
+}
+
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
+	// NativeSessionRegistration is opt-in attribution only, not spending admission.
+	NativeSessionRegistration *NativeSessionRegistrationConfig `yaml:"native_session_registration,omitempty" json:"native_session_registration,omitempty"`
 	// RequireAccountingReady holds model consultations until a transport proves
 	// attribution and shared admission for every physical request. The current
 	// CLI adapter cannot provide that capability; this is not a local budget.

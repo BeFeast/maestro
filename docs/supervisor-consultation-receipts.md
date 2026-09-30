@@ -72,9 +72,11 @@ including provider retries; a grant at process-spawn time is insufficient.
 One local invocation may contain many gateway logical requests, physical
 attempts, or model-generated summaries. Native usage remains supplemental.
 
-The existing gateway session headers are not injected by this slice. Each
-harness needs verified forwarding and identity precedence first. No new key,
-router, budget ledger, or usage queue consumer is added. Worker, pipeline,
-reviewer and summary paths still require their own integration. Passing tests
-and merging this source do not promote a gateway, install a binary, or resume
-a fleet.
+The optional [native Claude supervisor registration](supervisor-native-registration.md)
+adapter adds a trusted pre-launch binding and an owned native UUID for its bounded
+route. It does not prove gateway physical admission or make accounting ready.
+Other harnesses need their own verified forwarding and identity precedence.
+No new key, router, budget ledger, or usage queue consumer is added. Worker,
+pipeline, reviewer and summary paths still require their own integration.
+Passing tests and merging this source do not promote a gateway, install a binary,
+or resume a fleet.
