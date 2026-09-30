@@ -6,7 +6,6 @@ import (
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -21,11 +20,14 @@ import (
 )
 
 type Policy struct {
-	RequireVerifiedRoute bool   `yaml:"require_verified_route" json:"require_verified_route"`
-	ManifestPath         string `yaml:"manifest_path,omitempty" json:"manifest_path,omitempty"`
-	ManifestSHA256       string `yaml:"manifest_sha256,omitempty" json:"manifest_sha256,omitempty"`
-	revision             *Revision
-	generation           uint64
+	RequireVerifiedRoute  bool   `yaml:"require_verified_route" json:"require_verified_route"`
+	ManifestPath          string `yaml:"manifest_path,omitempty" json:"manifest_path,omitempty"`
+	ManifestSHA256        string `yaml:"manifest_sha256,omitempty" json:"manifest_sha256,omitempty"`
+	revision              *Revision
+	generation            uint64
+	controllerPin         *FileProof
+	controllerLease       *ControllerLease
+	controllerUnavailable bool
 }
 
 func (p Policy) Validate() error {
@@ -142,11 +144,9 @@ func VerifyFile(p FileProof) error {
 	return nil
 }
 
-// Inspect rechecks observable local evidence at every leaf. Current gateway
-// releases do not expose their effective startup admission snapshot; even a
-// perfectly matching reviewed manifest therefore holds at that boundary.
-// A future verified inspector must replace that hold with an actual observation,
-// never a supplied evidence_ref or user-set capability flag.
+// Inspect rechecks local pins and the gateway's live configuration observation
+// at every leaf. Matching config-only receipts cannot prove active account
+// routing or kernel containment; those still require their real observers.
 func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if err := policy.CheckCurrent(); err != nil {
 		return err
@@ -174,9 +174,7 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 		return Held("manifest_drift")
 	}
 	var m Manifest
-	dec := json.NewDecoder(bytes.NewReader(b))
-	dec.DisallowUnknownFields()
-	if dec.Decode(&m) != nil || dec.Decode(new(any)) != io.EOF || m.Version != 1 {
+	if DecodeStrict(b, &m) != nil || m.Version != 1 {
 		return Held("manifest_invalid")
 	}
 	if m.EvidenceKind != "installed" {
@@ -284,6 +282,9 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	expected, err := filepath.EvalSymlinks(m.Maestro.Path)
 	if err != nil || actual != expected {
 		return Held("maestro_binary_mismatch")
+	}
+	if err := VerifyFile(FileProof{Path: "/proc/self/exe", SHA256: m.Maestro.SHA256}); err != nil {
+		return Held("maestro_loaded_binary_mismatch")
 	}
 	if err := inspectProcess(m.Gateway); err != nil {
 		return err

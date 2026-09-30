@@ -1,10 +1,9 @@
 package aiexecution
 
 import (
-	"bytes"
 	"crypto/rand"
+	"encoding/binary"
 	"encoding/hex"
-	"encoding/json"
 	"io"
 	"net"
 	"net/http"
@@ -34,6 +33,7 @@ type RuntimeExpectation struct {
 }
 
 type runtimeReceipt struct {
+	ObservationScope  string    `json:"observation_scope"`
 	SchemaVersion     int       `json:"schema_version"`
 	ProjectionVersion string    `json:"projection_version"`
 	ProcessInstanceID string    `json:"process_instance_id"`
@@ -117,12 +117,10 @@ func observeRuntime(m Manifest, callerScopeHash string) error {
 		return Held("runtime_observation_invalid")
 	}
 	var receipt runtimeReceipt
-	decoder := json.NewDecoder(bytes.NewReader(b))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&receipt) != nil || decoder.Decode(new(any)) != io.EOF {
+	if DecodeStrict(b, &receipt) != nil {
 		return Held("runtime_observation_invalid")
 	}
-	if receipt.SchemaVersion != 1 || receipt.ProjectionVersion != e.ProjectionVersion || receipt.RequestNonce != nonce || receipt.ProcessInstanceID != e.ProcessInstanceID || !receipt.StartedAt.Equal(e.StartedAt) || receipt.Build.Version != e.BuildVersion || receipt.Build.GitCommit != e.GitCommit || receipt.ObservedAt.Before(start.Add(-time.Second)) || receipt.ObservedAt.After(time.Now().Add(time.Second)) {
+	if receipt.ObservationScope != "configuration_only" || receipt.SchemaVersion != 1 || receipt.ProjectionVersion != e.ProjectionVersion || receipt.RequestNonce != nonce || receipt.ProcessInstanceID != e.ProcessInstanceID || !receipt.StartedAt.Equal(e.StartedAt) || receipt.Build.Version != e.BuildVersion || receipt.Build.GitCommit != e.GitCommit || receipt.ObservedAt.Before(start.Add(-time.Second)) || receipt.ObservedAt.After(time.Now().Add(time.Second)) {
 		return Held("runtime_observation_binding_mismatch")
 	}
 	admission := receipt.ManagedAdmission
@@ -183,8 +181,8 @@ func procListenerMatches(encoded string, destination net.IP) bool {
 	}
 	// Linux /proc net tables encode each 32-bit word in host byte order.
 	for i := 0; i < len(address); i += 4 {
-		address[i], address[i+3] = address[i+3], address[i]
-		address[i+1], address[i+2] = address[i+2], address[i+1]
+		word := binary.NativeEndian.Uint32(address[i : i+4])
+		binary.BigEndian.PutUint32(address[i:i+4], word)
 	}
 	if (destination.To4() != nil) != (len(address) == 4) {
 		return false

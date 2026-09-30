@@ -107,6 +107,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err

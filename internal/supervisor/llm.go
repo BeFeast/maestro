@@ -594,9 +594,12 @@ func outputWithTimeoutReceipt(cmd *exec.Cmd, timeout time.Duration) ([]byte, boo
 }
 
 type boundedNativeOutput struct {
-	bytes.Buffer
+	buffer   bytes.Buffer
 	overflow bool
 }
+
+func (b *boundedNativeOutput) Bytes() []byte { return b.buffer.Bytes() }
+func (b *boundedNativeOutput) Len() int      { return b.buffer.Len() }
 
 func (b *boundedNativeOutput) Write(p []byte) (int, error) {
 	const maxOutput = 4 << 20
@@ -606,7 +609,7 @@ func (b *boundedNativeOutput) Write(p []byte) (int, error) {
 		p = p[:remaining]
 		b.overflow = true
 	}
-	_, _ = b.Buffer.Write(p)
+	_, _ = b.buffer.Write(p)
 	return n, nil
 }
 

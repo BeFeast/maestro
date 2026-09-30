@@ -29,7 +29,7 @@ func (l *fleetSpawnLimiter) ReserveAuxiliary(stateDir, roleRunID string) (func()
 	if filepath.Base(projectDir) == "native-reviews" {
 		projectDir = filepath.Dir(projectDir)
 	}
-	if _, ok := l.auxiliaryStateDirs[projectDir]; !ok {
+	if _, ok := l.stateDirs[projectDir]; !ok {
 		return nil, aiexecution.Held("auxiliary_project_unregistered")
 	}
 	settings, err := l.settingsLocked()

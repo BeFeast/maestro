@@ -23,7 +23,7 @@ func TestStrictWorkerOpaqueLeavesNeverLaunch(t *testing.T) {
 		t.Fatal("hook executed")
 	}
 	_, _, err = launchWorkerProcessLease(cfg, "slot", "tmux", dir, "missing-script", 1, 0, "initial_spawn")
-	if !errors.As(err, &hold) || hold.Code != "worker_route_proof_unavailable" {
+	if !errors.As(err, &hold) || hold.Code != "worker_execution_proof_unavailable" {
 		t.Fatal(err)
 	}
 }

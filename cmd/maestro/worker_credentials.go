@@ -17,10 +17,12 @@ func workerExecCmd(args []string) {
 	fs := flag.NewFlagSet("_worker-exec", flag.ContinueOnError)
 	fs.SetOutput(os.Stderr)
 	credentialsFile := fs.String("credentials-file", "", "private worker credential file reference")
+	proof := fs.String("execution-proof", "", "pinned managed execution proof descriptor")
+	proofSHA := fs.String("execution-proof-sha256", "", "managed execution proof digest")
 	if err := fs.Parse(args); err != nil {
 		os.Exit(2)
 	}
-	if err := worker.RunWorkerWithCredentials(*credentialsFile, fs.Args(), os.Stdin, os.Stdout); err != nil {
+	if err := worker.RunWorkerWithExecutionProof(*credentialsFile, *proof, *proofSHA, fs.Args(), os.Stdin, os.Stdout); err != nil {
 		fmt.Fprintf(os.Stderr, "[maestro] worker exec: %v\n", err)
 		var exitErr *exec.ExitError
 		if errors.As(err, &exitErr) && exitErr.ExitCode() > 0 {

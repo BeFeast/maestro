@@ -3,6 +3,7 @@ package aiexecution
 import (
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -22,6 +23,23 @@ func assertExecutionHold(t *testing.T, err error, code string) {
 	}
 }
 
+func TestRuntimeListenerRequiresExactDestinationAndNamespace(t *testing.T) {
+	listener, err := net.Listen("tcp4", "127.0.0.2:0")
+	if err != nil {
+		t.Skip(err)
+	}
+	defer listener.Close()
+	port := listener.Addr().(*net.TCPAddr).Port
+	assertExecutionHold(t, inspectListener(os.Getpid(), net.ParseIP("127.0.0.1"), port), "gateway_listener_mismatch")
+	if err := inspectListener(os.Getpid(), net.ParseIP("127.0.0.2"), port); err != nil {
+		t.Fatal(err)
+	}
+	assertExecutionHold(t, inspectListener(-1, net.ParseIP("127.0.0.2"), port), "gateway_network_namespace_mismatch")
+	if procListenerMatches("0200007F", net.ParseIP("127.0.0.1")) || procListenerMatches(strings.Repeat("0", 32), net.ParseIP("127.0.0.1")) {
+		t.Fatal("address/family mismatch accepted")
+	}
+}
+
 func TestRuntimeObservationBindsNonceProcessPolicyAndConfig(t *testing.T) {
 	for _, mode := range []string{"valid", "nonce", "instance", "stale", "partial_reload", "startup_drift", "current_drift", "policy", "caller", "redirect", "unknown_field", "wrong_pid"} {
 		t.Run(mode, func(t *testing.T) {
@@ -34,6 +52,7 @@ func TestRuntimeObservationBindsNonceProcessPolicyAndConfig(t *testing.T) {
 					t.Error("wrong observation request")
 				}
 				receipt := runtimeReceipt{SchemaVersion: 1, ProjectionVersion: expected.ProjectionVersion, ProcessInstanceID: expected.ProcessInstanceID, StartedAt: expected.StartedAt, ObservedAt: time.Now().UTC(), RequestNonce: r.URL.Query().Get("request_nonce"), ConfigApplyComplete: true}
+				receipt.ObservationScope = "configuration_only"
 				if len(receipt.RequestNonce) != 32 {
 					t.Error("missing fresh nonce")
 				}

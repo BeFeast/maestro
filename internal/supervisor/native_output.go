@@ -12,10 +12,11 @@ import (
 // NativeOutputCheckpoint locates raw owner-only output without copying it into
 // telemetry. Local success/completeness never implies financial settlement.
 type NativeOutputCheckpoint struct {
-	Filename string `json:"filename"`
-	SHA256   string `json:"sha256"`
-	Bytes    int    `json:"bytes"`
-	Complete bool   `json:"complete"`
+	Filename  string `json:"filename"`
+	SHA256    string `json:"sha256"`
+	Bytes     int    `json:"bytes"`
+	Complete  bool   `json:"complete"`
+	Truncated bool   `json:"truncated"`
 }
 
 type nativeOutputRecord struct {
@@ -26,6 +27,7 @@ type nativeOutputRecord struct {
 	Status          string `json:"local_status"`
 	SHA256          string `json:"sha256"`
 	Complete        bool   `json:"complete"`
+	Truncated       bool   `json:"truncated"`
 	Data            []byte `json:"data"`
 }
 
@@ -36,7 +38,7 @@ func (s *consultationStore) saveNativeOutput(identity ConsultationIdentity, inv 
 	sum := sha256.Sum256(output)
 	sha := hex.EncodeToString(sum[:])
 	complete := inv.Status == "succeeded"
-	record := nativeOutputRecord{Version: 1, RoleRunID: identity.ID, InvocationID: inv.ID, NativeSessionID: inv.NativeSession.Request.NativeSessionID, Status: inv.Status, SHA256: sha, Complete: complete, Data: output}
+	record := nativeOutputRecord{Version: 1, RoleRunID: identity.ID, InvocationID: inv.ID, NativeSessionID: inv.NativeSession.Request.NativeSessionID, Status: inv.Status, SHA256: sha, Complete: complete, Truncated: inv.Status == "output_limit", Data: output}
 	b, err := json.Marshal(record)
 	if err != nil {
 		return nil, err
@@ -45,5 +47,5 @@ func (s *consultationStore) saveNativeOutput(identity ConsultationIdentity, inv 
 	if err := atomicReceiptWrite(s.dir, filename, b); err != nil {
 		return nil, err
 	}
-	return &NativeOutputCheckpoint{Filename: filename, SHA256: sha, Bytes: len(output), Complete: complete}, nil
+	return &NativeOutputCheckpoint{Filename: filename, SHA256: sha, Bytes: len(output), Complete: complete, Truncated: record.Truncated}, nil
 }

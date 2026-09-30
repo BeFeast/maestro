@@ -38,6 +38,10 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			}
 			if mode == "cancelled" {
 				def.Cmd += " slow"
+				script := "#!/bin/sh\ncat >/dev/null\nprintf partial-output\nprintf 'call\\n' >> '" + count + "'\nsleep 5\n"
+				if err := os.WriteFile(filepath.Join(cfg.LocalPath, "claude"), []byte(script), 0700); err != nil {
+					t.Fatal(err)
+				}
 			}
 			cfg.Model.Backends["primary"] = def
 			ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
@@ -81,6 +85,9 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			}
 			if mode == "success" && string(record.Data) != "done" {
 				t.Fatal("successful output lost")
+			}
+			if mode == "cancelled" && string(record.Data) != "partial-output" {
+				t.Fatalf("partial output lost: %q", record.Data)
 			}
 			info, statErr := os.Stat(path)
 			if statErr != nil || info.Mode().Perm() != 0600 {

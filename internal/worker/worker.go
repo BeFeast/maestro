@@ -308,6 +308,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return "", err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, 1)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return "", err
@@ -574,6 +577,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return err
