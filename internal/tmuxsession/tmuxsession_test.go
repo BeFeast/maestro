@@ -195,10 +195,13 @@ func TestNativeRoleServiceAssemblyKeepsExactOwnershipWithoutLaunchingSystemd(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"--unit=" + lease.Unit, "--uid=1000", "--gid=1000", "--property=NetworkNamespacePath=/run/netns/native-slot", "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=KillMode=control-group", "--property=MemoryMax=2048M", "_native-monitor"} {
+	for _, want := range []string{"--unit=" + lease.Unit, "--uid=1000", "--gid=1000", "--property=NetworkNamespacePath=/run/netns/native-slot", "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=", "--property=KillMode=control-group", "--property=MemoryMax=2048M", "_native-monitor"} {
 		if !containsArg(args, want) {
 			t.Fatalf("missing %s in %v", want, args)
 		}
+	}
+	if containsArg(args, "--property=RestrictSUIDSGID=yes") {
+		t.Fatal("systemd RestrictSUIDSGID blocks the required openat2 symlink guard")
 	}
 	host, err := processLeaseLaunchCommand(lease, "/state/runner.sh", 1000, "")
 	if err != nil {

@@ -381,10 +381,13 @@ func NativeProcessServiceArgs(lease ProcessLease, uid, gid int, namespace string
 	} else {
 		return nil, fmt.Errorf("native worker requires its existing scratch lease")
 	}
+	// RestrictSUIDSGID blocks openat2 with ENOSYS on systemd 259 because its
+	// mode is an indirect argument. Keep openat2's symlink protections usable;
+	// NoNewPrivileges and empty capabilities prevent privilege gains instead.
 	args = append(args, "--uid="+strconv.Itoa(uid), "--gid="+strconv.Itoa(gid),
 		"--property=NetworkNamespacePath="+namespace,
 		"--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=",
-		"--property=RestrictSUIDSGID=yes", "--property=RestrictRealtime=yes", "--property=LockPersonality=yes",
+		"--property=RestrictRealtime=yes", "--property=LockPersonality=yes",
 		"--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
 		"--property=PrivateMounts=yes", "--property=MemoryMax="+strconv.Itoa(memoryMaxMB)+"M")
 	return append(args, command...), nil
