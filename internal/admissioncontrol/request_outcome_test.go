@@ -7,10 +7,47 @@ import (
 	"net"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
 )
+
+// Produced by the Python authority at ebe057213cee2ae04e85009c10b22398269e9365.
+// These include real ledger proofs, rather than Go-generated expected digests.
+func TestRequestOutcomePythonGolden(t *testing.T) {
+	body, err := os.ReadFile("testdata/native-request-outcomes-v2.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var fixtures []struct {
+		Case    string        `json:"case"`
+		Request SealRequest   `json:"request"`
+		Result  NativeOutcome `json:"result"`
+	}
+	if err := json.Unmarshal(body, &fixtures); err != nil || len(fixtures) != 6 {
+		t.Fatalf("invalid authority fixtures: %v", err)
+	}
+	for _, fixture := range fixtures {
+		t.Run(fixture.Case, func(t *testing.T) {
+			if err := ValidateNativeOutcome(fixture.Result, fixture.Request); err != nil {
+				t.Fatal(err)
+			}
+			actual, err := decodeNativeOutcome(requestOutcomeEnvelope(fixture.Request, fixture.Result), fixture.Request)
+			if err != nil || !reflect.DeepEqual(actual, fixture.Result) {
+				t.Fatalf("Python/Go outcome mismatch: %+v %v", actual, err)
+			}
+			encoded, err := json.Marshal(actual)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var saved NativeOutcome
+			if err := json.Unmarshal(encoded, &saved); err != nil || !reflect.DeepEqual(saved, actual) {
+				t.Fatalf("persisted outcome changed: %+v %v", saved, err)
+			}
+		})
+	}
+}
 
 func requestOutcomeFixture(request SealRequest) NativeOutcome {
 	o := NativeOutcome{SchemaVersion: 2, AdmissionBasis: "requests", MoneyStatus: "unknown",
