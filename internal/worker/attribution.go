@@ -88,7 +88,14 @@ func AdoptLiveRuntime(cfg *config.Config, sess *state.Session, pid int, tmuxName
 	leaseID, leaseUnit, leaseScope := sess.WorkerLeaseID, sess.WorkerLeaseUnit, sess.WorkerLeaseScope
 	scratchDir, manifest := sess.WorkerScratchDir, sess.WorkerLeaseManifest
 	leaseAttention := sess.WorkerLeaseAttention
-	beginSessionAttempt(cfg, sess, sess.Backend, "runtime_adoption", "runtime_state_lost", observedAt)
+	if sess.NativeRoleRunID != "" {
+		// Observing the same OS lease is not a new native generation.
+		sess.Status = state.StatusRunning
+		sess.FinishedAt = nil
+		sess.WorkerEndedAt = nil
+	} else {
+		beginSessionAttempt(cfg, sess, sess.Backend, "runtime_adoption", "runtime_state_lost", observedAt)
+	}
 	sess.WorkerLeaseID = leaseID
 	sess.WorkerLeaseUnit = leaseUnit
 	sess.WorkerLeaseScope = leaseScope

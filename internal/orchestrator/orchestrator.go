@@ -90,7 +90,7 @@ type Orchestrator struct {
 	reviewProduceMu       sync.Mutex
 	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
-	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
+	reviewProduceFn       func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -1047,6 +1047,8 @@ func (o *Orchestrator) respawnWorker(slotName string, sess *state.Session, issue
 // the escalation ladder uses to carry a tier's per-tier effort/model override
 // (#783). It defaults to o.cfg via respawnWorker.
 func (o *Orchestrator) respawnWorkerWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	beforeNative := nativeSessionSnapshot(cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
 		return o.respawnWorkerUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	})
@@ -1089,6 +1091,8 @@ func (o *Orchestrator) rateLimit() (github.RateLimitStatus, error) {
 // per-tier effort/model override (#783/#792). Callers that have no override pass
 // o.cfg.
 func (o *Orchestrator) respawnInPlaceWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase string, backendName string) error {
+	beforeNative := nativeSessionSnapshot(cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
 		return o.respawnInPlaceUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	})
@@ -1108,6 +1112,8 @@ func (o *Orchestrator) respawnInPlaceUnlocked(cfg *config.Config, slotName strin
 // checkpointed into the existing resumable checkpoint contract, then the same
 // slot/branch/worktree is restarted in place on the selected backend.
 func (o *Orchestrator) respawnPreservingWorktreeWithConfig(cfg *config.Config, slotName string, sess *state.Session, issue github.Issue, promptBase, backendName string) error {
+	beforeNative := nativeSessionSnapshot(cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	return state.WithSessionLease(cfg.StateDir, slotName, func() error {
 		return o.respawnPreservingWorktreeUnlocked(cfg, slotName, sess, issue, promptBase, backendName)
 	})
@@ -2910,6 +2916,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 	now := time.Now().UTC()
 	for _, slotName := range slotNames {
 		sess := s.Sessions[slotName]
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
 		if sess.Status != state.StatusDead || sess.NextRetryAt == nil {
 			continue
 		}
@@ -2940,6 +2949,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		}
 
 		sess := s.Sessions[slotName]
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
 		if sess.Status != state.StatusDead {
 			continue
 		}
@@ -2965,6 +2977,8 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			continue
 		}
 		clearOperatorGateHold(sess)
+
+		beforeNative := nativeSessionSnapshot(o.cfg, sess)
 
 		// Backoff elapsed — respawn the worker
 		log.Printf("[orch] worker %s backoff elapsed, respawning (retry %d)", slotName, sess.RetryCount)
@@ -3121,6 +3135,16 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 
 		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
+			if hold, ok := worker.NativeHold(respawnErr); ok {
+				retainNativeWorkerHold(sess, respawnErr)
+				restoreNativeHeldSession(sess, beforeNative)
+				if hold.LaunchUncertain {
+					permit.Commit(slotName)
+				} else {
+					permit.Release()
+				}
+				continue
+			}
 			permit.Release()
 			log.Printf("[orch] respawn worker %s: %v — marking as failed", slotName, respawnErr)
 			sess.Status = state.StatusFailed
@@ -4037,6 +4061,10 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 	reconciled := false
 	for slotName, sess := range s.Sessions {
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
+		beforeNative := nativeSessionSnapshot(o.cfg, sess)
 		// A worker launch is an external side effect: tmux may have accepted it
 		// even when the following state.Save lost a concurrent supervisor/watchdog
 		// merge race. Older code only inspected StatusRunning, so a live in-place
@@ -4222,6 +4250,10 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				o.updateTokensUsedFromWorkerLog(slotName, sess)
 				promptBase := o.selectPrompt(issue)
 				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+					if retainNativeWorkerHold(sess, respawnErr) {
+						restoreNativeHeldSession(sess, beforeNative)
+						continue
+					}
 					// RespawnInPlace reconciles against the deterministic tmux identity,
 					// so retrying cannot create a parallel worker. Keep the marker: a
 					// transient backend/launcher failure must not erase recovery intent.
@@ -4312,6 +4344,10 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+				if retainNativeWorkerHold(sess, respawnErr) {
+					restoreNativeHeldSession(sess, beforeNative)
+					continue
+				}
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -4392,6 +4428,10 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
+				if retainNativeWorkerHold(sess, respawnErr) {
+					restoreNativeHeldSession(sess, beforeNative)
+					continue
+				}
 				sess.PID = 0
 				sess.TmuxSession = ""
 				sess.FinishedAt = &now
@@ -4497,6 +4537,9 @@ func (o *Orchestrator) adoptLiveWorkerRuntime(slotName string, sess *state.Sessi
 		log.Printf("[orch] reconcile: %s tmux %q reported dead pane pid %d; refusing adoption", slotName, tmuxName, pid)
 		return false
 	}
+	if (o.cfg.WorkerNativeSessionRegistration != nil || sess.NativeRoleRunID != "") && worker.ValidateNativeWorkerRuntime(o.cfg, slotName, sess, pid) != nil {
+		return false
+	}
 	previous := sess.Status
 	worker.AdoptLiveRuntime(o.cfg, sess, pid, tmuxName, observedAt)
 	log.Printf("[orch] reconcile: %s adopted live worker runtime hidden behind status=%s (issue #%d, pid=%d, tmux=%q, worktree=%q) — no respawn, no duplicate",
@@ -4522,7 +4565,7 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 		originalErr := err
 		live := make(map[string]state.Session)
 		for slotName, sess := range s.Sessions {
-			if sess == nil || sess.Status != state.StatusRunning || strings.TrimSpace(sess.Worktree) == "" {
+			if sess == nil || sess.NativeRegistrationHold != "" || sess.Status != state.StatusRunning || strings.TrimSpace(sess.Worktree) == "" {
 				continue
 			}
 			tmuxName := strings.TrimSpace(sess.TmuxSession)
@@ -4534,6 +4577,9 @@ func (o *Orchestrator) saveStatePreservingLiveRuntime(s *state.State) error {
 			}
 			pid, paneWorktree, identityErr := o.tmuxPaneIdentity(tmuxName)
 			if identityErr != nil || pid <= 0 || !o.pidAlive(pid) || filepath.Clean(paneWorktree) != filepath.Clean(sess.Worktree) {
+				continue
+			}
+			if (o.cfg.WorkerNativeSessionRegistration != nil || sess.NativeRoleRunID != "") && worker.ValidateNativeWorkerRuntime(o.cfg, slotName, sess, pid) != nil {
 				continue
 			}
 			copy := *sess
@@ -4599,6 +4645,9 @@ func liveRuntimeSuperseded(current, runtime *state.Session) bool {
 	if current == nil || runtime == nil {
 		return true
 	}
+	if current.WorkerGeneration == runtime.WorkerGeneration && current.NativeRoleRunID != "" && (current.NativeRoleRunID != runtime.NativeRoleRunID || current.NativeSessionID != runtime.NativeSessionID) {
+		return true
+	}
 	if current.Status == state.StatusDone || current.Status == state.StatusCodeLanded {
 		return true
 	}
@@ -4631,6 +4680,12 @@ func applyLiveRuntimeProjection(current, runtime *state.Session) {
 	current.ProcessLeaseUnit = runtime.ProcessLeaseUnit
 	current.ProcessLeaseManager = runtime.ProcessLeaseManager
 	current.WorkerGeneration = runtime.WorkerGeneration
+	current.NativeSessionID = runtime.NativeSessionID
+	current.NativeRoleRunID = runtime.NativeRoleRunID
+	current.NativeParentRoleRunID = runtime.NativeParentRoleRunID
+	current.NativeRole = runtime.NativeRole
+	current.NativeReceiptDir = runtime.NativeReceiptDir
+	current.NativeRegistrationHold = runtime.NativeRegistrationHold
 	current.LogFile = runtime.LogFile
 	current.StartedAt = runtime.StartedAt
 	current.FinishedAt = runtime.FinishedAt
@@ -4901,6 +4956,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 	}
 
 	for slotName, sess := range s.Sessions {
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
+		beforeNative := nativeSessionSnapshot(o.cfg, sess)
 		// GitHub issue closure is terminal external truth for every nonterminal
 		// session status, including code_landed. Check it before PR, delivery,
 		// outcome, retry, or worker reconciliation so none of those independent
@@ -5185,6 +5244,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
+						if retainNativeWorkerHold(sess, err) {
+							restoreNativeHeldSession(sess, beforeNative)
+							continue
+						}
 						log.Printf("[orch] fallback respawn worker %s with %s: %v — marking as failed", slotName, nextBackend, err)
 						sess.Status = state.StatusFailed
 						now := time.Now().UTC()
@@ -5245,6 +5308,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
+						if retainNativeWorkerHold(sess, err) {
+							restoreNativeHeldSession(sess, beforeNative)
+							continue
+						}
 						log.Printf("[orch] %s fallback respawn worker %s with %s: %v — marking as dead (%s)", cp.noun, slotName, nextBackend, err, cp.displayToken)
 						sess.Status = state.StatusDead
 						sess.LastNotifiedStatus = cp.displayToken
@@ -5389,6 +5456,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								}
 								promptBase := o.selectPrompt(issue)
 								if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
+									if retainNativeWorkerHold(sess, respawnErr) {
+										restoreNativeHeldSession(sess, beforeNative)
+										continue
+									}
 									log.Printf("[orch] rate-limit fallback respawn %s: %v — marking dead", slotName, respawnErr)
 									sess.Status = state.StatusDead
 									sess.LastNotifiedStatus = "rate_limit"
@@ -5445,6 +5516,10 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									// for non-policy/shadow sessions — base o.cfg unchanged).
 									respawnCfg := o.tierOverrideConfigForSession(sess)
 									if respawnErr := o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
+										if retainNativeWorkerHold(sess, respawnErr) {
+											restoreNativeHeldSession(sess, beforeNative)
+											continue
+										}
 										log.Printf("[orch] checkpoint respawn %s failed: %v — will hit hard limit", slotName, respawnErr)
 									} else {
 										log.Printf("[orch] checkpoint respawn complete for %s", slotName)
@@ -9599,6 +9674,12 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		o.staleInvalidSpawnRepairApproval(s, dispatch, reason)
 		return false
 	}
+	if sess.NativeRegistrationHold != "" {
+		return false
+	}
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
+	repairCfg := nativeWorkerConfig(o.cfg, "repair", sess.NativeRoleRunID)
 	if target.PR > 0 && sess.PRNumber != target.PR {
 		reason := fmt.Sprintf("issue #%d reserved PR #%d no longer matches session %s PR #%d", issue.Number, target.PR, slot, sess.PRNumber)
 		log.Printf("[orch] refusing repair dispatch: %s", reason)
@@ -9746,14 +9827,17 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 			// Synthetic tests provide their own in-place executor and paths.
 			// Production has no hook and always takes the checkpointing,
 			// missing-worktree-restoring path below.
-			err = o.respawnInPlaceWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+			err = o.respawnInPlaceWithConfig(repairCfg, slot, sess, issue, promptBase, backend)
 		} else {
-			err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+			err = o.respawnPreservingWorktreeWithConfig(repairCfg, slot, sess, issue, promptBase, backend)
 		}
 	} else {
-		err = o.respawnPreservingWorktreeWithConfig(o.cfg, slot, sess, issue, promptBase, backend)
+		err = o.respawnPreservingWorktreeWithConfig(repairCfg, slot, sess, issue, promptBase, backend)
 	}
 	if err != nil {
+		if retainNativeWorkerHold(sess, err) {
+			return false
+		}
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
 		return false
 	}
@@ -10785,6 +10869,11 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		// dispatch is unchanged. Implement/validate phase transitions apply their own
 		// effort in worker.StartPhase.
 		workerCfg = pipeline.ApplyPhaseEffort(workerCfg, backendName, initialPhase)
+		nativeRole := worker.NativeRoleForPhase(initialPhase)
+		if repairSpawn {
+			nativeRole = "repair"
+		}
+		workerCfg = nativeWorkerConfig(workerCfg, nativeRole, "")
 		if backendDecision.ShadowTier != "" {
 			log.Printf("[orch] issue #%d: policy SHADOW would pick %s — dispatching %s unchanged",
 				issue.Number, backendDecision.ShadowReason, backendName)
@@ -10816,6 +10905,19 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		}
 		if err != nil {
+			if hold, ok := worker.NativeHold(err); ok {
+				heldSlot := hold.Slot
+				if heldSlot == "" && freshClaim != nil {
+					heldSlot = freshClaim.Slot
+				}
+				if hold.LaunchUncertain && heldSlot != "" {
+					permit.Commit(heldSlot)
+				} else {
+					permit.Release()
+				}
+				log.Printf("[orch] issue #%d native worker held: %s", issue.Number, hold.Code)
+				continue
+			}
 			permit.Release()
 			log.Printf("[orch] start worker for issue #%d: %v", issue.Number, err)
 			// #1100: release the pre-spawn lease immediately so a failed start

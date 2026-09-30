@@ -2607,6 +2607,13 @@ func spawnCmd(args []string) {
 	r := router.New(cfg)
 	backendDecision := r.ResolveBackendDecision(*targetIssue)
 	backendName := backendDecision.Backend
+	// The explicit spawn command launches an implementation worker; pipeline
+	// dispatch supplies its own initial role through the orchestrator.
+	if cfg.WorkerNativeSessionRegistration != nil {
+		launchCfg := *cfg
+		launchCfg.WorkerLaunchContext = &config.WorkerLaunchContext{Role: "implementer"}
+		cfg = &launchCfg
+	}
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)

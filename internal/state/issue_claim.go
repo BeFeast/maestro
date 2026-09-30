@@ -583,6 +583,11 @@ func sessionIssueClaim(slot string, sess *Session) (IssueClaim, bool) {
 		PRNumber:    sess.PRNumber,
 		Status:      string(sess.Status),
 	}
+	if sess.NativeRegistrationHold != "" {
+		claim.Kind = IssueClaimImplementation
+		claim.Reason = "native_registration_hold"
+		return claim, true
+	}
 	// GitHub issue closure is terminal external truth. Historical retry,
 	// operator-gate, PR, and worktree fields remain on the session for audit,
 	// but none of them may keep an issue claim alive after reconciliation.
