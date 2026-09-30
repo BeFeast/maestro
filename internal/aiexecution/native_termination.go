@@ -1,0 +1,114 @@
+package aiexecution
+
+import (
+	"context"
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/google/uuid"
+)
+
+// NativeProcessTermination proves the exact launched incarnation's OS outcome.
+// LocalStatus=local_output_unknown is a terminal OS observation, never proof of
+// complete stdout or a financially settled provider invocation.
+type NativeProcessTermination struct {
+	Version         int       `json:"version"`
+	Profile         FileProof `json:"profile"`
+	NativeSessionID string    `json:"native_session_id"`
+	Unit            string    `json:"unit"`
+	Cgroup          string    `json:"cgroup"`
+	StartedAt       time.Time `json:"started_at"`
+	EndedAt         time.Time `json:"ended_at"`
+	LocalStatus     string    `json:"local_status"`
+	ExitCode        int       `json:"exit_code"`
+	Digest          string    `json:"digest"`
+}
+
+type nativeTerminationProfile struct {
+	ClaimDir  string    `json:"claim_dir"`
+	Systemctl FileProof `json:"systemctl"`
+}
+
+func nativeTerminationDigest(proof NativeProcessTermination) string {
+	proof.Digest = ""
+	b, _ := json.Marshal(proof)
+	return digest(b)
+}
+
+// VerifyNativeProcessTermination re-observes the original pinned execution
+// profile and exact cgroup. A missing/collected unit is insufficient without a
+// durable pre-exec launch proof. It does not use current routing configuration.
+func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*NativeProcessTermination, error) {
+	if id, err := uuid.Parse(nativeID); err != nil || id.String() != nativeID || unit == "" || filepath.Base(unit) != unit {
+		return nil, Held("containment_termination_binding_invalid")
+	}
+	if VerifyFile(profile) != nil {
+		return nil, Held("containment_termination_profile_drift")
+	}
+	b, err := os.ReadFile(profile.Path)
+	var p nativeTerminationProfile
+	// The full schema is checked by the launch consumer. This narrow read
+	// deliberately depends only on the pinned original recovery fields.
+	if err != nil || len(b) > 128<<10 || json.Unmarshal(b, &p) != nil || !filepath.IsAbs(p.ClaimDir) || VerifyFile(p.Systemctl) != nil {
+		return nil, Held("containment_termination_profile_invalid")
+	}
+	read := func(suffix string) (NativeProcessTermination, error) {
+		var proof NativeProcessTermination
+		path := filepath.Join(p.ClaimDir, nativeID+suffix)
+		st, err := os.Lstat(path)
+		if err != nil {
+			return proof, err
+		}
+		if !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 || st.Size() > 16<<10 {
+			return proof, Held("containment_termination_proof_unsafe")
+		}
+		data, err := os.ReadFile(path)
+		if err != nil || DecodeStrict(data, &proof) != nil || proof.Version != 1 || proof.Profile != profile || proof.NativeSessionID != nativeID || proof.Unit != unit || proof.StartedAt.IsZero() || proof.Cgroup == "/" || !strings.HasPrefix(proof.Cgroup, "/") || filepath.Clean(proof.Cgroup) != proof.Cgroup || filepath.Base(proof.Cgroup) != unit || proof.Digest != nativeTerminationDigest(proof) {
+			return proof, Held("containment_termination_proof_invalid")
+		}
+		return proof, nil
+	}
+	launch, err := read(".launch.json")
+	if err != nil {
+		return nil, Held("containment_launch_proof_unavailable")
+	}
+	proof, err := read(".termination.json")
+	if os.IsNotExist(err) {
+		proof = launch
+		proof.LocalStatus = "local_output_unknown"
+		proof.ExitCode = -1
+		proof.EndedAt = time.Now().UTC()
+	} else if err != nil {
+		return nil, err
+	}
+	if proof.Cgroup != launch.Cgroup || !proof.StartedAt.Equal(launch.StartedAt) || proof.EndedAt.Before(proof.StartedAt) {
+		return nil, Held("containment_termination_proof_invalid")
+	}
+	events, err := os.ReadFile(filepath.Join("/sys/fs/cgroup", proof.Cgroup, "cgroup.events"))
+	if err != nil && !os.IsNotExist(err) || err == nil && !strings.Contains("\n"+string(events), "\npopulated 0\n") {
+		return nil, Held("containment_previous_cgroup_unresolved")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, p.Systemctl.Path, "show", "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=ControlGroup", unit)
+	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
+	out, err := cmd.Output()
+	if err != nil || len(out) > 16<<10 {
+		return nil, Held("containment_process_unobservable")
+	}
+	fields := map[string]string{}
+	for _, line := range strings.Split(string(out), "\n") {
+		if k, v, ok := strings.Cut(line, "="); ok {
+			fields[k] = v
+		}
+	}
+	if fields["LoadState"] != "not-found" && (fields["LoadState"] != "loaded" || fields["ActiveState"] != "inactive" && fields["ActiveState"] != "failed" || fields["ControlGroup"] != "" && fields["ControlGroup"] != proof.Cgroup) {
+		return nil, Held("containment_previous_cgroup_unresolved")
+	}
+	proof.Digest = nativeTerminationDigest(proof)
+	return &proof, nil
+}
