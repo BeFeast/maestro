@@ -91,6 +91,9 @@ func TestNativeEnvironmentDoesNotInheritProviderOrHostCredentials(t *testing.T) 
 			t.Fatal(err)
 		}
 		joined := strings.Join(env, "\n")
+		if !strings.Contains(joined, "CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000") {
+			t.Fatal("native request output ceiling missing", role)
+		}
 		for _, denied := range []string{"unmanaged", "broad", "HTTP_PROXY", "SSH_AUTH_SOCK", "core.fsmonitor=bad"} {
 			if strings.Contains(joined, denied) {
 				t.Fatal("environment escaped", denied)
