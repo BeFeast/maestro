@@ -1263,6 +1263,8 @@ type SupervisorStuckState struct {
 
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
+	// ConsultationID joins optional local execution receipts, never gateway usage.
+	ConsultationID   string                     `json:"consultation_id,omitempty"`
 	ID               string                     `json:"id"`
 	CreatedAt        time.Time                  `json:"created_at"`
 	RecommendationID string                     `json:"recommendation_id,omitempty"`

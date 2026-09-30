@@ -1061,6 +1061,10 @@ func normalizeDeliveryTimeout(min int) int {
 
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
+	// RequireAccountingReady holds model consultations until a transport proves
+	// attribution and shared admission for every physical request. The current
+	// CLI adapter cannot provide that capability; this is not a local budget.
+	RequireAccountingReady  bool                            `yaml:"require_accounting_ready" json:"require_accounting_ready,omitempty"`
 	Enabled                 bool                            `yaml:"enabled" json:"enabled"`
 	Backend                 string                          `yaml:"backend" json:"backend,omitempty"`
 	Model                   string                          `yaml:"model" json:"model,omitempty"`
