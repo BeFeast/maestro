@@ -60,20 +60,54 @@ that already started.
 ## Outcomes and recovery artifacts
 
 All registered native invocations, including exit 0, retain their launch marker
-and auxiliary occupancy until a trusted authority outcome establishes terminal
-financial status. No stderr or local return code supplies that status. The
-existing worker previous-generation outcome seam also stays closed. The actual
-authority seal/settlement bridge and its consumer/reconciliation API are the
-next required source slice.
+and auxiliary occupancy until every saved native binding has a trusted sealed
+financial outcome. The authority atomically revokes each exact registration and
+returns either sealed zero dispatch, validated ledger settlement without bound
+violations, or a hold. The control request intent and exact digest-bound result
+are fsynced before releasing any marker or permit. Stderr, local exit, expiry,
+and gateway transport observations cannot authorize financial recovery.
 
-Native stdout is capped at 4 MiB. Before returning an unresolved-outcome hold,
-the runner fsyncs an owner-only output checkpoint containing exact role-run,
-invocation and native-session IDs, raw bytes, digest, local status, completeness
-and truncation metadata. Cancellation, timeout and overflow preserve the bounded
-partial prefix. Metadata receipts reference that checkpoint; they do not copy
-raw output into telemetry. Later trusted reconciliation can recover the same
-result without requesting inference again. This slice does not yet consume such
-a recovered result or claim settlement.
+Native stdout is capped at 4 MiB and saved in an owner-only checkpoint with
+exact role-run, invocation and native IDs, raw bytes, digest, local status,
+completeness and truncation metadata. Cancellation, timeout and overflow retain
+the bounded partial prefix. A successful exact-role/input replay returns this
+validated checkpoint without inference; an incomplete or failed checkpoint can
+never become successful output. Corrupt, foreign, symlinked or unsafe checkpoints,
+and missing files already referenced by a completed invocation, hold both
+recovery and permit release.
+
+A crash before the completed invocation receipt is saved retains the exact
+planned invocation. Recovery observes the original pinned containment profile,
+native UUID, systemd unit, boot and service incarnation, and kernel cgroup;
+a saved boolean or an absent service alone cannot establish termination. The
+recovered process proof and output checkpoint are fsynced before sealing the
+authority binding. An orphan checkpoint with complete, matching output can be
+restored without inference. Missing output becomes a durable
+`local_output_unknown` record, never an invented empty successful answer. A
+timeout or unresolved containment with a preserved prefix remains a local
+failure even after terminal process and financial proof release occupancy.
+The full validated OS terminal snapshot is saved with its digest before
+financial completion. A completed receipt validates that durable snapshot and
+the financial proof without rereading retired profiles, binaries or cgroups;
+ordinary profile rotation cannot reclaim or freeze its released occupancy.
+An unresolved invocation still requires a fresh observation through its original
+pinned profile and remains held if that evidence is unavailable.
+
+`ReconcileNativeConsultation(cfg, identity, prompt)` and re-entry with the same
+identity/input reconcile only saved native bindings. They never acquire another
+permit, launch a process or walk the fallback chain. Multi-native consultations
+require every invocation to be sealed and terminal. A fresh cycle encountering
+a prior unresolved role first reconciles that role and returns
+`native_prior_outcome_reconciled` without returning old output or starting new
+inference. The next cycle can then proceed normally. A different prompt or
+reviewer model cannot reuse an old result.
+
+The controller independently validates the durable completed role receipt and
+checkpoint before dropping a retained in-memory permit. Durable pending native
+receipts still consume capacity if a launch marker is missing. The strict
+contained execution path must record the exact deterministic systemd unit and
+verified terminal process state before seal; uncertain containment remains held.
+Outcome proof and process termination are separate requirements.
 
 ## One capacity owner
 

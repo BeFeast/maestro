@@ -18,6 +18,9 @@ import (
 type NativeSessionRegistrationReceipt struct {
 	Request         admissioncontrol.RegistrationRequest `json:"request"`
 	Acknowledgement *admissioncontrol.Acknowledgement    `json:"acknowledgement,omitempty"`
+	AuthorityPin    string                               `json:"authority_pin,omitempty"`
+	OutcomeIntent   *admissioncontrol.SealRequest        `json:"outcome_intent,omitempty"`
+	Outcome         *admissioncontrol.NativeOutcome      `json:"outcome,omitempty"`
 }
 
 func registrationClient(cfg *config.Config) (admissioncontrol.Client, error) {
@@ -42,7 +45,7 @@ func prepareNativeSession(cfg *config.Config, identity ConsultationIdentity, inv
 		return &ConsultationHold{Code: "native_session_argument_conflict"}
 	}
 	r := cfg.Supervisor.NativeSessionRegistration
-	invocation.NativeSession = &NativeSessionRegistrationReceipt{Request: admissioncontrol.RegistrationRequest{
+	invocation.NativeSession = &NativeSessionRegistrationReceipt{AuthorityPin: nativeAuthorityPin(cfg), Request: admissioncontrol.RegistrationRequest{
 		Binding: admissioncontrol.Binding{GatewayScope: r.GatewayScope, NativeSessionID: invocation.ID, FleetID: r.FleetID,
 			ProjectID: identity.ProjectID, RunID: r.BudgetRunID, Role: identity.Role, ExpiresAt: time.Now().Unix() + r.TTLSeconds},
 		ExpectedVersion: r.ExpectedPolicyVersion,

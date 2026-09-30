@@ -94,6 +94,12 @@ func (f *registrationFixture) serve(conn net.Conn) {
 	if json.Unmarshal(body, &message) != nil {
 		return
 	}
+	if message.Op == "seal_native" {
+		data, _ := json.Marshal(map[string]any{"version": 1, "id": message.ID, "ok": false, "hold": map[string]string{"code": "authority_unavailable"}})
+		binary.BigEndian.PutUint32(prefix[:], uint32(len(data)))
+		_, _ = conn.Write(append(prefix[:], data...))
+		return
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.requests = append(f.requests, message.Args)
@@ -291,7 +297,10 @@ func TestNativeRegistrationResumeFlagsAndRecoveryLaunchFence(t *testing.T) {
 	_, err = ReconcileNativeSupervisorRegistration(cfg)
 	assertHold(t, err, "unresolved_launch_intent")
 	_, err = NewBackendLLMClient(cfg).Complete("restart")
-	assertHold(t, err, "unresolved_launch_intent")
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "native_process_termination_unverified" {
+		t.Fatal(err)
+	}
 	if nativeCalls(t, count) != 1 {
 		t.Fatal("uncertain launched request repeated")
 	}

@@ -78,3 +78,19 @@ func (l *fleetSpawnLimiter) ReserveAuxiliary(stateDir, roleRunID string) (func()
 	l.auxiliaryReservations[key] = struct{}{}
 	return func() { l.mu.Lock(); delete(l.auxiliaryReservations, key); l.mu.Unlock() }, nil
 }
+
+// ReconcileAuxiliary releases an existing in-memory reservation only after the
+// durable role receipt proves every native invocation terminal and the launch
+// marker has been removed. It does not reserve another run or trust caller flags.
+func (l *fleetSpawnLimiter) ReconcileAuxiliary(stateDir, roleRunID string) error {
+	if l == nil {
+		return aiexecution.Held("auxiliary_controller_unavailable")
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if err := supervisor.NativeAuxiliaryOutcomeComplete(stateDir, roleRunID); err != nil {
+		return err
+	}
+	delete(l.auxiliaryReservations, filepath.Clean(stateDir)+"\x00"+roleRunID)
+	return nil
+}
