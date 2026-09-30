@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
 )
@@ -270,7 +271,7 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 	if err != nil {
 		return fmt.Errorf("local_path %s has no readable origin remote", p.LocalPath)
 	}
-	if !remoteMatchesRepo(strings.TrimSpace(string(remote)), p.Repo) {
+	if !remoteMatchesRepo(strings.TrimSpace(string(remote)), p.Repo, p.Forge) {
 		return fmt.Errorf("local_path origin %q does not match configured repo %q", strings.TrimSpace(string(remote)), p.Repo)
 	}
 
@@ -300,25 +301,65 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 	return nil
 }
 
-func remoteMatchesRepo(remote, repo string) bool {
-	r := strings.TrimSpace(remote)
-	want := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(repo), "/"), ".git"))
-	lowerRemote := strings.ToLower(r)
-	if strings.HasPrefix(lowerRemote, "git@github.com:") {
-		got := strings.TrimSuffix(strings.TrimPrefix(lowerRemote, "git@github.com:"), ".git")
-		return got == want
-	}
-	u, err := url.Parse(r)
-	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
+// remoteMatchesRepo binds genesis to the configured forge, not its downstream
+// mirror. SSH uses the same hostname and owner/repo but its own transport port;
+// HTTP(S) additionally binds the web port and optional instance path prefix.
+// DNS/IP aliases are deliberately not inferred or resolved.
+func remoteMatchesRepo(remote, repo string, forge config.ForgeConfig) bool {
+	base := &url.URL{Scheme: "https", Host: "github.com"}
+	if forge.IsForgejo() {
+		var err error
+		base, err = url.Parse(forge.BaseURL)
+		if err != nil || base.Hostname() == "" || (base.Scheme != "http" && base.Scheme != "https") || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
+			return false
+		}
+	} else if forge.EffectiveKind() != config.ForgeKindGitHub {
 		return false
 	}
+	want := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(repo), "/"), ".git"))
+	r := strings.TrimSpace(remote)
+	// Only the conventional git user is accepted for SCP syntax, preserving
+	// the existing GitHub contract. A URL is parsed separately below.
+	if !strings.Contains(r, "://") && strings.HasPrefix(strings.ToLower(r), "git@") {
+		host, path, ok := strings.Cut(r[len("git@"):], ":")
+		return ok && strings.EqualFold(host, base.Hostname()) && strings.TrimSuffix(strings.ToLower(path), ".git") == want
+	}
+	u, err := url.Parse(r)
+	if err != nil || !strings.EqualFold(u.Hostname(), base.Hostname()) || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
+		return false
+	}
+	remotePath := u.Path
 	switch strings.ToLower(u.Scheme) {
-	case "https", "http", "ssh", "git":
+	case "https", "http":
+		if forge.IsForgejo() {
+			if !strings.EqualFold(u.Scheme, base.Scheme) || remoteWebPort(u) != remoteWebPort(base) {
+				return false
+			}
+			prefix := strings.Trim(base.Path, "/")
+			if prefix != "" {
+				var ok bool
+				remotePath, ok = strings.CutPrefix(remotePath, "/"+prefix+"/")
+				if !ok {
+					return false
+				}
+			}
+		}
+	case "ssh", "git":
 	default:
 		return false
 	}
-	got := strings.TrimSuffix(strings.ToLower(strings.Trim(u.Path, "/")), ".git")
+	got := strings.TrimSuffix(strings.ToLower(strings.Trim(remotePath, "/")), ".git")
 	return got == want
+}
+
+func remoteWebPort(u *url.URL) string {
+	if port := u.Port(); port != "" {
+		return port
+	}
+	if strings.EqualFold(u.Scheme, "https") {
+		return "443"
+	}
+	return "80"
 }
 
 // planReport previews prepared against the store at dbPath without any write. A
