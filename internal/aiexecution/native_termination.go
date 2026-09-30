@@ -1,6 +1,7 @@
 package aiexecution
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"io"
@@ -40,6 +41,10 @@ type nativeTerminationProfile struct {
 }
 
 func readNativeEvidence(path string, uid uint32, max int64) ([]byte, error) {
+	return readNativeOwnedFile(path, uid, max, 0077)
+}
+
+func readNativeOwnedFile(path string, uid uint32, max int64, mask os.FileMode) ([]byte, error) {
 	if !filepath.IsAbs(path) || filepath.Clean(path) != path {
 		return nil, Held("containment_evidence_unsafe")
 	}
@@ -55,7 +60,7 @@ func readNativeEvidence(path string, uid uint32, max int64) ([]byte, error) {
 			return nil, Held("containment_evidence_unsafe")
 		}
 	}
-	fd, err := unix.Open(path, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS})
 	if err != nil {
 		return nil, err
 	}
@@ -66,7 +71,7 @@ func readNativeEvidence(path string, uid uint32, max int64) ([]byte, error) {
 		return nil, err
 	}
 	s, ok := st.Sys().(*syscall.Stat_t)
-	if !ok || !st.Mode().IsRegular() || st.Mode().Perm()&0077 != 0 || s.Uid != uid || st.Size() > max {
+	if !ok || !st.Mode().IsRegular() || st.Mode().Perm()&mask != 0 || s.Uid != uid || st.Size() > max {
 		return nil, Held("containment_evidence_unsafe")
 	}
 	b, err := io.ReadAll(io.LimitReader(f, max+1))
@@ -89,15 +94,25 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 	if id, err := uuid.Parse(nativeID); err != nil || id.String() != nativeID || unit == "" || filepath.Base(unit) != unit {
 		return nil, Held("containment_termination_binding_invalid")
 	}
-	if VerifyFile(profile) != nil {
-		return nil, Held("containment_termination_profile_drift")
-	}
-	b, err := os.ReadFile(profile.Path)
+	b, err := readNativeOwnedFile(profile.Path, 0, 128<<10, 0022)
 	var p nativeTerminationProfile
 	// The full schema is checked by the launch consumer. This narrow read
 	// deliberately depends only on the pinned original recovery fields.
-	if err != nil || len(b) > 128<<10 || json.Unmarshal(b, &p) != nil || !filepath.IsAbs(p.ClaimDir) || VerifyFile(p.Systemctl) != nil {
+	if err != nil || digest(b) != profile.SHA256 || json.Unmarshal(b, &p) != nil || p.UID == 0 || !filepath.IsAbs(p.ClaimDir) {
 		return nil, Held("containment_termination_profile_invalid")
+	}
+	bin, err := readNativeOwnedFile(p.Systemctl.Path, 0, 64<<20, 0022)
+	if err != nil || digest(bin) != p.Systemctl.SHA256 {
+		return nil, Held("containment_systemctl_drift")
+	}
+	lockPath := filepath.Join(p.ClaimDir, nativeID+".recovery.lock")
+	lockFD, err := unix.Openat2(unix.AT_FDCWD, lockPath, &unix.OpenHow{Flags: unix.O_RDWR | unix.O_CREAT | unix.O_CLOEXEC, Mode: 0600, Resolve: unix.RESOLVE_NO_SYMLINKS})
+	if err != nil {
+		return nil, Held("containment_recovery_lock_unavailable")
+	}
+	defer unix.Close(lockFD)
+	if _, err := readNativeEvidence(lockPath, p.UID, 16); err != nil || unix.Flock(lockFD, unix.LOCK_EX|unix.LOCK_NB) != nil {
+		return nil, Held("containment_recovery_in_progress")
 	}
 	boot, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
 	if err != nil {
@@ -122,6 +137,9 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 	if err != nil {
 		return nil, Held("containment_launch_proof_unavailable")
 	}
+	if launch.LocalStatus != "launch_intent" || !launch.EndedAt.IsZero() || launch.ExitCode != -1 {
+		return nil, Held("containment_launch_proof_invalid")
+	}
 	proof, err := read(".termination.json")
 	recovered := false
 	if os.IsNotExist(err) {
@@ -132,6 +150,14 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 		proof.EndedAt = time.Now().UTC()
 	} else if err != nil {
 		return nil, err
+	}
+	switch proof.LocalStatus {
+	case "succeeded", "failed", "local_output_unknown":
+	default:
+		return nil, Held("containment_termination_proof_invalid")
+	}
+	if proof.LocalStatus == "succeeded" && proof.ExitCode != 0 {
+		return nil, Held("containment_termination_proof_invalid")
 	}
 	if proof.Cgroup != launch.Cgroup || proof.BootID != launch.BootID || proof.InvocationID != launch.InvocationID || !proof.StartedAt.Equal(launch.StartedAt) || proof.EndedAt.Before(proof.StartedAt) {
 		return nil, Held("containment_termination_proof_invalid")
@@ -144,10 +170,13 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 	defer cancel()
 	cmd := exec.CommandContext(ctx, p.Systemctl.Path, "show", "--no-pager", "--property=LoadState", "--property=ActiveState", "--property=ControlGroup", "--property=InvocationID", unit)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "LANG=C"}
-	out, err := cmd.Output()
-	if err != nil || len(out) > 16<<10 {
+	var output nativeRecoveryOutput
+	cmd.Stdout = &output
+	err = cmd.Run()
+	if err != nil || output.overflow {
 		return nil, Held("containment_process_unobservable")
 	}
+	out := output.buf.Bytes()
 	fields := map[string]string{}
 	for _, line := range strings.Split(string(out), "\n") {
 		if k, v, ok := strings.Cut(line, "="); ok {
@@ -168,4 +197,20 @@ func VerifyNativeProcessTermination(profile FileProof, nativeID, unit string) (*
 		}
 	}
 	return &proof, nil
+}
+
+type nativeRecoveryOutput struct {
+	buf      bytes.Buffer
+	overflow bool
+}
+
+func (o *nativeRecoveryOutput) Write(p []byte) (int, error) {
+	n := len(p)
+	left := (16 << 10) - o.buf.Len()
+	if len(p) > left {
+		p = p[:left]
+		o.overflow = true
+	}
+	o.buf.Write(p)
+	return n, nil
 }
