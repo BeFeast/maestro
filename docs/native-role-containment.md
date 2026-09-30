@@ -93,9 +93,15 @@ creates a PR on the configured repository with `base=main` and the assigned
 `feat/` branch, follows no redirects and never merges. Secrets are not argv or
 files. An uncertain response remains unknown, without automatic replay.
 
-The repository credential comes only from
-`MAESTRO_FORGEJO_REPOSITORY_TOKEN` in the authoritative private worker
-credential file. Its profile hash is selection evidence, **not an ACL**.
+Each root-owned profile selects its own private `forgejo_credential` file and
+exact SHA-256. The runner-owned mode-0600 JSON contains `version: 1`, the exact
+`repository`, and `token`; no symlink, hardlink or unsafe parent is accepted.
+The single validated snapshot enters only the stdin envelope and output
+redactor. The file is not mounted in the child. Daemon-global or ambient
+Forgejo credentials cannot override this selection; the managed gateway
+principal still comes from the existing private service credential boundary.
+Separate projects can run concurrently with separate repository-only tokens.
+The domain-separated token hash is selection evidence, **not an ACL**.
 Worker launch additionally requires a root-owned pinned
 `forgejo_authorization` attestation containing version 1, repository,
 credential_sha256, worker_login, observed_at/expires_at, `admin=false`, and
