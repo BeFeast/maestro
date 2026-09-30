@@ -74,46 +74,55 @@ func (c Client) Register(request RegistrationRequest) (Acknowledgement, error) {
 	if !filepath.IsAbs(c.SocketPath) || c.Timeout <= 0 || c.Timeout > 30*time.Second || !request.Valid() {
 		return ack, &Hold{Code: "registration_invalid"}
 	}
+	response, err := c.call(request.NativeSessionID, "register", request)
+	if err != nil {
+		return ack, err
+	}
+	return decodeResponse(response, request)
+}
+
+// call sends one bounded framed request to the pinned Unix peer; no retries.
+func (c Client) call(id, op string, args any) ([]byte, error) {
 	deadline := time.Now().Add(c.Timeout)
 	conn, err := net.DialTimeout("unix", c.SocketPath, c.Timeout)
 	if err != nil {
-		return ack, &Hold{Code: "authority_unavailable"}
+		return nil, &Hold{Code: "authority_unavailable"}
 	}
 	defer conn.Close()
 	if err := conn.SetDeadline(deadline); err != nil {
-		return ack, &Hold{Code: "authority_unavailable"}
+		return nil, &Hold{Code: "authority_unavailable"}
 	}
 	if err := verifyPeer(conn, c.AuthorityUID); err != nil {
-		return ack, err
+		return nil, err
 	}
 	body, err := json.Marshal(struct {
-		Version int                 `json:"version"`
-		ID      string              `json:"id"`
-		Op      string              `json:"op"`
-		Args    RegistrationRequest `json:"args"`
-	}{1, request.NativeSessionID, "register", request})
+		Version int    `json:"version"`
+		ID      string `json:"id"`
+		Op      string `json:"op"`
+		Args    any    `json:"args"`
+	}{1, id, op, args})
 	if err != nil || len(body) == 0 || len(body) > MaxFrame {
-		return ack, &Hold{Code: "registration_invalid"}
+		return nil, &Hold{Code: "registration_invalid"}
 	}
 	frame := make([]byte, 4+len(body))
 	binary.BigEndian.PutUint32(frame, uint32(len(body)))
 	copy(frame[4:], body)
 	if _, err := io.Copy(conn, bytes.NewReader(frame)); err != nil {
-		return ack, &Hold{Code: "authority_unavailable"}
+		return nil, &Hold{Code: "authority_unavailable"}
 	}
 	var size [4]byte
 	if _, err := io.ReadFull(conn, size[:]); err != nil {
-		return ack, &Hold{Code: "authority_unavailable"}
+		return nil, &Hold{Code: "authority_unavailable"}
 	}
 	n := binary.BigEndian.Uint32(size[:])
 	if n == 0 || n > MaxFrame {
-		return ack, &Hold{Code: "invalid_response"}
+		return nil, &Hold{Code: "invalid_response"}
 	}
 	response := make([]byte, int(n))
 	if _, err := io.ReadFull(conn, response); err != nil {
-		return ack, &Hold{Code: "authority_unavailable"}
+		return nil, &Hold{Code: "authority_unavailable"}
 	}
-	return decodeResponse(response, request)
+	return response, nil
 }
 
 // Strict response decoding rejects duplicate keys, extra/missing fields,
