@@ -121,7 +121,13 @@ func TestProjectSelectionOmittedPreservesWholeFleet(t *testing.T) {
 	}
 }
 
-func isolatedSelectionDaemon(store ConfigLoader, opts Options) *Daemon {
+func isolatedSelectionDaemon(t *testing.T, store ConfigLoader, opts Options) *Daemon {
+	t.Helper()
+	// Even stubbed flows open the emergency store during Run. Never let the
+	// fixture fall back to the operator's default ~/.maestro/maestro.db.
+	if opts.EmergencyDBPath == "" {
+		opts.EmergencyDBPath = filepath.Join(t.TempDir(), "emergency.db")
+	}
 	d := New(store, opts)
 	d.runLoop = func(ctx context.Context, _ *config.Config, _ Options, _ <-chan *config.Config) { <-ctx.Done() }
 	d.superviseLoop = func(ctx context.Context, _ string, _ func() *config.Config, _ Options, _ <-chan struct{}) {
@@ -156,7 +162,7 @@ func TestProjectSelectionBoundsHotMembershipAndHostCleanup(t *testing.T) {
 	cfg := testConfig(t, "owner/alpha")
 	store.Set("alpha-row", cfg)
 	store.Set("poison-unrelated", nil)
-	d := isolatedSelectionDaemon(store, Options{ProjectNames: []string{"alpha-row"}, WatchStore: true, WatchStoreInterval: time.Hour, TmpfsHygieneInterval: time.Millisecond})
+	d := isolatedSelectionDaemon(t, store, Options{ProjectNames: []string{"alpha-row"}, WatchStore: true, WatchStoreInterval: time.Hour, TmpfsHygieneInterval: time.Millisecond})
 	var sweeps atomic.Int64
 	d.tmpfsHygiene.sweep = func(context.Context) (tmpfshygiene.Summary, error) { sweeps.Add(1); return tmpfshygiene.Summary{}, nil }
 	startSelectionDaemon(t, d)
@@ -242,7 +248,7 @@ func TestProjectSelectionPreservesUnrelatedSQLiteStateAndApprovals(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	d := isolatedSelectionDaemon(store, Options{ProjectNames: []string{"selected-row"}, WatchStore: true, WatchStoreInterval: time.Hour, StateStore: "sqlite", StateDBPath: db, ApprovalsStore: "sqlite", ApprovalsDBPath: db})
+	d := isolatedSelectionDaemon(t, store, Options{ProjectNames: []string{"selected-row"}, WatchStore: true, WatchStoreInterval: time.Hour, StateStore: "sqlite", StateDBPath: db, ApprovalsStore: "sqlite", ApprovalsDBPath: db, EmergencyDBPath: db})
 	startSelectionDaemon(t, d)
 	waitForNames(t, d, "selected")
 	// Unselected project endpoints never reach its existing approved action.
