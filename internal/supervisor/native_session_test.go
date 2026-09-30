@@ -95,7 +95,7 @@ func (f *registrationFixture) serve(conn net.Conn) {
 		return
 	}
 	if message.Op == "seal_native" {
-		data, _ := json.Marshal(map[string]any{"version": 1, "id": message.ID, "ok": false, "hold": map[string]string{"code": "authority_unavailable"}})
+		data, _ := json.Marshal(map[string]any{"version": message.Version, "id": message.ID, "ok": false, "hold": map[string]string{"code": "authority_unavailable"}})
 		binary.BigEndian.PutUint32(prefix[:], uint32(len(data)))
 		_, _ = conn.Write(append(prefix[:], data...))
 		return
@@ -117,7 +117,7 @@ func (f *registrationFixture) serve(conn net.Conn) {
 	if f.mode == "lost" {
 		return
 	}
-	response := map[string]any{"version": 1, "id": message.ID, "ok": true, "result": admissioncontrol.Acknowledgement{Binding: message.Args.Binding, RegistrationVersion: message.Args.ExpectedVersion}}
+	response := map[string]any{"version": message.Version, "id": message.ID, "ok": true, "result": admissioncontrol.Acknowledgement{Binding: message.Args.Binding, RegistrationVersion: message.Args.ExpectedVersion}}
 	if f.mode == "hold" {
 		delete(response, "result")
 		response["ok"] = false

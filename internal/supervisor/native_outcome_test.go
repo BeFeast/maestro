@@ -20,6 +20,11 @@ import (
 
 func nativeOutcomeFixture(request admissioncontrol.SealRequest, held bool) admissioncontrol.NativeOutcome {
 	result := admissioncontrol.NativeOutcome{Binding: request.Binding, RegistrationVersion: request.RegistrationVersion, Sealed: true, Outcome: "settled", NextGenerationAllowed: true, PhysicalAttempts: 1, TerminalAttempts: 1, AttemptsDigest: strings.Repeat("a", 64)}
+	prefix := "native-outcome-v1:"
+	if request.AdmissionBasis == "requests" {
+		result.SchemaVersion, result.AdmissionBasis, result.MoneyStatus = 2, "requests", "unknown"
+		result.Outcome, prefix = "request_accounted", "native-outcome-v2:"
+	}
 	if held {
 		code := "outcome_unknown"
 		result.Outcome = "held"
@@ -41,8 +46,57 @@ func nativeOutcomeFixture(request admissioncontrol.SealRequest, held bool) admis
 	_ = encoder.Encode(object)
 	hash := sha256.Sum256(bytes.TrimSuffix(canonical.Bytes(), []byte("\n")))
 	result.SnapshotDigest = hex.EncodeToString(hash[:])
-	result.EvidenceID = "native-outcome-v1:" + result.SnapshotDigest
+	result.EvidenceID = prefix + result.SnapshotDigest
 	return result
+}
+
+func TestRequestAuxiliaryRecoveryRetainsUnknownMoneyAndDoesNotRepeatInference(t *testing.T) {
+	for _, role := range []string{"supervisor", "reviewer"} {
+		t.Run(role, func(t *testing.T) {
+			cfg, count, aux := outcomeTestConfig(t)
+			cfg.Supervisor.NativeSessionRegistration.AdmissionBasis = "requests"
+			calls := 0
+			var saved admissioncontrol.SealRequest
+			sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				calls++
+				if request.AdmissionBasis != "requests" || request.Role != role {
+					t.Fatal("unbound request basis/role")
+				}
+				if calls == 1 {
+					saved = request
+					return admissioncontrol.NativeOutcome{}, errors.New("lost reply")
+				}
+				if request != saved {
+					t.Fatal("recovery changed request identity")
+				}
+				return nativeOutcomeFixture(request, calls == 2), nil
+			}
+			id := newConsultationIdentity(cfg, "request-cycle")
+			id.Role = role
+			client := NewBackendLLMClient(cfg).(*backendLLMClient)
+			client.role = role
+			_, err := client.CompleteConsultation(id, "same prompt")
+			if err == nil || aux.released.Load() != 0 {
+				t.Fatal("lost reply released")
+			}
+			result, err := ReconcileNativeConsultation(cfg, id, "same prompt")
+			if err == nil || result.Output != "" || aux.released.Load() != 0 {
+				t.Fatal("partial request outcome released")
+			}
+			result, err = ReconcileNativeConsultation(cfg, id, "same prompt")
+			if err != nil || result.Output != "done" || aux.released.Load() != 1 || nativeCalls(t, count) != 1 {
+				t.Fatal("request outcome failed recovery", err)
+			}
+			receipt := loadReceipt(t, cfg)
+			outcome := receipt.Invocations[0].NativeSession.Outcome
+			if outcome == nil || outcome.Outcome != "request_accounted" || outcome.MoneyStatus != "unknown" {
+				t.Fatal("saved outcome fabricated money")
+			}
+			if _, err := ReconcileNativeConsultation(cfg, id, "same prompt"); err != nil || calls != 3 || nativeCalls(t, count) != 1 {
+				t.Fatal("saved request proof regenerated inference", err)
+			}
+		})
+	}
 }
 
 func outcomeTestConfig(t *testing.T) (*config.Config, string, *auxiliaryFixture) {

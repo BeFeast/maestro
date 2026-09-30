@@ -25,7 +25,7 @@ type NativeSessionRegistrationReceipt struct {
 
 func registrationClient(cfg *config.Config) (admissioncontrol.Client, error) {
 	r := cfg.Supervisor.NativeSessionRegistration
-	if r == nil || !filepath.IsAbs(r.ControlSocket) || r.AuthorityUID == nil || r.ExpectedPolicyVersion <= 0 ||
+	if r == nil || !filepath.IsAbs(r.ControlSocket) || r.AuthorityUID == nil || r.ExpectedPolicyVersion <= 0 || !admissioncontrol.ValidAdmissionBasis(r.AdmissionBasis) ||
 		!admissioncontrol.Identifier(r.FleetID) || !admissioncontrol.Identifier(r.GatewayScope) ||
 		!admissioncontrol.Identifier(r.BudgetRunID) || !admissioncontrol.Identifier(cfg.ProjectID) || r.TTLSeconds <= 0 || r.TTLSeconds > math.MaxInt64-time.Now().Unix() {
 		return admissioncontrol.Client{}, &ConsultationHold{Code: "registration_configuration_invalid"}
@@ -46,7 +46,7 @@ func prepareNativeSession(cfg *config.Config, identity ConsultationIdentity, inv
 	}
 	r := cfg.Supervisor.NativeSessionRegistration
 	invocation.NativeSession = &NativeSessionRegistrationReceipt{AuthorityPin: nativeAuthorityPin(cfg), Request: admissioncontrol.RegistrationRequest{
-		Binding: admissioncontrol.Binding{GatewayScope: r.GatewayScope, NativeSessionID: invocation.ID, FleetID: r.FleetID,
+		Binding: admissioncontrol.Binding{AdmissionBasis: r.AdmissionBasis, GatewayScope: r.GatewayScope, NativeSessionID: invocation.ID, FleetID: r.FleetID,
 			ProjectID: identity.ProjectID, RunID: r.BudgetRunID, Role: identity.Role, ExpiresAt: time.Now().Unix() + r.TTLSeconds},
 		ExpectedVersion: r.ExpectedPolicyVersion,
 	}}
