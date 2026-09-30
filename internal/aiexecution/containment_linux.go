@@ -59,13 +59,40 @@ func namespaceMatches(path string, dev, ino uint64) bool {
 	return ok && uint64(s.Dev) == dev && s.Ino == ino
 }
 
-func observeContainmentNetwork(p NativeContainmentProfile) error {
-	if verifyOwnedPath(p.Namespace, 0, false) != nil || !namespaceMatches(p.Namespace, p.NamespaceDev, p.NamespaceIno) || namespaceMatches("/proc/self/ns/net", p.NamespaceDev, p.NamespaceIno) {
-		return Held("containment_namespace_drift")
+// A bind-mounted nsfs inode can have the overflow owner inside a user namespace.
+// Trust its root-controlled name and kernel namespace type, not that inode's UID.
+// Ordinary files still use verifyOwnedPath with the exact required owner.
+func openPinnedNetworkNamespace(path string, dev, ino uint64) (*os.File, error) {
+	if !filepath.IsAbs(path) || filepath.Clean(path) != path || verifyOwnedPath(filepath.Dir(path), 0, true) != nil {
+		return nil, Held("containment_namespace_drift")
 	}
+	fd, err := unix.Openat2(unix.AT_FDCWD, path, &unix.OpenHow{Flags: unix.O_RDONLY | unix.O_CLOEXEC | unix.O_NONBLOCK, Resolve: unix.RESOLVE_NO_SYMLINKS | unix.RESOLVE_NO_MAGICLINKS})
+	if err != nil {
+		return nil, Held("containment_namespace_drift")
+	}
+	f := os.NewFile(uintptr(fd), path)
+	var st unix.Stat_t
+	var fs unix.Statfs_t
+	kind, kindErr := unix.IoctlRetInt(fd, unix.NS_GET_NSTYPE)
+	if unix.Fstat(fd, &st) != nil || unix.Fstatfs(fd, &fs) != nil || fs.Type != unix.NSFS_MAGIC || kindErr != nil || kind != unix.CLONE_NEWNET || uint64(st.Dev) != dev || st.Ino != ino || namespaceMatches("/proc/self/ns/net", dev, ino) {
+		f.Close()
+		return nil, Held("containment_namespace_drift")
+	}
+	return f, nil
+}
+
+func observeContainmentNetwork(p NativeContainmentProfile) error {
+	namespace, err := openPinnedNetworkNamespace(p.Namespace, p.NamespaceDev, p.NamespaceIno)
+	if err != nil {
+		return err
+	}
+	defer namespace.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, p.Sudo.Path, "-n", p.Nsenter.Path, "--net="+p.Namespace, "--", p.Nft.Path, "--json", "--stateless", "list", "ruleset")
+	// sudo normally closes inherited descriptors. Refer to the still-open parent
+	// descriptor so a pathname replacement cannot change the observed namespace.
+	pinnedPath := fmt.Sprintf("/proc/%d/fd/%d", os.Getpid(), namespace.Fd())
+	cmd := exec.CommandContext(ctx, p.Sudo.Path, "-n", p.Nsenter.Path, "--net="+pinnedPath, "--", p.Nft.Path, "--json", "--stateless", "list", "ruleset")
 	cmd.Env = []string{"PATH=/usr/sbin:/usr/bin:/bin", "LANG=C"}
 	var out boundedKernelOutput
 	cmd.Stdout = &out
