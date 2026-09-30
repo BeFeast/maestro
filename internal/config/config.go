@@ -1088,6 +1088,13 @@ type NativeSessionRegistrationConfig struct {
 	TTLSeconds            int64   `yaml:"ttl_seconds" json:"ttl_seconds"`
 }
 
+// WorkerLaunchContext is supplied by the trusted scheduler on a per-call config
+// copy. It is never read from YAML, prompt text, model output, or request headers.
+type WorkerLaunchContext struct {
+	Role            string
+	ParentRoleRunID string
+}
+
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
 	// NativeSessionRegistration is opt-in attribution only, not spending admission.
@@ -2660,9 +2667,11 @@ func containsControlOrSpace(value string) bool {
 type Config struct {
 	AIExecution             aiexecution.Policy           `yaml:"ai_execution" json:"ai_execution"`
 	RuntimeAuxiliaryLimiter aiexecution.AuxiliaryLimiter `yaml:"-" json:"-"`
-	Server                  ServerConfig                 `yaml:"server"`
-	Supervisor              SupervisorConfig             `yaml:"supervisor"`
-	Repo                    string                       `yaml:"repo"`
+	WorkerNativeSessionRegistration *NativeSessionRegistrationConfig `yaml:"worker_native_session_registration,omitempty" json:"worker_native_session_registration,omitempty"`
+	WorkerLaunchContext             *WorkerLaunchContext             `yaml:"-" json:"-"`
+	Server                          ServerConfig                     `yaml:"server"`
+	Supervisor                      SupervisorConfig                 `yaml:"supervisor"`
+	Repo                            string                           `yaml:"repo"`
 	// ProjectID is the optional stable UUID identifying this project durably,
 	// independent of the mutable repo/state/store names (#869). Empty for legacy
 	// rows; validated as a canonical UUID when present and kept immutable across

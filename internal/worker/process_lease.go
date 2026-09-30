@@ -60,6 +60,13 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 		}
 	}
 
+	if cfg.WorkerNativeSessionRegistration != nil {
+		// The runner may already have dispatched. Preserve the exact OS lease and
+		// scratch receipt; only exact adoption or proven termination may release it.
+		attachWorkerScratchReceipt(&lease, scratchLease)
+		return 0, lease, &NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true, Slot: slotName}
+	}
+
 	// A failed or ambiguous start must not strand a partially-created cgroup.
 	// startOrReconcile already adopts an exact matching tmux pane when creation
 	// succeeded despite a transport error; reaching this branch means no owned

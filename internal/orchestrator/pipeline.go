@@ -17,6 +17,9 @@ import (
 // Called when a running pipeline worker's process dies.
 // Returns true if the session was handled by pipeline logic (caller should skip normal dead-worker handling).
 func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *state.Session) bool {
+	if sess.NativeRegistrationHold != "" {
+		return true
+	}
 	if sess.Phase == state.PhaseNone {
 		return false // not a pipeline session
 	}
@@ -39,6 +42,8 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 // Advisor when configured, otherwise preserving the historical direct handoff
 // to implementation.
 func (o *Orchestrator) handlePlanComplete(st *state.State, slotName string, sess *state.Session) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
@@ -68,6 +73,8 @@ func (o *Orchestrator) handlePlanComplete(st *state.State, slotName string, sess
 // after the dead Planner process was observed and under the existing session
 // lease used by every phase transition.
 func (o *Orchestrator) startAdvisorPhase(st *state.State, cfg *config.Config, slotName string, sess *state.Session) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	if sess.AdvisorMaxReviewRounds == 0 {
 		sess.AdvisorMaxReviewRounds = cfg.Pipeline.EffectiveAdvisorReviewRounds()
 	}
@@ -118,6 +125,9 @@ func (o *Orchestrator) startAdvisorPhase(st *state.State, cfg *config.Config, sl
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "prompt_build_failed", err.Error())
 	}
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
+		if retainNativeWorkerHold(sess, err) {
+			return true
+		}
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_start_failed", err.Error())
 	}
 
@@ -131,6 +141,8 @@ func (o *Orchestrator) startAdvisorPhase(st *state.State, cfg *config.Config, sl
 // Advisor respected its review-only boundary, and either starts implementation
 // or returns accumulated findings to the Planner.
 func (o *Orchestrator) handleAdvisorComplete(slotName string, sess *state.Session) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	cfg := o.pipelineConfigForSession(sess)
 	if sess.AdvisorMaxReviewRounds == 0 {
 		sess.AdvisorMaxReviewRounds = cfg.Pipeline.EffectiveAdvisorReviewRounds()
@@ -193,6 +205,9 @@ func (o *Orchestrator) handleAdvisorComplete(slotName string, sess *state.Sessio
 		promptContent := pipeline.PlannerRevisionPrompt(cfg, issue, sess.Worktree, sess.Branch, sess)
 		backendName := pipeline.BackendForPhase(cfg, state.PhasePlan)
 		if startErr := o.startPhase(cfg, slotName, sess, promptContent, backendName); startErr != nil {
+			if retainNativeWorkerHold(sess, startErr) {
+				return true
+			}
 			return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "planner_revision_start_failed", startErr.Error())
 		}
 		log.Printf("[pipeline] Advisor %s verdict=%s for plan v%d round %d/%d (%s); returning exact findings to Planner: %s", slotName, result.Verdict, sess.PlanVersion, sess.AdvisorReviewRound, sess.AdvisorMaxReviewRounds, advisorRoute(sess), result.Findings)
@@ -205,6 +220,8 @@ func (o *Orchestrator) handleAdvisorComplete(slotName string, sess *state.Sessio
 }
 
 func (o *Orchestrator) startImplementPhase(cfg *config.Config, slotName string, sess *state.Session, notificationFormat string) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	sess.Phase = state.PhaseImplement
 	// A best-effort bypass after an Advisor backend outage starts a fresh role;
 	// keep the outage in Advisor history while clearing current-attempt backend
@@ -224,6 +241,9 @@ func (o *Orchestrator) startImplementPhase(cfg *config.Config, slotName string, 
 	promptContent := o.buildImplementerPrompt(sess, issue)
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
+		if retainNativeWorkerHold(sess, err) {
+			return true
+		}
 		log.Printf("[pipeline] start implement phase for %s: %v — marking dead", slotName, err)
 		o.markPipelineDead(sess)
 		return true
@@ -364,6 +384,8 @@ func (o *Orchestrator) markPipelineDead(sess *state.Session) {
 
 // handleImplementComplete advances to validate phase or proceeds to PR flow.
 func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Session) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
@@ -392,6 +414,9 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseValidate)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
+		if retainNativeWorkerHold(sess, err) {
+			return true
+		}
 		log.Printf("[pipeline] start validate phase for %s: %v — marking dead", slotName, err)
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()
@@ -407,6 +432,8 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 
 // handleValidateComplete checks validation result and either proceeds to PR flow or retries implementer.
 func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Session) bool {
+	beforeNative := nativeSessionSnapshot(o.cfg, sess)
+	defer func() { restoreNativeHeldSession(sess, beforeNative) }()
 	cfg := o.pipelineConfigForSession(sess)
 	o.runAfterRunHook(sess)
 
@@ -457,6 +484,9 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
+		if retainNativeWorkerHold(sess, err) {
+			return true
+		}
 		log.Printf("[pipeline] start implement retry for %s: %v — marking dead", slotName, err)
 		sess.Status = state.StatusDead
 		now := time.Now().UTC()

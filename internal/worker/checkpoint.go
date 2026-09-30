@@ -383,7 +383,11 @@ func SaveCheckpointContext(ctx context.Context, sess *state.Session) (string, er
 // RespawnInPlace stops the current worker and restarts it in the same worktree
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
-func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) (resultErr error) {
+	defer func() { stampNativeHold(slotName, sess, resultErr) }()
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
+	}
 	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
 		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
 	}
@@ -391,6 +395,39 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// issue_number before killing the current worker, so a slot-suffix-derived
 	// number can never respawn a mis-scoped worker in the preserved worktree.
 	if err := assertCanonicalIssue(slotName, sess, issue); err != nil {
+		return err
+	}
+
+	// Determine backend
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_unknown", Slot: slotName}
+		}
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		return err
+	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
+
+	nextGeneration := sess.WorkerGeneration + 1
+	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, sess.IssueNumber, sess.Worktree, sess.Branch)
+	if err != nil {
+		return err
+	}
+	defer native.close()
+	defer native.finishError(&resultErr)
+	if adopted, err := native.adoptSession(cfg, slotName, sess); adopted {
 		return err
 	}
 
@@ -421,25 +458,6 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 			checkpointContext = sanitizePromptUTF8(string(data))
 		}
 	}
-
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
-	backendCfg.TokenBudget = cfg.WorkerMaxTokens
-	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
-		return err
-	}
-	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -483,9 +501,12 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
 
+	if err := native.command(workerCmd); err != nil {
+		return err
+	}
+
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	nextGeneration := sess.WorkerGeneration + 1
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
@@ -505,7 +526,19 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
+	if err := native.beginLaunch(); err != nil {
+		return err
+	}
 	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
+	if native != nil && err != nil {
+		return err
+	}
+	if err == nil {
+		err = native.complete(pid, lease)
+	}
+	if native != nil && err != nil {
+		return err
+	}
 	if err != nil {
 		if lease.Unit != "" {
 			sess.WorkerGeneration = nextGeneration
@@ -524,6 +557,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// worktree/session identity and cumulative attribution history.
 	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	setSessionProcessLease(sess, lease)
+	native.stamp(sess)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""

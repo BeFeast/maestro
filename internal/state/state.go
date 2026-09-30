@@ -267,9 +267,16 @@ type Session struct {
 	StartedAt           time.Time `json:"started_at"`
 	// WorkerGeneration is the durable lease generation for the process that
 	// owns this canonical session. Every successful spawn, respawn, phase
-	// transition, or live-runtime adoption advances it. Destructive cleanup
+	// transition advances it. Legacy runtime adoption also advances it; native
+	// adoption preserves the receipt generation. Destructive cleanup
 	// captures and revalidates this exact value before touching the worktree.
-	WorkerGeneration uint64 `json:"worker_generation,omitempty"`
+	WorkerGeneration       uint64 `json:"worker_generation,omitempty"`
+	NativeRegistrationHold string `json:"native_registration_hold,omitempty"`
+	NativeReceiptDir       string `json:"native_receipt_dir,omitempty"`
+	NativeSessionID        string `json:"native_session_id,omitempty"`
+	NativeRoleRunID        string `json:"native_role_run_id,omitempty"`
+	NativeParentRoleRunID  string `json:"native_parent_role_run_id,omitempty"`
+	NativeRole             string `json:"native_role,omitempty"`
 	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
 	// Unit/scope intentionally duplicate the process receipt so reconciliation
 	// can reject corrupted cross-ownership without inventing another owner.
