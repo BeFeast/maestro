@@ -79,21 +79,22 @@ type CandidateReceipt struct {
 // InvocationReceipt represents a successfully started local process only. It is
 // not a token record, gateway logical request, or physical upstream attempt.
 type InvocationReceipt struct {
-	ID                  string    `json:"id"`
-	Number              int       `json:"number"`
-	SelectedBackend     string    `json:"selected_backend"`
-	HarnessKind         string    `json:"harness_kind"`
-	ConfiguredModel     string    `json:"configured_model"`
-	EffectiveCLIModel   *string   `json:"effective_cli_model"`
-	ModelArguments      []string  `json:"model_arguments"`
-	ModelEvidence       string    `json:"model_evidence"`
-	UpstreamActualModel *string   `json:"upstream_actual_model"`
-	AccountAlias        *string   `json:"account_alias"`
-	FallbackReason      string    `json:"fallback_reason,omitempty"`
-	RoutePolicyDecision string    `json:"route_policy_decision"`
-	StartedAt           time.Time `json:"started_at"`
-	EndedAt             time.Time `json:"ended_at"`
-	Status              string    `json:"status"`
+	NativeSession       *NativeSessionRegistrationReceipt `json:"native_session,omitempty"`
+	ID                  string                            `json:"id"`
+	Number              int                               `json:"number"`
+	SelectedBackend     string                            `json:"selected_backend"`
+	HarnessKind         string                            `json:"harness_kind"`
+	ConfiguredModel     string                            `json:"configured_model"`
+	EffectiveCLIModel   *string                           `json:"effective_cli_model"`
+	ModelArguments      []string                          `json:"model_arguments"`
+	ModelEvidence       string                            `json:"model_evidence"`
+	UpstreamActualModel *string                           `json:"upstream_actual_model"`
+	AccountAlias        *string                           `json:"account_alias"`
+	FallbackReason      string                            `json:"fallback_reason,omitempty"`
+	RoutePolicyDecision string                            `json:"route_policy_decision"`
+	StartedAt           time.Time                         `json:"started_at"`
+	EndedAt             time.Time                         `json:"ended_at"`
+	Status              string                            `json:"status"`
 }
 
 func newConsultationIdentity(cfg *config.Config, cycle string) ConsultationIdentity {
@@ -129,11 +130,13 @@ func newConsultationReceipt(cfg *config.Config, identity ConsultationIdentity) *
 		Backends                                   map[string]config.BackendDef
 		Strict, AllowMetered                       bool
 		AttemptTimeoutSeconds, TotalTimeoutSeconds int
+		Registration                               *config.NativeSessionRegistrationConfig
 	}{
 		Backend: primary, Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort,
 		Fallbacks: cfg.Model.FallbackBackends, Backends: cfg.Model.Backends,
 		Strict: cfg.Supervisor.RequireAccountingReady, AllowMetered: cfg.Supervisor.AllowMeteredBackend,
 		AttemptTimeoutSeconds: cfg.Supervisor.AttemptTimeoutSeconds, TotalTimeoutSeconds: cfg.Supervisor.TotalTimeoutSeconds,
+		Registration: cfg.Supervisor.NativeSessionRegistration,
 	}
 	b, _ := json.Marshal(snapshot)
 	hash := sha256.Sum256(b)

@@ -321,14 +321,45 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		}
 		intent := uuid.NewString()
 		invocation := invocationForCommand(candidate, cmd, intent, len(receipt.Invocations)+1, fallback)
+		candidateStatus := "launch_intent"
+		if c.cfg.Supervisor.NativeSessionRegistration != nil {
+			if err := prepareNativeSession(c.cfg, identity, &invocation, cmd); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
+			candidateStatus = "registration_intent"
+		}
 		receipt.PlannedInvocation = &invocation
-		receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: "launch_intent", IntentID: intent})
+		receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: candidateStatus, IntentID: intent})
 		index := len(receipt.Candidates) - 1
 		if err := persist(); err != nil {
 			if stdin != nil {
 				_ = stdin.Close()
 			}
 			return result, err
+		}
+		if invocation.NativeSession != nil {
+			if err := store.beginRegistration(identity, invocation.NativeSession); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			if err := registerNativeSession(c.cfg, invocation.NativeSession, time.Until(deadline)); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
+			receipt.Candidates[index].Status = "launch_intent"
+			if err := persist(); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
 		}
 		if err := store.beginLaunch(identity, intent); err != nil {
 			if stdin != nil {
@@ -337,6 +368,24 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			return result, &ConsultationHold{Code: "receipt_persistence_failed"}
 		}
 		launchIntentWritten = true
+		if invocation.NativeSession != nil {
+			if err := store.finishRegistration(); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			remaining = time.Until(deadline)
+			if remaining <= 0 || invocation.NativeSession.Request.ExpiresAt <= time.Now().Unix() {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "registration_launch_deadline"}
+			}
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
 		invocation.StartedAt = time.Now().UTC()
 		out, launched, status, runErr := outputWithTimeoutReceipt(cmd, timeout)
 		if stdin != nil {
@@ -357,6 +406,14 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			c.memory.recordSuccess(candidate.name)
 			result.Output = strings.TrimSpace(string(out))
 			return result, nil
+		}
+		if invocation.NativeSession != nil {
+			// The failed process outcome is synced above. Clear only this known
+			// completed launch before recording the next candidate's registration.
+			if err := store.finishLaunch(); err != nil {
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			launchIntentWritten = false
 		}
 		failed = append(failed, candidate.name)
 		c.memory.recordFailure(candidate.name, time.Now())
