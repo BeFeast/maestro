@@ -1,0 +1,35 @@
+{
+  "request": {
+    "gateway_scope": "fixture-gateway",
+    "native_session_id": "11111111-1111-4111-8111-111111111111",
+    "fleet_id": "fleet",
+    "project_id": "project-λ<& ",
+    "run_id": "budget",
+    "role": "supervisor",
+    "expires_at": 1700000000,
+    "registration_version": 1
+  },
+  "result": {
+    "binding": {
+      "gateway_scope": "fixture-gateway",
+      "native_session_id": "11111111-1111-4111-8111-111111111111",
+      "fleet_id": "fleet",
+      "project_id": "project-λ<& ",
+      "run_id": "budget",
+      "role": "supervisor",
+      "expires_at": 1700000000
+    },
+    "registration_version": 1,
+    "sealed": true,
+    "outcome": "no_dispatch",
+    "next_generation_allowed": true,
+    "physical_attempts": 0,
+    "terminal_attempts": 0,
+    "unresolved_attempts": 0,
+    "bound_violations": 0,
+    "hold_code": null,
+    "attempts_digest": "4f53cda18c2baa0c0354bb5f9a3ecbe5ed12ab4d8e11ba873c2f11161202b945",
+    "snapshot_digest": "fa372a03583b67043d5390b133d83927af3583c78c2423c712bf9febe4d0daff",
+    "evidence_id": "native-outcome-v1:fa372a03583b67043d5390b133d83927af3583c78c2423c712bf9febe4d0daff"
+  }
+}
