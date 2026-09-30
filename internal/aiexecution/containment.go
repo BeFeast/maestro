@@ -438,6 +438,7 @@ func containedNativeEnvironment(p NativeContainmentProfile, original []string, r
 		"XDG_CONFIG_HOME=/home/native/.config", "XDG_CACHE_HOME=/scratch/cache", "XDG_DATA_HOME=/home/native/.local/share", "BUN_INSTALL_CACHE_DIR=/cache/bun",
 		"GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1", "DISABLE_TELEMETRY=1",
 		"ANTHROPIC_BASE_URL=" + p.GatewayURL, "ANTHROPIC_AUTH_TOKEN=" + values["ANTHROPIC_AUTH_TOKEN"],
+		"CLAUDE_CODE_MAX_OUTPUT_TOKENS=32000",
 		"npm_config_cache=/cache/npm", "npm_config_offline=true", "npm_config_ignore_scripts=true",
 	}
 	for key, value := range p.BuildEnvironment {
