@@ -19,7 +19,7 @@ import (
 	"github.com/befeast/maestro/internal/webhook"
 )
 
-// daemonCmd runs every project in the config store as one long-lived process:
+// daemonCmd runs the selected projects (all by default) as one long-lived process:
 // an orchestrator + supervisor loop per project flow, plus a single
 // FleetServer aggregating them all (#756, epic #754). Legacy per-project units
 // and a separate `maestro serve` process are migration sources, not peers to a
@@ -28,6 +28,8 @@ func daemonCmd(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
 	defaults := daemonresources.Defaults(defaultConfigStorePath())
 	storePath := fs.String("store", defaults.Store, "Path to SQLite config store")
+	var projects multiFlag
+	fs.Var(&projects, "project", "Exact config-store row to run (repeatable; omitted runs all projects)")
 	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
 	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
 	tmpfsHygieneInterval := fs.Duration("tmpfs-hygiene-interval", daemon.DefaultTmpfsHygieneInterval, "Protect-aware /tmp apply interval")
@@ -50,6 +52,9 @@ func daemonCmd(args []string) {
 	emergencyDB := fs.String("emergency-db", defaults.EmergencyDB, "Shared SQLite db path the fleet-wide EMERGENCY STOP switch lives in (#840)")
 	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Whole SIGTERM drain + shutdown deadline; includes flow joins and restart checkpointing (#761, #966)")
 	fs.Parse(args)
+	if err := daemon.ValidateProjectSelection(projects); err != nil {
+		log.Fatalf("daemon: %v", err)
+	}
 	if err := refuseUnmigratedCanonicalStore(*storePath); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
@@ -64,6 +69,7 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
+		ProjectNames:            projects,
 		Host:                    *host,
 		Port:                    *port,
 		RunInterval:             *runInterval,

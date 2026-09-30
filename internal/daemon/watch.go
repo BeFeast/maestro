@@ -53,6 +53,7 @@ func (d *Daemon) watchStoreLoop(loopCtx, flowParent context.Context, interval ti
 // flows for project rows with no running flow. loggedDupSkip carries across
 // ticks so a duplicate-identity skip is logged once, not every cycle.
 func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.Time, loggedDupSkip map[string]bool) {
+	fp = d.selectedFingerprint(fp)
 	// Snapshot the running store-backed flows and the taken fleet identities
 	// under one lock so the add/remove decisions are internally consistent.
 	d.mu.Lock()
@@ -91,8 +92,9 @@ func (d *Daemon) reconcileStore(flowParent context.Context, fp map[string]time.T
 		d.stopFlow(flow.key)
 		// Now that every writer for this flow has exited, drop the removed project's
 		// rows from the shared maestro.db so its sessions/health stop surfacing in
-		// cross-project queries (#760). No-op in json mode (StateStore() is nil).
-		if fleet != nil && flow.cfg != nil {
+		// cross-project queries (#760). A scoped daemon preserves history instead
+		// of pruning shared state. No-op in json mode (StateStore() is nil).
+		if fleet != nil && flow.cfg != nil && len(d.opts.ProjectNames) == 0 {
 			if store := fleet.StateStore(); store != nil {
 				if err := store.ClearStateDir(flowParent, flow.cfg.StateDir); err != nil {
 					log.Printf("[daemon] store watch: clear state rows for %q (state_dir=%s) failed: %v", flow.name, flow.cfg.StateDir, err)
