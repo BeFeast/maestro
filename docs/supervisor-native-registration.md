@@ -46,7 +46,9 @@ The reusable `internal/admissioncontrol` package uses the ai-bills #87 version-1
 protocol: a four-byte big-endian length and UTF-8 JSON on a Unix stream, at most
 65536 bytes, one request per connection. It performs no retries. RPC duration is
 bounded by seven seconds and the remaining supervisor consultation deadline.
-The request is `register`, never `reserve`, `claim`, or a policy mutation.
+Initial attribution uses `register`, never `reserve`, `claim`, or a policy
+mutation. Completed native calls use the separate `seal_native` outcome bridge
+described in `strict-ai-execution.md`.
 
 For each supported Claude candidate:
 
@@ -60,9 +62,11 @@ For each supported Claude candidate:
 4. Sync the acknowledged binding/version before writing `launch.json`, clearing
    the registration marker and starting the process. A successful registration
    is not a successful process start and does not create an invocation receipt.
-5. Preserve the existing launch uncertainty fence after Start. Once a failed
-   process outcome is durably saved, its marker can be cleared before a separate
-   fallback candidate registers a new UUID under the same consultation.
+5. Preserve launch uncertainty after Start. Save the bounded output checkpoint
+   and exact native seal intent before reconciliation. Only a fsynced allowed
+   authority outcome plus proven local process termination can clear the marker
+   before a fallback registers a new UUID. Every saved native invocation in the
+   consultation must be terminal before its auxiliary permit is released.
 
 The supervisor accepts only the Claude harness with an executable basename
 `claude`; arbitrary wrappers and other harnesses hold. Configured session,

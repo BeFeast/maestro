@@ -22,6 +22,14 @@ func (a *auxiliaryFixture) ReserveAuxiliary(_, _ string) (func(), error) {
 	return func() { a.released.Add(1) }, nil
 }
 
+func (a *auxiliaryFixture) ReconcileAuxiliary(dir, id string) error {
+	if err := NativeAuxiliaryOutcomeComplete(dir, id); err != nil {
+		return err
+	}
+	a.released.Add(1)
+	return nil
+}
+
 func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 	for _, mode := range []string{"success", "failed", "cancelled"} {
 		t.Run(mode, func(t *testing.T) {
@@ -99,7 +107,9 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			}
 			fixture.mu.Unlock()
 			_, err = CompleteNativeReview(context.Background(), cfg, "claude-opus-5", uuid.NewString(), "retry")
-			assertHold(t, err, "unresolved_launch_intent")
+			if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" {
+				t.Fatal(err)
+			}
 			if nativeCalls(t, count) != 1 || aux.acquired.Load() != 1 {
 				t.Fatal("fresh identity bypassed unresolved outcome")
 			}

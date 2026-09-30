@@ -43,6 +43,15 @@ func PendingAuxiliaryRuns(stateDir string) ([]string, error) {
 					ids[receipt.Identity.ID] = true
 				}
 			}
+			if hasNativeSession(&receipt) {
+				if !receipt.NativeOutcomeComplete || !nativeInvocationsAllowed(&receipt) {
+					ids[receipt.Identity.ID] = true
+				} else if !ids[receipt.Identity.ID] {
+					if err := NativeAuxiliaryOutcomeComplete(dir, receipt.Identity.ID); err != nil {
+						return nil, err
+					}
+				}
+			}
 		} else if !errors.Is(err, os.ErrNotExist) {
 			return nil, err
 		}

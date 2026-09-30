@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/google/uuid"
 )
@@ -50,18 +51,20 @@ type ConsultationHold struct{ Code string }
 func (h *ConsultationHold) Error() string { return "supervisor consultation held: " + h.Code }
 
 type ConsultationReceipt struct {
-	SchemaVersion        int                  `json:"schema_version"`
-	Identity             ConsultationIdentity `json:"identity"`
-	StartedAt            time.Time            `json:"started_at"`
-	EndedAt              *time.Time           `json:"ended_at,omitempty"`
-	Status               string               `json:"status"`
-	RequestedBackend     string               `json:"requested_backend"`
-	RequestedModel       string               `json:"requested_model"`
-	RequestedModelSource string               `json:"requested_model_source"`
-	PolicyVersion        string               `json:"policy_version"`
-	PolicyDigest         string               `json:"policy_digest"`
-	CatalogRevision      *string              `json:"catalog_revision"`
-	Capability           AccountingCapability `json:"accounting_capability"`
+	SchemaVersion         int                  `json:"schema_version"`
+	Identity              ConsultationIdentity `json:"identity"`
+	StartedAt             time.Time            `json:"started_at"`
+	EndedAt               *time.Time           `json:"ended_at,omitempty"`
+	Status                string               `json:"status"`
+	RequestedBackend      string               `json:"requested_backend"`
+	RequestedModel        string               `json:"requested_model"`
+	RequestedModelSource  string               `json:"requested_model_source"`
+	PolicyVersion         string               `json:"policy_version"`
+	PolicyDigest          string               `json:"policy_digest"`
+	CatalogRevision       *string              `json:"catalog_revision"`
+	Capability            AccountingCapability `json:"accounting_capability"`
+	InputDigest           string               `json:"input_digest,omitempty"`
+	NativeOutcomeComplete bool                 `json:"native_outcome_complete,omitempty"`
 	// PlannedInvocation is an intent snapshot, not evidence that Start succeeded.
 	PlannedInvocation *InvocationReceipt  `json:"planned_invocation,omitempty"`
 	Candidates        []CandidateReceipt  `json:"candidates"`
@@ -79,23 +82,32 @@ type CandidateReceipt struct {
 // InvocationReceipt represents a successfully started local process only. It is
 // not a token record, gateway logical request, or physical upstream attempt.
 type InvocationReceipt struct {
-	OutputCheckpoint    *NativeOutputCheckpoint           `json:"output_checkpoint,omitempty"`
-	NativeSession       *NativeSessionRegistrationReceipt `json:"native_session,omitempty"`
-	ID                  string                            `json:"id"`
-	Number              int                               `json:"number"`
-	SelectedBackend     string                            `json:"selected_backend"`
-	HarnessKind         string                            `json:"harness_kind"`
-	ConfiguredModel     string                            `json:"configured_model"`
-	EffectiveCLIModel   *string                           `json:"effective_cli_model"`
-	ModelArguments      []string                          `json:"model_arguments"`
-	ModelEvidence       string                            `json:"model_evidence"`
-	UpstreamActualModel *string                           `json:"upstream_actual_model"`
-	AccountAlias        *string                           `json:"account_alias"`
-	FallbackReason      string                            `json:"fallback_reason,omitempty"`
-	RoutePolicyDecision string                            `json:"route_policy_decision"`
-	StartedAt           time.Time                         `json:"started_at"`
-	EndedAt             time.Time                         `json:"ended_at"`
-	Status              string                            `json:"status"`
+	ProcessLease               *NativeInvocationProcessLease     `json:"process_lease,omitempty"`
+	ProcessTerminationVerified bool                              `json:"process_termination_verified,omitempty"`
+	ProcessTerminationDigest   string                            `json:"process_termination_digest,omitempty"`
+	OutputCheckpoint           *NativeOutputCheckpoint           `json:"output_checkpoint,omitempty"`
+	NativeSession              *NativeSessionRegistrationReceipt `json:"native_session,omitempty"`
+	ID                         string                            `json:"id"`
+	Number                     int                               `json:"number"`
+	SelectedBackend            string                            `json:"selected_backend"`
+	HarnessKind                string                            `json:"harness_kind"`
+	ConfiguredModel            string                            `json:"configured_model"`
+	EffectiveCLIModel          *string                           `json:"effective_cli_model"`
+	ModelArguments             []string                          `json:"model_arguments"`
+	ModelEvidence              string                            `json:"model_evidence"`
+	UpstreamActualModel        *string                           `json:"upstream_actual_model"`
+	AccountAlias               *string                           `json:"account_alias"`
+	FallbackReason             string                            `json:"fallback_reason,omitempty"`
+	RoutePolicyDecision        string                            `json:"route_policy_decision"`
+	StartedAt                  time.Time                         `json:"started_at"`
+	EndedAt                    time.Time                         `json:"ended_at"`
+	Status                     string                            `json:"status"`
+}
+
+type NativeInvocationProcessLease struct {
+	Unit    string                `json:"unit"`
+	Manager string                `json:"manager"`
+	Profile aiexecution.FileProof `json:"profile"`
 }
 
 func newConsultationIdentity(cfg *config.Config, cycle string) ConsultationIdentity {
