@@ -13,8 +13,13 @@ reviewed R9 package. A successful source fixture is not installed readiness.
 
 ## Installed inputs
 
-`Manifest.containment` maps each worker slot and auxiliary role to a root-owned
+`Manifest.containment` maps worker slots and auxiliary roles to a root-owned
 profile `{path, sha256}`. `NativeContainmentProfile` is the authoritative schema.
+An explicit `worker` class profile is the fallback for new dynamic worker
+slots; exact slot pins take precedence and auxiliary roles never use it. The
+pilot uses one concurrent worker per project, serialized by its namespace
+claim. Every class launch still binds the exact ProjectID, UUID and service
+lease; this is not a substitute for a multi-worker namespace pool.
 It binds the project, UID/GID, namespace device/inode, complete nft ruleset
 digest, inference listener IPv4 URL, Forgejo IPv4 address/repository, memory
 limit, private claim/worktree/scratch directories, root-owned executable hashes,

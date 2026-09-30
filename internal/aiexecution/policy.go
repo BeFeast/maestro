@@ -126,11 +126,22 @@ func ContainmentProfilePin(policy Policy, key string) (FileProof, error) {
 	if DecodeStrict(b, &m) != nil {
 		return FileProof{}, Held("manifest_invalid")
 	}
-	pin, ok := m.Containment[key]
-	if !ok {
-		return FileProof{}, Held("containment_profile_missing")
+	return selectContainmentProfile(m, key)
+}
+
+func selectContainmentProfile(m Manifest, key string) (FileProof, error) {
+	if pin, ok := m.Containment[key]; ok {
+		return pin, nil
 	}
-	return pin, nil
+	// The explicit worker class serializes successive dynamic worker slots in
+	// the pilot's single namespace. Its ProjectID is checked at every launch;
+	// UUID, unit, registration and generation ownership remain exact.
+	if key != "" && key != "supervisor" && key != "reviewer" {
+		if pin, ok := m.Containment["worker"]; ok {
+			return pin, nil
+		}
+	}
+	return FileProof{}, Held("containment_profile_missing")
 }
 
 func GatewayProcessFromPolicy(policy Policy) (ProcessProof, error) {
@@ -335,9 +346,9 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if key == "" {
 		key = spec.Role
 	}
-	pin, ok := m.Containment[key]
-	if !ok {
-		return Held("containment_profile_missing")
+	pin, err := selectContainmentProfile(m, key)
+	if err != nil {
+		return err
 	}
 	profile, err := inspectContainmentProfile(pin, spec.ProjectID, m.Gateway)
 	if err != nil {
