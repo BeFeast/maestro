@@ -49,8 +49,11 @@ type Lens interface {
 
 // Producer publishes reviews for one repository through one forge client.
 type Producer struct {
-	Forge forge.Client
-	Repo  string
+	// Attempts is mandatory for HTTP lenses; nil fails closed before HTTP.
+	Attempts    *AttemptStore
+	MaxAttempts int
+	Forge       forge.Client
+	Repo        string
 	// Lenses are the streams to produce. The caller (daemon trigger, S5) maps
 	// the project's effective review-gate streams here — the two sets MUST
 	// match or the gate degrades on an unproduced stream.
@@ -178,9 +181,46 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	// any model runs or any comment is posted.
 	var errs []error
 	var runnable []Lens
+	claims := map[string]string{}
 	for _, lens := range p.Lenses {
+		if _, managed := lens.(*ChatLens); managed {
+			if settled, _ := p.statusSettled(lens.Name(), statuses); settled {
+				continue
+			}
+			observed := false
+			for _, st := range statuses {
+				if st.Context == lens.Name() {
+					observed = true
+					break
+				}
+			}
+			max := p.MaxAttempts
+			if max == 0 {
+				max = 1
+			}
+			if err := p.Attempts.Check(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, p.now(), max, observed); err != nil {
+				if !observed {
+					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
+				}
+				errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
+				continue
+			}
+		}
 		switch p.prepare(ctx, lens, pr.HeadSHA, statuses) {
 		case prepareRun:
+			if _, managed := lens.(*ChatLens); managed {
+				max := p.MaxAttempts
+				if max == 0 {
+					max = 1
+				}
+				id, err := p.Attempts.Claim(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, p.now(), max)
+				if err != nil {
+					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
+					errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
+					continue
+				}
+				claims[lens.Name()] = id
+			}
 			runnable = append(runnable, lens)
 		case prepareSkip:
 		case prepareCredsMissing:
@@ -197,7 +237,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	// Phase 2: run the reviews and flip each pending to its final state.
 	prompt := fmt.Sprintf(promptTemplate, pr.Title)
 	for _, lens := range runnable {
-		if err := p.runLens(ctx, lens, pr, prompt+string(diff), truncNote); err != nil {
+		if err := p.runLensClaimed(ctx, lens, pr, prompt+string(diff), truncNote, claims[lens.Name()]); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
 		}
 	}
@@ -348,11 +388,40 @@ func parseOutput(output string) (findings []Finding, ok bool) {
 
 // runLens is phase 2 for one lens: run the model, parse fail-closed, post the
 // findings and flip the pending status to its final state.
-func (p *Producer) runLens(ctx context.Context, lens Lens, pr forge.PR, prompt, truncNote string) error {
+func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, prompt, truncNote, claimID string) error {
+	if claimID != "" {
+		current, err := p.Forge.GetPR(ctx, p.Repo, pr.Number)
+		if err != nil || current.HeadSHA != pr.HeadSHA {
+			return fmt.Errorf("review head unverifiable or changed; claim retained")
+		}
+		statuses, err := p.Forge.CommitStatuses(ctx, p.Repo, pr.HeadSHA)
+		if err != nil {
+			return fmt.Errorf("review status unverifiable; claim retained")
+		}
+		for _, st := range statuses {
+			if st.Context == lens.Name() {
+				if st.State == forge.StatusSuccess || st.State == forge.StatusFailure {
+					return fmt.Errorf("review already settled; claim retained")
+				}
+				break
+			}
+		}
+	}
 	output, err := lens.Run(ctx, prompt)
+	if claimID != "" {
+		if saveErr := p.Attempts.Finish(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, claimID, p.now(), err); saveErr != nil {
+			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt persistence failed")
+			return fmt.Errorf("review receipt persistence failed: %w", saveErr)
+		}
+	}
 	if err != nil {
 		p.logf("%s run failed: %v", lens.Name(), err)
-		p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review run failed")
+		description := "review run failed"
+		var terminal *GatewayTerminalError
+		if errors.As(err, &terminal) {
+			description = "review held: " + terminal.Code
+		}
+		p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, description)
 		return fmt.Errorf("run: %w", err)
 	}
 	findings, ok := parseOutput(output)

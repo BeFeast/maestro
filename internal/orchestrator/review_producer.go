@@ -35,8 +35,14 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 		if !strings.HasPrefix(sv.Name, "llm-review-") {
 			continue
 		}
-		if sv.Observed || sv.LookupFailed {
+		if sv.LookupFailed || sv.Passed {
 			continue
+		}
+		if sv.Observed {
+			store := &review.AttemptStore{StateDir: o.cfg.StateDir}
+			if !store.Due(review.AttemptScope{Repo: o.repo, PR: prNumber, Head: headSHA, Lens: sv.Name}, time.Now(), o.cfg.ReviewProducer.EffectiveMaxAttempts()) {
+				continue
+			}
 		}
 		missing = append(missing, sv.Name)
 	}
@@ -61,7 +67,10 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 
 	produce := o.reviewProduceFn
 	if produce == nil {
-		produce = o.produceReviewStreams
+		stateDir := o.cfg.StateDir
+		produce = func(pr int, head string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
+			o.produceReviewStreamsWithState(pr, head, streams, rp, fc, stateDir)
+		}
 	}
 	// Snapshot the config on this goroutine: the orchestrator loop owns both
 	// this call and the hot-reload writes, so reading o.cfg here is
@@ -142,6 +151,10 @@ func reviewForge(fc config.ForgeConfig) (forge.Client, error) {
 // itself is forge-agnostic. Runs on the producer goroutine: everything it
 // needs arrives by value.
 func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
+	o.produceReviewStreamsWithState(prNumber, headSHA, streams, rp, fc, o.cfg.StateDir)
+}
+
+func (o *Orchestrator) produceReviewStreamsWithState(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig, stateDir string) {
 	lenses := reviewLenses(streams, rp)
 	if len(lenses) == 0 {
 		return
@@ -152,6 +165,8 @@ func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, stream
 		return
 	}
 	p := &review.Producer{
+		Attempts:          &review.AttemptStore{StateDir: stateDir},
+		MaxAttempts:       rp.EffectiveMaxAttempts(),
 		Forge:             fg,
 		Repo:              o.repo,
 		Lenses:            lenses,

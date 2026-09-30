@@ -1654,6 +1654,8 @@ type State struct {
 	// short SHA observed when the decision was recorded.
 	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
 
+	ReviewAttempts map[string]ReviewAttemptTrack `json:"review_attempts,omitempty"`
+
 	// PRGateSnapshots is the authoritative, durable PR/CI/review/merge progress
 	// observed by the orchestrator (#887). Each value is keyed by the exact
 	// project+issue+PR+head+generation identity; notification-dedup and review
@@ -2002,6 +2004,42 @@ func Save(stateDir string, s *State) error {
 // immediately before changing durable ownership, such as watchdog recovery
 // lease claims. fn must not perform external side effects or re-enter Load/Save.
 func Update(stateDir string, fn func(*State) error) error {
+	return updateState(stateDir, fn, nil)
+}
+
+// UpdateDurable additionally syncs the new file and its directory before releasing
+// the flock. Use it when a successful return grants permission for an external call.
+// A sync failure returns an error even if rename succeeded; callers must not act.
+func UpdateDurable(stateDir string, fn func(*State) error) error {
+	return updateState(stateDir, fn, syncStateSnapshot)
+}
+
+func syncStateSnapshot(stateDir string) error {
+	f, err := os.Open(StatePath(stateDir))
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	d, err := os.Open(stateDir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	closeErr = d.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func updateState(stateDir string, fn func(*State) error, syncSnapshot func(string) error) error {
 	if fn == nil {
 		return fmt.Errorf("update state: nil callback")
 	}
@@ -2027,6 +2065,11 @@ func Update(stateDir string, fn func(*State) error) error {
 	}
 	if err := saveLocked(stateDir, current); err != nil {
 		return err
+	}
+	if syncSnapshot != nil {
+		if err := syncSnapshot(stateDir); err != nil {
+			return fmt.Errorf("sync state snapshot: %w", err)
+		}
 	}
 	if hook := currentSaveHook(); hook != nil {
 		hook(stateDir, current)
@@ -2244,6 +2287,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.DispatchHold, merged.IdleStall = mergeDispatchVisibility(current, ours)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
+	merged.ReviewAttempts = mergeReviewAttempts(current.ReviewAttempts, ours.ReviewAttempts)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.ProviderModelHealth = mergeProviderModelHealth(current.ProviderModelHealth, ours.ProviderModelHealth)
