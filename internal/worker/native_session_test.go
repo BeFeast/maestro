@@ -61,6 +61,8 @@ func nativeTestFixture(t *testing.T) *nativeFixture {
 	oldSpawn, oldRead, oldConfirm := runTmuxNewSession, readTmuxPaneIdentity, confirmWorkerProcessLease
 	oldActive, oldAnchored, oldTerminate := workerProcessLeaseActive, workerProcessLeaseAnchored, terminateWorkerProcessLease
 	oldExists, oldWorkerExists := tmuxSessionExists, workerTmuxSessionExists
+	oldAbsent := nativeWorkerPaneAbsent
+	nativeWorkerPaneAbsent = func(string) (bool, error) { return !f.live, nil }
 	t.Cleanup(func() {
 		previousNativeGenerationOutcome = oldOutcome
 		registerNativeWorker = oldRegister
@@ -73,6 +75,7 @@ func nativeTestFixture(t *testing.T) *nativeFixture {
 		terminateWorkerProcessLease = oldTerminate
 		tmuxSessionExists = oldExists
 		workerTmuxSessionExists = oldWorkerExists
+		nativeWorkerPaneAbsent = oldAbsent
 	})
 	registerNativeWorker = func(_ admissioncontrol.Client, r admissioncontrol.RegistrationRequest) (admissioncontrol.Acknowledgement, error) {
 		saved, err := readNativeWorkerReceipt(nativeReceiptDir(f.cfg.StateDir, f.slot), uint64(len(f.registered)+1))
@@ -644,5 +647,110 @@ func TestNativeWorkerPreviousPhysicalOutcomeDefaultsToHoldEvenAfterLocalTerminat
 	slots, err := NativePendingSlots(f.cfg.StateDir, f.st.Sessions)
 	if err != nil || len(slots) != 0 {
 		t.Fatal("financial hold incorrectly retained proven terminated OS capacity")
+	}
+}
+
+func TestNativeWorkerMissingLeaseNeverFallsBackToLegacyKill(t *testing.T) {
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	sess := f.st.Sessions[f.slot]
+	unit, manager := sess.ProcessLeaseUnit, sess.ProcessLeaseManager
+	sess.ProcessLeaseUnit = ""
+	sess.ProcessLeaseManager = ""
+	err := StopProcess(f.slot, sess)
+	expectNativeHold(t, err, "native_process_identity_missing", true)
+	if f.stopped != 0 || !f.live || sess.PID != 4242 || sess.TmuxSession == "" {
+		t.Fatal("native missing lease used legacy teardown")
+	}
+	sess.ProcessLeaseUnit = unit
+	sess.ProcessLeaseManager = manager
+	if err := StopProcess(f.slot, sess); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopProcess(f.slot, sess); err != nil {
+		t.Fatalf("verified terminal idempotency: %v", err)
+	}
+	if f.stopped != 1 {
+		t.Fatal("idempotent native stop signalled again")
+	}
+}
+
+func TestNativeWorkerDestructiveCleanupRequiresOutcomeEvenWithoutHoldFlag(t *testing.T) {
+	defaultOutcome := previousNativeGenerationOutcome
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	sess := f.st.Sessions[f.slot]
+	raw := filepath.Join(sess.Worktree, "raw-checkpoint.txt")
+	if err := os.WriteFile(raw, []byte("unsettled source evidence"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := StopProcess(f.slot, sess); err != nil {
+		t.Fatal(err)
+	}
+	previousNativeGenerationOutcome = defaultOutcome
+	sess.Status = state.StatusDone
+	if sess.NativeRegistrationHold != "" {
+		t.Fatal("fixture must not depend on hold flag")
+	}
+	err := Stop(f.cfg, f.slot, sess)
+	expectNativeHold(t, err, "previous_outcome_unknown", false)
+	lease := CaptureCleanupLease(f.slot, sess)
+	if err := ValidateCleanupLease(lease, sess, CleanupProbes{PIDAlive: func(int) bool { return false }, TmuxAlive: func(string) bool { return false }}, CleanupPolicy{RequireTerminal: true}); err == nil {
+		t.Fatal("exit0-shaped session allowed financial evidence deletion")
+	}
+	if b, err := os.ReadFile(raw); err != nil || string(b) != "unsettled source evidence" {
+		t.Fatal("raw evidence deleted")
+	}
+}
+
+func TestNativeWorkerHeldOutcomeAllowsOnlyProvenLocalTerminationReconciliation(t *testing.T) {
+	defaultOutcome := previousNativeGenerationOutcome
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	previousNativeGenerationOutcome = defaultOutcome
+	f.cfg.WorkerLaunchContext = nil
+	sess := f.st.Sessions[f.slot]
+	sess.Phase = state.PhaseAdvisor
+	err := StartPhase(f.cfg, sess, f.slot, "accepted plan", "claude")
+	expectNativeHold(t, err, "previous_outcome_unknown", false)
+	if err := ReconcileNativeWorkerTermination(f.cfg, f.slot, sess); err == nil {
+		t.Fatal("active lease released")
+	}
+	f.live = false
+	original := workerProcessLeaseActive
+	workerProcessLeaseActive = func(tmuxsession.ProcessLease) (bool, error) { return false, errors.New("manager unavailable") }
+	if err := ReconcileNativeWorkerTermination(f.cfg, f.slot, sess); err == nil {
+		t.Fatal("unknown lease released")
+	}
+	workerProcessLeaseActive = original
+	if err := ReconcileNativeWorkerTermination(f.cfg, f.slot, sess); err != nil {
+		t.Fatal(err)
+	}
+	if f.stopped != 0 || sess.Status != state.StatusDead || sess.NativeRegistrationHold != "previous_outcome_unknown" || sess.ProcessLeaseUnit != "" {
+		t.Fatal("local reconciliation killed process or released financial hold")
+	}
+	slots, err := NativePendingSlots(f.cfg.StateDir, f.st.Sessions)
+	if err != nil || len(slots) != 0 {
+		t.Fatalf("proven local terminal still occupied: %v %v", slots, err)
+	}
+}
+
+func TestNativeWorkerConflictingLeaseCannotSignalAnotherGeneration(t *testing.T) {
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	sess := f.st.Sessions[f.slot]
+	sess.ProcessLeaseUnit = "foreign.scope"
+	err := StopProcess(f.slot, sess)
+	expectNativeHold(t, err, "native_process_identity_conflict", true)
+	if f.stopped != 0 || !f.live {
+		t.Fatal("foreign process lease signalled")
 	}
 }

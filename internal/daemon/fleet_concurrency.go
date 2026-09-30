@@ -135,7 +135,18 @@ func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[st
 			}
 		}
 		for slot, sess := range st.Sessions {
-			if sess != nil && sess.Status == state.StatusRunning && (includeUncertain || sess.NativeRegistrationHold == "") {
+			if sess != nil && sess.NativeRoleRunID != "" {
+				terminal, err := worker.NativeSessionProcessTerminal(dir, slot, sess)
+				if err != nil {
+					return nil, err
+				}
+				// Native occupancy comes only from its durable OS receipts. A stale
+				// Running projection cannot override proven local termination.
+				if includeUncertain || terminal {
+					continue
+				}
+			}
+			if sess != nil && sess.Status == state.StatusRunning && (sess.NativeRegistrationHold == "" || (includeUncertain && sess.NativeRoleRunID == "")) {
 				running[fleetWorkerKey(dir, slot)] = struct{}{}
 			}
 		}

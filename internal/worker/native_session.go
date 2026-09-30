@@ -481,6 +481,13 @@ func (n *nativeWorkerLaunch) adoptExisting(cfg *config.Config, slot string) (int
 // NativePendingSlots extends the existing fleet limiter with durable launch
 // uncertainty. Registration-only receipts consume no process capacity.
 func NativePendingSlots(stateDir string, sessions map[string]*state.Session) ([]string, error) {
+	for slot, sess := range sessions {
+		if sess != nil && sess.NativeRoleRunID != "" {
+			if _, err := NativeSessionProcessTerminal(stateDir, slot, sess); err != nil {
+				return nil, err
+			}
+		}
+	}
 	root := filepath.Join(stateDir, "worker-native-sessions")
 	info, err := os.Lstat(root)
 	if errors.Is(err, os.ErrNotExist) {
@@ -750,6 +757,114 @@ func ValidateNativeWorkerRuntime(cfg *config.Config, slot string, sess *state.Se
 	owned, err := workerProcessLeaseAnchored(lease, pid)
 	if err != nil || !owned {
 		return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+	}
+	return nil
+}
+
+// NativeSessionProcessTerminal validates only durable local OS termination.
+// This never grants financial recovery or deletion of raw worker evidence.
+func NativeSessionProcessTerminal(stateDir, slot string, sess *state.Session) (bool, error) {
+	if sess == nil || sess.NativeRoleRunID == "" {
+		return false, nil
+	}
+	if sess.NativeReceiptDir != nativeReceiptDir(stateDir, slot) {
+		return false, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	}
+	r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+	if err != nil {
+		return false, err
+	}
+	if r.Slot != slot || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID {
+		return false, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	}
+	return nativeWorkerTerminated(sess.NativeReceiptDir, r)
+}
+
+var nativeWorkerPaneAbsent = func(name string) (bool, error) {
+	out, err := exec.Command("tmux", "list-sessions", "-F", "#{session_name}").CombinedOutput()
+	if err != nil {
+		var exit *exec.ExitError
+		if errors.As(err, &exit) && exit.ExitCode() == 1 && (strings.Contains(string(out), "no server running on ") || (strings.Contains(string(out), "error connecting to ") && strings.Contains(string(out), "No such file or directory"))) {
+			return true, nil
+		}
+		return false, fmt.Errorf("native pane absence unknown")
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		if line == name {
+			return false, nil
+		}
+	}
+	return true, nil
+}
+
+// ReconcileNativeWorkerTermination observes a previously launched exact OS
+// lease without signalling anything. Financial holds survive local termination.
+// launch_intent is never released by absence: dispatch may not have happened yet.
+func ReconcileNativeWorkerTermination(cfg *config.Config, slot string, sess *state.Session) error {
+	if sess == nil || sess.NativeRoleRunID == "" {
+		return nil
+	}
+	dir, unlock, err := lockNativeWorker(cfg, slot)
+	if err != nil {
+		return err
+	}
+	defer unlock()
+	terminal, err := NativeSessionProcessTerminal(cfg.StateDir, slot, sess)
+	if err != nil {
+		return err
+	}
+	if !terminal {
+		r, err := readNativeWorkerReceipt(dir, sess.WorkerGeneration)
+		if err != nil {
+			return err
+		}
+		if r.ProjectID != cfg.ProjectID || r.Status != "launched" || r.ProcessLeaseUnit != sess.ProcessLeaseUnit || r.ProcessLeaseManager != sess.ProcessLeaseManager {
+			return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+		}
+		lease, has, err := sessionProcessLease(sess)
+		if err != nil || !has {
+			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+		}
+		active, err := workerProcessLeaseActive(lease)
+		if err != nil || active {
+			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+		}
+		absent, err := nativeWorkerPaneAbsent(TmuxSessionName(slot))
+		if err != nil || !absent {
+			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+		}
+		if err := markNativeWorkerTerminated(sess); err != nil {
+			return err
+		}
+	}
+	sess.PID = 0
+	sess.TmuxSession = ""
+	clearSessionProcessLease(sess)
+	if sess.Status == state.StatusRunning {
+		sess.Status = state.StatusDead
+		now := time.Now().UTC()
+		sess.FinishedAt = &now
+		state.MarkWorkerEnded(sess, now)
+	}
+	return nil
+}
+
+func nativeWorkerDestructiveOutcome(cfg *config.Config, slot string, sess *state.Session) error {
+	if sess == nil || sess.NativeRoleRunID == "" {
+		return nil
+	}
+	r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+	if err != nil {
+		return err
+	}
+	if r.Slot != slot || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID {
+		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	}
+	if cfg != nil && (r.ProjectID != cfg.ProjectID || sess.NativeReceiptDir != nativeReceiptDir(cfg.StateDir, slot)) {
+		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	}
+	if err := previousNativeGenerationOutcome(cfg, r); err != nil {
+		return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 	}
 	return nil
 }

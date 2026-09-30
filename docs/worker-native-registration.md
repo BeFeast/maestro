@@ -70,6 +70,12 @@ Normal runtime/CAS projection recovery also validates the native receipt and
 preserves its generation.
 
 Only proven exact OS-lease teardown writes the immutable `.terminated` receipt.
+Held generations can also reconcile local termination without signalling: the
+exact previously launched OS lease must be inactive and the exact tmux pane
+absent. An active/unknown lease or uncertain launch intent retains capacity.
+This read-only process check preserves the financial hold and raw worktree.
+Missing native process-lease state never falls back to legacy PID ancestry kill;
+already-terminated receipts allow only verified idempotent cleanup.
 Neither terminal-looking session status nor a newer stale state projection can
 release unresolved native occupancy. The existing fleet limiter unions native
 launch receipts with running sessions by project state directory and slot. It
