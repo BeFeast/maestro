@@ -47,6 +47,7 @@ type PreparedProject struct {
 	Name           string
 	ProjectID      string
 	Repo           string
+	Forge          config.ForgeConfig
 	LocalPath      string
 	WorktreeBase   string
 	ManagementHome config.ManagementHomeConfig
@@ -199,6 +200,7 @@ func prepareProject(sourcePath string, data []byte, sharedBackends map[string]*y
 		Name:           name,
 		ProjectID:      id,
 		Repo:           cfg.Repo,
+		Forge:          cfg.Forge,
 		LocalPath:      cfg.LocalPath,
 		WorktreeBase:   cfg.WorktreeBase,
 		ManagementHome: cfg.ManagementHome,

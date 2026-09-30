@@ -194,7 +194,7 @@ func TestRemoteMatchesRepoGitHubHostsAndSchemes(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := remoteMatchesRepo(tc.remote, tc.repo); got != tc.want {
+			if got := remoteMatchesRepo(tc.remote, tc.repo, config.ForgeConfig{}); got != tc.want {
 				t.Fatalf("remoteMatchesRepo(%q, %q) = %t, want %t", tc.remote, tc.repo, got, tc.want)
 			}
 		})
@@ -629,5 +629,188 @@ func TestValidateGenesisRuntime(t *testing.T) {
 	p.Repo = "BeFeast/other"
 	if err := validateGenesisRuntime(p); err == nil || !strings.Contains(err.Error(), "does not match") {
 		t.Fatalf("remote mismatch err = %v", err)
+	}
+}
+
+func TestRemoteMatchesRepoConfiguredForge(t *testing.T) {
+	forge := config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example:8443/instance"}
+	for _, tc := range []struct {
+		remote string
+		want   bool
+	}{
+		{"https://forge.example:8443/instance/BeFeast/demo.git", true},
+		{"git@forge.example:BeFeast/demo.git", true},
+		{"ssh://git@forge.example:2222/BeFeast/demo.git", true},
+		{"https://github.com/BeFeast/demo.git", false},
+		{"git@github.com:BeFeast/demo.git", false},
+		{"ssh://git@192.0.2.10:2222/BeFeast/demo.git", false},
+		{"https://forge.example/instance/BeFeast/demo.git", false},
+		{"http://forge.example:8443/instance/BeFeast/demo.git", false},
+		{"https://forge.example:8443/BeFeast/demo.git", false},
+		{"https://forge.example:8443/INSTANCE/BeFeast/demo.git", false},
+		{"https://forge.example:8443/instance/BeFeast/other.git", false},
+		{"https://forge.example:8443/instance/BeFeast/demo.git?other", false},
+		{"https://forge.example:8443/instance/BeFeast/demo.git#other", false},
+		{"file:///BeFeast/demo.git", false},
+	} {
+		t.Run(tc.remote, func(t *testing.T) {
+			if got := remoteMatchesRepo(tc.remote, "BeFeast/demo", forge); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
+	forge.BaseURL = "https://forge.example"
+	if !remoteMatchesRepo("https://forge.example:443/BeFeast/demo.git", "BeFeast/demo", forge) {
+		t.Fatal("explicit default HTTPS port must match")
+	}
+}
+
+func TestForgejoGenesisReopenAndRepeat(t *testing.T) {
+	dir := t.TempDir()
+	repo := filepath.Join(dir, "repo")
+	for _, args := range [][]string{{"init", repo}, {"-C", repo, "remote", "add", "origin", "git@forge.example:BeFeast/demo.git"}} {
+		if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+			t.Fatalf("git: %v: %s", err, out)
+		}
+	}
+	data := strings.NewReplacer("/srv/example-src/demo", repo, "/srv/example-worktrees/demo", filepath.Join(dir, "worktrees"), "/srv/example-vault/Dev/Areas/demo", dir).Replace(projectTestYAML)
+	data += "forge:\n  kind: forgejo\n  base_url: https://forge.example\nreview_gate: llm-review\ngithub_projects:\n  enabled: false\n"
+	prepared, err := configstore.PrepareProject("project.yaml", []byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared.Forge.BaseURL != "https://forge.example" {
+		t.Fatalf("forge lost in preparation: %+v", prepared.Forge)
+	}
+	if err := validateGenesisRuntime(prepared); err != nil {
+		t.Fatal(err)
+	}
+	db := filepath.Join(dir, "store.db")
+	plan := planReport(db, prepared, false)
+	if plan.Effect != configstore.EffectCreate || plan.Wrote {
+		t.Fatalf("plan: %+v", plan)
+	}
+	store, err := configstore.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := store.ApplyProject(context.Background(), prepared, prepared.ProjectID, prepared.Fingerprint, plan.BaselineFingerprint)
+	if err != nil {
+		store.Close()
+		t.Fatal(err)
+	}
+	if first.Effect != configstore.EffectCreate || !first.Wrote {
+		store.Close()
+		t.Fatalf("first: %+v", first)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	store, err = configstore.Open(db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	prepared2, err := store.PrepareProject(context.Background(), "project.yaml", []byte(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if prepared2.ProjectID != prepared.ProjectID || prepared2.Fingerprint != prepared.Fingerprint {
+		t.Fatal("identity/config fingerprint changed after reopen")
+	}
+	repeat, err := store.ApplyProject(context.Background(), prepared2, prepared2.ProjectID, prepared2.Fingerprint, plan.BaselineFingerprint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if repeat.Effect != configstore.EffectNoOp || repeat.Wrote {
+		t.Fatalf("repeat: %+v", repeat)
+	}
+	names, err := store.ProjectNames(context.Background())
+	if err != nil || len(names) != 1 {
+		t.Fatalf("rows: %v, %v", names, err)
+	}
+}
+
+// Run the real CLI entry points in a child test process because failures call
+// os.Exit. A wrong canonical host must fail before opening a writable store.
+func TestForgejoGenesisMismatchNoDatabaseWrites(t *testing.T) {
+	if os.Getenv("MAESTRO_GENESIS_MISMATCH_CHILD") == "1" {
+		for i, arg := range os.Args {
+			if arg == "--" {
+				projectCmd(os.Args[i+1:])
+				return
+			}
+		}
+		t.Fatal("missing child command")
+	}
+	for _, existing := range []bool{false, true} {
+		for _, command := range []string{"plan", "apply"} {
+			t.Run(command+map[bool]string{false: "-absent", true: "-existing"}[existing], func(t *testing.T) {
+				dir := t.TempDir()
+				repo := filepath.Join(dir, "repo")
+				for _, args := range [][]string{{"init", repo}, {"-C", repo, "remote", "add", "origin", "https://github.com/BeFeast/demo.git"}} {
+					if out, err := exec.Command("git", args...).CombinedOutput(); err != nil {
+						t.Fatalf("git: %v: %s", err, out)
+					}
+				}
+				data := strings.NewReplacer("/srv/example-src/demo", repo, "/srv/example-worktrees/demo", filepath.Join(dir, "worktrees"), "/srv/example-vault/Dev/Areas/demo", dir).Replace(projectTestYAML)
+				data += "forge:\n  kind: forgejo\n  base_url: https://forge.example\nreview_gate: llm-review\ngithub_projects:\n  enabled: false\n"
+				file := filepath.Join(dir, "project.yaml")
+				if err := os.WriteFile(file, []byte(data), 0o600); err != nil {
+					t.Fatal(err)
+				}
+				prepared, err := configstore.PrepareProject(file, []byte(data))
+				if err != nil {
+					t.Fatal(err)
+				}
+				db := filepath.Join(dir, "store.db")
+				if existing {
+					store, err := configstore.Open(db)
+					if err != nil {
+						t.Fatal(err)
+					}
+					defer store.Close()
+					if err := store.UpsertProject(context.Background(), "befeast-demo", data); err != nil {
+						t.Fatal(err)
+					}
+				}
+				before := map[string][]byte{}
+				for _, path := range []string{db, db + "-wal", db + "-shm"} {
+					b, err := os.ReadFile(path)
+					if err == nil {
+						before[path] = b
+					} else if !os.IsNotExist(err) {
+						t.Fatal(err)
+					}
+				}
+				args := []string{"-test.run=^TestForgejoGenesisMismatchNoDatabaseWrites$", "--", command, "--file", file, "--db", db, "--json"}
+				if command == "apply" {
+					args = append(args, "--confirm", prepared.ProjectID, "--fingerprint", prepared.Fingerprint, "--baseline", configstore.BaselineAbsent)
+				}
+				child := exec.Command(os.Args[0], args...)
+				child.Env = append(os.Environ(), "MAESTRO_GENESIS_MISMATCH_CHILD=1")
+				out, err := child.CombinedOutput()
+				if err == nil {
+					t.Fatalf("mismatch succeeded: %s", out)
+				}
+				var receipt genesisReceipt
+				if err := json.Unmarshal(out, &receipt); err != nil {
+					t.Fatalf("invalid receipt: %v: %s", err, out)
+				}
+				if receipt.Error == nil || receipt.Error.Code != "preflight_failed" || !strings.Contains(receipt.Error.Message, "does not match") {
+					t.Fatalf("unexpected failure: %s", out)
+				}
+				for _, path := range []string{db, db + "-wal", db + "-shm"} {
+					after, err := os.ReadFile(path)
+					if b, existed := before[path]; existed {
+						if err != nil || !bytes.Equal(b, after) {
+							t.Fatalf("mismatch changed %s: %v", path, err)
+						}
+					} else if !os.IsNotExist(err) {
+						t.Fatalf("mismatch created %s: %v", path, err)
+					}
+				}
+			})
+		}
 	}
 }
