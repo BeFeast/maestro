@@ -27,11 +27,13 @@ type BindingExpectation struct {
 }
 
 type BindingCredentialPin struct {
-	AuthRef          string            `json:"auth_ref"`
-	AccountAlias     string            `json:"account_alias"`
-	CredentialKind   string            `json:"credential_kind"`
-	CredentialSHA256 string            `json:"credential_sha256"`
-	Models           []BindingModelPin `json:"models"`
+	AuthRef               string            `json:"auth_ref"`
+	AccountAlias          string            `json:"account_alias"`
+	CredentialKind        string            `json:"credential_kind"`
+	CredentialSHA256      string            `json:"credential_sha256,omitempty"`
+	BindingMode           string            `json:"binding_mode,omitempty"`
+	AccountIdentitySHA256 string            `json:"account_identity_sha256,omitempty"`
+	Models                []BindingModelPin `json:"models"`
 }
 
 type BindingModelPin struct {
@@ -68,6 +70,9 @@ type claudeBindingCredential struct {
 	AccountAlias           string               `json:"account_alias"`
 	CredentialKind         string               `json:"credential_kind"`
 	CredentialSHA256       string               `json:"credential_sha256"`
+	BindingMode            string               `json:"binding_mode,omitempty"`
+	AccountIdentitySHA256  string               `json:"account_identity_sha256,omitempty"`
+	VerifiedGeneration     uint64               `json:"verified_generation,omitempty"`
 	PinMatches             bool                 `json:"pin_matches"`
 	AuthActive             bool                 `json:"auth_active"`
 	AuthGeneration         uint64               `json:"auth_generation"`
@@ -88,6 +93,32 @@ func bindingIdentifier(value string) bool {
 	return value != "" && len(value) <= 512 && strings.IndexFunc(value, func(r rune) bool { return r <= 32 || r == 127 }) < 0
 }
 
+const OAuthAccountBindingMode = "oauth-account-v1"
+
+func validCredentialExpectation(p BindingCredentialPin) bool {
+	switch p.BindingMode {
+	case "":
+		return validDigest(p.CredentialSHA256) && p.AccountIdentitySHA256 == "" && (p.CredentialKind == "x-api-key" || p.CredentialKind == "authorization-bearer")
+	case OAuthAccountBindingMode:
+		return p.CredentialKind == "authorization-bearer" && p.CredentialSHA256 == "" && validDigest(p.AccountIdentitySHA256)
+	default:
+		return false
+	}
+}
+
+func credentialObservationMatches(want BindingCredentialPin, got claudeBindingCredential) bool {
+	if !validCredentialExpectation(want) || got.BindingMode != want.BindingMode || got.CredentialKind != want.CredentialKind {
+		return false
+	}
+	if want.BindingMode == OAuthAccountBindingMode {
+		// The pinned builtin gateway verifies the actual token against the official
+		// provider profile. Auth metadata and a changing auth epoch alone are not
+		// identity evidence. Each verified token has its own runtime generation.
+		return got.AccountIdentitySHA256 == want.AccountIdentitySHA256 && got.VerifiedGeneration > 0 && validDigest(got.CredentialSHA256)
+	}
+	return got.CredentialSHA256 == want.CredentialSHA256 && got.AccountIdentitySHA256 == "" && got.VerifiedGeneration == 0
+}
+
 func validateBindingExpectation(m Manifest) error {
 	e := m.Bindings
 	if e.SchemaVersion != 1 || e.ProjectionVersion != ClaudeBindingProjection || len(e.Credentials) == 0 || len(e.Credentials) > 64 || len(m.Routes) == 0 {
@@ -95,7 +126,7 @@ func validateBindingExpectation(m Manifest) error {
 	}
 	auths, models := map[string]bool{}, map[string]bool{}
 	for _, credential := range e.Credentials {
-		if !validDigest(credential.AuthRef) || auths[credential.AuthRef] || !bindingIdentifier(credential.AccountAlias) || !validDigest(credential.CredentialSHA256) || (credential.CredentialKind != "x-api-key" && credential.CredentialKind != "authorization-bearer") || len(credential.Models) == 0 || len(credential.Models) > 128 {
+		if !validDigest(credential.AuthRef) || auths[credential.AuthRef] || !bindingIdentifier(credential.AccountAlias) || !validCredentialExpectation(credential) || len(credential.Models) == 0 || len(credential.Models) > 128 {
 			return Held("binding_expectation_invalid")
 		}
 		auths[credential.AuthRef] = true
@@ -208,7 +239,7 @@ func verifyClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) erro
 	}
 	for _, got := range i.Credentials {
 		want, ok := expected[got.AuthRef]
-		if !ok || got.AccountAlias != want.AccountAlias || got.CredentialKind != want.CredentialKind || got.CredentialSHA256 != want.CredentialSHA256 || !got.PinMatches || !got.AuthActive || got.AuthGeneration == 0 || got.AuthRegistrationEpoch == 0 || got.ModelRegistrationEpoch == 0 {
+		if !ok || got.AccountAlias != want.AccountAlias || !credentialObservationMatches(want, got) || !got.PinMatches || !got.AuthActive || got.AuthGeneration == 0 || got.AuthRegistrationEpoch == 0 || got.ModelRegistrationEpoch == 0 {
 			return Held("binding_credential_mismatch")
 		}
 		delete(expected, got.AuthRef)
@@ -229,4 +260,21 @@ func verifyClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) erro
 		}
 	}
 	return nil
+}
+
+// ValidateClaudeBindingReceipt shares the launch-time inventory contract with
+// offline provisioning tools. The caller must independently verify freshness,
+// nonce, authenticated transport and PID ownership of the observed endpoint.
+func ValidateClaudeBindingReceipt(m Manifest, raw []byte) error {
+	if err := validateBindingExpectation(m); err != nil {
+		return err
+	}
+	var receipt claudeBindingReceipt
+	if DecodeStrict(raw, &receipt) != nil {
+		return Held("binding_observation_invalid")
+	}
+	if receipt.SchemaVersion != 1 || receipt.ProjectionVersion != ClaudeBindingProjection || receipt.ObservationScope != "credential_selection_only" || receipt.ProcessInstanceID != m.Runtime.ProcessInstanceID {
+		return Held("binding_observation_binding_mismatch")
+	}
+	return verifyClaudeBindingInventory(m, receipt)
 }
