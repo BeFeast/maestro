@@ -1079,6 +1079,8 @@ func normalizeDeliveryTimeout(min int) int {
 // NativeSessionRegistrationConfig selects an existing trusted control authority.
 // No socket, UID, fleet, policy, or lifetime budget scope is inferred.
 type NativeSessionRegistrationConfig struct {
+	// Omitted preserves monetary v1; requests selects explicit request-cap v2.
+	AdmissionBasis        string  `yaml:"admission_basis,omitempty" json:"admission_basis,omitempty"`
 	ControlSocket         string  `yaml:"control_socket" json:"control_socket"`
 	AuthorityUID          *uint32 `yaml:"authority_uid" json:"authority_uid"`
 	ExpectedPolicyVersion int64   `yaml:"expected_policy_version" json:"expected_policy_version"`
@@ -2665,8 +2667,8 @@ func containsControlOrSpace(value string) bool {
 }
 
 type Config struct {
-	AIExecution             aiexecution.Policy           `yaml:"ai_execution" json:"ai_execution"`
-	RuntimeAuxiliaryLimiter aiexecution.AuxiliaryLimiter `yaml:"-" json:"-"`
+	AIExecution                     aiexecution.Policy               `yaml:"ai_execution" json:"ai_execution"`
+	RuntimeAuxiliaryLimiter         aiexecution.AuxiliaryLimiter     `yaml:"-" json:"-"`
 	WorkerNativeSessionRegistration *NativeSessionRegistrationConfig `yaml:"worker_native_session_registration,omitempty" json:"worker_native_session_registration,omitempty"`
 	WorkerLaunchContext             *WorkerLaunchContext             `yaml:"-" json:"-"`
 	Server                          ServerConfig                     `yaml:"server"`

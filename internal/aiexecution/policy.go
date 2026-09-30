@@ -108,6 +108,7 @@ type Manifest struct {
 // This package covers one installed gateway instance; no cross-role model or
 // principal substitution is implicit.
 type RoleRoute struct {
+	AdmissionBasis         string `json:"admission_basis,omitempty"`
 	Model                  string `json:"model"`
 	GatewayScope           string `json:"gateway_scope"`
 	BudgetRunID            string `json:"budget_run_id"`
@@ -245,7 +246,7 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 		return Held("role_run_invalid")
 	}
 	ack := spec.Registration
-	if ack == nil || ack.Revoked || ack.RegistrationVersion <= 0 || spec.ExpectedPolicyVersion != m.PolicyVersion || ack.Binding.ProjectID != m.ProjectID || ack.Binding.FleetID != m.FleetID || ack.Binding.RunID != route.BudgetRunID || ack.Binding.GatewayScope != route.GatewayScope || ack.Binding.Role != spec.Role || ack.Binding.ExpiresAt <= time.Now().Unix() {
+	if ack == nil || ack.Revoked || ack.RegistrationVersion <= 0 || !admissioncontrol.ValidAdmissionBasis(route.AdmissionBasis) || ack.Binding.AdmissionBasis != route.AdmissionBasis || spec.ExpectedPolicyVersion != m.PolicyVersion || ack.Binding.ProjectID != m.ProjectID || ack.Binding.FleetID != m.FleetID || ack.Binding.RunID != route.BudgetRunID || ack.Binding.GatewayScope != route.GatewayScope || ack.Binding.Role != spec.Role || ack.Binding.ExpiresAt <= time.Now().Unix() {
 		return Held("registration_binding_mismatch")
 	}
 	if id, err := uuid.Parse(ack.Binding.NativeSessionID); err != nil || id.String() != ack.Binding.NativeSessionID {

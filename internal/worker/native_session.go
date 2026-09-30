@@ -120,7 +120,7 @@ func nativeClient(cfg *config.Config) (admissioncontrol.Client, error) {
 	}
 	r := cfg.WorkerNativeSessionRegistration
 	if r == nil || !filepath.IsAbs(cfg.StateDir) || !filepath.IsAbs(r.ControlSocket) || r.AuthorityUID == nil ||
-		r.ExpectedPolicyVersion <= 0 || !admissioncontrol.Identifier(cfg.ProjectID) ||
+		r.ExpectedPolicyVersion <= 0 || !admissioncontrol.ValidAdmissionBasis(r.AdmissionBasis) || !admissioncontrol.Identifier(cfg.ProjectID) ||
 		!admissioncontrol.Identifier(r.FleetID) || !admissioncontrol.Identifier(r.GatewayScope) ||
 		!admissioncontrol.Identifier(r.BudgetRunID) || r.TTLSeconds <= 0 || r.TTLSeconds > math.MaxInt64-time.Now().Unix() {
 		return admissioncontrol.Client{}, &NativeRegistrationHold{Code: "configuration_invalid"}
@@ -362,7 +362,7 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 	receipt := &NativeWorkerReceipt{SchemaVersion: 1, ProjectID: cfg.ProjectID, Slot: slot, Generation: generation, IssueNumber: issue,
 		RoleRunID: uuid.NewString(), ParentRoleRunID: parent, Worktree: worktree, Branch: branch, Backend: backend, ConfigDigest: configDigest,
 		Status: "registration_intent", ProcessLeaseUnit: lease.Unit, ProcessLeaseManager: lease.Manager,
-		Request: admissioncontrol.RegistrationRequest{Binding: admissioncontrol.Binding{GatewayScope: r.GatewayScope,
+		Request: admissioncontrol.RegistrationRequest{Binding: admissioncontrol.Binding{AdmissionBasis: r.AdmissionBasis, GatewayScope: r.GatewayScope,
 			NativeSessionID: uuid.NewString(), FleetID: r.FleetID, ProjectID: cfg.ProjectID, RunID: r.BudgetRunID, Role: role, ExpiresAt: time.Now().Unix() + r.TTLSeconds}, ExpectedVersion: r.ExpectedPolicyVersion}}
 	if err := persistNativeWorkerReceipt(dir, receipt); err != nil {
 		return nil, &NativeRegistrationHold{Code: "receipt_persistence_failed"}

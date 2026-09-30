@@ -18,12 +18,19 @@ import (
 func fixtureNativeOutcome(request admissioncontrol.SealRequest, held bool) admissioncontrol.NativeOutcome {
 	outcome := admissioncontrol.NativeOutcome{Binding: request.Binding, RegistrationVersion: request.RegistrationVersion,
 		Sealed: true, Outcome: "no_dispatch", NextGenerationAllowed: true, AttemptsDigest: strings.Repeat("a", 64)}
+	prefix := "native-outcome-v1:"
+	if request.AdmissionBasis == "requests" {
+		outcome.SchemaVersion, outcome.AdmissionBasis, outcome.MoneyStatus = 2, "requests", "unknown"
+		outcome.Outcome, outcome.PhysicalAttempts, outcome.TerminalAttempts = "request_accounted", 1, 1
+		prefix = "native-outcome-v2:"
+	}
 	if held {
 		code := "outcome_unknown"
 		outcome.Outcome = "held"
 		outcome.NextGenerationAllowed = false
 		outcome.HoldCode = &code
 		outcome.PhysicalAttempts = 1
+		outcome.TerminalAttempts = 0
 		outcome.UnresolvedAttempts = 1
 	}
 	body, _ := json.Marshal(outcome)
@@ -39,8 +46,62 @@ func fixtureNativeOutcome(request admissioncontrol.SealRequest, held bool) admis
 	_ = encoder.Encode(object)
 	digest := sha256.Sum256(bytes.TrimSuffix(canonical.Bytes(), []byte("\n")))
 	outcome.SnapshotDigest = hex.EncodeToString(digest[:])
-	outcome.EvidenceID = "native-outcome-v1:" + outcome.SnapshotDigest
+	outcome.EvidenceID = prefix + outcome.SnapshotDigest
 	return outcome
+}
+
+func TestRequestWorkerPreservesBasisAcrossLostReplyAndNextPhase(t *testing.T) {
+	f := nativeTestFixture(t)
+	f.cfg.WorkerNativeSessionRegistration.AdmissionBasis = "requests"
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+	old := sealNativeWorker
+	t.Cleanup(func() { sealNativeWorker = old })
+	sess := f.st.Sessions[f.slot]
+	var saved admissioncontrol.SealRequest
+	calls := 0
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		calls++
+		receipt, err := readNativeWorkerReceipt(sess.NativeReceiptDir, 1)
+		if err != nil || receipt.Request.AdmissionBasis != "requests" || receipt.OutcomeIntent == nil || *receipt.OutcomeIntent != request {
+			t.Fatal("request basis was not durable before seal", err)
+		}
+		if calls == 1 {
+			saved = request
+			return admissioncontrol.NativeOutcome{}, errors.New("lost reply")
+		}
+		if request != saved {
+			t.Fatal("recovery changed request basis")
+		}
+		return fixtureNativeOutcome(request, false), nil
+	}
+	if _, err := ReconcileNativeWorkerOutcome(f.cfg, f.slot, 1); err == nil {
+		t.Fatal("lost reply released")
+	}
+	f.cfg.WorkerNativeSessionRegistration.AdmissionBasis = ""
+	if _, err := ReconcileNativeWorkerOutcome(f.cfg, f.slot, 1); err == nil || calls != 1 {
+		t.Fatal("configuration downgrade replaced original basis")
+	}
+	f.cfg.WorkerNativeSessionRegistration.AdmissionBasis = "requests"
+	receipt, err := ReconcileNativeWorkerOutcome(f.cfg, f.slot, 1)
+	if err != nil || receipt.Outcome == nil || receipt.Outcome.Outcome != "request_accounted" || receipt.Outcome.MoneyStatus != "unknown" {
+		t.Fatal(receipt, err)
+	}
+	disk, err := readNativeWorkerReceipt(sess.NativeReceiptDir, 1)
+	if err != nil || persistedNativeGenerationOutcome(nil, disk) != nil {
+		t.Fatal("typed saved outcome not reusable", err)
+	}
+	f.cfg.WorkerLaunchContext = nil
+	sess.Phase = state.PhaseAdvisor
+	oldID := sess.NativeSessionID
+	if err := StartPhase(f.cfg, sess, f.slot, "accepted plan", "claude"); err != nil {
+		t.Fatal(err)
+	}
+	if f.spawned != 2 || len(f.registered) != 2 || calls != 2 || sess.NativeSessionID == oldID || f.registered[1].AdmissionBasis != "requests" {
+		t.Fatal("next phase lost basis or repeated seal/inference")
+	}
 }
 
 func nativeOutcomeFixture(t *testing.T) *nativeFixture {

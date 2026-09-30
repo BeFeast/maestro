@@ -18,6 +18,7 @@ import (
 const MaxFrame = 65536
 
 type Binding struct {
+	AdmissionBasis  string `json:"admission_basis,omitempty"`
 	GatewayScope    string `json:"gateway_scope"`
 	NativeSessionID string `json:"native_session_id"`
 	FleetID         string `json:"fleet_id"`
@@ -25,6 +26,28 @@ type Binding struct {
 	RunID           string `json:"run_id"`
 	Role            string `json:"role"`
 	ExpiresAt       int64  `json:"expires_at"`
+}
+
+// An omitted basis is the original monetary v1 protocol. Request budgets opt
+// into a distinct wire version before registration; responses cannot choose it.
+func ValidAdmissionBasis(basis string) bool { return basis == "" || basis == "requests" }
+
+func (b Binding) ProtocolVersion() int {
+	if b.AdmissionBasis == "requests" {
+		return 2
+	}
+	if b.AdmissionBasis == "" {
+		return 1
+	}
+	return 0
+}
+
+func bindingFields(data json.RawMessage, binding Binding) bool {
+	keys := []string{"gateway_scope", "native_session_id", "fleet_id", "project_id", "run_id", "role", "expires_at"}
+	if binding.AdmissionBasis == "requests" {
+		keys = append(keys, "admission_basis")
+	}
+	return fields(data, keys...)
 }
 
 type RegistrationRequest struct {
@@ -63,7 +86,7 @@ func Identifier(value string) bool {
 
 func (r RegistrationRequest) Valid() bool {
 	id, err := uuid.Parse(r.NativeSessionID)
-	return err == nil && id.String() == r.NativeSessionID && r.ExpectedVersion > 0 && r.ExpiresAt > 0 &&
+	return err == nil && id.String() == r.NativeSessionID && ValidAdmissionBasis(r.AdmissionBasis) && r.ExpectedVersion > 0 && r.ExpiresAt > 0 &&
 		Identifier(r.GatewayScope) && Identifier(r.FleetID) && Identifier(r.ProjectID) && Identifier(r.RunID) && Identifier(r.Role)
 }
 
@@ -83,6 +106,13 @@ func (c Client) Register(request RegistrationRequest) (Acknowledgement, error) {
 
 // call sends one bounded framed request to the pinned Unix peer; no retries.
 func (c Client) call(id, op string, args any) ([]byte, error) {
+	version := 1
+	switch request := args.(type) {
+	case RegistrationRequest:
+		version = request.ProtocolVersion()
+	case SealRequest:
+		version = request.ProtocolVersion()
+	}
 	deadline := time.Now().Add(c.Timeout)
 	conn, err := net.DialTimeout("unix", c.SocketPath, c.Timeout)
 	if err != nil {
@@ -100,7 +130,7 @@ func (c Client) call(id, op string, args any) ([]byte, error) {
 		ID      string `json:"id"`
 		Op      string `json:"op"`
 		Args    any    `json:"args"`
-	}{1, id, op, args})
+	}{version, id, op, args})
 	if err != nil || len(body) == 0 || len(body) > MaxFrame {
 		return nil, &Hold{Code: "registration_invalid"}
 	}
@@ -145,7 +175,7 @@ func decodeResponse(data []byte, request RegistrationRequest) (Acknowledgement, 
 		Result  json.RawMessage `json:"result"`
 		Hold    json.RawMessage `json:"hold"`
 	}
-	if json.Unmarshal(data, &envelope) != nil || envelope.Version != 1 {
+	if json.Unmarshal(data, &envelope) != nil || envelope.Version != request.ProtocolVersion() {
 		return invalid()
 	}
 	if !envelope.OK {
@@ -157,7 +187,7 @@ func decodeResponse(data []byte, request RegistrationRequest) (Acknowledgement, 
 			return invalid()
 		}
 		switch hold.Code {
-		case "policy_conflict", "scope_missing", "identity_conflict", "registration_invalid", "registration_conflict", "registration_expired", "registration_revoked", "caller_forbidden", "authority_unavailable", "invalid_frame", "invalid_request", "unsupported_version", "operation_forbidden", "clock_unknown":
+		case "policy_conflict", "scope_missing", "identity_conflict", "registration_invalid", "registration_conflict", "registration_expired", "registration_revoked", "caller_forbidden", "authority_unavailable", "invalid_frame", "invalid_request", "unsupported_version", "operation_forbidden", "clock_unknown", "admission_basis_conflict":
 			return ack, &hold
 		default:
 			return invalid()
@@ -167,7 +197,7 @@ func decodeResponse(data []byte, request RegistrationRequest) (Acknowledgement, 
 		return invalid()
 	}
 	var result map[string]json.RawMessage
-	if json.Unmarshal(envelope.Result, &result) != nil || !fields(result["binding"], "gateway_scope", "native_session_id", "fleet_id", "project_id", "run_id", "role", "expires_at") {
+	if json.Unmarshal(envelope.Result, &result) != nil || !bindingFields(result["binding"], request.Binding) {
 		return invalid()
 	}
 	// JSON null must not silently become false or zero in a successful response.

@@ -11,6 +11,8 @@ project/fleet and the normalized project configuration digest. `routes` is a map
 by exact role (`planner`, `advisor`, `implementer`, `validator`, `repair`,
 `supervisor`, `reviewer`). Each route keeps its explicit model, gateway scope,
 budget-run binding, managed-principal digest, and domain-separated caller scope.
+An explicit `admission_basis: requests` must match the native registration;
+omission preserves monetary version 1. See [native request budgets](native-request-accounting.md).
 No model is substituted across roles. One package covers one installed gateway
 instance; different installed gateways need separate packages.
 
