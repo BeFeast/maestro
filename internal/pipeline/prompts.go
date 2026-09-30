@@ -2,7 +2,7 @@ package pipeline
 
 import (
 	"fmt"
-	"os"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"path/filepath"
 	"strings"
 
@@ -153,11 +153,11 @@ func PromptTemplateForPhase(cfg *config.Config, phase state.Phase) string {
 // even for a custom prompt so the issue, artifacts, version/round, ledger, and
 // strict verdict contract can never be accidentally omitted by a template.
 func AdvisorPrompt(cfg *config.Config, issue github.Issue, worktreePath, branchName string, sess *state.Session) (string, error) {
-	plan, err := os.ReadFile(filepath.Join(worktreePath, PlanFile))
+	plan, err := aiexecution.ReadWorkspaceFile(filepath.Join(worktreePath, PlanFile))
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", PlanFile, err)
 	}
-	validation, err := os.ReadFile(filepath.Join(worktreePath, ValidationFile))
+	validation, err := aiexecution.ReadWorkspaceFile(filepath.Join(worktreePath, ValidationFile))
 	if err != nil {
 		return "", fmt.Errorf("read %s: %w", ValidationFile, err)
 	}
@@ -254,7 +254,7 @@ func loadPromptOrDefault(path, defaultPrompt string) string {
 	if path == "" {
 		return defaultPrompt
 	}
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return defaultPrompt
 	}

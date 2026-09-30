@@ -10,6 +10,7 @@ import (
 	"testing"
 
 	"github.com/befeast/maestro/internal/aiexecution"
+	"github.com/befeast/maestro/internal/config"
 )
 
 func TestWorkerExecProofRefusesBeforeActualProcessStart(t *testing.T) {
@@ -57,7 +58,13 @@ func TestWorkerExecProofRefusesBeforeActualProcessStart(t *testing.T) {
 }
 
 func TestStrictNativeWorkerActualRoutePreflightHoldsBeforeLease(t *testing.T) {
+	if os.Getenv("MAESTRO_NATIVE_KERNEL_TESTS") != "1" {
+		t.Skip("set MAESTRO_NATIVE_KERNEL_TESTS=1 for native clone kernel fixture")
+	}
 	f := nativeTestFixture(t)
+	f.cfg.WorkerRuntime = config.WorkerRuntimeConfig{Mode: config.WorkerRuntimeModeIsolated, Scope: config.WorkerRuntimeScopeSystem}
+	runBranchGit(t, f.cfg.LocalPath, "worktree", "remove", "--force", filepath.Join(f.cfg.WorktreeBase, f.slot))
+	runBranchGit(t, f.cfg.LocalPath, "remote", "set-url", "origin", "https://git.oklabs.uk/BeFeast/maestro.git")
 	f.cfg.AIExecution.RequireVerifiedRoute = true
 	f.cfg.AIExecution = f.cfg.AIExecution.BindController(f.cfg.AIExecution, f.cfg.StateDir)
 	_, err := f.start()

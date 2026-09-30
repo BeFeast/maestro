@@ -52,6 +52,7 @@ type AuxiliaryLimiter interface {
 }
 
 type LaunchSpec struct {
+	RuntimeKey            string
 	ProjectID             string
 	Role                  string
 	RoleRunID             string
@@ -92,6 +93,7 @@ type Manifest struct {
 	Harness                 FileProof            `json:"harness"`
 	Gateway                 ProcessProof         `json:"gateway"`
 	Runtime                 RuntimeExpectation   `json:"runtime"`
+	Bindings                BindingExpectation   `json:"bindings"`
 	GatewayConfig           FileProof            `json:"gateway_config"`
 	AuthorityPolicy         FileProof            `json:"authority_policy"`
 	ModelAccountPolicy      FileProof            `json:"model_account_policy"`
@@ -99,6 +101,7 @@ type Manifest struct {
 	NativeWireReceipt       FileProof            `json:"native_wire_receipt"`
 	FullAPIAdmissionReceipt FileProof            `json:"full_api_admission_receipt"`
 	LegacyCIContainment     FileProof            `json:"legacy_ci_containment"`
+	Containment             map[string]FileProof `json:"containment"`
 }
 
 // Each role keeps its exact requested model and authenticated budget route.
@@ -110,6 +113,36 @@ type RoleRoute struct {
 	BudgetRunID            string `json:"budget_run_id"`
 	ManagedPrincipalSHA256 string `json:"managed_principal_sha256"`
 	CallerScopeHash        string `json:"caller_scope_hash"`
+}
+
+// ContainmentProfilePin selects the reviewed finite profile for one worker
+// slot or native auxiliary role. Inspect remains required before preparation.
+func ContainmentProfilePin(policy Policy, key string) (FileProof, error) {
+	b, err := os.ReadFile(policy.ManifestPath)
+	if err != nil || len(b) > 128<<10 || digest(b) != policy.ManifestSHA256 {
+		return FileProof{}, Held("manifest_drift")
+	}
+	var m Manifest
+	if DecodeStrict(b, &m) != nil {
+		return FileProof{}, Held("manifest_invalid")
+	}
+	pin, ok := m.Containment[key]
+	if !ok {
+		return FileProof{}, Held("containment_profile_missing")
+	}
+	return pin, nil
+}
+
+func GatewayProcessFromPolicy(policy Policy) (ProcessProof, error) {
+	b, err := os.ReadFile(policy.ManifestPath)
+	if err != nil || len(b) > 128<<10 || digest(b) != policy.ManifestSHA256 {
+		return ProcessProof{}, Held("manifest_drift")
+	}
+	var m Manifest
+	if DecodeStrict(b, &m) != nil {
+		return ProcessProof{}, Held("manifest_invalid")
+	}
+	return m.Gateway, nil
 }
 
 func digest(data []byte) string { sum := sha256.Sum256(data); return hex.EncodeToString(sum[:]) }
@@ -292,13 +325,30 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if err := observeRuntime(m, route.CallerScopeHash); err != nil {
 		return err
 	}
+	if err := observeClaudeBindings(m); err != nil {
+		return err
+	}
 	if err := inspectProcess(m.Gateway); err != nil {
 		return err
 	}
-	// File hashes are reviewed expectations, not observations of actual egress
-	// rules or the credentials available to this process. Do not grant readiness
-	// until the installed containment inspector covers those runtime properties.
-	return Held("egress_credential_containment_unobservable")
+	key := spec.RuntimeKey
+	if key == "" {
+		key = spec.Role
+	}
+	pin, ok := m.Containment[key]
+	if !ok {
+		return Held("containment_profile_missing")
+	}
+	profile, err := inspectContainmentProfile(pin, spec.ProjectID, m.Gateway)
+	if err != nil {
+		return err
+	}
+	if profile.Harness != m.Harness || profile.Maestro != m.Maestro {
+		return Held("containment_manifest_binary_mismatch")
+	}
+	// The caller must now use PrepareContainedNativeCommand; readiness itself
+	// does not attest to a process that has not yet entered its OS lease.
+	return nil
 }
 
 func inspectProcess(p ProcessProof) error {

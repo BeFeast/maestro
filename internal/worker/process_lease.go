@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
@@ -48,6 +49,7 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 		return 0, tmuxsession.ProcessLease{}, err
 	}
 	lease.Runtime = runtime
+	lease.HostRunner = cfg.AIExecution.RequireVerifiedRoute
 	pid, err := startOrReconcileTmuxSession(tmuxName, worktree, runnerPath, lease, previousPID)
 	if err == nil {
 		ready, readyErr := confirmWorkerProcessLease(lease, pid, processLeaseStartWait)
@@ -111,6 +113,9 @@ func waitWorkerProcessLeaseReady(lease tmuxsession.ProcessLease, pid int, timeou
 func workerProcessLease(cfg *config.Config, slotName string, generation uint64) (tmuxsession.ProcessLease, error) {
 	if cfg == nil {
 		return tmuxsession.ProcessLease{}, fmt.Errorf("worker process lease: nil config")
+	}
+	if cfg.AIExecution.RequireVerifiedRoute && (!cfg.WorkerRuntime.IsolatedEnabled() || cfg.WorkerRuntime.EffectiveScope() != tmuxsession.ProcessLeaseManagerSystem) {
+		return tmuxsession.ProcessLease{}, aiexecution.Held("containment_system_service_required")
 	}
 	if cfg.WorkerRuntime.IsolatedEnabled() {
 		return tmuxsession.WorkerProcessServiceLease(processLeaseProjectIdentity(cfg), slotName, generation, cfg.WorkerRuntime.EffectiveScope())

@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
 	"os/exec"
@@ -210,7 +211,11 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		return slotName, nil
 	}
 
-	if info, err := os.Stat(worktreePath); err == nil {
+	if cfg.AIExecution.RequireVerifiedRoute {
+		if err := materializeNativeClone(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
+	} else if info, err := os.Stat(worktreePath); err == nil {
 		if !info.IsDir() {
 			return "", fmt.Errorf("reserved worktree path %s exists but is not a directory", worktreePath)
 		}
@@ -278,6 +283,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	if cfg.AIExecution.RequireVerifiedRoute {
+		prompt += "\n\nNative delivery: push the assigned feat/ branch over the canonical HTTPS origin. To create the PR, pipe a JSON object with title, body, head (the assigned branch), and base=main to /runtime/maestro _native-forgejo-pr. The scoped credential is already configured; never print it. Agent/Task delegation, merge, server administration, and direct provider access are unavailable.\n"
+	}
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
 	if err := assertCanonicalPrompt(slotName, issue.Number, prompt); err != nil {
 		return "", err
@@ -392,14 +400,14 @@ func localBranchExists(localPath, branch string) bool {
 	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(branch) == "" {
 		return false
 	}
-	return exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+	return aiexecution.NativeGitCommand("-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
 }
 
 func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
 	if !isGitWorktreeForRepo(localPath, worktree) {
 		return fmt.Errorf("reserved path %s is not a worktree for the configured repository", worktree)
 	}
-	out, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("inspect reserved worktree branch: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -490,7 +498,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Delete old local branch (ignore errors — branch may not exist locally)
-	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
+	aiexecution.NativeGitCommand("-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
 
 	// Create fresh worktree with new branch
 	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
@@ -502,7 +510,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
-	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+	create := addWorktreeFromBase
+	if cfg.AIExecution.RequireVerifiedRoute {
+		create = materializeNativeClone
+	}
+	if err := create(cfg.LocalPath, worktreePath, branchName); err != nil {
 		return err
 	}
 
@@ -547,6 +559,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	if cfg.AIExecution.RequireVerifiedRoute {
+		prompt += "\n\nNative delivery: push the assigned feat/ branch over the canonical HTTPS origin. To create the PR, pipe a JSON object with title, body, head (the assigned branch), and base=main to /runtime/maestro _native-forgejo-pr. The scoped credential is already configured; never print it. Agent/Task delegation, merge, server administration, and direct provider access are unavailable.\n"
+	}
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
 	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
 		return err
@@ -763,7 +778,10 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 
 	// Remove worktree
 	if sess.Worktree != "" {
-		out, err := exec.Command("git", "-C", cfg.LocalPath,
+		if aiexecution.NativeGitRegistered(sess.Worktree) {
+			return RemoveWorktree(cfg.LocalPath, sess.Worktree)
+		}
+		out, err := aiexecution.NativeGitCommand("-C", cfg.LocalPath,
 			"worktree", "remove", "--force", sess.Worktree).CombinedOutput()
 		if err != nil {
 			log.Printf("[worker] remove worktree %s: %v\n%s", sess.Worktree, err, out)
@@ -839,7 +857,10 @@ func RemoveWorktree(localPath, worktreePath string) error {
 	if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", localPath,
+	if isNativeCloneForRepo(localPath, worktreePath) {
+		return os.RemoveAll(worktreePath)
+	}
+	out, err := aiexecution.NativeGitCommand("-C", localPath,
 		"worktree", "remove", "--force", worktreePath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree remove %s: %w\n%s", worktreePath, err, out)
@@ -995,7 +1016,7 @@ func normalizedGitPaths(paths []string) []string {
 
 func runGit(worktreePath string, args ...string) (string, error) {
 	cmdArgs := append([]string{"-C", worktreePath}, args...)
-	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand(cmdArgs...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
 	}
@@ -1080,7 +1101,7 @@ func toSlash(path string) string {
 }
 
 func resolveConflictFileKeepBothSides(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}
@@ -1098,7 +1119,7 @@ func resolveConflictFileKeepBothSides(path string) error {
 	if statErr == nil {
 		mode = fi.Mode()
 	}
-	if err := os.WriteFile(path, []byte(resolved), mode); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(path, []byte(resolved), mode); err != nil {
 		return fmt.Errorf("write resolved file: %w", err)
 	}
 	return nil
@@ -1199,7 +1220,7 @@ func slugify(title string) string {
 // readValidationContract reads VALIDATION.md from the worktree root.
 // Returns the file content or empty string if the file doesn't exist.
 func readValidationContract(worktreePath string) string {
-	data, err := os.ReadFile(filepath.Join(worktreePath, "VALIDATION.md"))
+	data, err := aiexecution.ReadWorkspaceFile(filepath.Join(worktreePath, "VALIDATION.md"))
 	if err != nil {
 		return ""
 	}
@@ -1215,7 +1236,7 @@ var repoRulesPromptFiles = []string{"AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"}
 func repoRulesPromptSection(worktreePath string) string {
 	for _, name := range repoRulesPromptFiles {
 		path := filepath.Join(worktreePath, name)
-		data, err := os.ReadFile(path)
+		data, err := aiexecution.ReadWorkspaceFile(path)
 		if err != nil {
 			continue
 		}
@@ -1464,7 +1485,7 @@ func appendSectionsAndValidation(prompt string, sectionPaths []string, validatio
 
 	// Append prompt sections
 	for _, path := range sectionPaths {
-		data, err := os.ReadFile(path)
+		data, err := aiexecution.ReadWorkspaceFile(path)
 		if err != nil {
 			log.Printf("[worker] warn: could not read prompt section %s: %v", path, err)
 			continue

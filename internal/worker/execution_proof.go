@@ -2,6 +2,7 @@ package worker
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
 type workerExecutionProof struct {
@@ -20,6 +22,9 @@ type workerExecutionProof struct {
 	ControllerLease    aiexecution.ControllerLease `json:"controller_lease"`
 	Spec               aiexecution.LaunchSpec      `json:"spec"`
 	Arguments          []string                    `json:"arguments"`
+	RuntimeKey         string                      `json:"runtime_key"`
+	ProcessLeaseUnit   string                      `json:"process_lease_unit"`
+	Worktree           string                      `json:"worktree"`
 }
 
 func prepareWorkerExecutionProof(cfg *config.Config, n *nativeWorkerLaunch, cmd *exec.Cmd, runnerPath string) error {
@@ -56,6 +61,8 @@ func prepareWorkerExecutionProof(cfg *config.Config, n *nativeWorkerLaunch, cmd 
 		}
 	}
 	proof := workerExecutionProof{Version: 1, Policy: cfg.AIExecution, ControllerRevision: pin, ControllerLease: lease, Arguments: args, Spec: aiexecution.LaunchSpec{ProjectID: cfg.ProjectID, Role: r.Request.Role, RoleRunID: r.RoleRunID, Model: model, GatewayScope: r.Request.GatewayScope, ExpectedPolicyVersion: r.Request.ExpectedVersion, Registration: r.Acknowledgement, ProjectConfigSHA256: configDigest}}
+	proof.RuntimeKey, proof.ProcessLeaseUnit, proof.Worktree = r.Slot, r.ProcessLeaseUnit, cmd.Dir
+	proof.Spec.RuntimeKey = r.Slot
 	b, err := json.Marshal(proof)
 	if err != nil {
 		return aiexecution.Held("worker_execution_proof_invalid")
@@ -64,6 +71,36 @@ func prepareWorkerExecutionProof(cfg *config.Config, n *nativeWorkerLaunch, cmd 
 		return aiexecution.Held("worker_execution_proof_unavailable")
 	}
 	return nil
+}
+
+func prepareContainedWorkerCommand(path, sha string, original *exec.Cmd) (*aiexecution.ContainedNativeCommand, error) {
+	if err := inspectWorkerExecutionProof(path, sha, original); err != nil {
+		return nil, err
+	}
+	b, err := readOwnedRegularNoFollow(path, 128<<10)
+	if err != nil {
+		return nil, aiexecution.Held("worker_execution_proof_unavailable")
+	}
+	sum := sha256.Sum256(b)
+	var proof workerExecutionProof
+	if hex.EncodeToString(sum[:]) != sha || aiexecution.DecodeStrict(b, &proof) != nil {
+		return nil, aiexecution.Held("worker_execution_proof_drift")
+	}
+	var lease tmuxsession.ProcessLease
+	raw, err := base64.RawStdEncoding.DecodeString(os.Getenv(tmuxsession.NativeProcessLeaseEnv))
+	if err != nil || len(raw) > 16<<10 || aiexecution.DecodeStrict(raw, &lease) != nil || !lease.HostRunner || lease.Unit != proof.ProcessLeaseUnit || lease.Manager != tmuxsession.ProcessLeaseManagerSystem {
+		return nil, aiexecution.Held("containment_process_lease_invalid")
+	}
+	pin, err := aiexecution.ContainmentProfilePin(proof.Policy, proof.RuntimeKey)
+	if err != nil {
+		return nil, err
+	}
+	gateway, err := aiexecution.GatewayProcessFromPolicy(proof.Policy)
+	if err != nil {
+		return nil, err
+	}
+	original.Dir = proof.Worktree
+	return aiexecution.PrepareContainedNativeCommand(pin, proof.Spec.ProjectID, proof.Spec.Role, proof.Spec.Registration.Binding.NativeSessionID, gateway, original, lease)
 }
 
 func workerExecutionProofPin(path string) (string, error) {

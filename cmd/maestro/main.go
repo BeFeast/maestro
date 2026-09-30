@@ -413,6 +413,14 @@ func main() {
 		streamSplitCmd(args)
 	case "_worker-exec":
 		workerExecCmd(args)
+	case "_native-monitor":
+		nativeContainmentCmd(false)
+	case "_native-entry":
+		nativeContainmentCmd(true)
+	case "_native-forgejo-credential":
+		nativeForgejoCredentialCmd(args)
+	case "_native-forgejo-pr":
+		nativeForgejoPullRequestCmd()
 	case "_worker-lease-cleanup":
 		workerLeaseCleanupCmd(args)
 	case "_watch-updater":

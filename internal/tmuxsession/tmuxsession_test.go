@@ -189,6 +189,30 @@ func TestProcessLeaseLaunchCommandUsesExactSystemScope(t *testing.T) {
 	}
 }
 
+func TestNativeRoleServiceAssemblyKeepsExactOwnershipWithoutLaunchingSystemd(t *testing.T) {
+	lease := ProcessLease{Unit: "maestro-native-0123456789abcdef0123456789abcdef.service", Manager: ProcessLeaseManagerSystem, HostRunner: true}
+	args, err := NativeProcessServiceArgs(lease, 1000, 1000, "/run/netns/native-slot", 2048, []string{"/usr/local/bin/maestro", "_native-monitor"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"--unit=" + lease.Unit, "--uid=1000", "--gid=1000", "--property=NetworkNamespacePath=/run/netns/native-slot", "--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=KillMode=control-group", "--property=MemoryMax=2048M", "_native-monitor"} {
+		if !containsArg(args, want) {
+			t.Fatalf("missing %s in %v", want, args)
+		}
+	}
+	host, err := processLeaseLaunchCommand(lease, "/state/runner.sh", 1000, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.Join(host, " "), "systemd-run") || !strings.Contains(strings.Join(host, " "), NativeProcessLeaseEnv+"=") {
+		t.Fatal(host)
+	}
+	lease.Manager = ProcessLeaseManagerUser
+	if _, err := NativeProcessServiceArgs(lease, 1000, 1000, "/run/netns/native-slot", 2048, []string{"/usr/local/bin/maestro"}); err == nil {
+		t.Fatal("accepted user manager")
+	}
+}
+
 func TestProcessLeaseLaunchCommandBindsScratchOnTheSameService(t *testing.T) {
 	lease := ProcessLease{
 		Unit:    "maestro-worker-0123456789abcdef0123456789abcdef-g7.service",

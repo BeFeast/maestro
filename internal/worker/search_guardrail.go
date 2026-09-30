@@ -40,6 +40,7 @@ const (
 // (0600) service file and injects its allow-listed values only into the worker
 // process at exec time. A plain `cat` of `*-run.sh` exposes names/references only.
 var workerCredentialEnvKeys = []string{
+	"MAESTRO_FORGEJO_REPOSITORY_TOKEN",
 	"ANTHROPIC_BASE_URL",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
@@ -55,6 +56,7 @@ var workerCredentialEnvKeys = []string{
 // values are secret (tokens/keys, not the plainly-public base URLs). Only these
 // are treated as canary/redaction targets when scrubbing legacy artifacts.
 var workerCredentialSecretKeys = []string{
+	"MAESTRO_FORGEJO_REPOSITORY_TOKEN",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"CLIPROXY_API_KEY",
@@ -957,6 +959,9 @@ func workerExecEnvironment(base []string, credentials map[string]string) []strin
 		blocked[key] = struct{}{}
 	}
 	blocked[workerCredentialsFileEnvVar] = struct{}{}
+	// Only the dedicated authoritative credential-file key may select the
+	// repository token. FORGEJO_TOKEN is generated inside the contained entry.
+	blocked["FORGEJO_TOKEN"] = struct{}{}
 	out := make([]string, 0, len(base)+len(credentials))
 	for _, entry := range base {
 		key, _, ok := strings.Cut(entry, "=")
@@ -996,12 +1001,14 @@ func RunWorkerWithExecutionProof(credentialsFile, proofPath, proofSHA256 string,
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = workerExecEnvironment(os.Environ(), credentials)
+	cmd.Stdin = stdin
 	if proofPath != "" || proofSHA256 != "" {
-		if err := inspectWorkerExecutionProof(proofPath, proofSHA256, cmd); err != nil {
+		contained, err := prepareContainedWorkerCommand(proofPath, proofSHA256, cmd)
+		if err != nil {
 			return err
 		}
+		cmd = contained.Cmd
 	}
-	cmd.Stdin = stdin
 	reader, writer := io.Pipe()
 	cmd.Stdout = writer
 	cmd.Stderr = writer

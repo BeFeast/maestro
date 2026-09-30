@@ -10,6 +10,8 @@ package tmuxsession
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -43,6 +45,9 @@ const (
 var startMu sync.Mutex
 
 var processLeaseUnitPattern = regexp.MustCompile(`^maestro-worker-[0-9a-f]{32}-g[1-9][0-9]*\.(scope|service)$`)
+var nativeAuxiliaryUnitPattern = regexp.MustCompile(`^maestro-native-[0-9a-f]{32}\.service$`)
+
+const NativeProcessLeaseEnv = "MAESTRO_NATIVE_PROCESS_LEASE"
 
 func ValidProcessLeaseUnit(unit string) bool {
 	return processLeaseUnitPattern.MatchString(strings.TrimSpace(unit))
@@ -71,9 +76,10 @@ type ProcessLeaseRuntime struct {
 // Manager is persisted because production workers use the system manager while
 // non-service development launches use the user manager.
 type ProcessLease struct {
-	Unit    string
-	Manager string
-	Runtime *ProcessLeaseRuntime
+	Unit       string
+	Manager    string
+	Runtime    *ProcessLeaseRuntime
+	HostRunner bool
 }
 
 // WorkerProcessLease returns the unique process boundary for one worker
@@ -243,6 +249,16 @@ func processLeaseLaunchCommand(lease ProcessLease, runnerPath string, uid int, p
 	if strings.TrimSpace(runnerPath) == "" {
 		return nil, fmt.Errorf("worker process lease requires runner path")
 	}
+	if lease.HostRunner {
+		if lease.Manager != ProcessLeaseManagerSystem || !strings.HasSuffix(lease.Unit, ".service") {
+			return nil, fmt.Errorf("native host runner requires the system service lease")
+		}
+		data, err := json.Marshal(lease)
+		if err != nil {
+			return nil, err
+		}
+		return []string{resolvedPath("env"), NativeProcessLeaseEnv + "=" + base64.RawStdEncoding.EncodeToString(data), bashPath, runnerPath}, nil
+	}
 
 	common, err := processLeaseRunArgs(lease, runnerPath, path)
 	if err != nil {
@@ -326,13 +342,52 @@ func processLeaseRunArgs(lease ProcessLease, runnerPath, path string) ([]string,
 }
 
 func validateProcessLease(lease ProcessLease) error {
-	if !ValidProcessLeaseUnit(lease.Unit) {
+	if !ValidProcessLeaseUnit(lease.Unit) && !nativeAuxiliaryUnitPattern.MatchString(lease.Unit) {
 		return fmt.Errorf("invalid worker process lease unit %q", lease.Unit)
 	}
 	if lease.Manager != ProcessLeaseManagerSystem && lease.Manager != ProcessLeaseManagerUser {
 		return fmt.Errorf("invalid worker process lease manager %q", lease.Manager)
 	}
 	return nil
+}
+
+// NativeProcessServiceArgs keeps the worker generation's existing unit and
+// scratch/cleanup ownership. Auxiliary UUID units use the same system manager
+// boundary without claiming a worker slot or a new scheduler.
+func NativeProcessServiceArgs(lease ProcessLease, uid, gid int, namespace string, memoryMaxMB int, command []string) ([]string, error) {
+	if err := validateProcessLease(lease); err != nil {
+		return nil, err
+	}
+	if lease.Manager != ProcessLeaseManagerSystem || !strings.HasSuffix(lease.Unit, ".service") || uid <= 0 || gid <= 0 || memoryMaxMB <= 0 || !filepath.IsAbs(namespace) || len(command) == 0 || !filepath.IsAbs(command[0]) {
+		return nil, fmt.Errorf("invalid native system service")
+	}
+	var args []string
+	if lease.Runtime != nil {
+		var err error
+		args, err = processLeaseRunArgs(lease, "unused-native-runner", "")
+		if err != nil {
+			return nil, err
+		}
+		args = args[:len(args)-2]
+		filtered := args[:0]
+		for _, arg := range args {
+			if !strings.HasPrefix(arg, "--property=MemoryMax=") {
+				filtered = append(filtered, arg)
+			}
+		}
+		args = filtered
+	} else if nativeAuxiliaryUnitPattern.MatchString(lease.Unit) {
+		args = []string{"--quiet", "--wait", "--pipe", "--collect", "--service-type=exec", "--unit=" + lease.Unit, "--property=Slice=" + isolatedWorkerSlice, "--property=KillMode=control-group", "--property=TimeoutStopSec=5s", "--property=OOMPolicy=stop"}
+	} else {
+		return nil, fmt.Errorf("native worker requires its existing scratch lease")
+	}
+	args = append(args, "--uid="+strconv.Itoa(uid), "--gid="+strconv.Itoa(gid),
+		"--property=NetworkNamespacePath="+namespace,
+		"--property=NoNewPrivileges=yes", "--property=CapabilityBoundingSet=", "--property=AmbientCapabilities=",
+		"--property=RestrictSUIDSGID=yes", "--property=RestrictRealtime=yes", "--property=LockPersonality=yes",
+		"--property=ProtectKernelTunables=yes", "--property=ProtectKernelModules=yes", "--property=ProtectControlGroups=yes",
+		"--property=PrivateMounts=yes", "--property=MemoryMax="+strconv.Itoa(memoryMaxMB)+"M")
+	return append(args, command...), nil
 }
 
 type processLeaseCommandRunner func(context.Context, string, ...string) ([]byte, error)

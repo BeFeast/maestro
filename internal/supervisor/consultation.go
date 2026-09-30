@@ -8,6 +8,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/google/uuid"
 )
@@ -79,23 +80,33 @@ type CandidateReceipt struct {
 // InvocationReceipt represents a successfully started local process only. It is
 // not a token record, gateway logical request, or physical upstream attempt.
 type InvocationReceipt struct {
-	OutputCheckpoint    *NativeOutputCheckpoint           `json:"output_checkpoint,omitempty"`
-	NativeSession       *NativeSessionRegistrationReceipt `json:"native_session,omitempty"`
-	ID                  string                            `json:"id"`
-	Number              int                               `json:"number"`
-	SelectedBackend     string                            `json:"selected_backend"`
-	HarnessKind         string                            `json:"harness_kind"`
-	ConfiguredModel     string                            `json:"configured_model"`
-	EffectiveCLIModel   *string                           `json:"effective_cli_model"`
-	ModelArguments      []string                          `json:"model_arguments"`
-	ModelEvidence       string                            `json:"model_evidence"`
-	UpstreamActualModel *string                           `json:"upstream_actual_model"`
-	AccountAlias        *string                           `json:"account_alias"`
-	FallbackReason      string                            `json:"fallback_reason,omitempty"`
-	RoutePolicyDecision string                            `json:"route_policy_decision"`
-	StartedAt           time.Time                         `json:"started_at"`
-	EndedAt             time.Time                         `json:"ended_at"`
-	Status              string                            `json:"status"`
+	ProcessLease               *NativeInvocationProcessLease         `json:"process_lease,omitempty"`
+	ProcessTerminationVerified bool                                  `json:"process_termination_verified,omitempty"`
+	ProcessTermination         *aiexecution.NativeProcessTermination `json:"process_termination,omitempty"`
+	ProcessTerminationDigest   string                                `json:"process_termination_digest,omitempty"`
+	OutputCheckpoint           *NativeOutputCheckpoint               `json:"output_checkpoint,omitempty"`
+	NativeSession              *NativeSessionRegistrationReceipt     `json:"native_session,omitempty"`
+	ID                         string                                `json:"id"`
+	Number                     int                                   `json:"number"`
+	SelectedBackend            string                                `json:"selected_backend"`
+	HarnessKind                string                                `json:"harness_kind"`
+	ConfiguredModel            string                                `json:"configured_model"`
+	EffectiveCLIModel          *string                               `json:"effective_cli_model"`
+	ModelArguments             []string                              `json:"model_arguments"`
+	ModelEvidence              string                                `json:"model_evidence"`
+	UpstreamActualModel        *string                               `json:"upstream_actual_model"`
+	AccountAlias               *string                               `json:"account_alias"`
+	FallbackReason             string                                `json:"fallback_reason,omitempty"`
+	RoutePolicyDecision        string                                `json:"route_policy_decision"`
+	StartedAt                  time.Time                             `json:"started_at"`
+	EndedAt                    time.Time                             `json:"ended_at"`
+	Status                     string                                `json:"status"`
+}
+
+type NativeInvocationProcessLease struct {
+	Unit    string                `json:"unit"`
+	Manager string                `json:"manager"`
+	Profile aiexecution.FileProof `json:"profile"`
 }
 
 func newConsultationIdentity(cfg *config.Config, cycle string) ConsultationIdentity {

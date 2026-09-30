@@ -18,6 +18,7 @@ import (
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/worker"
 	"github.com/google/uuid"
 )
@@ -349,6 +350,7 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		}
 		intent := uuid.NewString()
 		invocation := invocationForCommand(candidate, cmd, intent, len(receipt.Invocations)+1, fallback)
+		var contained *aiexecution.ContainedNativeCommand
 		if c.executionRole() == "reviewer" && (invocation.EffectiveCLIModel == nil || *invocation.EffectiveCLIModel != c.cfg.Supervisor.Model) {
 			if stdin != nil {
 				_ = stdin.Close()
@@ -414,6 +416,27 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 				}
 				return result, err
 			}
+			if c.cfg.AIExecution.RequireVerifiedRoute {
+				pin, err := aiexecution.ContainmentProfilePin(c.cfg.AIExecution, identity.Role)
+				if err != nil {
+					return result, err
+				}
+				gateway, err := aiexecution.GatewayProcessFromPolicy(c.cfg.AIExecution)
+				if err != nil {
+					return result, err
+				}
+				unit, err := aiexecution.NativeAuxiliaryUnit(invocation.ID)
+				if err != nil {
+					return result, err
+				}
+				lease := tmuxsession.ProcessLease{Unit: unit, Manager: tmuxsession.ProcessLeaseManagerSystem}
+				contained, err = aiexecution.PrepareContainedNativeCommand(pin, identity.ProjectID, identity.Role, invocation.ID, gateway, cmd, lease)
+				if err != nil {
+					return result, err
+				}
+				invocation.ProcessLease = &NativeInvocationProcessLease{Unit: unit, Manager: lease.Manager, Profile: pin}
+				cmd = contained.Cmd
+			}
 			receipt.Candidates[index].Status = "launch_intent"
 			if err := persist(); err != nil {
 				if stdin != nil {
@@ -460,7 +483,22 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			}
 			return result, err
 		}
-		out, launched, status, runErr := outputWithTimeoutReceiptContext(c.executionContext, cmd, timeout)
+		var stop func() error
+		if contained != nil {
+			stop = contained.StopAndVerify
+		}
+		out, launched, status, runErr := outputWithTimeoutReceiptContext(c.executionContext, cmd, timeout, stop)
+		if contained != nil && launched && status != "containment_unresolved" {
+			proof, err := aiexecution.VerifyNativeProcessTermination(invocation.ProcessLease.Profile, invocation.ID, invocation.ProcessLease.Unit)
+			if err != nil {
+				status = "containment_unresolved"
+				runErr = err
+			} else {
+				invocation.ProcessTerminationVerified = true
+				invocation.ProcessTerminationDigest = proof.Digest
+				invocation.ProcessTermination = proof
+			}
+		}
 		if stdin != nil {
 			_ = stdin.Close()
 		}
@@ -613,7 +651,7 @@ func (b *boundedNativeOutput) Write(p []byte) (int, error) {
 	return n, nil
 }
 
-func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) ([]byte, bool, string, error) {
+func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, stops ...func() error) ([]byte, bool, string, error) {
 	if ctx == nil {
 		ctx = context.Background()
 	}
@@ -621,7 +659,14 @@ func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout
 		return nil, false, "cancelled", err
 	}
 	var out boundedNativeOutput
+	stop := func() error {
+		if len(stops) == 1 && stops[0] != nil {
+			return stops[0]()
+		}
+		return nil
+	}
 	cmd.Stdout = &out
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
 		return nil, false, "start_failed", err
 	}
@@ -631,6 +676,9 @@ func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout
 	defer timer.Stop()
 	select {
 	case err := <-done:
+		if stopErr := stop(); stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
 		if out.overflow {
 			return out.Bytes(), true, "output_limit", fmt.Errorf("native output exceeded bounded receipt limit")
 		}
@@ -640,15 +688,23 @@ func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout
 		}
 		return out.Bytes(), true, status, err
 	case <-ctx.Done():
+		stopErr := stop()
 		worker.ForceKillProcessTree(cmd.Process.Pid)
 		<-done
+		if stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
 		return out.Bytes(), true, "cancelled", ctx.Err()
 	case <-timer.C:
 		// This is already a hard attempt deadline. Do not spend the worker
 		// reaper's two-second SIGTERM grace period here or the bounded fallback
 		// chain can overrun its advertised total deadline.
+		stopErr := stop()
 		worker.ForceKillProcessTree(cmd.Process.Pid)
 		<-done
+		if stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
 		return out.Bytes(), true, "timed_out", fmt.Errorf("timed out after %s", timeout.Round(time.Second))
 	}
 }

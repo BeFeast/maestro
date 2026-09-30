@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"net/url"
 	"os"
@@ -108,7 +109,7 @@ func runResearch(worktreePath string, issueNumber int, issueTitle, issueBody str
 		return context, fmt.Errorf("create research dir: %w", err)
 	}
 	outFile := filepath.Join(researchPath, fmt.Sprintf("%d.md", issueNumber))
-	if err := os.WriteFile(outFile, []byte(context), 0644); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(outFile, []byte(context), 0644); err != nil {
 		return context, fmt.Errorf("write research file: %w", err)
 	}
 	log.Printf("[pipeline] research: wrote context to %s (%d bytes)", outFile, len(context))
@@ -453,7 +454,7 @@ func listGoSourceFiles(worktreePath string) []string {
 
 func findSymbolTokenPosition(worktreePath string, files []string, symbol string) (string, int, int, bool) {
 	for _, rel := range files {
-		data, err := os.ReadFile(filepath.Join(worktreePath, rel))
+		data, err := aiexecution.ReadWorkspaceFile(filepath.Join(worktreePath, rel))
 		if err != nil {
 			continue
 		}
@@ -664,7 +665,7 @@ func isSourceExt(ext string) bool {
 
 // readFileHead reads the first N lines of a file.
 func readFileHead(path string, lines int) string {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return ""
 	}
@@ -676,7 +677,7 @@ func readFileHead(path string, lines int) string {
 }
 
 func readFileWindow(path string, centerLine, radius int) string {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil || centerLine <= 0 {
 		return ""
 	}
