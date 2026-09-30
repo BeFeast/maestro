@@ -345,6 +345,15 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	owner, err := claimControllerForCommand(cmd, args, acquireControllerOwner)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if owner != nil {
+		defer owner.Close()
+	}
+
 	switch cmd {
 	case "init":
 		initCmd(args)
@@ -966,13 +975,9 @@ func superviseCmd(args []string) {
 	}
 
 	fs := flag.NewFlagSet("supervise", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
-	storePath, storeProject := configStoreFlags(fs)
-	once := fs.Bool("once", false, "Run once and exit")
-	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
-	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
-	dryRun := fs.Bool("dry-run", false, "Compute decision without recording state")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path used for durable delivery claims")
+	flags := addSuperviseFlags(fs, approvalstore.DefaultDBPath())
+	configPath, storePath, storeProject := flags.configPath, flags.storePath, flags.storeProject
+	once, interval, jsonOutput, dryRun, approvalsDB := flags.once, flags.interval, flags.jsonOutput, flags.dryRun, flags.approvalsDB
 	fs.Parse(args)
 	if fs.NArg() > 0 {
 		subcmd := fs.Arg(0)
