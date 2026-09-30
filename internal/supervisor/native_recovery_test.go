@@ -11,6 +11,7 @@ import (
 	"github.com/befeast/maestro/internal/admissioncontrol"
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
+	"github.com/google/uuid"
 )
 
 func plannedNativeFixture(t *testing.T) (*config.Config, string, *auxiliaryFixture, ConsultationIdentity, *nativeTermination) {
@@ -25,7 +26,8 @@ func plannedNativeFixture(t *testing.T) (*config.Config, string, *auxiliaryFixtu
 	inv := receipt.Invocations[0]
 	inv.NativeSession.Outcome, inv.NativeSession.OutcomeIntent = nil, nil
 	inv.ProcessLease = &NativeInvocationProcessLease{Unit: "maestro-native-" + strings.ReplaceAll(inv.ID, "-", "") + ".service", Manager: "system", Profile: aiexecution.FileProof{Path: "/fixture/original-profile", SHA256: strings.Repeat("b", 64)}}
-	proof := &nativeTermination{Profile: inv.ProcessLease.Profile, NativeSessionID: inv.ID, Unit: inv.ProcessLease.Unit, StartedAt: inv.StartedAt, EndedAt: inv.EndedAt, LocalStatus: "succeeded", Digest: strings.Repeat("c", 64)}
+	proof := &nativeTermination{Version: 1, Profile: inv.ProcessLease.Profile, NativeSessionID: inv.ID, Unit: inv.ProcessLease.Unit, Cgroup: "/system.slice/" + inv.ProcessLease.Unit, BootID: uuid.NewString(), InvocationID: strings.Repeat("c", 32), StartedAt: inv.StartedAt, EndedAt: inv.EndedAt, LocalStatus: "succeeded"}
+	proof.Digest = nativeHash(*proof)
 	inv.StartedAt, inv.EndedAt, inv.Status, inv.OutputCheckpoint = time.Time{}, time.Time{}, "", nil
 	receipt.PlannedInvocation = &inv
 	receipt.Invocations = nil
@@ -69,6 +71,9 @@ func TestNativePlannedCrashRestoresExactOrphanCheckpoint(t *testing.T) {
 func TestNativePlannedCrashMissingOutputReleasesSettledOccupancyWithoutSuccess(t *testing.T) {
 	cfg, count, aux, id, proof := plannedNativeFixture(t)
 	proof.LocalStatus = "local_output_unknown"
+	proof.ExitCode = -1
+	proof.Digest = ""
+	proof.Digest = nativeHash(*proof)
 	path := filepath.Join(cfg.StateDir, "supervisor-consultations", proof.NativeSessionID+".output.json")
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
@@ -149,6 +154,9 @@ func TestNativeKnownTerminationPreservesPartialTimeoutAndContainmentOutputAsFail
 		t.Run(status, func(t *testing.T) {
 			cfg, count, aux, id, proof := plannedNativeFixture(t)
 			proof.LocalStatus = "failed"
+			proof.ExitCode = 1
+			proof.Digest = ""
+			proof.Digest = nativeHash(*proof)
 			receipt := loadReceipt(t, cfg)
 			inv := *receipt.PlannedInvocation
 			inv.StartedAt, inv.EndedAt, inv.Status = proof.StartedAt, proof.EndedAt, status
@@ -177,6 +185,52 @@ func TestNativeKnownTerminationPreservesPartialTimeoutAndContainmentOutputAsFail
 			out, err := store.loadNativeOutput(id, saved)
 			if err != nil || string(out) != "partial prefix" || saved.OutputCheckpoint.Complete || status == "containment_unresolved" && saved.Status != "local_output_unknown" {
 				t.Fatal("partial prefix was lost or upgraded", err)
+			}
+		})
+	}
+}
+
+func TestNativeCompletedSnapshotSurvivesProfileRotationButUnresolvedDoesNot(t *testing.T) {
+	for _, completed := range []bool{true, false} {
+		t.Run(map[bool]string{true: "completed", false: "unresolved"}[completed], func(t *testing.T) {
+			cfg, count, aux, id, _ := plannedNativeFixture(t)
+			sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				return nativeOutcomeFixture(request, false), nil
+			}
+			if completed {
+				if _, err := ReconcileNativeConsultation(cfg, id, "prompt"); err != nil {
+					t.Fatal(err)
+				}
+			}
+			liveChecks := 0
+			verifyNativeTermination = func(aiexecution.FileProof, string, string) (*nativeTermination, error) {
+				liveChecks++
+				return nil, errors.New("original profile and systemctl rotated")
+			}
+			result, err := ReconcileNativeConsultation(cfg, id, "prompt")
+			if completed {
+				if err != nil || result.Output != "done" || liveChecks != 0 {
+					t.Fatal("completed result depended on retired process configuration", err)
+				}
+				if err := NativeAuxiliaryOutcomeComplete(cfg.StateDir, id.ID); err != nil {
+					t.Fatal("completed occupancy could not release after rotation", err)
+				}
+				pending, err := PendingAuxiliaryRuns(cfg.StateDir)
+				if err != nil || len(pending) != 0 || liveChecks != 0 {
+					t.Fatal("old completed receipt froze shared capacity", err)
+				}
+				// The controller validates the full saved OS snapshot independently.
+				receipt := loadReceipt(t, cfg)
+				receipt.Invocations[0].ProcessTermination.InvocationID = strings.Repeat("d", 32)
+				_ = (&consultationStore{dir: filepath.Join(cfg.StateDir, "supervisor-consultations")}).save(&receipt)
+				if err := NativeAuxiliaryOutcomeComplete(cfg.StateDir, id.ID); err == nil {
+					t.Fatal("corrupt saved OS proof released capacity")
+				}
+			} else if err == nil || result.Output != "" || liveChecks == 0 || aux.released.Load() != 0 {
+				t.Fatal("unresolved process bypassed original profile drift", err)
+			}
+			if nativeCalls(t, count) != 1 {
+				t.Fatal("recovery generated inference")
 			}
 		})
 	}

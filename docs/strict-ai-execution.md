@@ -86,6 +86,12 @@ restored without inference. Missing output becomes a durable
 `local_output_unknown` record, never an invented empty successful answer. A
 timeout or unresolved containment with a preserved prefix remains a local
 failure even after terminal process and financial proof release occupancy.
+The full validated OS terminal snapshot is saved with its digest before
+financial completion. A completed receipt validates that durable snapshot and
+the financial proof without rereading retired profiles, binaries or cgroups;
+ordinary profile rotation cannot reclaim or freeze its released occupancy.
+An unresolved invocation still requires a fresh observation through its original
+pinned profile and remains held if that evidence is unavailable.
 
 `ReconcileNativeConsultation(cfg, identity, prompt)` and re-entry with the same
 identity/input reconcile only saved native bindings. They never acquire another

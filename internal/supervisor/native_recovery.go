@@ -5,26 +5,16 @@ import (
 	"errors"
 	"os"
 	"strings"
-	"time"
 
 	"github.com/befeast/maestro/internal/aiexecution"
 )
 
-type nativeTermination struct {
-	Profile               aiexecution.FileProof
-	NativeSessionID, Unit string
-	StartedAt, EndedAt    time.Time
-	LocalStatus, Digest   string
-}
+type nativeTermination = aiexecution.NativeProcessTermination
 
 // No local exit, missing unit, saved bool, or authority financial outcome can
 // substitute for the original containment verifier's kernel observation.
 var verifyNativeTermination = func(profile aiexecution.FileProof, nativeID, unit string) (*nativeTermination, error) {
-	proof, err := aiexecution.VerifyNativeProcessTermination(profile, nativeID, unit)
-	if err != nil {
-		return nil, err
-	}
-	return &nativeTermination{Profile: proof.Profile, NativeSessionID: proof.NativeSessionID, Unit: proof.Unit, StartedAt: proof.StartedAt, EndedAt: proof.EndedAt, LocalStatus: proof.LocalStatus, Digest: proof.Digest}, nil
+	return aiexecution.VerifyNativeProcessTermination(profile, nativeID, unit)
 }
 
 func nativeDigest(value string) bool {
@@ -39,9 +29,7 @@ func checkNativeTermination(inv InvocationReceipt) (*nativeTermination, error) {
 		return nil, hold
 	}
 	proof, err := verifyNativeTermination(lease.Profile, inv.ID, lease.Unit)
-	if err != nil || proof == nil || proof.Profile != lease.Profile || proof.NativeSessionID != inv.ID || proof.Unit != lease.Unit ||
-		proof.StartedAt.IsZero() || proof.EndedAt.Before(proof.StartedAt) || !nativeDigest(proof.Digest) ||
-		(proof.LocalStatus != "succeeded" && proof.LocalStatus != "failed" && proof.LocalStatus != "local_output_unknown") ||
+	if err != nil || proof == nil || aiexecution.ValidateNativeProcessTermination(*proof, lease.Profile, inv.ID, lease.Unit) != nil ||
 		(inv.ProcessTerminationDigest != "" && proof.Digest != inv.ProcessTerminationDigest) {
 		return nil, hold
 	}
@@ -89,6 +77,7 @@ func recoverNativeInvocationOutput(store *consultationStore, receipt *Consultati
 	inv.StartedAt, inv.EndedAt = proof.StartedAt, proof.EndedAt
 	inv.ProcessTerminationVerified = true
 	inv.ProcessTerminationDigest = proof.Digest
+	inv.ProcessTermination = proof
 	record, err := store.readNativeOutputRecord(receipt.Identity, *inv)
 	if errors.Is(err, os.ErrNotExist) {
 		if inv.OutputCheckpoint != nil {

@@ -83,7 +83,10 @@ func validNativeInvocation(receipt *ConsultationReceipt, inv *InvocationReceipt)
 		return false
 	}
 	if inv.ProcessLease != nil && (inv.ProcessLease.Unit != "maestro-native-"+strings.ReplaceAll(inv.ID, "-", "")+".service" ||
-		inv.ProcessLease.Manager != "system" || !inv.ProcessTerminationVerified || !nativeDigest(inv.ProcessTerminationDigest)) {
+		inv.ProcessLease.Manager != "system" || !inv.ProcessTerminationVerified || inv.ProcessTermination == nil ||
+		inv.ProcessTerminationDigest != inv.ProcessTermination.Digest ||
+		aiexecution.ValidateNativeProcessTermination(*inv.ProcessTermination, inv.ProcessLease.Profile, inv.ID, inv.ProcessLease.Unit) != nil ||
+		inv.Status == "succeeded" && inv.ProcessTermination.LocalStatus != "succeeded") {
 		return false
 	}
 	if native.OutcomeIntent != nil && (native.OutcomeIntent.Binding != native.Request.Binding || native.OutcomeIntent.RegistrationVersion != native.Acknowledgement.RegistrationVersion) {
@@ -349,6 +352,9 @@ func replayNativeConsultation(cfg *config.Config, identity ConsultationIdentity,
 	if !nativeDigest(receipt.InputDigest) || (!priorRun && (receipt.Identity != identity || receipt.InputDigest != nativeInputDigest(cfg, identity, prompt))) {
 		return result, true, aiexecution.Held("native_input_conflict")
 	}
+	if len(receipt.Invocations) > 32 || len(receipt.Invocations) == 32 && receipt.PlannedInvocation != nil {
+		return result, true, aiexecution.Held("native_outcome_unverified")
+	}
 	if _, err := readAuxiliaryReceipt(cfg.StateDir, "registration.json"); err == nil || !errors.Is(err, os.ErrNotExist) {
 		return result, true, &ConsultationHold{Code: "unresolved_registration_intent"}
 	}
@@ -372,7 +378,7 @@ func replayNativeConsultation(cfg *config.Config, identity ConsultationIdentity,
 	}
 	for i := range receipt.Invocations {
 		inv := &receipt.Invocations[i]
-		if inv.ProcessLease != nil && (!inv.ProcessTerminationVerified || inv.ProcessTerminationDigest == "" || inv.Status == "containment_unresolved") {
+		if inv.ProcessLease != nil && (!inv.ProcessTerminationVerified || inv.ProcessTermination == nil || inv.ProcessTerminationDigest == "" || inv.Status == "containment_unresolved") {
 			if !current || !marker || receipt.NativeOutcomeComplete {
 				return result, true, aiexecution.Held("native_process_termination_unverified")
 			}
@@ -394,7 +400,7 @@ func replayNativeConsultation(cfg *config.Config, identity ConsultationIdentity,
 		if !validNativeInvocation(receipt, &inv) {
 			return result, true, aiexecution.Held("native_outcome_unverified")
 		}
-		if inv.ProcessLease != nil {
+		if inv.ProcessLease != nil && !receipt.NativeOutcomeComplete {
 			if _, err := checkNativeTermination(inv); err != nil {
 				return result, true, err
 			}
@@ -480,11 +486,6 @@ func NativeAuxiliaryOutcomeComplete(stateDir, roleRunID string) error {
 		return aiexecution.Held("native_outcome_unverified")
 	}
 	for _, inv := range receipt.Invocations {
-		if inv.ProcessLease != nil {
-			if _, err := checkNativeTermination(inv); err != nil {
-				return err
-			}
-		}
 		if _, err := store.loadNativeOutput(receipt.Identity, inv); err != nil {
 			return err
 		}
