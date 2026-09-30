@@ -90,7 +90,7 @@ type Orchestrator struct {
 	reviewProduceMu       sync.Mutex
 	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
-	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
+	reviewProduceFn       func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -8019,7 +8019,7 @@ func (o *Orchestrator) deliveryRevisionContains(ancestor, descendant string) (bo
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
-	contains, err := approver.RevisionContains(ctx, o.cfg.Repo, o.cfg.LocalPath, ancestor, descendant)
+	contains, err := approver.RevisionContains(ctx, o.cfg.Repo, o.cfg.LocalPath, ancestor, descendant, o.cfg.Forge)
 	if err != nil {
 		return false, fmt.Errorf("check delivery revision ancestry in isolated canonical repository: %w", err)
 	}

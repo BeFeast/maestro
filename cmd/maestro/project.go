@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -306,60 +305,8 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 // HTTP(S) additionally binds the web port and optional instance path prefix.
 // DNS/IP aliases are deliberately not inferred or resolved.
 func remoteMatchesRepo(remote, repo string, forge config.ForgeConfig) bool {
-	base := &url.URL{Scheme: "https", Host: "github.com"}
-	if forge.IsForgejo() {
-		var err error
-		base, err = url.Parse(forge.BaseURL)
-		if err != nil || base.Hostname() == "" || (base.Scheme != "http" && base.Scheme != "https") || base.User != nil || base.RawQuery != "" || base.Fragment != "" {
-			return false
-		}
-	} else if forge.EffectiveKind() != config.ForgeKindGitHub {
-		return false
-	}
-	want := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(repo), "/"), ".git"))
-	r := strings.TrimSpace(remote)
-	// Only the conventional git user is accepted for SCP syntax, preserving
-	// the existing GitHub contract. A URL is parsed separately below.
-	if !strings.Contains(r, "://") && strings.HasPrefix(strings.ToLower(r), "git@") {
-		host, path, ok := strings.Cut(r[len("git@"):], ":")
-		return ok && strings.EqualFold(host, base.Hostname()) && strings.TrimSuffix(strings.ToLower(path), ".git") == want
-	}
-	u, err := url.Parse(r)
-	if err != nil || !strings.EqualFold(u.Hostname(), base.Hostname()) || u.RawQuery != "" || u.Fragment != "" || u.Opaque != "" {
-		return false
-	}
-	remotePath := u.Path
-	switch strings.ToLower(u.Scheme) {
-	case "https", "http":
-		if forge.IsForgejo() {
-			if !strings.EqualFold(u.Scheme, base.Scheme) || remoteWebPort(u) != remoteWebPort(base) {
-				return false
-			}
-			prefix := strings.Trim(base.Path, "/")
-			if prefix != "" {
-				var ok bool
-				remotePath, ok = strings.CutPrefix(remotePath, "/"+prefix+"/")
-				if !ok {
-					return false
-				}
-			}
-		}
-	case "ssh", "git":
-	default:
-		return false
-	}
-	got := strings.TrimSuffix(strings.ToLower(strings.Trim(remotePath, "/")), ".git")
-	return got == want
-}
-
-func remoteWebPort(u *url.URL) string {
-	if port := u.Port(); port != "" {
-		return port
-	}
-	if strings.EqualFold(u.Scheme, "https") {
-		return "443"
-	}
-	return "80"
+	identity, err := forge.RepositoryIdentity(repo)
+	return err == nil && identity.MatchesOrigin(remote, false)
 }
 
 // planReport previews prepared against the store at dbPath without any write. A

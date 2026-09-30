@@ -910,6 +910,8 @@ type DeliveryConfig struct {
 	// but it participates in ApprovalDigest: moving the checkout changes what
 	// source and scripts would execute and therefore requires a fresh approval.
 	LocalPath string `yaml:"-" json:"-"`
+	// Forge is runtime-only canonical source identity, never an approval fetch URL.
+	Forge ForgeConfig `yaml:"-" json:"-"`
 }
 
 // deliveryTimeoutDefaultMinutes is the fallback delivery timeout.
@@ -935,6 +937,7 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 		return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: deliveryTimeoutDefaultMinutes}
 	}
 	d := c.Delivery
+	d.Forge = c.Forge
 	if d.configured() {
 		if strings.TrimSpace(string(d.Mode)) == "" {
 			if strings.TrimSpace(d.Command) != "" {
@@ -953,9 +956,10 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 			Command:        c.DeployCmd,
 			TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes),
 			LocalPath:      c.LocalPath,
+			Forge:          c.Forge,
 		}
 	}
-	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes), LocalPath: c.LocalPath}
+	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes), LocalPath: c.LocalPath, Forge: c.Forge}
 }
 
 // configured reports whether the operator set any field of the delivery block.
@@ -989,9 +993,14 @@ func (d DeliveryConfig) EffectiveApprovalTimeout() time.Duration {
 
 // ApprovalDigest binds the exact execution-relevant delivery configuration to
 // the approval without persisting the raw command as an executable payload.
-// Any command, verifier, timeout, mode, target, or rollback drift requires a
-// fresh approval before execution.
+// Any command, verifier, timeout, mode, target, rollback, or canonical forge
+// drift requires a fresh approval before execution. Credentials and the token
+// environment-variable name are not execution identity and never enter it.
 func (d DeliveryConfig) ApprovalDigest() string {
+	base, err := d.Forge.CanonicalBaseURL()
+	if err != nil {
+		base = "invalid:" + d.Forge.BaseURL
+	}
 	parts := []string{
 		string(d.Mode),
 		d.Command,
@@ -1004,6 +1013,13 @@ func (d DeliveryConfig) ApprovalDigest() string {
 		d.VerificationLabel,
 		d.RollbackLabel,
 		d.LocalPath,
+	}
+	// The historical materializer was fixed to canonical GitHub, so its digest
+	// already implied that identity. Preserve those approvals without rewriting
+	// rows. A non-default forge must bind its identity explicitly; old Forgejo
+	// approvals therefore become stale, while executing leases remain intact.
+	if d.Forge.EffectiveKind() != ForgeKindGitHub || err != nil {
+		parts = append([]string{"delivery-source/v2", d.Forge.EffectiveKind(), base}, parts...)
 	}
 	var canonical strings.Builder
 	for _, part := range parts {

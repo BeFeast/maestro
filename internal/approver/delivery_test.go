@@ -990,7 +990,7 @@ func TestGitIsolatedPreparer_RejectsMismatchedSourceOriginBeforeFetch(t *testing
 	testGit(t, filepath.Dir(source), "init", source)
 	testGit(t, source, "remote", "add", "origin", "https://github.com/attacker/wrong.git")
 	_, err := (gitIsolatedPreparer{expectedRepo: "owner/app"}).Prepare(context.Background(), source, strings.Repeat("a", 40))
-	if err == nil || !strings.Contains(err.Error(), "does not match the approved GitHub repository") {
+	if err == nil || !strings.Contains(err.Error(), "does not match the approved forge repository") {
 		t.Fatalf("Prepare mismatch error = %v", err)
 	}
 }
