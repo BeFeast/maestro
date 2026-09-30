@@ -11,6 +11,14 @@ import (
 func TestNativeForgejoCredentialProjectIsolationAndSnapshot(t *testing.T) {
 	// /tmp is intentionally rejected by the production parent-path check.
 	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	// testing.T creates its per-test parent with MkdirAll; normalize that
+	// test-owned ancestor too when the caller uses a permissive umask.
+	if err := os.Chmod(filepath.Dir(dir), 0700); err != nil {
+		t.Fatal(err)
+	}
 	profiles := make([]NativeContainmentProfile, 0, 2)
 	for _, repo := range []string{"hedroom", "halenote"} {
 		b, _ := json.Marshal(map[string]any{"version": 1, "repository": "BeFeast/" + repo, "token": repo + "-private"})
