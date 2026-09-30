@@ -105,7 +105,7 @@ func runResearch(worktreePath string, issueNumber int, issueTitle, issueBody str
 
 	// Write research file
 	researchPath := filepath.Join(worktreePath, researchDir)
-	if err := os.MkdirAll(researchPath, 0755); err != nil {
+	if err := aiexecution.MkdirWorkspaceAll(researchPath, 0755); err != nil {
 		return context, fmt.Errorf("create research dir: %w", err)
 	}
 	outFile := filepath.Join(researchPath, fmt.Sprintf("%d.md", issueNumber))
@@ -249,6 +249,9 @@ func findRelevantFiles(worktreePath string, keywords []string) []relevantFile {
 }
 
 func findSymbolContexts(worktreePath, issueTitle, issueBody string) ([]symbolContext, error) {
+	if aiexecution.NativeGitRegistered(worktreePath) {
+		return nil, aiexecution.Held("native_symbol_context_requires_native_tool")
+	}
 	if _, err := os.Stat(filepath.Join(worktreePath, "go.mod")); err != nil {
 		return nil, fmt.Errorf("not a Go module")
 	}

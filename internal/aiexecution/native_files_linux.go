@@ -1,10 +1,12 @@
 package aiexecution
 
 import (
+	"errors"
 	"golang.org/x/sys/unix"
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 	"syscall"
 )
 
@@ -75,4 +77,38 @@ func WriteWorkspaceFile(path string, data []byte, mode os.FileMode) error {
 	defer f.Close()
 	_, err = f.Write(data)
 	return err
+}
+
+func MkdirWorkspaceAll(path string, mode os.FileMode) error {
+	root := nativeGitRoot(path)
+	if root == "" {
+		return os.MkdirAll(path, mode)
+	}
+	fd, err := unix.Openat2(unix.AT_FDCWD, root, &unix.OpenHow{Flags: unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_NO_SYMLINKS})
+	if err != nil {
+		return err
+	}
+	defer func() { unix.Close(fd) }()
+	rel, err := filepath.Rel(root, path)
+	if err != nil {
+		return err
+	}
+	for _, part := range strings.Split(rel, string(filepath.Separator)) {
+		if part == "." || part == "" {
+			continue
+		}
+		if part == ".." {
+			return Held("native_workspace_path_unsafe")
+		}
+		if err := unix.Mkdirat(fd, part, uint32(mode.Perm())); err != nil && !errors.Is(err, unix.EEXIST) {
+			return err
+		}
+		next, err := unix.Openat2(fd, part, &unix.OpenHow{Flags: unix.O_PATH | unix.O_DIRECTORY | unix.O_CLOEXEC, Resolve: unix.RESOLVE_BENEATH | unix.RESOLVE_NO_SYMLINKS})
+		if err != nil {
+			return err
+		}
+		unix.Close(fd)
+		fd = next
+	}
+	return nil
 }

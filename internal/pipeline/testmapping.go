@@ -33,7 +33,7 @@ func mapTests(issueNumber int, issueTitle, issueBody, worktreePath, plan string)
 
 	// Generate verify.sh
 	verifyPath := filepath.Join(worktreePath, ".maestro", "verify.sh")
-	if err := os.MkdirAll(filepath.Dir(verifyPath), 0755); err != nil {
+	if err := aiexecution.MkdirWorkspaceAll(filepath.Dir(verifyPath), 0755); err != nil {
 		return "", "", fmt.Errorf("create verify dir: %w", err)
 	}
 

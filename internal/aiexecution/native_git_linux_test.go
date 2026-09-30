@@ -109,4 +109,19 @@ func TestNativeWorkspaceSymlinksNeverReadOrOverwriteHostFiles(t *testing.T) {
 	if err != nil || string(got) != "checkpoint" {
 		t.Fatal(string(got), err)
 	}
+	outside := t.TempDir()
+	directoryLink := filepath.Join(repo, ".maestro")
+	if err := os.Symlink(outside, directoryLink); err != nil {
+		t.Fatal(err)
+	}
+	if err := MkdirWorkspaceAll(filepath.Join(directoryLink, "research"), 0700); err == nil {
+		t.Fatal("directory symlink followed")
+	}
+	if _, err := os.Stat(filepath.Join(outside, "research")); !os.IsNotExist(err) {
+		t.Fatal("created directory outside clone")
+	}
+	os.Remove(directoryLink)
+	if err := MkdirWorkspaceAll(filepath.Join(directoryLink, "research"), 0700); err != nil {
+		t.Fatal(err)
+	}
 }

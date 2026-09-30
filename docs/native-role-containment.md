@@ -74,6 +74,9 @@ executables/filter live outside the writable clone and survive deletion of
 `.git`. Checkpoint/prompt/pipeline artifact file access uses beneath-root
 `openat2` with no symlinks. Missing native clones are retained as a recovery
 hold rather than reconstructed from an unrelated parent branch.
+Directory creation uses the same beneath-root boundary. Host `gopls` context
+and configured visual shell commands do not run against native clones;
+filename research remains available and native tools perform those operations.
 
 Host recovery can inspect, switch, checkpoint and commit locally. Host-side
 network Git operations on these clones return
