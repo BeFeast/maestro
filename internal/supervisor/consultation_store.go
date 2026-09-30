@@ -39,6 +39,10 @@ func openConsultationStore(stateDir string) (*consultationStore, func(), error) 
 		unlock()
 		return nil, nil, &ConsultationHold{Code: "receipt_invalid"}
 	}
+	if hasNativeSession(&previous) && (!previous.NativeOutcomeComplete || !nativeInvocationsAllowed(&previous)) {
+		unlock()
+		return nil, nil, &ConsultationHold{Code: "unresolved_native_outcome"}
+	}
 	for _, c := range previous.Candidates {
 		if c.Status == "launch_intent" || c.Status == "registration_intent" {
 			unlock()
@@ -61,6 +65,10 @@ func openConsultationStore(stateDir string) (*consultationStore, func(), error) 
 // Reconciliation takes the same writer lock and may inspect pending registration,
 // but a launch marker always blocks it: registration cannot settle inference.
 func lockConsultationStore(stateDir string) (*consultationStore, func(), error) {
+	return lockConsultationStoreMode(stateDir, false)
+}
+
+func lockConsultationStoreMode(stateDir string, allowLaunch bool) (*consultationStore, func(), error) {
 	dir := filepath.Join(stateDir, "supervisor-consultations")
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		return nil, nil, err
@@ -82,10 +90,10 @@ func lockConsultationStore(stateDir string) (*consultationStore, func(), error) 
 	// Keep a separate durable launch marker until the outcome is fsynced.
 	// Even a rename-success/fsync-failure while saving current must not permit
 	// the next process to interpret that uncertain write as a cleared intent.
-	if _, err := os.Stat(filepath.Join(dir, "launch.json")); err == nil {
+	if _, err := os.Stat(filepath.Join(dir, "launch.json")); err == nil && !allowLaunch {
 		unlock()
 		return nil, nil, &ConsultationHold{Code: "unresolved_launch_intent"}
-	} else if !errors.Is(err, os.ErrNotExist) {
+	} else if err != nil && !errors.Is(err, os.ErrNotExist) {
 		unlock()
 		return nil, nil, err
 	}

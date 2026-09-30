@@ -4066,12 +4066,28 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 
 	reconciled := false
 	for slotName, sess := range s.Sessions {
+		if sess.NativeRoleRunID != "" && sess.NativeRegistrationHold == "" {
+			if started, err := worker.NativeWorkerSealStarted(o.cfg.StateDir, slotName, sess); err == nil && started {
+				sess.NativeRegistrationHold = "native_generation_sealed"
+				reconciled = true
+			}
+		}
 		if sess.NativeRegistrationHold != "" {
 			wasRunning := sess.Status == state.StatusRunning
 			if err := worker.ReconcileNativeWorkerTermination(o.cfg, slotName, sess); err != nil {
 				log.Printf("[orch] native held OS termination unresolved for %s", slotName)
 			} else if wasRunning && sess.Status != state.StatusRunning {
 				reconciled = true
+			}
+			if sess.NativeRegistrationHold == "previous_outcome_unknown" || sess.NativeRegistrationHold == "native_generation_sealed" {
+				terminal, terminalErr := worker.NativeSessionProcessTerminal(o.cfg.StateDir, slotName, sess)
+				if terminalErr == nil && terminal {
+					receipt, outcomeErr := worker.ReconcileNativeWorkerOutcome(o.cfg, slotName, sess.WorkerGeneration)
+					if outcomeErr == nil && receipt.Outcome != nil && receipt.Outcome.NextGenerationAllowed {
+						sess.NativeRegistrationHold = ""
+						reconciled = true
+					}
+				}
 			}
 			continue
 		}

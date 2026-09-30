@@ -199,6 +199,11 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 	if strings.TrimSpace(c.cfg.StateDir) == "" {
 		return result, &ConsultationHold{Code: "receipt_store_unavailable"}
 	}
+	if c.cfg.Supervisor.NativeSessionRegistration != nil {
+		if previous, found, err := replayNativeConsultation(c.cfg, identity, prompt); found || err != nil {
+			return previous, err
+		}
+	}
 	store, unlock, err := openConsultationStore(c.cfg.StateDir)
 	if err != nil {
 		var hold *ConsultationHold
@@ -214,6 +219,9 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		return result, &ConsultationHold{Code: "receipt_store_unavailable"}
 	}
 	receipt := newConsultationReceipt(c.cfg, identity)
+	if c.cfg.Supervisor.NativeSessionRegistration != nil {
+		receipt.InputDigest = nativeInputDigest(c.cfg, identity, prompt)
+	}
 	result.Receipt = receipt
 	save := store.save
 	if c.receiptSave != nil {
@@ -253,6 +261,11 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		if errors.As(retErr, &nativeHold) && nativeHold.Code == "native_outcome_unverified" {
 			return
 		}
+		if hasNativeInvocations(receipt) && !nativeInvocationsAllowed(receipt) {
+			result.Output = ""
+			retErr = aiexecution.Held("native_outcome_unverified")
+			return
+		}
 		end := time.Now().UTC()
 		receipt.EndedAt = &end
 		if retErr != nil {
@@ -260,6 +273,7 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		} else {
 			receipt.Status = "succeeded"
 		}
+		receipt.NativeOutcomeComplete = hasNativeInvocations(receipt)
 		if err := persist(); err != nil {
 			result.Output = ""
 			retErr = err
@@ -521,10 +535,9 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			return result, err
 		}
 		if invocation.NativeSession != nil && launched {
-			// Every local outcome, including exit 0, is financially unresolved
-			// until the authority outcome bridge proves a terminal result for
-			// this exact role-run. Keep its durable marker and auxiliary permit.
-			return result, aiexecution.Held("native_outcome_unverified")
+			if err := sealNativeInvocations(c.cfg, receipt, persist); err != nil {
+				return result, err
+			}
 		}
 		if runErr == nil {
 			c.memory.recordSuccess(candidate.name)

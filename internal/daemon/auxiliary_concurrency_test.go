@@ -1,13 +1,19 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
+	"github.com/befeast/maestro/internal/admissioncontrol"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/google/uuid"
@@ -16,6 +22,91 @@ import (
 type auxiliaryTestStore struct {
 	fleetConcurrencyTestStore
 	dirs map[string]bool
+}
+
+func TestAuxiliaryNativeOutcomeRecoveryRetainsUnknownPermitAndReleasesOnlyVerifiedSnapshot(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.Chmod(dir, 0700)
+	store := &auxiliaryTestStore{fleetConcurrencyTestStore: fleetConcurrencyTestStore{settings: config.FleetConcurrencySettings{MaxAuxiliaryRuns: 1}}}
+	l := newFleetSpawnLimiter(store)
+	l.RegisterStateDir(dir)
+	id, nativeID := uuid.NewString(), uuid.NewString()
+	if _, err := l.ReserveAuxiliary(dir, id); err != nil {
+		t.Fatal(err)
+	}
+	if err := l.ReconcileAuxiliary(dir, id); err == nil {
+		t.Fatal("missing proof released memory permit")
+	}
+	if _, err := l.ReserveAuxiliary(dir, uuid.NewString()); err == nil {
+		t.Fatal("unknown role lost capacity")
+	}
+	now := time.Now().UTC()
+	request := admissioncontrol.RegistrationRequest{Binding: admissioncontrol.Binding{GatewayScope: "gateway", NativeSessionID: nativeID, FleetID: "fleet", ProjectID: "project", RunID: "budget", Role: "supervisor", ExpiresAt: now.Unix() + 60}, ExpectedVersion: 1}
+	seal := admissioncontrol.SealRequest{Binding: request.Binding, RegistrationVersion: 1}
+	outcome := admissioncontrol.NativeOutcome{Binding: request.Binding, RegistrationVersion: 1, Sealed: true, Outcome: "settled", NextGenerationAllowed: true, PhysicalAttempts: 1, TerminalAttempts: 1, AttemptsDigest: strings.Repeat("a", 64)}
+	body, _ := json.Marshal(outcome)
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.UseNumber()
+	var object map[string]any
+	_ = decoder.Decode(&object)
+	delete(object, "snapshot_digest")
+	delete(object, "evidence_id")
+	var canonical bytes.Buffer
+	encoder := json.NewEncoder(&canonical)
+	encoder.SetEscapeHTML(false)
+	_ = encoder.Encode(object)
+	digest := sha256.Sum256(bytes.TrimSuffix(canonical.Bytes(), []byte("\n")))
+	outcome.SnapshotDigest = hex.EncodeToString(digest[:])
+	outcome.EvidenceID = "native-outcome-v1:" + outcome.SnapshotDigest
+	data := []byte("saved output")
+	hash := sha256.Sum256(data)
+	sha := hex.EncodeToString(hash[:])
+	filename := nativeID + ".output.json"
+	// This is the public on-disk checkpoint protocol, independent from process state.
+	record := struct {
+		Version         int    `json:"version"`
+		RoleRunID       string `json:"role_run_id"`
+		InvocationID    string `json:"invocation_id"`
+		NativeSessionID string `json:"native_session_id"`
+		Status          string `json:"local_status"`
+		SHA256          string `json:"sha256"`
+		Complete        bool   `json:"complete"`
+		Truncated       bool   `json:"truncated"`
+		Data            []byte `json:"data"`
+	}{1, id, nativeID, nativeID, "succeeded", sha, true, false, data}
+	body, _ = json.Marshal(record)
+	root := filepath.Join(dir, "supervisor-consultations")
+	_ = os.MkdirAll(root, 0700)
+	_ = os.WriteFile(filepath.Join(root, filename), body, 0600)
+	receipt := supervisor.ConsultationReceipt{SchemaVersion: 1, Identity: supervisor.ConsultationIdentity{ID: id, ProjectID: "project", CycleID: id, Role: "supervisor"}, StartedAt: now, EndedAt: &now, Status: "succeeded", InputDigest: strings.Repeat("b", 64), NativeOutcomeComplete: true,
+		Invocations: []supervisor.InvocationReceipt{{ID: nativeID, Number: 1, StartedAt: now, EndedAt: now, Status: "succeeded", OutputCheckpoint: &supervisor.NativeOutputCheckpoint{Filename: filename, SHA256: sha, Bytes: len(data), Complete: true}, NativeSession: &supervisor.NativeSessionRegistrationReceipt{Request: request, Acknowledgement: &admissioncontrol.Acknowledgement{Binding: request.Binding, RegistrationVersion: 1}, AuthorityPin: strings.Repeat("c", 64), OutcomeIntent: &seal, Outcome: &outcome}}}}
+	body, _ = json.Marshal(receipt)
+	_ = os.WriteFile(filepath.Join(root, "current.json"), body, 0600)
+	auxLaunch(t, dir, id)
+	if err := l.ReconcileAuxiliary(dir, id); err == nil {
+		t.Fatal("live marker released")
+	}
+	_ = os.Remove(filepath.Join(root, "launch.json"))
+	_ = os.Chmod(filepath.Join(root, filename), 0644)
+	if err := l.ReconcileAuxiliary(dir, id); err == nil {
+		t.Fatal("untrusted checkpoint released")
+	}
+	_ = os.Chmod(filepath.Join(root, filename), 0600)
+	if err := l.ReconcileAuxiliary(dir, id); err != nil {
+		t.Fatal(err)
+	}
+	release, err := l.ReserveAuxiliary(dir, uuid.NewString())
+	if err != nil {
+		t.Fatal("settled role did not release capacity", err)
+	}
+	release()
+	restarted := newFleetSpawnLimiter(store)
+	restarted.RegisterStateDir(dir)
+	release, err = restarted.ReserveAuxiliary(dir, uuid.NewString())
+	if err != nil {
+		t.Fatal("settled receipt consumed restart capacity", err)
+	}
+	release()
 }
 
 func (s *auxiliaryTestStore) RememberAuxiliaryStateDir(_ context.Context, dir string) error {

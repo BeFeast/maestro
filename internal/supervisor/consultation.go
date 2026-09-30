@@ -51,18 +51,20 @@ type ConsultationHold struct{ Code string }
 func (h *ConsultationHold) Error() string { return "supervisor consultation held: " + h.Code }
 
 type ConsultationReceipt struct {
-	SchemaVersion        int                  `json:"schema_version"`
-	Identity             ConsultationIdentity `json:"identity"`
-	StartedAt            time.Time            `json:"started_at"`
-	EndedAt              *time.Time           `json:"ended_at,omitempty"`
-	Status               string               `json:"status"`
-	RequestedBackend     string               `json:"requested_backend"`
-	RequestedModel       string               `json:"requested_model"`
-	RequestedModelSource string               `json:"requested_model_source"`
-	PolicyVersion        string               `json:"policy_version"`
-	PolicyDigest         string               `json:"policy_digest"`
-	CatalogRevision      *string              `json:"catalog_revision"`
-	Capability           AccountingCapability `json:"accounting_capability"`
+	SchemaVersion         int                  `json:"schema_version"`
+	Identity              ConsultationIdentity `json:"identity"`
+	StartedAt             time.Time            `json:"started_at"`
+	EndedAt               *time.Time           `json:"ended_at,omitempty"`
+	Status                string               `json:"status"`
+	RequestedBackend      string               `json:"requested_backend"`
+	RequestedModel        string               `json:"requested_model"`
+	RequestedModelSource  string               `json:"requested_model_source"`
+	PolicyVersion         string               `json:"policy_version"`
+	PolicyDigest          string               `json:"policy_digest"`
+	CatalogRevision       *string              `json:"catalog_revision"`
+	Capability            AccountingCapability `json:"accounting_capability"`
+	InputDigest           string               `json:"input_digest,omitempty"`
+	NativeOutcomeComplete bool                 `json:"native_outcome_complete,omitempty"`
 	// PlannedInvocation is an intent snapshot, not evidence that Start succeeded.
 	PlannedInvocation *InvocationReceipt  `json:"planned_invocation,omitempty"`
 	Candidates        []CandidateReceipt  `json:"candidates"`
@@ -82,8 +84,8 @@ type CandidateReceipt struct {
 type InvocationReceipt struct {
 	ProcessLease               *NativeInvocationProcessLease         `json:"process_lease,omitempty"`
 	ProcessTerminationVerified bool                                  `json:"process_termination_verified,omitempty"`
-	ProcessTermination         *aiexecution.NativeProcessTermination `json:"process_termination,omitempty"`
 	ProcessTerminationDigest   string                                `json:"process_termination_digest,omitempty"`
+	ProcessTermination         *aiexecution.NativeProcessTermination `json:"process_termination,omitempty"`
 	OutputCheckpoint           *NativeOutputCheckpoint               `json:"output_checkpoint,omitempty"`
 	NativeSession              *NativeSessionRegistrationReceipt     `json:"native_session,omitempty"`
 	ID                         string                                `json:"id"`

@@ -63,6 +63,8 @@ type NativeWorkerReceipt struct {
 	LogFile             string                               `json:"log_file,omitempty"`
 	PID                 int                                  `json:"pid,omitempty"`
 	AccountingReady     bool                                 `json:"accounting_ready"`
+	OutcomeIntent       *admissioncontrol.SealRequest        `json:"outcome_intent,omitempty"`
+	Outcome             *admissioncontrol.NativeOutcome      `json:"outcome,omitempty"`
 }
 
 type nativeWorkerLaunch struct {
@@ -79,11 +81,9 @@ var persistNativeWorkerReceipt = writeNativeWorkerReceipt
 
 // A launched CLI can exit after an unknown/partial physical send. Neither a
 // local exit nor successful OS teardown proves financial settlement. This
-// deliberately closed seam is replaced only by an actual trusted authority
-// outcome bridge, never by stderr parsing or an operator configuration boolean.
-var previousNativeGenerationOutcome = func(_ *config.Config, _ *NativeWorkerReceipt) error {
-	return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
-}
+// seam opens only from a durably saved exact authority seal/outcome. A network
+// result that was not persisted is never sufficient to mint a next generation.
+var previousNativeGenerationOutcome = persistedNativeGenerationOutcome
 
 func NativeRoleForPhase(phase state.Phase) string {
 	switch phase {
@@ -266,6 +266,9 @@ func readNativeWorkerReceipt(dir string, generation uint64) (*NativeWorkerReceip
 	if (r.Status == "launch_intent" || r.Status == "launched") && !filepath.IsAbs(r.LogFile) {
 		return nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
 	}
+	if err := validateNativeWorkerOutcome(&r); err != nil {
+		return nil, err
+	}
 	return &r, nil
 }
 
@@ -320,6 +323,9 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 	configDigest := nativeConfigDigest(cfg, backend, backendCfg, role)
 	previous, err := readNativeWorkerReceipt(dir, generation)
 	if err == nil {
+		if previous.OutcomeIntent != nil {
+			return nil, &NativeRegistrationHold{Code: "native_generation_sealed", LaunchUncertain: true}
+		}
 		if previous.ProjectID != cfg.ProjectID || previous.Slot != slot || previous.IssueNumber != issue || previous.Worktree != worktree || previous.Branch != branch || previous.Backend != backend || previous.ConfigDigest != configDigest || previous.Request.Role != role || previous.ParentRoleRunID != parent || previous.ProcessLeaseUnit != lease.Unit || previous.ProcessLeaseManager != lease.Manager {
 			return nil, &NativeRegistrationHold{Code: "identity_conflict", LaunchUncertain: previous.Status == "launch_intent" || previous.Status == "launched"}
 		}
@@ -346,7 +352,10 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 		}
 		parent = prior.RoleRunID
 		if err := previousNativeGenerationOutcome(cfg, prior); err != nil {
-			return nil, &NativeRegistrationHold{Code: "previous_outcome_unknown"}
+			prior, err = reconcileNativeWorkerOutcomeLocked(cfg, dir, prior)
+			if err != nil || previousNativeGenerationOutcome(cfg, prior) != nil {
+				return nil, &NativeRegistrationHold{Code: "previous_outcome_unknown"}
+			}
 		}
 	}
 	r := cfg.WorkerNativeSessionRegistration
@@ -746,6 +755,9 @@ func ValidateNativeWorkerRuntime(cfg *config.Config, slot string, sess *state.Se
 	r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
 	if err != nil {
 		return err
+	}
+	if r.OutcomeIntent != nil {
+		return &NativeRegistrationHold{Code: "native_generation_sealed", LaunchUncertain: true}
 	}
 	if r.ProjectID != cfg.ProjectID || r.Slot != slot || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID || r.Worktree != sess.Worktree || r.Branch != sess.Branch || r.ProcessLeaseUnit != sess.ProcessLeaseUnit || r.ProcessLeaseManager != sess.ProcessLeaseManager || r.Status != "launched" {
 		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
