@@ -131,6 +131,9 @@ func validateCleanupIdentity(lease WorktreeCleanupLease, current *state.Session,
 	if current == nil {
 		return fmt.Errorf("%w: slot %s no longer holds a session", ErrCleanupLeaseChanged, lease.Slot)
 	}
+	if current.NativeRegistrationHold != "" {
+		return fmt.Errorf("%w: slot %s has unresolved native generation", ErrCleanupLeaseChanged, lease.Slot)
+	}
 	if current.IssueNumber != lease.IssueNumber {
 		return fmt.Errorf("%w: slot %s issue changed #%d->#%d", ErrCleanupLeaseChanged, lease.Slot, lease.IssueNumber, current.IssueNumber)
 	}

@@ -23,7 +23,7 @@ func TestNativeWorkerOccupancySurvivesRestartWithoutMaskingFloor(t *testing.T) {
 		t.Fatal(err)
 	}
 	request := admissioncontrol.RegistrationRequest{Binding: admissioncontrol.Binding{GatewayScope: "fixture-gateway", NativeSessionID: uuid.NewString(), FleetID: "fixture-fleet", ProjectID: "fixture-project", RunID: "fixture-budget", Role: "planner", ExpiresAt: time.Now().Unix() + 100}, ExpectedVersion: 1}
-	r := &worker.NativeWorkerReceipt{SchemaVersion: 1, ProjectID: request.ProjectID, Slot: slot, Generation: 1, IssueNumber: 1207, RoleRunID: uuid.NewString(), Status: "launch_intent", Request: request, Acknowledgement: &admissioncontrol.Acknowledgement{Binding: request.Binding, RegistrationVersion: 1}, ProcessLeaseUnit: "fixture.scope", ProcessLeaseManager: "system"}
+	r := &worker.NativeWorkerReceipt{SchemaVersion: 1, ProjectID: request.ProjectID, Slot: slot, Generation: 1, IssueNumber: 1207, RoleRunID: uuid.NewString(), Status: "launch_intent", LogFile: filepath.Join(dir, "fixture.log"), Request: request, Acknowledgement: &admissioncontrol.Acknowledgement{Binding: request.Binding, RegistrationVersion: 1}, ProcessLeaseUnit: "fixture.scope", ProcessLeaseManager: "system"}
 	write := func() {
 		t.Helper()
 		b, err := json.Marshal(r)

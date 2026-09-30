@@ -33,6 +33,14 @@ func nativeTestFixture(t *testing.T) *nativeFixture {
 		t.Setenv(key, "")
 	}
 	root := t.TempDir()
+	bin := filepath.Join(root, "bin")
+	if err := os.MkdirAll(bin, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(bin, "claude"), []byte("#!/bin/sh\nexit 91\n"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
 	repo := newBranchTestRepo(t)
 	runBranchGit(t, repo, "remote", "add", "origin", repo)
 	runBranchGit(t, repo, "fetch", "origin")
@@ -48,10 +56,13 @@ func nativeTestFixture(t *testing.T) *nativeFixture {
 	worktree := filepath.Join(f.cfg.WorktreeBase, f.slot)
 	runBranchGit(t, repo, "worktree", "add", "-b", BranchName(f.slot, f.issue), worktree, "main")
 	oldRegister, oldPersist := registerNativeWorker, persistNativeWorkerReceipt
+	oldOutcome := previousNativeGenerationOutcome
+	previousNativeGenerationOutcome = func(*config.Config, *NativeWorkerReceipt) error { return nil }
 	oldSpawn, oldRead, oldConfirm := runTmuxNewSession, readTmuxPaneIdentity, confirmWorkerProcessLease
 	oldActive, oldAnchored, oldTerminate := workerProcessLeaseActive, workerProcessLeaseAnchored, terminateWorkerProcessLease
 	oldExists, oldWorkerExists := tmuxSessionExists, workerTmuxSessionExists
 	t.Cleanup(func() {
+		previousNativeGenerationOutcome = oldOutcome
 		registerNativeWorker = oldRegister
 		persistNativeWorkerReceipt = oldPersist
 		runTmuxNewSession = oldSpawn
@@ -237,7 +248,7 @@ func TestNativeWorkerUncertainGenerationAdoptionPreservesPreviousReceipt(t *test
 	if err := StartPhase(f.cfg, sess, f.slot, "review", "claude"); err != nil {
 		t.Fatal(err)
 	}
-	if sess.WorkerGeneration != 2 || sess.NativeParentRoleRunID != oldRun || f.spawned != 2 || len(f.registered) != 2 {
+	if sess.WorkerGeneration != 2 || sess.NativeParentRoleRunID != oldRun || f.spawned != 2 || len(f.registered) != 2 || sess.LogFile != filepath.Join(state.LogDir(f.cfg.StateDir), f.slot+"-advisor.log") {
 		t.Fatal("wrong crash adoption")
 	}
 }
@@ -286,6 +297,7 @@ func TestNativeWorkerRejectsCarrierRoleAndSessionOverrides(t *testing.T) {
 		mutate func(*nativeFixture)
 		code   string
 	}{
+		{"invalid_budget", func(f *nativeFixture) { f.cfg.WorkerMaxTokens = 100 }, "backend_configuration_invalid"},
 		{"missing_role", func(f *nativeFixture) { f.cfg.WorkerLaunchContext = nil }, "role_context_missing"},
 		{"remote", func(f *nativeFixture) { f.cfg.RemoteRunner.Enabled = true }, "harness_unsupported"},
 		{"codex", func(f *nativeFixture) {
@@ -443,5 +455,194 @@ func TestNativeWorkerGenerationNotChangedByRuntimeProjectionAdoption(t *testing.
 	AdoptLiveRuntime(f.cfg, sess, 4242, TmuxSessionName(f.slot), time.Now())
 	if sess.WorkerGeneration != 1 || sess.NativeSessionID != id || sess.NativeRoleRunID != run {
 		t.Fatal("runtime observation minted generation")
+	}
+}
+
+func TestNativeWorkerCrashAdoptionRejectsForeignIdentityWithoutReplay(t *testing.T) {
+	for _, kind := range []string{"pane", "branch", "lease", "scope", "role", "parent"} {
+		t.Run(kind, func(t *testing.T) {
+			f := nativeTestFixture(t)
+			f.unobservable = true
+			_, err := f.start()
+			expectNativeHold(t, err, "unresolved_launch", true)
+			f.unobservable = false
+			switch kind {
+			case "pane":
+				readTmuxPaneIdentity = func(string) (int, string, error) { return 4242, filepath.Join(f.cfg.WorktreeBase, "foreign"), nil }
+			case "branch":
+				runBranchGit(t, filepath.Join(f.cfg.WorktreeBase, f.slot), "switch", "-c", "foreign")
+			case "lease":
+				workerProcessLeaseAnchored = func(tmuxsession.ProcessLease, int) (bool, error) { return false, nil }
+			case "scope":
+				f.cfg.WorkerNativeSessionRegistration.GatewayScope = "foreign-gateway"
+			case "role":
+				f.cfg.WorkerLaunchContext.Role = "repair"
+			case "parent":
+				f.cfg.WorkerLaunchContext.ParentRoleRunID = "00000000-0000-4000-8000-000000000001"
+			}
+			_, err = f.start()
+			h, ok := NativeHold(err)
+			if !ok || !h.LaunchUncertain {
+				t.Fatalf("foreign adoption=%v", err)
+			}
+			if f.spawned != 1 || len(f.registered) != 1 || f.stopped != 0 {
+				t.Fatal("foreign state regenerated, launched or stopped runtime")
+			}
+		})
+	}
+}
+
+func TestNativeWorkerReceiptCorruptionHoldsWithoutNewIdentity(t *testing.T) {
+	for _, kind := range []string{"duplicate_key", "unknown_key", "symlink", "world_readable", "accounting_ready"} {
+		t.Run(kind, func(t *testing.T) {
+			f := nativeTestFixture(t)
+			registerNativeWorker = func(admissioncontrol.Client, admissioncontrol.RegistrationRequest) (admissioncontrol.Acknowledgement, error) {
+				return admissioncontrol.Acknowledgement{}, errors.New("reply lost")
+			}
+			_, err := f.start()
+			expectNativeHold(t, err, "authority_unavailable", false)
+			path := filepath.Join(nativeReceiptDir(f.cfg.StateDir, f.slot), nativeReceiptName(1))
+			b, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch kind {
+			case "duplicate_key":
+				b = []byte(strings.Replace(string(b), `"schema_version":1`, `"schema_version":1,"schema_version":1`, 1))
+			case "unknown_key":
+				b = []byte(strings.Replace(string(b), `"schema_version":1`, `"schema_version":1,"extra":true`, 1))
+			case "symlink":
+				target := filepath.Join(t.TempDir(), "foreign.json")
+				if err := os.WriteFile(target, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Remove(path); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(target, path); err != nil {
+					t.Fatal(err)
+				}
+			case "world_readable":
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+			case "accounting_ready":
+				b = []byte(strings.Replace(string(b), `"accounting_ready":false`, `"accounting_ready":true`, 1))
+			}
+			if kind != "symlink" && kind != "world_readable" {
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			_, err = f.start()
+			expectNativeHold(t, err, "receipt_invalid", true)
+			if f.spawned != 0 {
+				t.Fatal("corrupt receipt launched")
+			}
+		})
+	}
+}
+
+func TestNativeWorkerDisabledFeatureRetainsLegacyStart(t *testing.T) {
+	f := nativeTestFixture(t)
+	f.cfg.WorkerNativeSessionRegistration = nil
+	f.cfg.WorkerLaunchContext = nil
+	runTmuxNewSession = func(_, _, runner string, _ tmuxsession.ProcessLease) ([]byte, error) {
+		f.live = true
+		f.spawned++
+		b, err := os.ReadFile(runner)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(b), "--session-id") {
+			t.Fatal("disabled feature injected identity")
+		}
+		return nil, nil
+	}
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	if f.spawned != 1 || len(f.registered) != 0 || f.st.Sessions[f.slot].NativeRoleRunID != "" {
+		t.Fatal("disabled mode acquired registration")
+	}
+	if _, err := os.Stat(filepath.Join(f.cfg.StateDir, "worker-native-sessions")); !os.IsNotExist(err) {
+		t.Fatal("disabled mode created native receipt root")
+	}
+}
+
+func TestNativeWorkerRemovingConfigCannotDowngradeExistingNativeLaunch(t *testing.T) {
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	f.cfg.WorkerNativeSessionRegistration = nil
+	_, err := f.start()
+	expectNativeHold(t, err, "configuration_removed", true)
+	if f.spawned != 1 || len(f.registered) != 1 {
+		t.Fatal("removed config replayed native worker")
+	}
+}
+
+func TestNativeWorkerHoldNeitherBurnsRetryBudgetNorReleasesWorkspace(t *testing.T) {
+	f := nativeTestFixture(t)
+	registerNativeWorker = func(admissioncontrol.Client, admissioncontrol.RegistrationRequest) (admissioncontrol.Acknowledgement, error) {
+		return admissioncontrol.Acknowledgement{}, errors.New("reply lost")
+	}
+	_, err := f.start()
+	expectNativeHold(t, err, "authority_unavailable", false)
+	sess := f.st.Sessions[f.slot]
+	if got := f.st.FailedAttemptsForIssue(f.issue.Number); got != 0 {
+		t.Fatalf("held registration burned %d failed attempts", got)
+	}
+	if !f.st.IssueInProgress(f.issue.Number) {
+		t.Fatal("hold released issue claim")
+	}
+	lease := CaptureCleanupLease(f.slot, sess)
+	if err := ValidateCleanupLease(lease, sess, CleanupProbes{PIDAlive: func(int) bool { return false }, TmuxAlive: func(string) bool { return false }}, CleanupPolicy{RequireTerminal: true}); err == nil {
+		t.Fatal("hold allowed worktree cleanup")
+	}
+	if err := Stop(f.cfg, f.slot, sess); err == nil {
+		t.Fatal("hold allowed destructive Stop")
+	}
+	if _, err := os.Stat(sess.Worktree); err != nil {
+		t.Fatal("held worktree lost")
+	}
+}
+
+func TestNativeWorkerPreviousPhysicalOutcomeDefaultsToHoldEvenAfterLocalTermination(t *testing.T) {
+	defaultOutcome := previousNativeGenerationOutcome
+	f := nativeTestFixture(t)
+	if _, err := f.start(); err != nil {
+		t.Fatal(err)
+	}
+	previousNativeGenerationOutcome = defaultOutcome
+	sess := f.st.Sessions[f.slot]
+	f.cfg.WorkerLaunchContext = nil
+	oldID, oldRun := sess.NativeSessionID, sess.NativeRoleRunID
+	if err := StopProcess(f.slot, sess); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []string{"respawn", "in_place", "phase"} {
+		var err error
+		switch kind {
+		case "respawn":
+			err = Respawn(f.cfg, f.slot, sess, f.cfg.Repo, f.issue, "prompt", "claude")
+		case "in_place":
+			err = RespawnInPlace(f.cfg, f.slot, sess, f.cfg.Repo, f.issue, "prompt", "claude")
+		case "phase":
+			sess.Phase = state.PhaseAdvisor
+			err = StartPhase(f.cfg, sess, f.slot, "accepted plan artifact", "claude")
+		}
+		expectNativeHold(t, err, "previous_outcome_unknown", false)
+	}
+	if f.spawned != 1 || len(f.registered) != 1 || sess.WorkerGeneration != 1 || sess.NativeSessionID != oldID || sess.NativeRoleRunID != oldRun {
+		t.Fatal("local termination/accepted artifact authorized fresh financial execution")
+	}
+	if _, err := os.Stat(filepath.Join(nativeReceiptDir(f.cfg.StateDir, f.slot), nativeReceiptName(2))); !os.IsNotExist(err) {
+		t.Fatal("unknown prior outcome minted a generation")
+	}
+	slots, err := NativePendingSlots(f.cfg.StateDir, f.st.Sessions)
+	if err != nil || len(slots) != 0 {
+		t.Fatal("financial hold incorrectly retained proven terminated OS capacity")
 	}
 }

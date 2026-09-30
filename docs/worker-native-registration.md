@@ -81,8 +81,27 @@ Native holds remain attached to the canonical session/issue claim. They retain
 retry counts, feedback, prior phase, Advisor rounds and generation identity;
 they do not trigger provider fallback or generic worker-failure handling. The
 fsynced receipt is authoritative when the ordinary state projection write fails.
-Supported recovery requires explicit context and exact evidence; no all-role
-readiness claim follows from registration alone.
+Supported launch adoption requires explicit context and exact process evidence;
+no all-role readiness claim follows from registration alone.
+
+This slice deliberately separates launch ownership from provider outcomes.
+A local process exit or `.terminated` receipt does **not** prove that every
+physical request committed zero output or settled financially. Before minting
+any next-generation UUID after a launched generation, the closed
+`previousNativeGenerationOutcome` seam must confirm a trusted physical outcome.
+Its production default is `previous_outcome_unknown`: every phase transition,
+respawn and fallback holds before a new UUID or registration. The source paths
+and their identity/ancestry proof are implemented and exercised with explicit
+synthetic outcome evidence; production currently supports initial registration
+and exact adoption only until an actual authority outcome bridge is supplied.
+
+Accepted artifacts, CLI exit 0, Claude stderr, quota wording, local process
+teardown and successful registration cannot open this seam. OS capacity release
+and financial recovery authorization remain separate. R5/native recovery is
+not complete, and the actual trusted physical-outcome bridge is the next
+mandatory source slice before an operational package can enable supported
+next-generation execution. There is no operator configuration boolean that
+converts unknown outcomes into permission. Accounting readiness stays false.
 
 ## Verification
 

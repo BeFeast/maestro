@@ -77,3 +77,40 @@ func TestNativeWorkerPhaseHoldPreservesPriorPhaseAndCounters(t *testing.T) {
 		t.Fatal("hold repeated phase")
 	}
 }
+
+func TestNativeWorkerRepairUsesTrustedCopiedRoleAndRetainsApprovalOnHold(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("claude", "claude")
+	cfg.WorkerNativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+	o, fresh, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "repair exact PR", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "failure", Complete: true}, nil
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{Passed: true}, nil
+	}
+	calls := 0
+	o.respawnInPlaceFn = func(c *config.Config, _ string, s *state.Session, _ string, _ github.Issue, _, _ string) error {
+		calls++
+		if c == cfg || c.WorkerLaunchContext == nil || c.WorkerLaunchContext.Role != "repair" || c.WorkerLaunchContext.ParentRoleRunID != s.NativeRoleRunID {
+			t.Fatal("repair lacked isolated trusted role")
+		}
+		return &worker.NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true}
+	}
+	st := repairGateTestState(time.Now().UTC(), head)
+	st.Sessions["slot-7"].NativeRoleRunID = "00000000-0000-4000-8000-000000000001"
+	o.startNewWorkers(st, 1)
+	if calls != 1 || len(*fresh) != 0 || st.Sessions["slot-7"].NativeRegistrationHold != "unresolved_launch" || cfg.WorkerLaunchContext != nil {
+		t.Fatal("repair hold lost identity")
+	}
+	if got := approvalStatus(t, st, "repair-7"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("held repair consumed approval=%s", got)
+	}
+	o.startNewWorkers(st, 1)
+	if calls != 1 {
+		t.Fatal("held repair automatically retried")
+	}
+}

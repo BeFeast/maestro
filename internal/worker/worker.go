@@ -88,17 +88,14 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
 		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
 	}
-	if cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
-		return "", &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
-	}
-	if cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
-		return "", fmt.Errorf("remote runner v1 does not support phase-pipeline dispatches")
-	}
 
 	defer func() {
 		if h, ok := NativeHold(resultErr); ok {
 			h.Slot = slotName
 			resultSlot = slotName
+			if s.Sessions == nil {
+				s.Sessions = make(map[string]*state.Session)
+			}
 			sess := s.Sessions[slotName]
 			if sess == nil {
 				sess = &state.Session{IssueNumber: issue.Number, IssueTitle: issue.Title, Worktree: filepath.Join(cfg.WorktreeBase, slotName), Branch: BranchName(slotName, issue), Backend: backendName, Status: state.StatusFailed}
@@ -108,6 +105,13 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 			_ = state.Save(cfg.StateDir, s) // The fsynced native receipt remains authoritative if this projection fails.
 		}
 	}()
+	if cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return "", &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
+	}
+	if cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
+		return "", fmt.Errorf("remote runner v1 does not support phase-pipeline dispatches")
+	}
+
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := BranchName(slotName, issue)
 	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
@@ -133,6 +137,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return "", &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return "", err
 	}
 
@@ -312,7 +319,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	// Start tmux session inside its unique OS process lease.
-	if err := native.beginLaunch(); err != nil {
+	if err := native.beginLaunch(logFile); err != nil {
 		return "", err
 	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0, "initial_spawn")
@@ -452,6 +459,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return err
 	}
 
@@ -466,6 +476,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	defer native.finishError(&resultErr)
 	if adopted, err := native.adoptSession(cfg, slotName, sess); adopted {
 		return err
+	}
+	if native != nil {
+		sess.NativeRegistrationHold = ""
 	}
 
 	// Clean up old worker (tmux session, process, worktree)
@@ -573,7 +586,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
-	if err := native.beginLaunch(); err != nil {
+	if err := native.beginLaunch(logFile); err != nil {
 		return err
 	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID, "fallover")
@@ -698,6 +711,9 @@ func StopProcess(slotName string, sess *state.Session) error {
 
 // Stop kills a worker and removes its worktree.
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
+	if sess != nil && sess.NativeRegistrationHold != "" {
+		return &NativeRegistrationHold{Code: "unresolved_native_generation", LaunchUncertain: true, Slot: slotName}
+	}
 	if err := StopProcess(slotName, sess); err != nil {
 		return err
 	}
