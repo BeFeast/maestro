@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log"
 	"os"
@@ -96,6 +97,12 @@ func (d *Daemon) runTmpfsHygieneTick(ctx context.Context) {
 }
 
 func (d *Daemon) sweepTmpfsHygiene(ctx context.Context) (tmpfshygiene.Summary, error) {
+	// Host-wide cleanup requires the whole fleet's protection paths. Loading
+	// only selected configs would endanger unselected workspaces; loading all
+	// configs would violate the scope. A scoped daemon therefore never applies it.
+	if len(d.opts.ProjectNames) != 0 {
+		return tmpfshygiene.Summary{}, errors.New("host-wide tmpfs hygiene is disabled with --project")
+	}
 	opts := d.tmpfsHygiene.options
 	opts.Mode = tmpfshygiene.ModeApply
 	cfgs, err := d.store.LoadAll(ctx)

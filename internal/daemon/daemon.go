@@ -183,6 +183,11 @@ type ConfigLoader interface {
 
 // Options configures a Daemon.
 type Options struct {
+	// ProjectNames selects exact config-store row names before loading configs,
+	// importing state, or starting flows. Empty preserves whole-fleet behavior.
+	// The same immutable selection bounds hot membership and project CRUD.
+	ProjectNames []string
+
 	// Host and Port bind the single aggregating FleetServer (#516: one web
 	// for the whole fleet, default :8786).
 	Host string
@@ -443,6 +448,8 @@ func (d *Daemon) rememberShutdownStateDirs(dirs []string) {
 // its watchdog dead while the flow still reports healthy (#764). The 10m/5m
 // defaults are safe, so this only fires on an explicit non-positive value.
 func New(store ConfigLoader, opts Options) *Daemon {
+	// A caller cannot widen the daemon's scope by mutating its original slice.
+	opts.ProjectNames = append([]string(nil), opts.ProjectNames...)
 	if opts.RunInterval <= 0 {
 		log.Printf("[daemon] run-interval %s is not positive; clamping to default %s", opts.RunInterval, DefaultRunInterval)
 		opts.RunInterval = DefaultRunInterval
@@ -504,7 +511,7 @@ func New(store ConfigLoader, opts Options) *Daemon {
 	return d
 }
 
-// Run loads every project from the store, starts a flow (orchestrator +
+// Run loads the selected projects from the store, starts a flow (orchestrator +
 // supervisor) for each, and serves one FleetServer aggregating them all. It
 // blocks until ctx is cancelled, then drains every flow before returning.
 //
@@ -521,6 +528,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	}
 	if len(named) == 0 {
 		log.Printf("[daemon] config store has no projects yet — serving an empty fleet and waiting for --watch-store hot-add")
+	}
+	if len(d.opts.ProjectNames) != 0 {
+		log.Printf("[daemon] explicit project selection=%q; other store rows remain inactive; global state pruning and host-wide tmpfs hygiene disabled", d.opts.ProjectNames)
 	}
 
 	// Dedup on the flow's real identity (StateDir, falling back to Repo), not
@@ -585,6 +595,9 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// started/drained flow. The in-memory test loader does not satisfy the
 	// interface, so the endpoint reports 501 there.
 	if ps, ok := d.store.(server.FleetProjectStore); ok {
+		if len(d.opts.ProjectNames) != 0 {
+			ps = selectedProjectWriter{store: ps, names: d.opts.ProjectNames}
+		}
 		fleet.SetProjectStore(ps)
 	}
 	approvalsMode, err := approvalstore.ParseMode(d.opts.ApprovalsStore)
@@ -629,8 +642,11 @@ func (d *Daemon) Run(ctx context.Context) error {
 		// Drop rows for projects no longer in the fleet (removed from the config
 		// store while the daemon was stopped). Without this, a cross-project query
 		// keeps returning sessions/health for a project that is not running (#760).
-		if perr := store.RetainStateDirs(ctx, keep); perr != nil {
-			log.Printf("[daemon] state prune (drop removed-project rows) failed: %v", perr)
+		// An explicit subset does not own the other projects' historical rows.
+		if len(d.opts.ProjectNames) == 0 {
+			if perr := store.RetainStateDirs(ctx, keep); perr != nil {
+				log.Printf("[daemon] state prune (drop removed-project rows) failed: %v", perr)
+			}
 		}
 	}
 	// #824: expose the inbound GitHub webhook ingestion endpoint on the fleet
@@ -765,7 +781,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 	// surprise startup prune while still bounding abandoned residue to 10m past
 	// its age gate. Each result is emitted as one JSON line and published to Fleet.
 	var stopTmpfsHygiene func()
-	if d.tmpfsHygiene != nil {
+	if d.tmpfsHygiene != nil && len(d.opts.ProjectNames) == 0 {
 		hctx, hygieneCancel := context.WithCancel(ctx)
 		hygieneDone := make(chan struct{})
 		go func() {
@@ -918,16 +934,34 @@ type namedConfig struct {
 }
 
 // loadNamedConfigs resolves the projects to start. When the store supports
-// per-project reload (projectStore != nil), it loads via ProjectsFingerprint so
-// each config carries its store name for the diff-loop; otherwise it falls back
-// to LoadAll with empty names, preserving the Phase 1 behaviour for plain
-// ConfigLoaders and the in-memory test loader.
+// per-project reload or explicit selection is requested, it loads via
+// ProjectsFingerprint so selection happens before any config load. Otherwise it
+// falls back to LoadAll with empty names, preserving the Phase 1 behaviour for
+// plain ConfigLoaders and the in-memory test loader.
 func (d *Daemon) loadNamedConfigs(ctx context.Context) ([]namedConfig, error) {
-	if d.projectStore != nil {
-		fp, err := d.projectStore.ProjectsFingerprint(ctx)
+	if err := ValidateProjectSelection(d.opts.ProjectNames); err != nil {
+		return nil, err
+	}
+	ps := d.projectStore
+	if len(d.opts.ProjectNames) != 0 {
+		var ok bool
+		ps, ok = d.store.(configwatch.ProjectStore)
+		if !ok {
+			return nil, errors.New("--project requires a config store supporting named project loads")
+		}
+	}
+	if ps != nil {
+		fp, err := ps.ProjectsFingerprint(ctx)
 		if err != nil {
 			return nil, fmt.Errorf("fingerprint config store: %w", err)
 		}
+		// Validate the entire initial selection before loading even its first row.
+		for _, name := range d.opts.ProjectNames {
+			if _, ok := fp[name]; !ok {
+				return nil, fmt.Errorf("--project %q is not in the config store", name)
+			}
+		}
+		fp = d.selectedFingerprint(fp)
 		names := make([]string, 0, len(fp))
 		for name := range fp {
 			names = append(names, name)
@@ -935,9 +969,12 @@ func (d *Daemon) loadNamedConfigs(ctx context.Context) ([]namedConfig, error) {
 		sort.Strings(names)
 		out := make([]namedConfig, 0, len(names))
 		for _, name := range names {
-			cfg, err := d.projectStore.Load(ctx, name)
+			cfg, err := ps.Load(ctx, name)
 			if err != nil {
 				return nil, fmt.Errorf("load project %s: %w", name, err)
+			}
+			if cfg == nil && len(d.opts.ProjectNames) != 0 {
+				return nil, fmt.Errorf("--project %q returned an empty config", name)
 			}
 			out = append(out, namedConfig{name: name, cfg: cfg})
 		}

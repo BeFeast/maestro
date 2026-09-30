@@ -187,6 +187,24 @@ poll interval and starts one flow — no restart, no `systemctl enable` per proj
 Removing a project stays a separate explicit operator action (`maestro config-store
 rm <name>`).
 
+For a limited rollout, repeat `--project` with exact config-store row names:
+
+```bash
+maestro daemon --store ~/.maestro/maestro.db --watch-store \
+  --project befeast-hedroom --project befeast-halenote \
+  --approvals-store sqlite --state-store sqlite
+```
+
+The selection applies before config loads, state imports, flow startup, and hot
+membership changes. Empty, duplicate, or initially missing names fail startup.
+Removing a selected row stops its flow; re-adding that same name can start it
+again with `--watch-store`. Other rows never join this daemon. Unselected state
+and approval IDs remain in the same canonical database, and dashboard project
+CRUD cannot modify unselected rows. Scoped runs skip global state pruning and
+host-wide tmpfs cleanup; tmpfs pressure monitoring and shared auxiliary receipt
+debt still apply. This is a flow selector, not a separate database or OS security
+boundary. Omitting `--project` retains the existing whole-fleet behavior.
+
 ```bash
 # The daemon already serves the fleet Mission Control and API; do not start a
 # separate `maestro serve` process for the same fleet.
