@@ -26,12 +26,15 @@ startup/current config hashes, process instance, build, caller and policy must
 match, and configuration application must be complete. Expected hashes come
 from the gateway's own read-only `admission-config-digests` helper.
 
-**Installed readiness remains held in this source slice.** Matching config
-hashes do not observe the active credential-to-account mapping, dynamic model
-registry, kernel egress rules or credentials reachable by tool subprocesses.
-The final containment hold must be replaced by those actual observers, not a
-config flag or a copied source-test receipt. Account and containment mechanisms
-are separate required source work before any operational activation.
+The inspector also observes the exact active credential/model selection and
+the installed namespace, complete nft ruleset, gateway listener and root-owned
+execution profile. The shared launcher contains native workers, supervisors and
+reviewers as described in [Native role containment](native-role-containment.md).
+Credential selection evidence does not establish account ownership; that still
+requires reviewed provisioning evidence. Missing or mismatched installed proof
+holds execution. Source tests do not establish operational readiness: the
+reviewed R9 installation and complete systemd-to-native-entry acceptance remain
+required before activation.
 
 ## Leaf behavior
 
@@ -63,11 +66,18 @@ that already started.
 
 All registered native invocations, including exit 0, retain their launch marker
 and auxiliary occupancy until every saved native binding has a trusted sealed
-financial outcome. The authority atomically revokes each exact registration and
+outcome for its original admission basis. The authority atomically revokes each exact registration and
 returns either sealed zero dispatch, validated ledger settlement without bound
 violations, or a hold. The control request intent and exact digest-bound result
 are fsynced before releasing any marker or permit. Stderr, local exit, expiry,
 and gateway transport observations cannot authorize financial recovery.
+
+The companion typed request-accounting integration selects version 2 only for
+an explicit, persisted `admission_basis: requests`. Its completion is
+`request_accounted` with `money_status: unknown`, never monetary settlement or
+an invented zero cost. The original monetary version-1 contract remains
+unchanged. Both bases require OS termination, durable output and trusted exact
+binding completion before release; neither permits inference replay on recovery.
 
 Native stdout is capped at 4 MiB and saved in an owner-only checkpoint with
 exact role-run, invocation and native IDs, raw bytes, digest, local status,
