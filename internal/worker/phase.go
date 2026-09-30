@@ -44,6 +44,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return err
 	}
 	// #841/#900: thread the phase role's effort override into the worker argv via
@@ -119,7 +122,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
-	if err := native.beginLaunch(); err != nil {
+	if err := native.beginLaunch(logFile); err != nil {
 		return err
 	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "phase_transition")

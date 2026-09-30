@@ -57,6 +57,7 @@ type NativeWorkerReceipt struct {
 	Acknowledgement     *admissioncontrol.Acknowledgement    `json:"acknowledgement,omitempty"`
 	ProcessLeaseUnit    string                               `json:"process_lease_unit"`
 	ProcessLeaseManager string                               `json:"process_lease_manager"`
+	LogFile             string                               `json:"log_file,omitempty"`
 	PID                 int                                  `json:"pid,omitempty"`
 	AccountingReady     bool                                 `json:"accounting_ready"`
 }
@@ -72,6 +73,14 @@ var registerNativeWorker = func(client admissioncontrol.Client, request admissio
 	return client.Register(request)
 }
 var persistNativeWorkerReceipt = writeNativeWorkerReceipt
+
+// A launched CLI can exit after an unknown/partial physical send. Neither a
+// local exit nor successful OS teardown proves financial settlement. This
+// deliberately closed seam is replaced only by an actual trusted authority
+// outcome bridge, never by stderr parsing or an operator configuration boolean.
+var previousNativeGenerationOutcome = func(_ *config.Config, _ *NativeWorkerReceipt) error {
+	return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
+}
 
 func NativeRoleForPhase(phase state.Phase) string {
 	switch phase {
@@ -103,6 +112,9 @@ func nativeRole(cfg *config.Config, sess *state.Session) (string, string) {
 }
 
 func nativeClient(cfg *config.Config) (admissioncontrol.Client, error) {
+	if cfg == nil {
+		return admissioncontrol.Client{}, &NativeRegistrationHold{Code: "configuration_invalid"}
+	}
 	r := cfg.WorkerNativeSessionRegistration
 	if r == nil || !filepath.IsAbs(cfg.StateDir) || !filepath.IsAbs(r.ControlSocket) || r.AuthorityUID == nil ||
 		r.ExpectedPolicyVersion <= 0 || !admissioncontrol.Identifier(cfg.ProjectID) ||
@@ -248,6 +260,9 @@ func readNativeWorkerReceipt(dir string, generation uint64) (*NativeWorkerReceip
 	if r.Status != "registration_intent" && (r.Acknowledgement == nil || r.Acknowledgement.Binding != r.Request.Binding || r.Acknowledgement.Revoked || r.Acknowledgement.RegistrationVersion <= 0 || r.Acknowledgement.RegistrationVersion > r.Request.ExpectedVersion) {
 		return nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
 	}
+	if (r.Status == "launch_intent" || r.Status == "launched") && !filepath.IsAbs(r.LogFile) {
+		return nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+	}
 	return &r, nil
 }
 
@@ -255,6 +270,9 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 	if cfg.WorkerNativeSessionRegistration == nil {
 		if sess != nil && sess.NativeRoleRunID != "" {
 			return nil, &NativeRegistrationHold{Code: "configuration_removed"}
+		}
+		if _, err := os.Lstat(nativeReceiptDir(cfg.StateDir, slot)); err == nil || !errors.Is(err, os.ErrNotExist) {
+			return nil, &NativeRegistrationHold{Code: "configuration_removed", LaunchUncertain: true}
 		}
 		return nil, nil
 	}
@@ -324,6 +342,9 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 			return nil, &NativeRegistrationHold{Code: "ancestry_conflict"}
 		}
 		parent = prior.RoleRunID
+		if err := previousNativeGenerationOutcome(cfg, prior); err != nil {
+			return nil, &NativeRegistrationHold{Code: "previous_outcome_unknown"}
+		}
 	}
 	r := cfg.WorkerNativeSessionRegistration
 	receipt := &NativeWorkerReceipt{SchemaVersion: 1, ProjectID: cfg.ProjectID, Slot: slot, Generation: generation, IssueNumber: issue,
@@ -374,13 +395,17 @@ func (n *nativeWorkerLaunch) command(cmd *exec.Cmd) error {
 	cmd.Args = append(cmd.Args, "--session-id", n.receipt.Request.NativeSessionID)
 	return nil
 }
-func (n *nativeWorkerLaunch) beginLaunch() error {
+func (n *nativeWorkerLaunch) beginLaunch(logFile string) error {
 	if n == nil {
 		return nil
 	}
 	if n.adopt || n.receipt.Status != "registered" || n.receipt.Request.ExpiresAt <= time.Now().Unix() {
 		return &NativeRegistrationHold{Code: "launch_not_authorized", LaunchUncertain: n.adopt}
 	}
+	if !filepath.IsAbs(logFile) {
+		return &NativeRegistrationHold{Code: "log_identity_invalid"}
+	}
+	n.receipt.LogFile = logFile
 	n.receipt.Status = "launch_intent"
 	if err := persistNativeWorkerReceipt(n.dir, n.receipt); err != nil {
 		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
@@ -411,6 +436,9 @@ func (n *nativeWorkerLaunch) stamp(sess *state.Session) {
 	sess.NativeRole = n.receipt.Request.Role
 	sess.NativeReceiptDir = n.dir
 	sess.NativeRegistrationHold = ""
+	if n.receipt.LogFile != "" {
+		sess.LogFile = n.receipt.LogFile
+	}
 }
 
 // adoptExisting validates the exact process lease and canonical workspace before
@@ -454,6 +482,16 @@ func (n *nativeWorkerLaunch) adoptExisting(cfg *config.Config, slot string) (int
 // uncertainty. Registration-only receipts consume no process capacity.
 func NativePendingSlots(stateDir string, sessions map[string]*state.Session) ([]string, error) {
 	root := filepath.Join(stateDir, "worker-native-sessions")
+	info, err := os.Lstat(root)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	if !info.IsDir() || info.Mode().Perm()&0077 != 0 || !nativeOwned(info) {
+		return nil, fmt.Errorf("invalid native receipt root")
+	}
 	dirs, err := os.ReadDir(root)
 	if errors.Is(err, os.ErrNotExist) {
 		return nil, nil
@@ -463,11 +501,21 @@ func NativePendingSlots(stateDir string, sessions map[string]*state.Session) ([]
 	}
 	var pending []string
 	for _, dir := range dirs {
+		if dir.Type()&os.ModeSymlink != 0 {
+			return nil, fmt.Errorf("invalid native receipt directory")
+		}
 		if !dir.IsDir() {
 			continue
 		}
 		if state.ValidateSlotID(dir.Name()) != nil {
 			return nil, fmt.Errorf("invalid native slot receipt")
+		}
+		info, err := dir.Info()
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode().Perm()&0077 != 0 || !nativeOwned(info) {
+			return nil, fmt.Errorf("invalid native receipt directory")
 		}
 		files, err := os.ReadDir(filepath.Join(root, dir.Name()))
 		if err != nil {
@@ -478,8 +526,8 @@ func NativePendingSlots(stateDir string, sessions map[string]*state.Session) ([]
 				continue
 			}
 			generation, err := strconv.ParseUint(strings.TrimSuffix(strings.TrimPrefix(file.Name(), "generation-"), ".json"), 10, 64)
-			if err != nil {
-				return nil, err
+			if err != nil || generation == 0 || file.Name() != nativeReceiptName(generation) {
+				return nil, fmt.Errorf("invalid native receipt generation")
 			}
 			r, err := readNativeWorkerReceipt(filepath.Join(root, dir.Name()), generation)
 			if err != nil {

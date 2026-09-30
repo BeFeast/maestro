@@ -5290,7 +5290,7 @@ func SessionProvesFailedAttempt(sess *Session) bool {
 }
 
 func sessionProvesFailedAttempt(sess *Session) bool {
-	if sess == nil || sess.RateLimitHit {
+	if sess == nil || sess.RateLimitHit || sess.NativeRegistrationHold != "" {
 		return false
 	}
 	switch sess.WorkerOutcome {

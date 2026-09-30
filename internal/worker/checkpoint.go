@@ -416,6 +416,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return err
 	}
 	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
@@ -526,7 +529,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
-	if err := native.beginLaunch(); err != nil {
+	if err := native.beginLaunch(logFile); err != nil {
 		return err
 	}
 	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
