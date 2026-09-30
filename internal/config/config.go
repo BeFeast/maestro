@@ -662,15 +662,16 @@ func (c GitHubMirrorConfig) ReconcileInterval() time.Duration {
 // survive that restart; restarting via `systemctl --user restart` keeps the
 // unit's ExecStop drain semantics intact.
 type SelfDeployConfig struct {
-	Enabled        bool     `yaml:"enabled"`          // default false (opt-in)
-	Script         string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
-	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
-	InstallViaSudo bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
-	Scope          string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
-	Units          []string `yaml:"units"`            // systemd units to restart (default: ["maestro.service"])
-	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
-	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
-	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+	PromotionPolicy string   `yaml:"promotion_policy"` // automatic (default) or explicit (blocks automatic triggers; does not provide manual promotion)
+	Enabled         bool     `yaml:"enabled"`          // default false (opt-in)
+	Script          string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
+	BinPath         string   `yaml:"bin_path"`         // install target (default: path of the running binary)
+	InstallViaSudo  bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
+	Scope           string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
+	Units           []string `yaml:"units"`            // systemd units to restart (default: ["maestro.service"])
+	HealthURL       string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
+	HealthTokenEnv  string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
+	TimeoutMinutes  int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
 	// RestartTimeoutSeconds bounds only the blocking systemctl restart step. It is
 	// deliberately much smaller than TimeoutMinutes so Fleet unavailability is
 	// reported shortly after the daemon's bounded drain, not hidden under the
@@ -685,6 +686,30 @@ type SelfDeployConfig struct {
 	// converges. The orchestrator debounces re-triggers within this window.
 	// Default: timeout_minutes (at most one deploy per budget).
 	MinIntervalMinutes int `yaml:"min_interval_minutes"`
+}
+
+const (
+	SelfDeployPromotionAutomatic = "automatic"
+	SelfDeployPromotionExplicit  = "explicit"
+)
+
+// EffectivePromotionPolicy preserves automatic promotion for existing configs.
+// Unknown values are retained so programmatic configs cannot fail open.
+func (c SelfDeployConfig) EffectivePromotionPolicy() string {
+	policy := strings.ToLower(strings.TrimSpace(c.PromotionPolicy))
+	if policy == "" {
+		return SelfDeployPromotionAutomatic
+	}
+	return policy
+}
+
+func (c SelfDeployConfig) ValidatePromotionPolicy() error {
+	switch c.EffectivePromotionPolicy() {
+	case SelfDeployPromotionAutomatic, SelfDeployPromotionExplicit:
+		return nil
+	default:
+		return fmt.Errorf("config: self_deploy.promotion_policy %q is invalid (want automatic or explicit)", c.PromotionPolicy)
+	}
 }
 
 // SelfDeployScope* are the valid values for SelfDeployConfig.Scope.
@@ -2881,6 +2906,9 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateRemoteRunner(cfg); err != nil {
+		return nil, err
+	}
+	if err := cfg.SelfDeploy.ValidatePromotionPolicy(); err != nil {
 		return nil, err
 	}
 	if !cfg.Delivery.ValidMode() {

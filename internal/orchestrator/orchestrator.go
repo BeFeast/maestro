@@ -90,7 +90,7 @@ type Orchestrator struct {
 	reviewProduceMu       sync.Mutex
 	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
-	reviewProduceFn func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
+	reviewProduceFn       func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -8695,7 +8695,7 @@ func (o *Orchestrator) runDeliveryCommand(prNumber int, eff config.DeliveryConfi
 // supervisor finding when the result file is consumed on a later cycle (see
 // consumeSelfDeployResult).
 func (o *Orchestrator) maybeSelfDeployAfterMerge(s *state.State, prNumber int) {
-	if !o.cfg.SelfDeploy.Enabled {
+	if o == nil || o.cfg == nil || !o.cfg.SelfDeploy.Enabled || o.cfg.SelfDeploy.EffectivePromotionPolicy() != config.SelfDeployPromotionAutomatic {
 		return
 	}
 	now := time.Now().UTC()
@@ -8761,7 +8761,7 @@ func (o *Orchestrator) maybeSelfDeployAfterMerge(s *state.State, prNumber int) {
 //     deploy the orchestrator just launched for its own merge (which advanced
 //     main too) does not double-trigger here.
 func (o *Orchestrator) maybeSelfDeployOnMainAdvance(s *state.State) {
-	if o == nil || o.cfg == nil || !o.cfg.SelfDeploy.Enabled {
+	if o == nil || o.cfg == nil || !o.cfg.SelfDeploy.Enabled || o.cfg.SelfDeploy.EffectivePromotionPolicy() != config.SelfDeployPromotionAutomatic {
 		return
 	}
 	// Without a resolvable build SHA (e.g. a bare "dev" binary) drift cannot be
@@ -8819,6 +8819,9 @@ func (o *Orchestrator) maybeSelfDeployOnMainAdvance(s *state.State) {
 
 // triggerSelfDeploy starts the opt-in self-deploy (#698) for a merged PR.
 func (o *Orchestrator) triggerSelfDeploy(prNumber int) error {
+	if err := selfdeploy.CheckAutomaticPromotion(o.cfg); err != nil {
+		return err
+	}
 	if o.selfDeployStartFn != nil {
 		return o.selfDeployStartFn(prNumber)
 	}
