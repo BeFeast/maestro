@@ -1984,7 +1984,10 @@ func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
 // (*_env indirection, never values); the chat lenses talk to CLIProxy — never
 // a direct provider login (the #1148 bash design defect this replaces).
 type ReviewProducerConfig struct {
-	Enabled bool `yaml:"enabled"` // opt-in per project row
+	// MaxAttempts caps HTTP review attempts per exact head/lens; 0 defaults to 1.
+	// Values 2..5 opt into bounded retries supported by gateway evidence.
+	MaxAttempts int  `yaml:"max_attempts,omitempty"`
+	Enabled     bool `yaml:"enabled"` // opt-in per project row
 	// ChatBaseURL is the CLIProxy root for the opus/terra chat lenses, e.g.
 	// "http://127.0.0.1:23020". Required for those streams to run.
 	ChatBaseURL string `yaml:"chat_base_url,omitempty"`
@@ -2004,6 +2007,13 @@ type ReviewProducerConfig struct {
 	// MaxDiffBytes caps the diff fed to the models (default 400000, the bash
 	// LLM_REVIEW_MAX_DIFF_BYTES). Truncation is surfaced in the status.
 	MaxDiffBytes int `yaml:"max_diff_bytes,omitempty"`
+}
+
+func (c ReviewProducerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts == 0 {
+		return 1
+	}
+	return c.MaxAttempts
 }
 
 func (c ReviewProducerConfig) EffectiveChatAPIKeyEnv() string {

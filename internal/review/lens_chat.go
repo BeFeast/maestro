@@ -86,21 +86,35 @@ func (l *ChatLens) Run(ctx context.Context, prompt string) (string, error) {
 	if httpc == nil {
 		httpc = &http.Client{}
 	}
-	resp, err := httpc.Do(req)
+	// Never follow redirects with inference credentials or replay a POST.
+	client := *httpc
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("chat completion: %w", err)
+		code := "transport_unknown"
+		if ctx.Err() != nil {
+			code = "cancelled"
+		}
+		return "", &GatewayTerminalError{Code: code}
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	limit := int64(16 << 20)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		limit = maxErrorBody
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return "", &GatewayTerminalError{Code: "response_incomplete", HTTPStatus: resp.StatusCode, ResponseSHA256: digest(body)}
+	}
+	truncated := int64(len(body)) > limit
+	if truncated {
+		body = body[:limit]
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		excerpt := strings.TrimSpace(string(body))
-		if len(excerpt) > 512 {
-			excerpt = excerpt[:512]
-		}
-		return "", fmt.Errorf("chat completion: HTTP %d: %s", resp.StatusCode, excerpt)
+		return "", terminalError(resp.StatusCode, body, truncated)
+	}
+	if truncated {
+		return "", &GatewayTerminalError{Code: "response_too_large", HTTPStatus: resp.StatusCode, ResponseSHA256: digest(body), ResponseTruncated: true}
 	}
 	var parsed struct {
 		Choices []struct {
