@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
@@ -27,12 +28,14 @@ import (
 
 // NativeRegistrationHold never contains prompt text, raw argv or authority data.
 type NativeRegistrationHold struct {
+	cause           error
 	Code            string
 	LaunchUncertain bool
 	Slot            string
 }
 
 func (h *NativeRegistrationHold) Error() string { return "worker native registration held: " + h.Code }
+func (h *NativeRegistrationHold) Unwrap() error { return h.cause }
 
 func NativeHold(err error) (*NativeRegistrationHold, bool) {
 	var hold *NativeRegistrationHold
@@ -570,6 +573,11 @@ func (n *nativeWorkerLaunch) finishError(err *error) {
 	if h, ok := NativeHold(*err); ok {
 		h.LaunchUncertain = h.LaunchUncertain || uncertain
 		h.Slot = n.receipt.Slot
+		return
+	}
+	var executionHold *aiexecution.Hold
+	if errors.As(*err, &executionHold) {
+		*err = &NativeRegistrationHold{Code: executionHold.Code, LaunchUncertain: uncertain, Slot: n.receipt.Slot, cause: *err}
 		return
 	}
 	*err = &NativeRegistrationHold{Code: "setup_failed", LaunchUncertain: uncertain, Slot: n.receipt.Slot}

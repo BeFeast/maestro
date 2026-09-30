@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"os"
 	"os/exec"
 	"strings"
@@ -25,6 +26,7 @@ import (
 // stdout (the review text) is captured separately from stderr so a stray
 // progress/telemetry line can never read as a spurious finding.
 type CursorLens struct {
+	ExecutionPolicy aiexecution.Policy
 	// Stream is the status context / stream name, e.g. "llm-review-cursor".
 	Stream string
 	// Model is the cursor model, e.g. "composer-2.5" (the included-usage
@@ -65,6 +67,12 @@ func (l *CursorLens) timeout() time.Duration {
 
 // Run executes cursor-agent over the prompt and returns its stdout.
 func (l *CursorLens) Run(ctx context.Context, prompt string) (string, error) {
+	if err := l.ExecutionPolicy.CheckCurrent(); err != nil {
+		return "", err
+	}
+	if l.ExecutionPolicy.RequireVerifiedRoute {
+		return "", aiexecution.Held("cursor_transport_unsupported")
+	}
 	ctx, cancel := context.WithTimeout(ctx, l.timeout())
 	defer cancel()
 

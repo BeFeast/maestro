@@ -510,6 +510,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err

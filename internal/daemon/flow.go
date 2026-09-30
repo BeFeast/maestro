@@ -48,6 +48,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	cfg := proj.Cfg()
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+		cfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+		cfg.AIExecution = cfg.AIExecution.BindController(cfg.AIExecution, cfg.StateDir)
+		if err := cfg.AIExecution.CheckCurrent(); err != nil {
+			log.Printf("[%s] AI execution held: controller revision initialization failed: %v", storeName, err)
+		}
 		if d.spawnLimiter != nil {
 			d.spawnLimiter.RegisterProject(cfg.StateDir, cfg.Repo, d.opts.SuperviseInterval)
 		}
@@ -207,6 +212,11 @@ func (d *Daemon) stopFlow(key string) {
 	if !ok {
 		return
 	}
+	if flow.cfg != nil {
+		if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+			log.Printf("[%s] controller lease revoked; durable invalidation failed: %v", flow.name, err)
+		}
+	}
 	flow.cancel()
 	<-flow.done
 	if d.spawnLimiter != nil && flow.cfg != nil {
@@ -243,6 +253,11 @@ func (d *Daemon) stopAllUntil(deadline time.Time) {
 	d.mu.Unlock()
 
 	for _, flow := range flows {
+		if flow.cfg != nil {
+			if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+				log.Printf("[%s] controller lease revoked; durable invalidation failed: %v", flow.name, err)
+			}
+		}
 		flow.cancel()
 	}
 	if len(flows) == 0 {
@@ -340,10 +355,19 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			// the diff-loop handles as a fresh flow); hot-reloadable edits still
 			// apply (#768, Codex).
 			if identityChanged(flow.cfg, newCfg) {
+				if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+					log.Printf("[%s] controller lease revoked; config reload held after durable invalidation failure: %v", flow.name, err)
+				}
 				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path/forge) changed — restart required, live reload skipped", flow.name)
 				continue
 			}
 			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+			newCfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+			newCfg.AIExecution = flow.cfg.AIExecution.BindController(newCfg.AIExecution, newCfg.StateDir)
+			if err := newCfg.AIExecution.CheckCurrent(); err != nil {
+				log.Printf("[%s] config reload held: controller revision not durably applied: %v", flow.name, err)
+				continue
+			}
 			// Holder first, so the supervise loop's next cycle and the updated
 			// dashboard snapshot below both observe the new config.
 			flow.holder.Store(newCfg)

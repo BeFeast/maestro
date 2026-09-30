@@ -32,6 +32,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/forge"
 )
 
@@ -49,6 +50,7 @@ type Lens interface {
 
 // Producer publishes reviews for one repository through one forge client.
 type Producer struct {
+	ExecutionPolicy aiexecution.Policy
 	// Attempts is mandatory for HTTP lenses; nil fails closed before HTTP.
 	Attempts    *AttemptStore
 	MaxAttempts int
@@ -183,7 +185,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	var runnable []Lens
 	claims := map[string]string{}
 	for _, lens := range p.Lenses {
-		if _, managed := lens.(*ChatLens); managed {
+		if managedLens(lens) {
 			if settled, _ := p.statusSettled(lens.Name(), statuses); settled {
 				continue
 			}
@@ -208,7 +210,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 		}
 		switch p.prepare(ctx, lens, pr.HeadSHA, statuses) {
 		case prepareRun:
-			if _, managed := lens.(*ChatLens); managed {
+			if managedLens(lens) {
 				max := p.MaxAttempts
 				if max == 0 {
 					max = 1
@@ -407,7 +409,21 @@ func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, p
 			}
 		}
 	}
-	output, err := lens.Run(ctx, prompt)
+	if err := p.ExecutionPolicy.CheckCurrent(); err != nil {
+		return err
+	}
+	if p.ExecutionPolicy.RequireVerifiedRoute {
+		if native, ok := lens.(*NativeClaudeLens); !ok || !native.policy.RequireVerifiedRoute {
+			return aiexecution.Held("review_transport_unsupported")
+		}
+	}
+	var output string
+	var err error
+	if native, ok := lens.(*NativeClaudeLens); ok {
+		output, err = native.RunClaimed(ctx, prompt, claimID)
+	} else {
+		output, err = lens.Run(ctx, prompt)
+	}
 	if claimID != "" {
 		if saveErr := p.Attempts.Finish(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, claimID, p.now(), err); saveErr != nil {
 			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt persistence failed")

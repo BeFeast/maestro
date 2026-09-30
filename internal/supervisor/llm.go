@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
@@ -55,7 +57,10 @@ type LLMClient interface {
 }
 
 type backendLLMClient struct {
-	cfg *config.Config
+	cfg                 *config.Config
+	role                string
+	executionContext    context.Context
+	projectConfigSHA256 string
 	// backendHealth is an optional per-cycle snapshot of the project's
 	// BackendHealth gates. When present, candidates in an active cooldown are
 	// skipped instead of re-tried every supervise tick — without it the walk
@@ -169,7 +174,7 @@ func NewBackendLLMClient(cfg *config.Config) LLMClient {
 // never observes a mutated map. The failure memory pointer is shared — it must
 // survive across cycles.
 func (c *backendLLMClient) withBackendHealth(health map[string]state.BackendHealth) *backendLLMClient {
-	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory, receiptSave: c.receiptSave}
+	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory, receiptSave: c.receiptSave, role: c.role, executionContext: c.executionContext, projectConfigSHA256: c.projectConfigSHA256}
 }
 
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
@@ -178,13 +183,16 @@ func (c *backendLLMClient) Complete(prompt string) (string, error) {
 }
 
 func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, prompt string) (result ConsultationResult, retErr error) {
-	if c.cfg.Supervisor.RequireAccountingReady {
+	if err := c.cfg.AIExecution.CheckCurrent(); err != nil {
+		return result, err
+	}
+	if c.cfg.Supervisor.RequireAccountingReady && !c.cfg.AIExecution.RequireVerifiedRoute {
 		return result, &ConsultationHold{Code: "accounting_route_unsupported"}
 	}
 	if identity.ID == "" {
 		identity = newConsultationIdentity(c.cfg, identity.CycleID)
 	}
-	if uuid.Validate(identity.ID) != nil || identity.Role != "supervisor" || identity.ProjectID != c.cfg.ProjectID || routeIdentifier(identity.CycleID) == "" || (identity.ParentRoleRunID != "" && uuid.Validate(identity.ParentRoleRunID) != nil) {
+	if uuid.Validate(identity.ID) != nil || identity.Role != c.executionRole() || identity.ProjectID != c.cfg.ProjectID || routeIdentifier(identity.CycleID) == "" || (identity.ParentRoleRunID != "" && uuid.Validate(identity.ParentRoleRunID) != nil) {
 		return result, &ConsultationHold{Code: "consultation_identity_invalid"}
 	}
 	if strings.TrimSpace(c.cfg.StateDir) == "" {
@@ -220,10 +228,28 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		return result, err
 	}
 	launchIntentWritten := false
+	var releaseAux func()
+	if c.cfg.RuntimeAuxiliaryLimiter != nil {
+		releaseAux, err = c.cfg.RuntimeAuxiliaryLimiter.ReserveAuxiliary(c.cfg.StateDir, identity.ID)
+		if err != nil {
+			return result, err
+		}
+	} else if c.cfg.AIExecution.RequireVerifiedRoute || c.executionRole() == "reviewer" {
+		return result, aiexecution.Held("auxiliary_controller_unavailable")
+	}
+	defer func() {
+		if releaseAux != nil && !launchIntentWritten {
+			releaseAux()
+		}
+	}()
 	defer func() {
 		// A persistence failure after launch must not erase its durable intent.
 		var hold *ConsultationHold
 		if errors.As(retErr, &hold) && hold.Code == "receipt_persistence_failed" {
+			return
+		}
+		var nativeHold *aiexecution.Hold
+		if errors.As(retErr, &nativeHold) && nativeHold.Code == "native_outcome_unverified" {
 			return
 		}
 		end := time.Now().UTC()
@@ -244,6 +270,8 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			// A retained marker conservatively holds the next consultation.
 			if err := store.finishLaunch(); err != nil {
 				log.Printf("[supervisor] consultation outcome persisted; launch marker cleanup incomplete")
+			} else {
+				launchIntentWritten = false
 			}
 		}
 	}()
@@ -321,6 +349,12 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		}
 		intent := uuid.NewString()
 		invocation := invocationForCommand(candidate, cmd, intent, len(receipt.Invocations)+1, fallback)
+		if c.executionRole() == "reviewer" && (invocation.EffectiveCLIModel == nil || *invocation.EffectiveCLIModel != c.cfg.Supervisor.Model) {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, aiexecution.Held("reviewer_model_unproven")
+		}
 		candidateStatus := "launch_intent"
 		if c.cfg.Supervisor.NativeSessionRegistration != nil {
 			if err := prepareNativeSession(c.cfg, identity, &invocation, cmd); err != nil {
@@ -353,6 +387,33 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 				}
 				return result, err
 			}
+			configDigest, digestErr := config.AIExecutionConfigDigest(c.cfg)
+			if c.projectConfigSHA256 != "" {
+				configDigest = c.projectConfigSHA256
+				digestErr = nil
+			}
+			if digestErr != nil {
+				return result, aiexecution.Held("project_config_unobservable")
+			}
+			if err := aiexecution.Inspect(c.cfg.AIExecution, aiexecution.LaunchSpec{
+				ProjectID: identity.ProjectID, Role: identity.Role, RoleRunID: identity.ID, Model: c.cfg.Supervisor.Model,
+				GatewayScope:          c.cfg.Supervisor.NativeSessionRegistration.GatewayScope,
+				ExpectedPolicyVersion: c.cfg.Supervisor.NativeSessionRegistration.ExpectedPolicyVersion,
+				Registration:          invocation.NativeSession.Acknowledgement,
+				ProjectConfigSHA256:   configDigest,
+			}, cmd); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				receipt.Candidates[index].Status = "readiness_held"
+				if err := persist(); err != nil {
+					return result, err
+				}
+				if err := store.finishRegistration(); err != nil {
+					return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+				}
+				return result, err
+			}
 			receipt.Candidates[index].Status = "launch_intent"
 			if err := persist(); err != nil {
 				if stdin != nil {
@@ -360,6 +421,12 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 				}
 				return result, err
 			}
+		}
+		if c.cfg.AIExecution.RequireVerifiedRoute && invocation.NativeSession == nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, aiexecution.Held("native_registration_required")
 		}
 		if err := store.beginLaunch(identity, intent); err != nil {
 			if stdin != nil {
@@ -387,12 +454,25 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			}
 		}
 		invocation.StartedAt = time.Now().UTC()
-		out, launched, status, runErr := outputWithTimeoutReceipt(cmd, timeout)
+		if err := c.cfg.AIExecution.CheckCurrent(); err != nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, err
+		}
+		out, launched, status, runErr := outputWithTimeoutReceiptContext(c.executionContext, cmd, timeout)
 		if stdin != nil {
 			_ = stdin.Close()
 		}
 		invocation.EndedAt = time.Now().UTC()
 		invocation.Status = status
+		if invocation.NativeSession != nil && launched {
+			checkpoint, err := store.saveNativeOutput(identity, invocation, out)
+			if err != nil {
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			invocation.OutputCheckpoint = checkpoint
+		}
 		receipt.PlannedInvocation = nil
 		receipt.Candidates[index].Status = status
 		if launched {
@@ -401,6 +481,12 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		// Persist the completed call BEFORE deciding whether another candidate may run.
 		if err := persist(); err != nil {
 			return result, err
+		}
+		if invocation.NativeSession != nil && launched {
+			// Every local outcome, including exit 0, is financially unresolved
+			// until the authority outcome bridge proves a terminal result for
+			// this exact role-run. Keep its durable marker and auxiliary permit.
+			return result, aiexecution.Held("native_outcome_unverified")
 		}
 		if runErr == nil {
 			c.memory.recordSuccess(candidate.name)
@@ -504,7 +590,37 @@ func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
 }
 
 func outputWithTimeoutReceipt(cmd *exec.Cmd, timeout time.Duration) ([]byte, bool, string, error) {
-	var out bytes.Buffer
+	return outputWithTimeoutReceiptContext(context.Background(), cmd, timeout)
+}
+
+type boundedNativeOutput struct {
+	buffer   bytes.Buffer
+	overflow bool
+}
+
+func (b *boundedNativeOutput) Bytes() []byte { return b.buffer.Bytes() }
+func (b *boundedNativeOutput) Len() int      { return b.buffer.Len() }
+
+func (b *boundedNativeOutput) Write(p []byte) (int, error) {
+	const maxOutput = 4 << 20
+	n := len(p)
+	remaining := maxOutput - b.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.overflow = true
+	}
+	_, _ = b.buffer.Write(p)
+	return n, nil
+}
+
+func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout time.Duration) ([]byte, bool, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, "cancelled", err
+	}
+	var out boundedNativeOutput
 	cmd.Stdout = &out
 	if err := cmd.Start(); err != nil {
 		return nil, false, "start_failed", err
@@ -515,18 +631,25 @@ func outputWithTimeoutReceipt(cmd *exec.Cmd, timeout time.Duration) ([]byte, boo
 	defer timer.Stop()
 	select {
 	case err := <-done:
+		if out.overflow {
+			return out.Bytes(), true, "output_limit", fmt.Errorf("native output exceeded bounded receipt limit")
+		}
 		status := "succeeded"
 		if err != nil {
 			status = "failed"
 		}
 		return out.Bytes(), true, status, err
+	case <-ctx.Done():
+		worker.ForceKillProcessTree(cmd.Process.Pid)
+		<-done
+		return out.Bytes(), true, "cancelled", ctx.Err()
 	case <-timer.C:
 		// This is already a hard attempt deadline. Do not spend the worker
 		// reaper's two-second SIGTERM grace period here or the bounded fallback
 		// chain can overrun its advertised total deadline.
 		worker.ForceKillProcessTree(cmd.Process.Pid)
 		<-done
-		return nil, true, "timed_out", fmt.Errorf("timed out after %s", timeout.Round(time.Second))
+		return out.Bytes(), true, "timed_out", fmt.Errorf("timed out after %s", timeout.Round(time.Second))
 	}
 }
 
@@ -584,14 +707,20 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		client = backendClient.withBackendHealth(st.BackendHealth)
 	}
 	var output string
-	if e.cfg.Supervisor.RequireAccountingReady {
+	if currentErr := e.cfg.AIExecution.CheckCurrent(); currentErr != nil {
+		err = currentErr
+	} else if e.cfg.Supervisor.RequireAccountingReady && !e.cfg.AIExecution.RequireVerifiedRoute {
 		err = &ConsultationHold{Code: "accounting_route_unsupported"}
+	} else if _, native := client.(*backendLLMClient); e.cfg.AIExecution.RequireVerifiedRoute && !native {
+		err = aiexecution.Held("custom_completer_unsupported")
 	} else if rich, ok := client.(ConsultationClient); ok {
 		identity := newConsultationIdentity(e.cfg, deterministic.ID)
 		var result ConsultationResult
 		result, err = rich.CompleteConsultation(identity, prompt)
 		output = result.Output
 		deterministic.ConsultationID = identity.ID
+	} else if e.cfg.AIExecution.RequireVerifiedRoute {
+		err = aiexecution.Held("custom_completer_unsupported")
 	} else {
 		output, err = client.Complete(prompt)
 	}
@@ -604,6 +733,10 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		var hold *ConsultationHold
 		if errors.As(err, &hold) {
 			deterministic.ErrorClass = hold.Code
+		}
+		var executionHold *aiexecution.Hold
+		if errors.As(err, &executionHold) {
+			deterministic.ErrorClass = executionHold.Code
 		}
 		deterministic.Reasons = append(deterministic.Reasons, "Supervisor model backends were unavailable; deterministic guardrail executed without model synthesis.")
 		return deterministic, nil
@@ -979,4 +1112,11 @@ func copyTarget(target *state.SupervisorTarget) *state.SupervisorTarget {
 	copy := *target
 	copy.Session = strings.TrimSpace(copy.Session)
 	return &copy
+}
+
+func (c *backendLLMClient) executionRole() string {
+	if c.role != "" {
+		return c.role
+	}
+	return "supervisor"
 }

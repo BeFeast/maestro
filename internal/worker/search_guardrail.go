@@ -498,7 +498,7 @@ func logPipeline(split *streamSplit, logFile string) string {
 	return "2>&1 | " + splitter + " | " + tee
 }
 
-func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin string, split *streamSplit) string {
+func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin string, split *streamSplit, executionProof ...string) string {
 	var b strings.Builder
 	b.WriteString("#!/bin/bash\n")
 	b.WriteString("export MAESTRO_WORKTREE=" + shellQuote(worktree) + "\n")
@@ -520,6 +520,9 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 	if credsFile != "" {
 		workerExec = append(workerExec, "--credentials-file", credsFile)
 	}
+	if len(executionProof) == 2 {
+		workerExec = append(workerExec, "--execution-proof", executionProof[0], "--execution-proof-sha256", executionProof[1])
+	}
 	workerExec = append(workerExec, "--")
 	workerExec = append(workerExec, args...)
 	pipeline := logPipeline(split, logFile)
@@ -531,7 +534,7 @@ func buildWorkerRunnerScript(args []string, stdinFile, logFile, worktree, guardD
 	return b.String()
 }
 
-func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit) error {
+func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFile, logFile, worktree string, split *streamSplit, executionProof ...string) error {
 	// Resolve argv[0] while the daemon is generating the runner. A long-lived
 	// tmux server can retain an older PATH than maestro.service, so leaving a
 	// bare command such as "claude" makes retry/repair launches depend on stale
@@ -562,7 +565,7 @@ func writeWorkerRunnerScript(stateDir, runnerPath string, args []string, stdinFi
 			return fmt.Errorf("clear stale token-budget marker: %w", err)
 		}
 	}
-	runnerContent := buildWorkerRunnerScript(resolvedArgs, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split)
+	runnerContent := buildWorkerRunnerScript(resolvedArgs, stdinFile, logFile, worktree, guardDir, credsFile, maestroBin, split, executionProof...)
 	if err := writeFileAtomicMode(filepath.Dir(runnerPath), runnerPath, runnerContent, workerRunnerScriptMode); err != nil {
 		return fmt.Errorf("write runner script: %w", err)
 	}
@@ -980,6 +983,10 @@ func workerExecEnvironment(base []string, credentials map[string]string) []strin
 // in-memory snapshot before returning bytes to JSONL/tee. A rotation therefore
 // cannot race separate injector/filter reads, and no value enters argv or disk.
 func RunWorkerWithCredentials(credentialsFile string, args []string, stdin io.Reader, stdout io.Writer) error {
+	return RunWorkerWithExecutionProof(credentialsFile, "", "", args, stdin, stdout)
+}
+
+func RunWorkerWithExecutionProof(credentialsFile, proofPath, proofSHA256 string, args []string, stdin io.Reader, stdout io.Writer) error {
 	if len(args) == 0 || strings.TrimSpace(args[0]) == "" {
 		return fmt.Errorf("worker command is empty")
 	}
@@ -989,6 +996,11 @@ func RunWorkerWithCredentials(credentialsFile string, args []string, stdin io.Re
 	}
 	cmd := exec.Command(args[0], args[1:]...)
 	cmd.Env = workerExecEnvironment(os.Environ(), credentials)
+	if proofPath != "" || proofSHA256 != "" {
+		if err := inspectWorkerExecutionProof(proofPath, proofSHA256, cmd); err != nil {
+			return err
+		}
+	}
 	cmd.Stdin = stdin
 	reader, writer := io.Pipe()
 	cmd.Stdout = writer

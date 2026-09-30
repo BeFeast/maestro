@@ -153,6 +153,7 @@ func FleetSettingSpecs() []FleetSettingSpec {
 			FleetOnly: true,
 			Default:   strconv.Itoa(DefaultFleetMaxLiveWorkers),
 		},
+		{Key: FleetMaxAuxiliaryRunsKey, Kind: SettingKindInt, FleetOnly: true, Default: "2"},
 		{
 			Key:      "stalled_progress_watchdog.enabled",
 			YAMLPath: []string{"stalled_progress_watchdog", "enabled"},
@@ -261,8 +262,9 @@ func NormalizeSettingValue(key, value string) (string, error) {
 }
 
 const (
-	FleetMinLiveWorkersKey = "fleet.min_live_workers"
-	FleetMaxLiveWorkersKey = "fleet.max_live_workers"
+	FleetMinLiveWorkersKey   = "fleet.min_live_workers"
+	FleetMaxLiveWorkersKey   = "fleet.max_live_workers"
+	FleetMaxAuxiliaryRunsKey = "fleet.max_auxiliary_runs"
 
 	DefaultFleetMinLiveWorkers = 5
 	DefaultFleetMaxLiveWorkers = 10
@@ -272,8 +274,9 @@ const (
 // a soft operating target; the maximum is a hard spawn ceiling shared by every
 // project flow. A stored zero disables that side of the band.
 type FleetConcurrencySettings struct {
-	MinLiveWorkers int
-	MaxLiveWorkers int
+	MinLiveWorkers   int
+	MaxLiveWorkers   int
+	MaxAuxiliaryRuns int
 }
 
 // ResolveFleetConcurrencySettings applies built-in defaults to missing keys and
@@ -282,12 +285,14 @@ type FleetConcurrencySettings struct {
 // was edited out of band.
 func ResolveFleetConcurrencySettings(settings map[string]string) (FleetConcurrencySettings, error) {
 	resolved := FleetConcurrencySettings{
-		MinLiveWorkers: DefaultFleetMinLiveWorkers,
-		MaxLiveWorkers: DefaultFleetMaxLiveWorkers,
+		MinLiveWorkers:   DefaultFleetMinLiveWorkers,
+		MaxLiveWorkers:   DefaultFleetMaxLiveWorkers,
+		MaxAuxiliaryRuns: 2,
 	}
 	for key, target := range map[string]*int{
-		FleetMinLiveWorkersKey: &resolved.MinLiveWorkers,
-		FleetMaxLiveWorkersKey: &resolved.MaxLiveWorkers,
+		FleetMinLiveWorkersKey:   &resolved.MinLiveWorkers,
+		FleetMaxLiveWorkersKey:   &resolved.MaxLiveWorkers,
+		FleetMaxAuxiliaryRunsKey: &resolved.MaxAuxiliaryRuns,
 	} {
 		raw, ok := settings[key]
 		if !ok {

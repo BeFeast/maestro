@@ -31,6 +31,14 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 	if cfg == nil {
 		return 0, tmuxsession.ProcessLease{}, fmt.Errorf("launch worker process lease: nil config")
 	}
+	if err := cfg.AIExecution.CheckCurrent(); err != nil {
+		return 0, tmuxsession.ProcessLease{}, err
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		if err := preflightWorkerExecutionDescriptor(cfg, runnerPath); err != nil {
+			return 0, tmuxsession.ProcessLease{}, err
+		}
+	}
 	lease, err := workerProcessLease(cfg, slotName, generation)
 	if err != nil {
 		return 0, tmuxsession.ProcessLease{}, err

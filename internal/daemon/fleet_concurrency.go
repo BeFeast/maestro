@@ -33,23 +33,30 @@ type fleetProjectRegistration struct {
 // authoritative state file, closing both the concurrent-flow race and the
 // single-flow batch overshoot window.
 type fleetSpawnLimiter struct {
-	mu           sync.Mutex
-	settings     fleetConcurrencySettingsLoader
-	stateDirs    map[string]struct{}
-	projects     map[string]fleetProjectRegistration
-	reservations map[uint64]fleetSpawnReservation
-	nextID       uint64
-	loadState    func(string) (*state.State, error)
+	mu                    sync.Mutex
+	settings              fleetConcurrencySettingsLoader
+	stateDirs             map[string]struct{}
+	projects              map[string]fleetProjectRegistration
+	reservations          map[uint64]fleetSpawnReservation
+	auxiliaryReservations map[string]struct{}
+	auxiliaryStateDirs    map[string]struct{}
+	auxiliaryStore        auxiliaryReceiptIndex
+	nextID                uint64
+	loadState             func(string) (*state.State, error)
 }
 
 func newFleetSpawnLimiter(store ConfigLoader) *fleetSpawnLimiter {
 	loader, _ := store.(fleetConcurrencySettingsLoader)
+	index, _ := store.(auxiliaryReceiptIndex)
 	return &fleetSpawnLimiter{
-		settings:     loader,
-		stateDirs:    make(map[string]struct{}),
-		projects:     make(map[string]fleetProjectRegistration),
-		reservations: make(map[uint64]fleetSpawnReservation),
-		loadState:    state.Load,
+		settings:              loader,
+		auxiliaryStore:        index,
+		stateDirs:             make(map[string]struct{}),
+		projects:              make(map[string]fleetProjectRegistration),
+		reservations:          make(map[uint64]fleetSpawnReservation),
+		auxiliaryReservations: make(map[string]struct{}),
+		auxiliaryStateDirs:    make(map[string]struct{}),
+		loadState:             state.Load,
 	}
 }
 
@@ -67,6 +74,7 @@ func (l *fleetSpawnLimiter) RegisterProject(stateDir, repo string, superviseInte
 	}
 	l.mu.Lock()
 	l.stateDirs[stateDir] = struct{}{}
+	l.auxiliaryStateDirs[stateDir] = struct{}{}
 	l.projects[stateDir] = fleetProjectRegistration{
 		repo:              strings.TrimSpace(repo),
 		queueSignalMaxAge: 2*superviseInterval + time.Minute,
