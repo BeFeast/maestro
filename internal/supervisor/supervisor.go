@@ -4951,7 +4951,7 @@ func executeApprovedDeliveries(cfg *config.Config, st *state.State, reader Reade
 	latestReader, ok := reader.(approver.LatestMergedGenerationReader)
 	if !ok {
 		// The normal supervisor reader may be mirror-first and intentionally
-		// omit this freshness-only API. Execution must consult GitHub directly;
+		// omit this freshness-only API. Execution must consult the configured forge directly;
 		// a cached mirror is not authoritative for a just-landed merge.
 		latestReader = github.New(cfg.Repo, cfg.Forge)
 	}
@@ -4968,7 +4968,7 @@ func executeApprovedDeliveries(cfg *config.Config, st *state.State, reader Reade
 		Delivery:  cfg.EffectiveDelivery(),
 		Checkout:  checkout,
 		Actor:     "supervisor",
-		Freshness: approver.NewGitHubDeliveryFreshnessChecker(latestReader, cfg.Repo, cfg.LocalPath),
+		Freshness: approver.NewDeliveryFreshnessChecker(latestReader, cfg.Repo, cfg.LocalPath, cfg.Forge),
 	}
 	for _, a := range pending {
 		// Approved delivery rows must already exist in the authoritative ledger.

@@ -25,7 +25,6 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"net/url"
 	"os"
 	"os/exec"
 	pathpkg "path"
@@ -56,7 +55,7 @@ func (f CommandRunnerFunc) Run(ctx context.Context, dir, command string) (string
 }
 
 // DeliveryFreshnessChecker proves that the approved merge is still the newest
-// authoritative GitHub merge generation immediately before execution. It is
+// authoritative forge merge generation immediately before execution. It is
 // called twice: once before the durable claim and once immediately after it,
 // before any checkout or delivery side effect. Production must always provide
 // one; tests may inject a deterministic function.
@@ -71,19 +70,19 @@ func (f DeliveryFreshnessFunc) CheckDeliveryFreshness(ctx context.Context, paylo
 	return f(ctx, payload)
 }
 
-// LatestMergedGenerationReader is the authoritative GitHub read needed by the
+// LatestMergedGenerationReader is the authoritative forge read needed by the
 // execution-time freshness fence. Implementations return every generation tied
 // at the latest merged_at second; silently picking one by PR number would turn
-// GitHub's second-resolution timestamp into an unsafe ordering oracle.
+// the forge's second-resolution timestamp into an unsafe ordering oracle.
 type LatestMergedGenerationReader interface {
 	LatestMergedPRGenerations(context.Context) ([]github.PRMergeInfo, error)
 }
 
-// NewGitHubDeliveryFreshnessChecker builds the production freshness fence.
+// NewDeliveryFreshnessChecker builds the production freshness fence.
 // Different revisions with the same merged_at second are ordered only by an
 // isolated remote ancestry proof. A read/topology error or incomparable pair
 // fails closed without returning provider text that might contain credentials.
-func NewGitHubDeliveryFreshnessChecker(reader LatestMergedGenerationReader, repo, sourceDir string) DeliveryFreshnessChecker {
+func NewDeliveryFreshnessChecker(reader LatestMergedGenerationReader, repo, sourceDir string, forge config.ForgeConfig) DeliveryFreshnessChecker {
 	return DeliveryFreshnessFunc(func(ctx context.Context, approved *state.DeliveryPayload) error {
 		if reader == nil || approved == nil {
 			return ErrDeliveryFreshnessUnverified
@@ -93,7 +92,7 @@ func NewGitHubDeliveryFreshnessChecker(reader LatestMergedGenerationReader, repo
 			return ErrDeliveryFreshnessUnverified
 		}
 		return checkLatestDeliveryGenerations(ctx, approved, latest, func(ctx context.Context, ancestor, descendant string) (bool, error) {
-			return RevisionContains(ctx, repo, sourceDir, ancestor, descendant)
+			return RevisionContains(ctx, repo, sourceDir, ancestor, descendant, forge)
 		})
 	})
 }
@@ -317,35 +316,36 @@ func RunBoundedShell(ctx context.Context, dir, command string, outputLimit int) 
 // gitIsolatedPreparer is the production checkout fence. LocalPath is used only
 // for a hook-free, include-free read of remote.origin.url so the configured
 // checkout can be bound to the approved owner/repository. The approved object
-// is fetched from a canonical GitHub HTTPS URL into a brand-new repository,
+// is fetched from the configured canonical forge URL into a brand-new repository,
 // then materialized with the built-in git archive stream. In particular, no
 // hook, filter, fsmonitor, credential helper, URL rewrite, or checkout setting
 // from LocalPath is inherited or executed.
 //
 // fetchURL is a test-only seam for a local bare origin. Production always
-// leaves it empty and derives https://github.com/<owner>/<repo>.git from the
-// repo already bound into the approval payload/hash and executor guard.
+// leaves it empty and derives the remote from the forge and repository
+// identity already bound into the approval digest and executor guard.
 type gitIsolatedPreparer struct {
 	expectedRepo string
+	forge        config.ForgeConfig
 	fetchURL     string
 }
 
 // NewLocalFixtureCheckoutPreparer exposes the production-hardened isolated
 // materializer to self-checks and tests backed by a local bare origin. Runtime
-// delivery must leave Checkout nil so the canonical GitHub remote is derived
-// from the approval-bound owner/repository identity.
+// delivery must leave Checkout nil so the canonical forge remote is derived
+// from the approval-bound forge and owner/repository identity.
 func NewLocalFixtureCheckoutPreparer(expectedRepo, fetchURL string) CheckoutPreparer {
 	return gitIsolatedPreparer{expectedRepo: expectedRepo, fetchURL: fetchURL}
 }
 
 // RevisionContains reports whether ancestor is reachable from descendant in
-// the approved GitHub repository. It deliberately does not consult LocalPath's
+// the approved forge repository. It deliberately does not consult LocalPath's
 // object database, refs, replace refs, grafts, commit graph, or Git config:
 // both exact objects are fetched from the canonical remote into a brand-new
 // repository under the same sanitized Git environment used for delivery
 // materialization.
-func RevisionContains(ctx context.Context, expectedRepo, sourceDir, ancestor, descendant string) (bool, error) {
-	return revisionContainsFromRemote(ctx, gitIsolatedPreparer{expectedRepo: expectedRepo}, sourceDir, ancestor, descendant)
+func RevisionContains(ctx context.Context, expectedRepo, sourceDir, ancestor, descendant string, forge config.ForgeConfig) (bool, error) {
+	return revisionContainsFromRemote(ctx, gitIsolatedPreparer{expectedRepo: expectedRepo, forge: forge}, sourceDir, ancestor, descendant)
 }
 
 func revisionContainsFromRemote(ctx context.Context, p gitIsolatedPreparer, sourceDir, ancestor, descendant string) (bool, error) {
@@ -354,11 +354,11 @@ func revisionContainsFromRemote(ctx context.Context, p gitIsolatedPreparer, sour
 	if !validFullRevision(ancestor) || !validFullRevision(descendant) || len(ancestor) != len(descendant) {
 		return false, errors.New("revision ancestry requires two full same-format git object IDs")
 	}
-	expectedRepo, fetchURL, err := p.expectedRemote()
+	identity, fetchURL, err := p.expectedRemote()
 	if err != nil {
 		return false, err
 	}
-	if err := validateSourceOrigin(ctx, sourceDir, expectedRepo, fetchURL, p.fetchURL != ""); err != nil {
+	if err := validateSourceOrigin(ctx, sourceDir, identity, fetchURL, p.fetchURL != ""); err != nil {
 		return false, err
 	}
 
@@ -406,11 +406,11 @@ func (p gitIsolatedPreparer) Prepare(ctx context.Context, sourceDir, approvedRev
 	if !validFullRevision(pinned) {
 		return nil, fmt.Errorf("approved revision is not a full hexadecimal git object ID")
 	}
-	expectedRepo, fetchURL, err := p.expectedRemote()
+	identity, fetchURL, err := p.expectedRemote()
 	if err != nil {
 		return nil, err
 	}
-	if err := validateSourceOrigin(ctx, sourceDir, expectedRepo, fetchURL, p.fetchURL != ""); err != nil {
+	if err := validateSourceOrigin(ctx, sourceDir, identity, fetchURL, p.fetchURL != ""); err != nil {
 		return nil, err
 	}
 
@@ -477,18 +477,18 @@ func (p gitIsolatedPreparer) Prepare(ctx context.Context, sourceDir, approvedRev
 	return &PreparedCheckout{Dir: checkout, Revision: head, Cleanup: cleanup}, nil
 }
 
-func (p gitIsolatedPreparer) expectedRemote() (repo, fetchURL string, err error) {
-	repo, err = canonicalGitHubRepo(p.expectedRepo)
+func (p gitIsolatedPreparer) expectedRemote() (config.RepositoryIdentity, string, error) {
+	identity, err := p.forge.RepositoryIdentity(p.expectedRepo)
 	if err != nil {
-		return "", "", err
+		return config.RepositoryIdentity{}, "", err
 	}
 	if p.fetchURL != "" {
-		return repo, p.fetchURL, nil
+		return identity, p.fetchURL, nil
 	}
-	return repo, "https://github.com/" + repo + ".git", nil
+	return identity, identity.FetchURL(), nil
 }
 
-func validateSourceOrigin(ctx context.Context, sourceDir, expectedRepo, fetchURL string, localFixture bool) error {
+func validateSourceOrigin(ctx context.Context, sourceDir string, identity config.RepositoryIdentity, fetchURL string, localFixture bool) error {
 	remote, err := runIsolatedGitText(ctx, sourceDir, 4<<10, "config", "--local", "--no-includes", "--get-all", "remote.origin.url")
 	if err != nil {
 		return fmt.Errorf("read configured checkout origin without executing repo config: %w", err)
@@ -504,59 +504,10 @@ func validateSourceOrigin(ctx context.Context, sourceDir, expectedRepo, fetchURL
 		}
 		return nil
 	}
-	repo, err := githubRepoFromRemote(remote)
-	if err != nil || !strings.EqualFold(repo, expectedRepo) {
-		return errors.New("configured checkout origin does not match the approved GitHub repository")
+	if !identity.MatchesOrigin(remote, true) {
+		return errors.New("configured checkout origin does not match the approved forge repository")
 	}
 	return nil
-}
-
-func canonicalGitHubRepo(repo string) (string, error) {
-	repo = strings.TrimSpace(repo)
-	parts := strings.Split(repo, "/")
-	if len(parts) != 2 || !validGitHubRepoPart(parts[0]) || !validGitHubRepoPart(parts[1]) {
-		return "", fmt.Errorf("repo must use the canonical owner/repository form")
-	}
-	return parts[0] + "/" + parts[1], nil
-}
-
-func validGitHubRepoPart(part string) bool {
-	if part == "" || part == "." || part == ".." {
-		return false
-	}
-	for _, ch := range part {
-		if !((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-			(ch >= '0' && ch <= '9') || ch == '-' || ch == '_' || ch == '.') {
-			return false
-		}
-	}
-	return true
-}
-
-func githubRepoFromRemote(remote string) (string, error) {
-	remote = strings.TrimSpace(remote)
-	if strings.HasPrefix(remote, "git@github.com:") {
-		return canonicalGitHubRepo(strings.TrimSuffix(strings.TrimPrefix(remote, "git@github.com:"), ".git"))
-	}
-	u, err := url.Parse(remote)
-	if err != nil || (u.Scheme != "https" && u.Scheme != "ssh") ||
-		!strings.EqualFold(u.Hostname(), "github.com") || u.RawQuery != "" || u.Fragment != "" {
-		return "", errors.New("origin is not a canonical GitHub HTTPS/SSH remote")
-	}
-	if u.Scheme == "https" && (u.User != nil || (u.Port() != "" && u.Port() != "443")) {
-		return "", errors.New("GitHub HTTPS origin embeds credentials or a non-standard port")
-	}
-	if u.Scheme == "ssh" {
-		if u.User == nil || u.User.Username() != "git" || u.User.String() != "git" || (u.Port() != "" && u.Port() != "22") {
-			return "", errors.New("GitHub SSH origin has an unexpected identity")
-		}
-	}
-	repo := strings.TrimPrefix(pathpkg.Clean(u.EscapedPath()), "/")
-	unescaped, err := url.PathUnescape(repo)
-	if err != nil || unescaped != repo {
-		return "", errors.New("GitHub origin contains escaped path data")
-	}
-	return canonicalGitHubRepo(strings.TrimSuffix(repo, ".git"))
 }
 
 func isolatedGitCommand(ctx context.Context, dir string, args ...string) *exec.Cmd {
@@ -568,6 +519,7 @@ func isolatedGitCommand(ctx context.Context, dir string, args ...string) *exec.C
 		"-c", "core.excludesFile=/dev/null",
 		"-c", "credential.helper=",
 		"-c", "protocol.ext.allow=never",
+		"-c", "http.followRedirects=false",
 		"--no-replace-objects",
 	}
 	// Private GitHub repos remain usable without inheriting any mutable Git
@@ -942,7 +894,7 @@ type DeliveryExecutor struct {
 	// OutputLimit bounds runtime-only capture; output is always discarded and
 	// never stored, returned in DeliveryResult, or logged. 0 uses the default.
 	OutputLimit int
-	// Freshness is the authoritative execution-time GitHub generation fence.
+	// Freshness is the authoritative execution-time forge generation fence.
 	// It is mandatory: an approval that cannot prove it is still the newest
 	// merged generation never claims or runs a side effect.
 	Freshness DeliveryFreshnessChecker
@@ -1010,7 +962,7 @@ func (d *DeliveryExecutor) checkout() CheckoutPreparer {
 	if d.Checkout != nil {
 		return d.Checkout
 	}
-	return gitIsolatedPreparer{expectedRepo: d.Repo}
+	return gitIsolatedPreparer{expectedRepo: d.Repo, forge: d.Delivery.Forge}
 }
 
 func (d *DeliveryExecutor) actor() string {
@@ -1060,10 +1012,17 @@ func (d *DeliveryExecutor) Deliver(ctx context.Context, id string) DeliveryResul
 	if pre.Action != state.ApprovalActionDeployProject || pre.Delivery == nil {
 		return DeliveryResult{Approval: pre, Status: state.ApprovalStatusExecutionFailed, Err: ErrNotDeliverable, Skipped: true}
 	}
+	currentDigest := d.Delivery.ApprovalDigest()
+	if strings.TrimSpace(pre.Delivery.ConfigDigest) != currentDigest {
+		stale, staleErr := d.Store.InvalidateDeliveryConfig(ctx, d.StateDir, id, currentDigest, d.now())
+		return DeliveryResult{Approval: stale, Status: statusOf(stale), Summary: "delivery config changed; no command ran", Err: staleErr, Skipped: true}
+	}
+	if pre.Status != state.ApprovalStatusApproved {
+		return DeliveryResult{Approval: pre, Status: pre.Status, Err: state.ErrApprovalNotApproved, Skipped: true}
+	}
 	if guardErr := d.repoGuard(pre); guardErr != nil {
 		return DeliveryResult{Approval: pre, Status: state.ApprovalStatusExecutionFailed, Err: guardErr, Skipped: true}
 	}
-	currentDigest := d.Delivery.ApprovalDigest()
 	if freshErr := d.checkFreshness(ctx, pre.Delivery); freshErr != nil {
 		if errors.Is(freshErr, ErrDeliverySuperseded) || errors.Is(freshErr, ErrDeliveryGenerationAmbiguous) {
 			stale, staleErr := d.Store.MarkStale(ctx, d.StateDir, id, d.now(), "delivery generation is no longer current")
@@ -1090,7 +1049,7 @@ func (d *DeliveryExecutor) Deliver(ctx context.Context, id string) DeliveryResul
 	}
 
 	payload := claimed.Delivery.Clone()
-	// Close the merge-between-read-and-claim race. A newer GitHub merge after
+	// Close the merge-between-read-and-claim race. A newer forge merge after
 	// the first check terminal-fails this claimed generation before checkout or
 	// any project side effect. A merge after this second authoritative read is a
 	// distributed event no local transaction can lock; the check is therefore
@@ -1276,11 +1235,11 @@ func (d *DeliveryExecutor) repoGuard(a *state.Approval) error {
 	if a == nil || a.Delivery == nil {
 		return errors.New("delivery approval repo binding mismatch")
 	}
-	cfgRepo, cfgErr := canonicalGitHubRepo(d.Repo)
-	stampedRepo, stampedErr := canonicalGitHubRepo(a.Repo)
-	payloadRepo, payloadErr := canonicalGitHubRepo(a.Delivery.Repo)
+	cfgRepo, cfgErr := d.Delivery.Forge.RepositoryIdentity(d.Repo)
+	stampedRepo, stampedErr := d.Delivery.Forge.RepositoryIdentity(a.Repo)
+	payloadRepo, payloadErr := d.Delivery.Forge.RepositoryIdentity(a.Delivery.Repo)
 	if cfgErr != nil || stampedErr != nil || payloadErr != nil ||
-		!strings.EqualFold(cfgRepo, stampedRepo) || !strings.EqualFold(cfgRepo, payloadRepo) {
+		!strings.EqualFold(cfgRepo.Repo, stampedRepo.Repo) || !strings.EqualFold(cfgRepo.Repo, payloadRepo.Repo) {
 		return errors.New("delivery approval repo binding mismatch")
 	}
 	return nil
