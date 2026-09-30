@@ -70,6 +70,7 @@ Commands:
   tmpfs-hygiene Protect-aware allowlisted /tmp tmpfs sweep (dry-run/apply JSONL)
   version-bump  Bump project version based on merged PR labels
   selfcheck     Run the bundled behavioral smoke gate (self-deploy pre-finalize check)
+  candidate-preflight Compare supplied stable/candidate resource snapshots without runtime access
   version       Print version
 
 Global flags:
@@ -397,6 +398,8 @@ func main() {
 		versionBumpCmd(args)
 	case "selfcheck":
 		selfcheckCmd(args)
+	case "candidate-preflight":
+		candidatePreflightCmd(args)
 	case "stream-split":
 		streamSplitCmd(args)
 	case "_worker-exec":
