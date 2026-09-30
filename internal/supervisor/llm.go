@@ -431,7 +431,7 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 				return result, err
 			}
 			if c.cfg.AIExecution.RequireVerifiedRoute {
-				pin, err := aiexecution.ContainmentProfilePin(c.cfg.AIExecution, identity.Role)
+				pin, err := aiexecution.ContainmentProfilePin(c.cfg.AIExecution, identity.Role, identity.Role)
 				if err != nil {
 					return result, err
 				}

@@ -117,7 +117,7 @@ type RoleRoute struct {
 
 // ContainmentProfilePin selects the reviewed finite profile for one worker
 // slot or native auxiliary role. Inspect remains required before preparation.
-func ContainmentProfilePin(policy Policy, key string) (FileProof, error) {
+func ContainmentProfilePin(policy Policy, key, role string) (FileProof, error) {
 	b, err := os.ReadFile(policy.ManifestPath)
 	if err != nil || len(b) > 128<<10 || digest(b) != policy.ManifestSHA256 {
 		return FileProof{}, Held("manifest_drift")
@@ -126,17 +126,24 @@ func ContainmentProfilePin(policy Policy, key string) (FileProof, error) {
 	if DecodeStrict(b, &m) != nil {
 		return FileProof{}, Held("manifest_invalid")
 	}
-	return selectContainmentProfile(m, key)
+	return selectContainmentProfile(m, key, role)
 }
 
-func selectContainmentProfile(m Manifest, key string) (FileProof, error) {
+func selectContainmentProfile(m Manifest, key, role string) (FileProof, error) {
 	if pin, ok := m.Containment[key]; ok {
 		return pin, nil
 	}
 	// The explicit worker class serializes successive dynamic worker slots in
 	// the pilot's single namespace. Its ProjectID is checked at every launch;
 	// UUID, unit, registration and generation ownership remain exact.
-	if key != "" && key != "supervisor" && key != "reviewer" {
+	workerRole := role == "worker" || role == "planner" || role == "advisor" || role == "implementer" || role == "validator" || role == "repair"
+	i := strings.LastIndexByte(key, '-')
+	slot := false
+	if i > 0 {
+		number, err := strconv.ParseUint(key[i+1:], 10, 64)
+		slot = err == nil && number > 0
+	}
+	if workerRole && slot {
 		if pin, ok := m.Containment["worker"]; ok {
 			return pin, nil
 		}
@@ -346,7 +353,7 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if key == "" {
 		key = spec.Role
 	}
-	pin, err := selectContainmentProfile(m, key)
+	pin, err := selectContainmentProfile(m, key, spec.Role)
 	if err != nil {
 		return err
 	}

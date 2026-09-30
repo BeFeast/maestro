@@ -31,21 +31,26 @@ func TestNativeWorkerClassProfileSupportsSuccessiveSlotsWithoutAuxFallback(t *te
 	worker, exact := FileProof{Path: "/profiles/worker", SHA256: strings.Repeat("a", 64)}, FileProof{Path: "/profiles/exact", SHA256: strings.Repeat("b", 64)}
 	m := Manifest{Containment: map[string]FileProof{"worker": worker, "sup-1": exact}}
 	for _, slot := range []string{"sup-2", "sup-10000"} {
-		pin, err := selectContainmentProfile(m, slot)
+		pin, err := selectContainmentProfile(m, slot, "implementer")
 		if err != nil || pin != worker {
 			t.Fatal(slot, pin, err)
 		}
 	}
-	if pin, err := selectContainmentProfile(m, "sup-1"); err != nil || pin != exact {
+	if pin, err := selectContainmentProfile(m, "sup-1", "implementer"); err != nil || pin != exact {
 		t.Fatal(pin, err)
 	}
-	for _, role := range []string{"supervisor", "reviewer", ""} {
-		if _, err := selectContainmentProfile(m, role); err == nil {
+	for _, role := range []string{"supervisor", "reviewer", "planner", "router", "repair", "summary", ""} {
+		if _, err := selectContainmentProfile(m, role, role); err == nil {
 			t.Fatal("auxiliary used worker profile", role)
 		}
 	}
+	for _, role := range []string{"router", "summary", "supervisor", "reviewer"} {
+		if _, err := selectContainmentProfile(m, "sup-2", role); err == nil {
+			t.Fatal("unsupported role used worker fallback", role)
+		}
+	}
 	delete(m.Containment, "worker")
-	if _, err := selectContainmentProfile(m, "sup-2"); err == nil {
+	if _, err := selectContainmentProfile(m, "sup-2", "implementer"); err == nil {
 		t.Fatal("implicit profile fallback")
 	}
 }

@@ -91,7 +91,7 @@ func prepareContainedWorkerCommand(path, sha string, original *exec.Cmd) (*aiexe
 	if err != nil || len(raw) > 16<<10 || aiexecution.DecodeStrict(raw, &lease) != nil || !lease.HostRunner || lease.Unit != proof.ProcessLeaseUnit || lease.Manager != tmuxsession.ProcessLeaseManagerSystem {
 		return nil, aiexecution.Held("containment_process_lease_invalid")
 	}
-	pin, err := aiexecution.ContainmentProfilePin(proof.Policy, proof.RuntimeKey)
+	pin, err := aiexecution.ContainmentProfilePin(proof.Policy, proof.RuntimeKey, proof.Spec.Role)
 	if err != nil {
 		return nil, err
 	}
