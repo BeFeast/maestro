@@ -4062,6 +4062,12 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 	reconciled := false
 	for slotName, sess := range s.Sessions {
 		if sess.NativeRegistrationHold != "" {
+			wasRunning := sess.Status == state.StatusRunning
+			if err := worker.ReconcileNativeWorkerTermination(o.cfg, slotName, sess); err != nil {
+				log.Printf("[orch] native held OS termination unresolved for %s", slotName)
+			} else if wasRunning && sess.Status != state.StatusRunning {
+				reconciled = true
+			}
 			continue
 		}
 		beforeNative := nativeSessionSnapshot(o.cfg, sess)

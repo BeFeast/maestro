@@ -648,6 +648,25 @@ func StopProcess(slotName string, sess *state.Session) error {
 	if leaseErr != nil {
 		return leaseErr
 	}
+	if sess != nil && sess.NativeRoleRunID != "" && !hasLease {
+		r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+		if err != nil || r.Slot != slotName || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID {
+			return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slotName}
+		}
+		terminal, err := nativeWorkerTerminated(sess.NativeReceiptDir, r)
+		if err != nil || !terminal {
+			return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slotName}
+		}
+		sess.PID = 0
+		sess.TmuxSession = ""
+		return nil
+	}
+	if sess != nil && sess.NativeRoleRunID != "" && hasLease {
+		r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+		if err != nil || r.Slot != slotName || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID || r.ProcessLeaseUnit != lease.Unit || r.ProcessLeaseManager != lease.Manager {
+			return &NativeRegistrationHold{Code: "native_process_identity_conflict", LaunchUncertain: true, Slot: slotName}
+		}
+	}
 	if hasLease {
 		// The cgroup is the ownership boundary. Signal it directly so
 		// double-forked/reparented descendants receive the graceful window and
@@ -714,6 +733,9 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 	if sess != nil && sess.NativeRegistrationHold != "" {
 		return &NativeRegistrationHold{Code: "unresolved_native_generation", LaunchUncertain: true, Slot: slotName}
 	}
+	if err := nativeWorkerDestructiveOutcome(cfg, slotName, sess); err != nil {
+		return err
+	}
 	if err := StopProcess(slotName, sess); err != nil {
 		return err
 	}
@@ -759,6 +781,12 @@ type CleanupResult struct {
 func CleanupWorktrees(cfg *config.Config, s *state.State) []CleanupResult {
 	var results []CleanupResult
 	for slotName, sess := range s.Sessions {
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
+		if err := nativeWorkerDestructiveOutcome(cfg, slotName, sess); err != nil {
+			continue
+		}
 		if !state.IsTerminal(sess.Status) {
 			continue
 		}
