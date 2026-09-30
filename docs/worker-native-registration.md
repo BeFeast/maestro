@@ -90,24 +90,45 @@ fsynced receipt is authoritative when the ordinary state projection write fails.
 Supported launch adoption requires explicit context and exact process evidence;
 no all-role readiness claim follows from registration alone.
 
-This slice deliberately separates launch ownership from provider outcomes.
-A local process exit or `.terminated` receipt does **not** prove that every
-physical request committed zero output or settled financially. Before minting
-any next-generation UUID after a launched generation, the closed
-`previousNativeGenerationOutcome` seam must confirm a trusted physical outcome.
-Its production default is `previous_outcome_unknown`: every phase transition,
-respawn and fallback holds before a new UUID or registration. The source paths
-and their identity/ancestry proof are implemented and exercised with explicit
-synthetic outcome evidence; production currently supports initial registration
-and exact adoption only until an actual authority outcome bridge is supplied.
+Launch ownership remains separate from provider outcomes. A local process exit
+or `.terminated` receipt does **not** prove physical requests settled. Before
+minting any next-generation UUID after a launched generation, the worker uses
+`seal_native` through the pinned authority peer. The saved request is the exact
+old binding plus installed registration version, even after policy rollover or
+expiry. An `outcome_intent` is fsynced before the call; the exact digest-validated
+result is fsynced before any next-generation authorization.
 
-Accepted artifacts, CLI exit 0, Claude stderr, quota wording, local process
-teardown and successful registration cannot open this seam. OS capacity release
-and financial recovery authorization remain separate. R5/native recovery is
-not complete, and the actual trusted physical-outcome bridge is the next
-mandatory source slice before an operational package can enable supported
-next-generation execution. There is no operator configuration boolean that
-converts unknown outcomes into permission. Accounting readiness stays false.
+An outcome intent prevents re-adopting that native generation: a lost reply may
+already have sealed it. `worker.ReconcileNativeWorkerOutcome(cfg, slot,
+generation)` repeats only that same idempotent seal, never launches or signals,
+and can replace a held snapshot after late trusted ledger settlement. Normal
+next-generation entrypoints perform the same reconciliation under their
+existing per-slot lock. The orchestrator can reconcile a financially held,
+proven locally terminal generation, retaining its hold until the saved authority
+snapshot explicitly permits recovery. Cleanup without configuration reads only
+the persisted proof and never makes a network call.
+
+The authority permanently revokes that native binding before aggregating its
+physical attempts. Only a sealed zero-attempt result, or all physical attempts
+settled through immutable validated durable-ledger provenance without bound
+violations, can permit a next generation. Unknown, missing, partial, conflicting,
+or non-durable evidence keeps `previous_outcome_unknown`. Direct gateway
+financial acknowledgements, accepted artifacts, exit 0, stderr, quota wording,
+registration and process teardown cannot open this seam. Transport failures are
+never silently replayed, and an outcome persistence failure cannot authorize
+cleanup or a new UUID.
+
+The authority separately fences each physical send inside a native process.
+A managed gateway must validate atomic `native_fence` claim capability and
+report strict full terminal evidence. Stable native ingress fingerprint checks
+prevent same-body SDK replay after partial or lost successful responses. These
+transport observations do not settle financial liabilities or permit a new
+native generation; that requires the sealed ledger-backed outcome above.
+
+Accounting readiness stays false in these attribution receipts. Supported
+all-role readiness, native child coverage, configured authority/tariff evidence,
+and operational enablement remain separate prerequisites. There is no operator
+boolean that converts unknown outcomes into permission.
 
 ## Verification
 
@@ -115,6 +136,9 @@ Fake registrar/process fixtures exercise all four worker entrypoints, role and
 ancestry rotation, exact ack validation, untrusted session arguments, unknown
 carriers, persistence failures, lost registration/launch replies, crash adoption,
 concurrent ownership, terminal release, retry/phase holds, and limiter restart
-union/floor separation. Fixtures use temporary repositories and no credentials,
+union/floor separation. Outcome fixtures cover cross-language canonical digests,
+claim/registration policy separation, lost seal replies, persistence failures,
+held late settlement, phase transitions, exact cleanup proof, and corruption.
+Fixtures use temporary repositories and no credentials,
 live DB, service control or provider calls. The feature-disabled suite retains
 legacy launch/cleanup behavior.
