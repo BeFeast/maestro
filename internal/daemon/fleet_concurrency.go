@@ -11,6 +11,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 type fleetConcurrencySettingsLoader interface {
@@ -100,6 +101,10 @@ func fleetWorkerKey(stateDir, slot string) string {
 }
 
 func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
+	return l.workerOccupancyLocked(false)
+}
+
+func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[string]struct{}, error) {
 	dirs := make([]string, 0, len(l.stateDirs))
 	for dir := range l.stateDirs {
 		dirs = append(dirs, dir)
@@ -112,8 +117,28 @@ func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load fleet state %s: %w", dir, err)
 		}
+		if includeUncertain {
+			slots, err := worker.NativePendingSlots(dir, st.Sessions)
+			if err != nil {
+				return nil, fmt.Errorf("load native worker occupancy: %w", err)
+			}
+			for _, slot := range slots {
+				running[fleetWorkerKey(dir, slot)] = struct{}{}
+			}
+		}
 		for slot, sess := range st.Sessions {
-			if sess != nil && sess.Status == state.StatusRunning {
+			if sess != nil && sess.NativeRoleRunID != "" {
+				terminal, err := worker.NativeSessionProcessTerminal(dir, slot, sess)
+				if err != nil {
+					return nil, err
+				}
+				// Native occupancy comes only from its durable OS receipts. A stale
+				// Running projection cannot override proven local termination.
+				if includeUncertain || terminal {
+					continue
+				}
+			}
+			if sess != nil && sess.Status == state.StatusRunning && (sess.NativeRegistrationHold == "" || (includeUncertain && sess.NativeRoleRunID == "")) {
 				running[fleetWorkerKey(dir, slot)] = struct{}{}
 			}
 		}
@@ -136,7 +161,7 @@ func (l *fleetSpawnLimiter) reconcileReservationsLocked(running map[string]struc
 }
 
 func (l *fleetSpawnLimiter) liveLocked() (int, error) {
-	running, err := l.runningLocked()
+	running, err := l.workerOccupancyLocked(true)
 	if err != nil {
 		return 0, err
 	}

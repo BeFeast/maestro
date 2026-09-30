@@ -13,20 +13,16 @@ import (
 // StartPhase launches a new worker session for a pipeline phase in an existing worktree.
 // Unlike Start, this does NOT create a new worktree or branch — it reuses the session's
 // existing workspace. The session is updated in place with a new PID and status.
-func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error {
+func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) (resultErr error) {
+	defer func() { stampNativeHold(slotName, sess, resultErr) }()
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
+	}
 	if cfg != nil && cfg.RemoteRunner.Enabled {
 		return fmt.Errorf("remote runner v1 does not support phase transitions")
 	}
 	if sess.Worktree == "" {
 		return fmt.Errorf("session %s has no worktree", slotName)
-	}
-
-	// Finish the previous phase's exact process lease before starting another
-	// generation in the same slot. This remains correct after the pane exits
-	// while a reparented tool subprocess is still alive.
-	tmuxName := TmuxSessionName(slotName)
-	if err := StopProcess(slotName, sess); err != nil {
-		return fmt.Errorf("stop previous phase process lease: %w", err)
 	}
 
 	// Determine backend
@@ -35,6 +31,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	}
 	backendDef, ok := cfg.Model.Backends[backendName]
 	if !ok {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_unknown", Slot: slotName}
+		}
 		log.Printf("[worker] warn: backend %q not found, falling back to default %q", backendName, cfg.Model.Default)
 		backendName = cfg.Model.Default
 		backendDef, ok = cfg.Model.Backends[backendName]
@@ -45,6 +44,9 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return err
 	}
 	// #841/#900: thread the phase role's effort override into the worker argv via
@@ -54,6 +56,25 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		backendCfg.TierEffort = effort
 	}
 	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
+
+	nextGeneration := sess.WorkerGeneration + 1
+	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, sess.IssueNumber, sess.Worktree, sess.Branch)
+	if err != nil {
+		return err
+	}
+	defer native.close()
+	defer native.finishError(&resultErr)
+	if adopted, err := native.adoptSession(cfg, slotName, sess); adopted {
+		return err
+	}
+
+	// Finish the previous phase's exact process lease before starting another
+	// generation in the same slot. This remains correct after the pane exits
+	// while a reparented tool subprocess is still alive.
+	tmuxName := TmuxSessionName(slotName)
+	if err := StopProcess(slotName, sess); err != nil {
+		return fmt.Errorf("stop previous phase process lease: %w", err)
+	}
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -80,9 +101,12 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
 
+	if err := native.command(workerCmd); err != nil {
+		return err
+	}
+
 	// Write runner script
 	runnerPath := fmt.Sprintf("%s/%s-run.sh", cfg.StateDir, slotName)
-	nextGeneration := sess.WorkerGeneration + 1
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
@@ -98,7 +122,19 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 		return fmt.Errorf("before_run hook: %w", err)
 	}
 
+	if err := native.beginLaunch(logFile); err != nil {
+		return err
+	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "phase_transition")
+	if native != nil && err != nil {
+		return err
+	}
+	if err == nil {
+		err = native.complete(pid, processLease)
+	}
+	if native != nil && err != nil {
+		return err
+	}
 	if err != nil {
 		if processLease.Unit != "" {
 			sess.WorkerGeneration = nextGeneration
@@ -115,6 +151,7 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	sess.LogFile = logFile
 	beginSessionAttempt(cfg, sess, backendName, "phase_transition", "phase_transition", time.Now())
 	setSessionProcessLease(sess, processLease)
+	native.stamp(sess)
 	sess.LastOutputHash = ""
 	sess.LastOutputChangedAt = time.Time{}
 	sess.LastNotifiedStatus = ""
