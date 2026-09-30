@@ -26,6 +26,9 @@ var writeControllerRevision = replaceRevisionFile
 
 func (r *Revision) Bind(p Policy) Policy {
 	r.Invalidate()
+	p.controllerPin = nil
+	p.controllerLease = nil
+	p.controllerUnavailable = false
 	p.revision = r
 	p.generation = r.generation.Add(1)
 	return p
@@ -141,6 +144,9 @@ func (p Policy) ControllerPin() (FileProof, error) {
 // snapshot. Detached worker exec processes compare the exact same pin.
 func (p Policy) BindController(next Policy, stateDir string) Policy {
 	bound := p.BindNext(next)
+	if !bound.RequireVerifiedRoute {
+		return bound
+	}
 	if !filepath.IsAbs(stateDir) {
 		bound.controllerUnavailable = true
 		return bound

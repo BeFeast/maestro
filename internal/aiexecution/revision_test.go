@@ -16,6 +16,35 @@ func TestRevisionInvalidatesSnapshotsEvenWhenStrictWasDisabled(t *testing.T) {
 	assertExecutionHold(t, next.CheckCurrent(), "project_config_changed")
 }
 
+func TestLegacyControllerIgnoresUnavailableDurableRevision(t *testing.T) {
+	oldWrite := writeControllerRevision
+	defer func() { writeControllerRevision = oldWrite }()
+	writes := 0
+	writeControllerRevision = func(string, []byte) error {
+		writes++
+		return errors.New("synthetic fsync failure")
+	}
+	legacy := (Policy{}).BindController(Policy{}, t.TempDir())
+	if err := legacy.CheckCurrent(); err != nil || writes != 0 {
+		t.Fatalf("legacy controller depends on durable revision: %v (writes=%d)", err, writes)
+	}
+	strict := legacy.BindController(Policy{RequireVerifiedRoute: true}, t.TempDir())
+	assertExecutionHold(t, legacy.CheckCurrent(), "project_config_changed")
+	assertExecutionHold(t, strict.CheckCurrent(), "controller_revision_unavailable")
+	// Rebinding a copied strict policy must clear private unavailable/pin state.
+	copy := strict
+	copy.RequireVerifiedRoute = false
+	copy.controllerPin = &FileProof{Path: "/nonexistent"}
+	next := strict.BindController(copy, "relative-and-unavailable")
+	if err := next.CheckCurrent(); err != nil || next.controllerPin != nil || next.controllerLease != nil {
+		t.Fatalf("legacy reload retained strict-only pin state: %v", err)
+	}
+	if err := next.Invalidate(); err != nil {
+		t.Fatalf("legacy invalidation depends on disk: %v", err)
+	}
+	assertExecutionHold(t, next.CheckCurrent(), "project_config_changed")
+}
+
 func TestDetachedControllerLeaseRevokedEvenWhenDurableInvalidationFails(t *testing.T) {
 	dir := t.TempDir()
 	policy := Policy{RequireVerifiedRoute: true}
@@ -29,6 +58,7 @@ func TestDetachedControllerLeaseRevokedEvenWhenDurableInvalidationFails(t *testi
 		t.Fatal(err)
 	}
 	oldWrite := writeControllerRevision
+	defer func() { writeControllerRevision = oldWrite }()
 	writeControllerRevision = func(string, []byte) error { return errors.New("synthetic fsync failure") }
 	if err := policy.Invalidate(); err == nil {
 		t.Fatal("durable failure hidden")
