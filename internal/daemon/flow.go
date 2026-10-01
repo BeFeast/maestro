@@ -106,6 +106,17 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 
 	var wg sync.WaitGroup
 	wg.Add(2)
+	if cfg != nil {
+		// #1232: one-shot reconcile of consultations a previous daemon abandoned
+		// under this project's auxiliary receipt roots, independent of pause or
+		// supervisor.enabled. Tracked in the flow WaitGroup so stopFlow drains it.
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			defer recoverFlow(flow, "auxiliary-reconcile")
+			reconcileAbandonedAuxiliaryConsultations(cfg, flow.name)
+		}()
+	}
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "orchestrator")

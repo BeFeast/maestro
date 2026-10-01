@@ -6,6 +6,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
+	"log"
 	"os"
 	"path/filepath"
 	"strings"
@@ -14,6 +16,7 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/google/uuid"
@@ -228,5 +231,77 @@ func TestAuxiliaryReleaseAndReceiptFailureHold(t *testing.T) {
 	}
 	if _, err := l.ReserveAuxiliary(dir, uuid.NewString()); err == nil {
 		t.Fatal("unreadable occupancy admitted new run")
+	}
+}
+
+func TestReserveAuxiliaryJournalsOccupancyWhenCeilingExhausted(t *testing.T) {
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal(err)
+	}
+	store := &auxiliaryTestStore{fleetConcurrencyTestStore: fleetConcurrencyTestStore{settings: config.FleetConcurrencySettings{MaxAuxiliaryRuns: 1}}}
+	l := newFleetSpawnLimiter(store)
+	l.RegisterStateDir(dir)
+	abandoned := uuid.NewString()
+	auxLaunch(t, dir, abandoned)
+	var journal bytes.Buffer
+	previous := log.Writer()
+	log.SetOutput(&journal)
+	t.Cleanup(func() { log.SetOutput(previous) })
+	_, err := l.ReserveAuxiliary(dir, uuid.NewString())
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "auxiliary_capacity_exhausted" {
+		t.Fatalf("err=%v", err)
+	}
+	out := journal.String()
+	for _, want := range []string{"auxiliary capacity exhausted", "(1/1 occupied)", "root=" + filepath.Clean(dir), "identity=" + abandoned, "source=launch_marker", "intent=", "age="} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("journal lacks %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestReconcileAbandonedAuxiliaryConsultationsCoversEveryRootWithReceipts(t *testing.T) {
+	stateDir := t.TempDir()
+	type call struct{ dir, role string }
+	var calls []call
+	oldReconcile := reconcileNativeConsultation
+	t.Cleanup(func() { reconcileNativeConsultation = oldReconcile })
+	reconcileNativeConsultation = func(cfg *config.Config, identity supervisor.ConsultationIdentity, prompt string) (supervisor.ConsultationResult, error) {
+		if uuid.Validate(identity.ID) != nil || identity.ProjectID != "project" || prompt != "" {
+			t.Fatalf("identity=%+v prompt=%q", identity, prompt)
+		}
+		calls = append(calls, call{cfg.StateDir, identity.Role})
+		return supervisor.ConsultationResult{}, aiexecution.Held("native_prior_outcome_reconciled")
+	}
+	cfg := &config.Config{ProjectID: "project", StateDir: stateDir}
+	cfg.Supervisor.NativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+	// Paused projects and supervisor.enabled=false never reach Engine.decideWithLLM;
+	// the startup reconcile must not depend on either.
+	cfg.Supervisor.Enabled = false
+	reconcileAbandonedAuxiliaryConsultations(cfg, "flow")
+	if len(calls) != 0 {
+		t.Fatal("roots without receipts were reconciled", calls)
+	}
+	if _, err := os.Lstat(filepath.Join(stateDir, "supervisor-consultations")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("reconcile created a receipt directory for an unused root", err)
+	}
+	auxLaunch(t, stateDir, uuid.NewString())
+	reviews := filepath.Join(stateDir, "native-reviews")
+	if err := os.MkdirAll(filepath.Join(reviews, "supervisor-consultations"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(reviews, "supervisor-consultations", "current.json"), []byte("{}"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	reconcileAbandonedAuxiliaryConsultations(cfg, "flow")
+	want := []call{{stateDir, "supervisor"}, {reviews, "reviewer"}}
+	if len(calls) != 2 || calls[0] != want[0] || calls[1] != want[1] {
+		t.Fatalf("calls=%v want %v", calls, want)
+	}
+	cfg.Supervisor.NativeSessionRegistration = nil
+	reconcileAbandonedAuxiliaryConsultations(cfg, "flow")
+	if len(calls) != 2 {
+		t.Fatal("non-native project reconciled native consultations")
 	}
 }

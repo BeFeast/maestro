@@ -22,8 +22,23 @@ func retainNativeWorkerHold(sess *state.Session, err error) bool {
 		return false
 	}
 	sess.NativeRegistrationHold = hold.Code
-	log.Printf("[orch] native worker generation held: %s", hold.Code)
+	log.Printf("[orch] native worker generation held: %s%s", hold.Code, nativeWorkerExecHoldSuffix(sess))
 	return true
+}
+
+// nativeWorkerExecHoldSuffix appends the hold code the host runner wrote to the
+// worker log, so an unresolved_launch journal line names the actual refusal
+// (for example containment_forgejo_authorization_unverified) instead of only
+// the generic launch uncertainty (#1235).
+func nativeWorkerExecHoldSuffix(sess *state.Session) string {
+	if sess == nil || sess.NativeRegistrationHold != "unresolved_launch" {
+		return ""
+	}
+	code := worker.NativeWorkerExecHold(sess.LogFile)
+	if code == "" {
+		return ""
+	}
+	return " (worker exec held: " + code + ")"
 }
 
 // Snapshot only for the opt-in contract. A hold is not a consumed retry,
