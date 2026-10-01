@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -49,11 +50,41 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 	if len(missing) == 0 {
 		return
 	}
+	o.startReviewProduction(prNumber, headSHA, missing)
+}
 
-	// One run per PR (not per head): the producer reviews the PR's CURRENT
-	// head regardless of the head this cycle observed, so a head-keyed guard
-	// would let a run kicked on the old head race a second one kicked on the
-	// new — two full model passes over the same commit.
+// Only a verified, unspent native operator grant may bypass the ordinary
+// success/pending trigger. This does not change merge gates or automatic retries.
+func (o *Orchestrator) maybeProduceAuthorizedReview(prNumber int, headSHA string) bool {
+	if o.cfg == nil || !o.cfg.ReviewProducer.Enabled || !o.cfg.ReviewProducer.NativeOpus || headSHA == "" || !slices.Contains(o.cfg.EffectiveReviewGateStreams(), "llm-review-opus") {
+		return false
+	}
+	const stream = "llm-review-opus"
+	queued := o.reviewRearmQueuedFn
+	if queued == nil {
+		queued = func(pr int, head, lens string) bool {
+			return (&review.AttemptStore{StateDir: o.cfg.StateDir}).NativeRearmQueued(o.cfg, review.AttemptScope{Repo: o.repo, PR: pr, Head: head, Lens: lens}, time.Now())
+		}
+	}
+	if !queued(prNumber, headSHA, stream) {
+		return false
+	}
+	verdict, err := o.prReviewGateVerdict(prNumber)
+	if err != nil {
+		return false
+	}
+	for _, sv := range verdict.Streams {
+		if sv.Name == stream && sv.Observed && !sv.LookupFailed && !sv.Passed && o.prGateHeadMatches(prNumber, headSHA) {
+			o.startReviewProduction(prNumber, headSHA, []string{stream})
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) startReviewProduction(prNumber int, headSHA string, missing []string) {
+	// One run per PR, including while an older head's dispatch is still
+	// settling. The producer separately rejects a changed head before work.
 	o.reviewProduceMu.Lock()
 	if o.reviewProduceInFlight == nil {
 		o.reviewProduceInFlight = make(map[int]bool)
@@ -195,6 +226,7 @@ func (o *Orchestrator) produceReviewStreamsWithState(prNumber int, headSHA strin
 		MaxAttempts:       rp.EffectiveMaxAttempts(),
 		Forge:             fg,
 		Repo:              o.repo,
+		ExpectedHead:      headSHA,
 		Lenses:            lenses,
 		PendingStaleAfter: rp.EffectivePendingStale(),
 		MaxDiffBytes:      rp.EffectiveMaxDiffBytes(),

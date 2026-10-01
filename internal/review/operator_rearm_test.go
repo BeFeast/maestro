@@ -74,6 +74,14 @@ func TestNativeOperatorRearmQueuesExactlyOnceAndPreservesOldLimitAndHistory(t *t
 	if !p.Attempts.Due(scope, p.now(), 1) {
 		t.Fatal("queued operator review is not due")
 	}
+	if !p.Attempts.NativeRearmQueued(cfg, scope, p.now()) {
+		t.Fatal("explicit queued grant is not visible to the daemon")
+	}
+	cfg.Supervisor.NativeSessionRegistration.BudgetRunID = "other-run"
+	if p.Attempts.NativeRearmQueued(cfg, scope, p.now()) {
+		t.Fatal("daemon trigger crossed budget run")
+	}
+	cfg.Supervisor.NativeSessionRegistration.BudgetRunID = "original-budget-run"
 	_ = p.ProducePR(context.Background(), scope.PR)
 	if err := state.Save(cfg.StateDir, before); err != nil {
 		t.Fatal(err)
@@ -82,11 +90,30 @@ func TestNativeOperatorRearmQueuesExactlyOnceAndPreservesOldLimitAndHistory(t *t
 	if calls.Load() != 1 {
 		t.Fatal("grant not single-use", calls.Load())
 	}
+	if p.Attempts.NativeRearmQueued(cfg, scope, p.now()) {
+		t.Fatal("consumed grant remains queued")
+	}
 	after, _ := state.Load(cfg.StateDir)
 	track := after.ReviewAttempts[scope.key()]
 	grant, err := p.Attempts.readRearm(scope)
 	if err != nil || track.MaxAttempts != 1 || len(track.Attempts) != 2 || !reflect.DeepEqual(track.Attempts[0], old.Attempts[0]) || grant.BudgetRunID != "original-budget-run" {
 		t.Fatal("history/budget/limit changed")
+	}
+}
+
+func TestNativeOperatorRearmCannotDispatchAdvancedPRHead(t *testing.T) {
+	p, cfg, scope, req, calls := rearmFixture(t)
+	if _, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now()); err != nil {
+		t.Fatal(err)
+	}
+	p.ExpectedHead = scope.Head
+	f := p.Forge.(*fakeForge)
+	f.pr.HeadSHA = "advanced-head"
+	if err := p.ProducePR(context.Background(), scope.PR); err == nil || calls.Load() != 0 {
+		t.Fatal("authorized dispatch crossed PR head")
+	}
+	if !p.Attempts.NativeRearmQueued(cfg, scope, p.now()) {
+		t.Fatal("head mismatch consumed grant")
 	}
 }
 

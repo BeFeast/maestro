@@ -91,6 +91,7 @@ type Orchestrator struct {
 	reviewProduceInFlight map[int]bool
 	// reviewProduceFn is the production seam (tests). nil = produceReviewStreams.
 	reviewProduceFn       func(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig)
+	reviewRearmQueuedFn   func(prNumber int, headSHA, stream string) bool
 	router                *router.Router
 	repo                  string
 	binaryVersion         string
@@ -5854,6 +5855,14 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		if hold, ok := o.operatorGateHoldFromLabels(sess.IssueNumber, pr.Number); ok {
 			persistGate()
 			o.applyOperatorGateHold(sess, pr, hold)
+			continue
+		}
+
+		// An explicitly authorized review must be reachable when its prior
+		// error is itself part of the failed aggregate. Keep that red gate and
+		// the worker retry history intact while the existing producer runs.
+		if gateObservable && ciRollup.Complete && o.maybeProduceAuthorizedReview(pr.Number, gateTransition.HeadSHA) {
+			persistGate()
 			continue
 		}
 

@@ -56,6 +56,9 @@ type Producer struct {
 	MaxAttempts int
 	Forge       forge.Client
 	Repo        string
+	// ExpectedHead pins daemon dispatch to the observed/authorized head. An
+	// advanced branch must be reconsidered in the next orchestration cycle.
+	ExpectedHead string
 	// Lenses are the streams to produce. The caller (daemon trigger, S5) maps
 	// the project's effective review-gate streams here — the two sets MUST
 	// match or the gate degrades on an unproduced stream.
@@ -140,6 +143,9 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	pr, err := p.Forge.GetPR(ctx, p.Repo, prNumber)
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
+	}
+	if p.ExpectedHead != "" && pr.HeadSHA != p.ExpectedHead {
+		return fmt.Errorf("review %s#%d: head changed before dispatch", p.Repo, prNumber)
 	}
 	diff, err := p.Forge.GetPRDiff(ctx, p.Repo, prNumber)
 	if err != nil {

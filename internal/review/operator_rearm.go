@@ -190,6 +190,25 @@ func (s *AttemptStore) operatorRearmDue(scope AttemptScope, track state.ReviewAt
 	return s.operatorRearmReady(scope, track, r.ID, lens, now)
 }
 
+// NativeRearmQueued reports only explicit operator authority, never an automatic
+// retry. The daemon may use this before evaluating an aggregate CI error caused
+// by the prior review itself. The producer still revalidates when claiming.
+func (s *AttemptStore) NativeRearmQueued(cfg *config.Config, scope AttemptScope, now time.Time) bool {
+	if s.available() != nil || cfg == nil || cfg.StateDir != s.StateDir || cfg.Repo != scope.Repo || !scope.valid() || cfg.Supervisor.NativeSessionRegistration == nil {
+		return false
+	}
+	r, err := s.readRearm(scope)
+	if err != nil {
+		return false
+	}
+	st, err := state.Load(s.StateDir)
+	if err != nil {
+		return false
+	}
+	lens := &NativeClaudeLens{policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: cfg.Supervisor.NativeSessionRegistration.BudgetRunID}
+	return s.operatorRearmReady(scope, st.ReviewAttempts[scope.key()], r.ID, lens, now)
+}
+
 func (p *Producer) queuedRearm(scope AttemptScope, lens Lens) string {
 	native, ok := lens.(*NativeClaudeLens)
 	if !ok || p.Attempts.available() != nil {
