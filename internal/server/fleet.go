@@ -1467,8 +1467,9 @@ type fleetClosedIssueOutcome struct {
 }
 
 type fleetProjectState struct {
-	Name string `json:"name"`
-	Repo string `json:"repo"`
+	Name         string `json:"name"`
+	Repo         string `json:"repo"`
+	ForgeBaseURL string `json:"forge_base_url,omitempty"`
 	// Forge is the row's effective code forge kind — "github" (every legacy row)
 	// or "forgejo" (#1172). WebhooksApplicable reports whether this row's forge
 	// kind supports webhook ingestion at all: forgejo rows are poll-only by design
@@ -2101,6 +2102,7 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 		if attention, found := workerLeaseAttentionForSlot(st.WorkerLeaseAttention, slot); found {
 			projectState := fleetProjectState{
 				Name: project.Name, Repo: project.cfg.Repo, DashboardURL: project.DashboardURL,
+				Forge: project.cfg.Forge.EffectiveKind(), ForgeBaseURL: project.cfg.Forge.BaseURL,
 				ReadOnly: project.cfg.Server.ReadOnly || s.readOnly,
 			}
 			writeJSON(w, http.StatusOK, fleetWorkerDetailResponse{
@@ -2120,10 +2122,12 @@ func (s *FleetServer) handleFleetWorker(w http.ResponseWriter, r *http.Request) 
 	projectState := fleetProjectState{
 		Name:         project.Name,
 		Repo:         project.cfg.Repo,
+		Forge:        project.cfg.Forge.EffectiveKind(),
+		ForgeBaseURL: project.cfg.Forge.BaseURL,
 		DashboardURL: project.DashboardURL,
 		ReadOnly:     project.cfg.Server.ReadOnly || s.readOnly,
 	}
-	infos := []sessionInfo{makeSessionInfo(project.cfg.Repo, slot, sess)}
+	infos := []sessionInfo{makeSessionInfo(project.cfg, slot, sess)}
 	applyBackendDrift(project.cfg, &infos[0])
 	applySupervisorAttention(infos, st.LatestSupervisorDecision())
 	applyMergeControlProjection(project.cfg, st, &infos[0])
@@ -2237,7 +2241,7 @@ func (s *FleetServer) handleFleetAction(w http.ResponseWriter, r *http.Request) 
 	}
 	if translateUIActionID(strings.TrimSpace(req.ActionID)) == config.SupervisorActionCloseIssueBatch && len(req.Issues) == 0 && cfg != nil {
 		if st, err := state.Load(cfg.StateDir); err == nil {
-			req.Issues = fleetCloseCandidateTargets(fleetCloseCandidates(fleetProjectState{Name: project.Name, Repo: cfg.Repo}, st))
+			req.Issues = fleetCloseCandidateTargets(fleetCloseCandidates(fleetProjectState{Name: project.Name, Repo: cfg.Repo, Forge: cfg.Forge.EffectiveKind(), ForgeBaseURL: cfg.Forge.BaseURL}, st))
 		}
 	}
 	if strings.TrimSpace(req.ActionID) == config.SupervisorActionRestartStaleBackendWorkers {
@@ -4544,6 +4548,7 @@ func (s *FleetServer) projectSnapshot(project FleetProject, now time.Time) (flee
 	// #1172 M5: forgejo rows are poll-only — no webhook ingestion exists for them,
 	// so the fleet-global `webhooks` block says nothing about this project.
 	item.Forge = cfg.Forge.EffectiveKind()
+	item.ForgeBaseURL = cfg.Forge.BaseURL
 	item.WebhooksApplicable = !cfg.Forge.IsForgejo()
 	item.ProjectID = strings.TrimSpace(cfg.ProjectID)
 	item.ManagementHome = fleetManagementHomeFromConfig(cfg.ManagementHome)
@@ -5335,9 +5340,9 @@ func fleetCloseCandidates(project fleetProjectState, st *state.State) []fleetClo
 		}
 		candidates = append(candidates, fleetCloseCandidate{
 			IssueNumber: sess.IssueNumber,
-			IssueURL:    githubIssueURL(project.Repo, sess.IssueNumber),
+			IssueURL:    forgeIssueURL(project.forgeConfig(), project.Repo, sess.IssueNumber),
 			PRNumber:    sess.PRNumber,
-			PRURL:       githubPRURL(project.Repo, sess.PRNumber),
+			PRURL:       forgePRURL(project.forgeConfig(), project.Repo, sess.PRNumber),
 			Session:     slot,
 			FinishedAt:  formatOptionalFleetTime(sess.FinishedAt),
 		})
@@ -5674,9 +5679,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			}
 			state.Session = worker.Slot
 			state.IssueNumber = worker.IssueNumber
-			state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+			state.IssueURL = firstNonEmpty(worker.IssueURL, forgeIssueURL(project.forgeConfig(), project.Repo, worker.IssueNumber))
 			state.PRNumber = worker.PRNumber
-			state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+			state.PRURL = firstNonEmpty(worker.PRURL, forgePRURL(project.forgeConfig(), project.Repo, worker.PRNumber))
 			if reason := strings.TrimSpace(worker.StatusReason); reason != "" {
 				state.Summary = truncateFleetOperatorText(reason, 150)
 			}
@@ -5713,9 +5718,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			worker := project.Active[0]
 			state.Session = worker.Slot
 			state.IssueNumber = worker.IssueNumber
-			state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+			state.IssueURL = firstNonEmpty(worker.IssueURL, forgeIssueURL(project.forgeConfig(), project.Repo, worker.IssueNumber))
 			state.PRNumber = worker.PRNumber
-			state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+			state.PRURL = firstNonEmpty(worker.PRURL, forgePRURL(project.forgeConfig(), project.Repo, worker.PRNumber))
 			if worker.IssueNumber > 0 {
 				state.Summary = fmt.Sprintf("%s is working on issue #%d.", worker.Slot, worker.IssueNumber)
 			}
@@ -5752,9 +5757,9 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 			if worker.PRNumber > 0 {
 				state.Session = worker.Slot
 				state.IssueNumber = worker.IssueNumber
-				state.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+				state.IssueURL = firstNonEmpty(worker.IssueURL, forgeIssueURL(project.forgeConfig(), project.Repo, worker.IssueNumber))
 				state.PRNumber = worker.PRNumber
-				state.PRURL = firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber))
+				state.PRURL = firstNonEmpty(worker.PRURL, forgePRURL(project.forgeConfig(), project.Repo, worker.PRNumber))
 				break
 			}
 		}
@@ -5786,7 +5791,7 @@ func buildFleetProjectOperatorState(project fleetProjectState) fleetOperatorStat
 		}
 		if q.SelectedCandidate != nil && q.SelectedCandidate.Number > 0 {
 			state.IssueNumber = q.SelectedCandidate.Number
-			state.IssueURL = githubIssueURL(project.Repo, q.SelectedCandidate.Number)
+			state.IssueURL = forgeIssueURL(project.forgeConfig(), project.Repo, q.SelectedCandidate.Number)
 			state.Summary = fmt.Sprintf("Issue #%d is selected for the next worker.", q.SelectedCandidate.Number)
 			if fleetPendingDispatchPastSLA(project, time.Now().UTC()) {
 				state = fleetDispatchSLAOperatorState(project, state)
@@ -5814,7 +5819,7 @@ func fleetProjectPRLifecycleOperatorState(project fleetProjectState) (fleetOpera
 	gate := project.PRStates[0]
 	base := fleetOperatorState{
 		PRNumber: gate.PRNumber,
-		PRURL:    githubPRURL(project.Repo, gate.PRNumber),
+		PRURL:    forgePRURL(project.forgeConfig(), project.Repo, gate.PRNumber),
 		PRGate:   &gate,
 	}
 	for _, worker := range append(append([]sessionInfo{}, project.Active...), project.Attention...) {
@@ -5823,7 +5828,7 @@ func fleetProjectPRLifecycleOperatorState(project fleetProjectState) (fleetOpera
 		}
 		base.Session = worker.Slot
 		base.IssueNumber = worker.IssueNumber
-		base.IssueURL = firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber))
+		base.IssueURL = firstNonEmpty(worker.IssueURL, forgeIssueURL(project.forgeConfig(), project.Repo, worker.IssueNumber))
 		break
 	}
 	if gate.Merged {
@@ -5962,9 +5967,9 @@ func fleetAutoMergingOperatorState(project fleetProjectState, worker sessionInfo
 		NextAction:  "Auto-merging — no action needed.",
 		Session:     worker.Slot,
 		IssueNumber: worker.IssueNumber,
-		IssueURL:    firstNonEmpty(worker.IssueURL, githubIssueURL(project.Repo, worker.IssueNumber)),
+		IssueURL:    firstNonEmpty(worker.IssueURL, forgeIssueURL(project.forgeConfig(), project.Repo, worker.IssueNumber)),
 		PRNumber:    worker.PRNumber,
-		PRURL:       firstNonEmpty(worker.PRURL, githubPRURL(project.Repo, worker.PRNumber)),
+		PRURL:       firstNonEmpty(worker.PRURL, forgePRURL(project.forgeConfig(), project.Repo, worker.PRNumber)),
 	}
 }
 
@@ -6291,9 +6296,9 @@ func applyFleetOperatorTarget(project fleetProjectState, operator fleetOperatorS
 		return operator
 	}
 	operator.IssueNumber = target.Issue
-	operator.IssueURL = githubIssueURL(project.Repo, target.Issue)
+	operator.IssueURL = forgeIssueURL(project.forgeConfig(), project.Repo, target.Issue)
 	operator.PRNumber = target.PR
-	operator.PRURL = githubPRURL(project.Repo, target.PR)
+	operator.PRURL = forgePRURL(project.forgeConfig(), project.Repo, target.PR)
 	operator.Session = target.Session
 	return operator
 }
@@ -6464,9 +6469,9 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 		Action:            approval.Action,
 		Target:            approval.Target,
 		IssueNumber:       issue,
-		IssueURL:          githubIssueURL(project.Repo, issue),
+		IssueURL:          forgeIssueURL(project.forgeConfig(), project.Repo, issue),
 		PRNumber:          pr,
-		PRURL:             githubPRURL(project.Repo, pr),
+		PRURL:             forgePRURL(project.forgeConfig(), project.Repo, pr),
 		Session:           session,
 		SessionStatus:     sessionStatus,
 		Status:            string(approval.Status),
@@ -6501,7 +6506,7 @@ func makeFleetApprovalState(project fleetProjectState, st *state.State, approval
 	if approval.Status == state.ApprovalStatusPending && !item.TargetTerminal {
 		item.PastSLA = approvalPastSLA(&item, now)
 	}
-	item.TargetLinks = fleetApprovalTargetLinks(project.Repo, item)
+	item.TargetLinks = fleetApprovalTargetLinks(project, item)
 	return item
 }
 
@@ -6636,20 +6641,20 @@ func fleetApprovalTarget(st *state.State, target *state.SupervisorTarget) (issue
 	return issue, pr, session, sessionStatus
 }
 
-func fleetApprovalTargetLinks(repo string, approval fleetApprovalState) []targetLinkInfo {
+func fleetApprovalTargetLinks(project fleetProjectState, approval fleetApprovalState) []targetLinkInfo {
 	links := make([]targetLinkInfo, 0, 3)
 	if approval.IssueNumber > 0 {
 		links = append(links, targetLinkInfo{
 			Kind:  "issue",
 			Label: fmt.Sprintf("Issue #%d", approval.IssueNumber),
-			URL:   githubIssueURL(repo, approval.IssueNumber),
+			URL:   forgeIssueURL(project.forgeConfig(), project.Repo, approval.IssueNumber),
 		})
 	}
 	if approval.PRNumber > 0 {
 		links = append(links, targetLinkInfo{
 			Kind:  "pr",
 			Label: fmt.Sprintf("PR #%d", approval.PRNumber),
-			URL:   githubPRURL(repo, approval.PRNumber),
+			URL:   forgePRURL(project.forgeConfig(), project.Repo, approval.PRNumber),
 		})
 	}
 	if strings.TrimSpace(approval.Session) != "" {
@@ -7688,7 +7693,7 @@ func renderFleetProjectRailPR(project fleetProjectState) string {
 			b.WriteString(link)
 		}
 		b.WriteString(`</div>`)
-	} else if url := fleetProjectPullsURL(project.Repo); url != "" {
+	} else if url := fleetProjectPullsURL(project); url != "" {
 		b.WriteString(`<div class="rail-links"><a href="` + html.EscapeString(url) + `" target="_blank" rel="noreferrer">Open PRs</a></div>`)
 	}
 	return b.String()
@@ -7713,7 +7718,7 @@ func fleetProjectPRLinks(project fleetProjectState, limit int) []string {
 		seen[worker.PRNumber] = struct{}{}
 		url := strings.TrimSpace(worker.PRURL)
 		if url == "" {
-			url = githubPRURL(project.Repo, worker.PRNumber)
+			url = forgePRURL(project.forgeConfig(), project.Repo, worker.PRNumber)
 		}
 		label := fmt.Sprintf("PR #%d", worker.PRNumber)
 		if url == "" {
@@ -7811,7 +7816,7 @@ func renderFleetProjectRailLinks(project fleetProjectState) string {
 	}
 	url := strings.TrimSpace(project.DashboardURL)
 	if url == "" {
-		url = fleetProjectGitHubURL(project.Repo)
+		url = fleetProjectRepoURL(project)
 	}
 	label := "Open"
 	if fleetProjectUnconfigured(project) {
@@ -7899,18 +7904,25 @@ func fleetProjectUnconfigured(project fleetProjectState) bool {
 	return !project.Outcome.Configured
 }
 
-func fleetProjectGitHubURL(repo string) string {
-	repo = strings.TrimSpace(repo)
+func (project fleetProjectState) forgeConfig() config.ForgeConfig {
+	return config.ForgeConfig{Kind: project.Forge, BaseURL: project.ForgeBaseURL}
+}
+
+func fleetProjectRepoURL(project fleetProjectState) string {
+	repo := strings.TrimSpace(project.Repo)
 	if !validGitHubRepo(repo) {
 		return ""
 	}
-	return "https://github.com/" + repo
+	return strings.TrimSuffix(project.forgeConfig().IssueWebURL(repo, 1), "/issues/1")
 }
 
-func fleetProjectPullsURL(repo string) string {
-	base := fleetProjectGitHubURL(repo)
+func fleetProjectPullsURL(project fleetProjectState) string {
+	base := fleetProjectRepoURL(project)
 	if base == "" {
 		return ""
+	}
+	if project.forgeConfig().IsForgejo() {
+		return base + "/pulls"
 	}
 	return base + "/pulls?q=is%3Apr+is%3Aopen"
 }

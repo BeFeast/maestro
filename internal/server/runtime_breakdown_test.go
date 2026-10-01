@@ -1,6 +1,7 @@
 package server
 
 import (
+	"github.com/befeast/maestro/internal/config"
 	"testing"
 	"time"
 
@@ -36,7 +37,7 @@ func TestRuntimeBreakdownSeparatesWorkerFromWorkflow(t *testing.T) {
 		FinishedAt:    &finishedAt,
 	}
 
-	info := makeSessionInfo("test/repo", "scr-46", sess)
+	info := makeSessionInfo(&config.Config{Repo: "test/repo"}, "scr-46", sess)
 
 	if info.WorkerRuntimeSeconds != 180 {
 		t.Errorf("worker_runtime_seconds = %d, want 180 (3m of actual agent wall-clock, not the 1h46m3s workflow elapsed)",
@@ -78,7 +79,7 @@ func TestRuntimeBreakdownRunningSessionWorkerRuntimeIsLiveWallClock(t *testing.T
 		StartedAt:   startedAt,
 	}
 
-	info := makeSessionInfo("test/repo", "slot-x", sess)
+	info := makeSessionInfo(&config.Config{Repo: "test/repo"}, "slot-x", sess)
 
 	if info.WorkerRuntimeSeconds < 600 || info.WorkerRuntimeSeconds > 900 {
 		t.Errorf("worker_runtime_seconds = %d, want ~720 (running session wall-clock)", info.WorkerRuntimeSeconds)
@@ -108,7 +109,7 @@ func TestRuntimeBreakdownRunningRespawnIgnoresPriorWorkerEndAndUsesActiveRouteMo
 		},
 	}
 
-	info := makeSessionInfo("BeFeast/ok-player", "ok-player-272", sess)
+	info := makeSessionInfo(&config.Config{Repo: "BeFeast/ok-player"}, "ok-player-272", sess)
 	if info.WorkerRuntimeSeconds < 100 || info.WorkerRuntimeSeconds > 140 {
 		t.Fatalf("worker runtime = %d, want current attempt around 120s", info.WorkerRuntimeSeconds)
 	}

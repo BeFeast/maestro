@@ -678,6 +678,8 @@ function mapProject(project, workers, now) {
     slug,
     name: project.name,
     repo: project.repo || "",
+    forge: project.forge || "github",
+    forgeBaseURL: project.forge_base_url || "",
     configPath: project.config_path || "",
     dashboardUrl: project.dashboard_url || "",
     backend: project.supervisor?.latest?.mode || "claude",

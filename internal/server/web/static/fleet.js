@@ -579,7 +579,7 @@ function addFleetSearchResult(results, seen, input) {
 }
 
 function searchProjectURL(project) {
-  return (project && project.dashboard_url) || githubRepoURL(project && project.repo) || "";
+  return (project && project.dashboard_url) || projectRepoURL(project) || "";
 }
 
 function buildFleetSearchIndex() {
@@ -1456,15 +1456,16 @@ function updateProjectSegmentCounts(projects) {
   setProjectCount(projectCountIdleEl, idle);
 }
 
-function githubRepoURL(repo) {
-  const value = String(repo || "").trim();
+function projectRepoURL(project) {
+  const value = String(project && project.repo || "").trim();
   if (!/^[^\s/]+\/[^\s/]+$/.test(value)) return "";
-  return "https://github.com/" + value;
+  const base = project.forge === "forgejo" ? String(project.forge_base_url || "").replace(/\/+$/, "") : "https://github.com";
+  return base ? base + "/" + value : "";
 }
 
-function githubPullsURL(repo) {
-  const url = githubRepoURL(repo);
-  return url ? url + "/pulls?q=is%3Apr+is%3Aopen" : "";
+function projectPullsURL(project) {
+  const url = projectRepoURL(project);
+  return url ? url + (project.forge === "forgejo" ? "/pulls" : "/pulls?q=is%3Apr+is%3Aopen") : "";
 }
 
 function projectIdentityRailHTML(project) {
@@ -1540,10 +1541,10 @@ function projectPRRailHTML(project) {
     if (!worker.live || displayStatus(worker) === "done" || worker.status === "done") continue;
     if (seen.has(worker.pr_number)) continue;
     seen.add(worker.pr_number);
-    links.push(linkHTML(worker.pr_url || (project.repo ? 'https://github.com/' + project.repo + '/pull/' + worker.pr_number : ''), 'PR #' + worker.pr_number));
+    links.push(linkHTML(worker.pr_url || (projectRepoURL(project) ? projectRepoURL(project) + (project.forge === 'forgejo' ? '/pulls/' : '/pull/') + worker.pr_number : ''), 'PR #' + worker.pr_number));
     if (links.length >= 3) break;
   }
-  const fallback = !links.length && githubPullsURL(project.repo) ? [linkHTML(githubPullsURL(project.repo), 'Open PRs')] : [];
+  const fallback = !links.length && projectPullsURL(project) ? [linkHTML(projectPullsURL(project), 'Open PRs')] : [];
   return '<div class="rail-mainline">' + escapeText(project.pr_open || 0) + ' open</div>' +
     '<div class="rail-links">' + links.concat(fallback).join(' ') + '</div>';
 }
@@ -1592,12 +1593,12 @@ function formatClockDuration(totalSeconds) {
 
 function projectLinksRailHTML(project) {
   const links = [];
-  const setupURL = project.dashboard_url || githubRepoURL(project.repo);
+  const setupURL = project.dashboard_url || projectRepoURL(project);
   if (projectIsUnconfigured(project) && setupURL) {
     links.push('<a class="setup-link" href="' + escapeText(setupURL) + '" target="_blank" rel="noreferrer">Set up &rarr;</a>');
   }
   if (project.dashboard_url) links.push(linkHTML(project.dashboard_url, "Dashboard"));
-  if (githubRepoURL(project.repo)) links.push(linkHTML(githubRepoURL(project.repo), "GitHub"));
+  if (projectRepoURL(project)) links.push(linkHTML(projectRepoURL(project), "Repository"));
   links.push('<button type="button" class="link-button project-workers-link" data-project="' + escapeText(project.name || "") + '">Workers</button>');
   return '<div class="rail-links">' + links.join(' ') + '</div>';
 }
@@ -1605,7 +1606,7 @@ function projectLinksRailHTML(project) {
 function projectOpenRailHTML(project) {
   const cta = projectNextActionCTAHTML(project);
   if (cta) return cta;
-  const url = project.dashboard_url || githubRepoURL(project.repo);
+  const url = project.dashboard_url || projectRepoURL(project);
   const label = projectIsUnconfigured(project) ? "Set up" : "Open";
   return '<div class="rail-open-link">' + linkHTML(url, label + " →") + '</div>';
 }
@@ -1661,7 +1662,7 @@ function projectRailRowHTML(project) {
       '<span class="project-rail-toggle-caret" aria-hidden="true">&#9656;</span>' +
     '</button></td>';
   const needsAttention = projectHasAttentionCTA(project) ? "1" : "0";
-  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || githubRepoURL(project.repo) || "") + '" data-needs-attention="' + needsAttention + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
+  const mainRow = '<tr class="project-rail-row project-row-' + cssToken(key) + modifier + (expanded ? ' project-rail-row-expanded' : '') + '" data-project="' + escapeText(project.name || "") + '" data-url="' + escapeText(project.dashboard_url || projectRepoURL(project) || "") + '" data-needs-attention="' + needsAttention + '" aria-controls="' + escapeText(detailID) + '" tabindex="0">' +
     toggleCell +
     '<td class="project-rail-project"><div class="project-rail-project-wrap"><div class="project-rail-project-copy">' + projectIdentityRailHTML(project) + '</div></div></td>' +
     '<td class="project-rail-state-cell">' + projectStateRailHTML(project) + '</td>' +
@@ -2372,7 +2373,7 @@ function renderProject(project) {
   }
   const failed = countFailed(project);
   const links = '<div class="links">' + linkHTML(project.dashboard_url, "Dashboard") + " " +
-    linkHTML(project.repo ? "https://github.com/" + project.repo : "", "GitHub") + '</div>';
+    linkHTML(projectRepoURL(project), "Repository") + '</div>';
   return '<article class="' + projectClass(project) + '">' +
     projectHeaderHTML(project, links) +
     '<div class="metric-row">' +

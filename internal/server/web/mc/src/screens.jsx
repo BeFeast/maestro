@@ -1,3 +1,4 @@
+import { projectRepoURL, projectIssueURL, projectPRURL } from "./forgeLinks.js";
 import React from "react";
 import { Icon, Panel, PathValue, Pill, QueueBar, Segmented, ConfirmDialog, UrlValue } from "./atoms.jsx";
 import { useFleet } from "./fleetContext.jsx";
@@ -167,7 +168,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           <div className="hb-actions">
             <button className="tb-btn" onClick={() => navigate(`workers?project=${encodeURIComponent(p.slug)}`)}>Open workers →</button>
             {p.repo && (
-              <a className="tb-btn" href={`https://github.com/${p.repo}`} target="_blank" rel="noreferrer">Open in GitHub →</a>
+              <a className="tb-btn" href={projectRepoURL(p)} target="_blank" rel="noreferrer">Open repository →</a>
             )}
             {p.projectBoard?.url && (
               <a
@@ -213,7 +214,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
               {p.operatorState.pr_number ? (
                 <a
                   className="tb-btn primary"
-                  href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`}
+                  href={p.operatorState.pr_url || projectPRURL(p, p.operatorState.pr_number)}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -246,7 +247,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
           <div style={{ padding: "var(--s-4) var(--s-5)" }}>
             <div style={{ fontSize: 14, color: "var(--fg-0)" }}>
               {p.operatorState.pr_number ? (
-                <a href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`} target="_blank" rel="noreferrer">
+                <a href={p.operatorState.pr_url || projectPRURL(p, p.operatorState.pr_number)} target="_blank" rel="noreferrer">
                   PR #{p.operatorState.pr_number}
                 </a>
               ) : null}
@@ -265,7 +266,7 @@ export function ProjectScreen({ slug, navigate, openDrawer, focus }) {
               {p.operatorState.pr_number && (
                 <a
                   className="tb-btn ghost"
-                  href={p.operatorState.pr_url || `https://github.com/${p.repo}/pull/${p.operatorState.pr_number}`}
+                  href={p.operatorState.pr_url || projectPRURL(p, p.operatorState.pr_number)}
                   target="_blank"
                   rel="noreferrer"
                 >
@@ -836,7 +837,7 @@ function QueueNextPanel({ p }) {
   const eligibleCount = Number(q.eligible ?? p.eligible ?? 0);
   const excluded = Number(q.excluded || 0);
 
-  const issueURL = num => (p.repo && num ? `https://github.com/${p.repo}/issues/${num}` : "");
+  const issueURL = num => projectIssueURL(p, num);
   const counts = [];
   counts.push(`${open} open`);
   counts.push(`${eligibleCount} eligible`);
@@ -848,7 +849,7 @@ function QueueNextPanel({ p }) {
       sub={counts.join(" · ")}
       right={p.projectBoard?.url
         ? <a href={p.projectBoard.url} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open board →</a>
-        : (p.repo ? <a href={`https://github.com/${p.repo}/issues`} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open issues →</a> : null)}
+        : (p.repo ? <a href={`${projectRepoURL(p)}/issues`} target="_blank" rel="noreferrer" style={{ fontSize: 11.5 }}>Open issues →</a> : null)}
     >
       <div style={{ padding: "var(--s-4) var(--s-5)" }}>
         {open > 0 && (
@@ -956,7 +957,7 @@ export function DispatchBlockersPanel({ project: p, now = Date.now() }) {
   const hold = p?.dispatchHold || {};
   const q = p?.queueSnapshot || {};
   const rows = dispatchGuardRows(q);
-  const issueURL = num => (p?.repo && num ? `https://github.com/${p.repo}/issues/${num}` : "");
+  const issueURL = num => projectIssueURL(p, num);
   const sinceMs = hold.since ? parseTimestamp(hold.since) : null;
   const heldLabel = displayReasonClass(hold.reasonClass) || "dispatch hold";
 

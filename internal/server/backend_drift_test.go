@@ -120,7 +120,7 @@ func TestApplyBackendDriftMarksMatchingWorkerFresh(t *testing.T) {
 	cfg := backendDriftTestConfig(t)
 	sess := staleBackendSession(1, 0)
 	sess.Attribution[0].Effort = "high"
-	info := makeSessionInfo(cfg.Repo, "sup-1", sess)
+	info := makeSessionInfo(cfg, "sup-1", sess)
 
 	applyBackendDrift(cfg, &info)
 	if info.BackendDrift != nil {

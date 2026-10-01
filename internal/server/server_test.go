@@ -1324,13 +1324,13 @@ func TestComponentPrimitivesEmbedded(t *testing.T) {
 }
 
 func TestGitHubURLs(t *testing.T) {
-	if got := githubIssueURL("owner/repo", 42); got != "https://github.com/owner/repo/issues/42" {
+	if got := forgeIssueURL(config.ForgeConfig{}, "owner/repo", 42); got != "https://github.com/owner/repo/issues/42" {
 		t.Errorf("githubIssueURL() = %q", got)
 	}
-	if got := githubPRURL("owner/repo", 10); got != "https://github.com/owner/repo/pull/10" {
+	if got := forgePRURL(config.ForgeConfig{}, "owner/repo", 10); got != "https://github.com/owner/repo/pull/10" {
 		t.Errorf("githubPRURL() = %q", got)
 	}
-	if got := githubIssueURL("not-a-repo", 42); got != "" {
+	if got := forgeIssueURL(config.ForgeConfig{}, "not-a-repo", 42); got != "" {
 		t.Errorf("githubIssueURL(invalid) = %q, want empty", got)
 	}
 }
