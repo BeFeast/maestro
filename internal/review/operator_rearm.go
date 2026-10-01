@@ -1,7 +1,6 @@
 package review
 
 import (
-	"context"
 	"encoding/json"
 	"errors"
 	"os"
@@ -10,6 +9,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
@@ -122,8 +122,8 @@ func (s *AttemptStore) readRearm(scope AttemptScope) (*operatorRearm, error) {
 	return &r, nil
 }
 
-// AuthorizeNativeRearm grants exactly one manually invoked review after verified
-// normal settlement. Automatic polling and MaxAttempts remain unchanged.
+// AuthorizeNativeRearm queues exactly one explicitly authorized review after
+// verified normal settlement. Automatic retry limits remain unchanged.
 func (s *AttemptStore) AuthorizeNativeRearm(cfg *config.Config, scope AttemptScope, req OperatorRearmRequest, now time.Time) (string, error) {
 	if s == nil || cfg == nil || cfg.StateDir != s.StateDir || cfg.Repo != scope.Repo || !scope.valid() || cfg.Supervisor.NativeSessionRegistration == nil || !cfg.AIExecution.RequireVerifiedRoute || uuid.Validate(req.PreviousAttemptID) != nil || len(req.EvidenceSHA256) != 64 || len(req.NativeProofSHA256) != 64 || strings.TrimSpace(req.Actor) == "" || strings.TrimSpace(req.Reason) == "" || !req.ExpiresAt.After(now) || req.ExpiresAt.After(now.Add(2*time.Hour)) {
 		return "", ErrReviewHeld
@@ -179,38 +179,44 @@ func (s *AttemptStore) operatorRearmReady(scope AttemptScope, track state.Review
 	return err == nil && proof == r.Request.NativeProofSHA256
 }
 
-// ProducePRWithOperatorRearm is a distinct operator entrypoint. The ordinary
-// producer/daemon cannot consume the grant, even after a configuration reload.
-func (p *Producer) ProducePRWithOperatorRearm(ctx context.Context, pr int, id string) error {
-	if uuid.Validate(id) != nil || len(p.Lenses) != 1 {
-		return ErrReviewHeld
+// operatorRearmDue is a polling hint only. The producer rechecks current native
+// project/run bindings, and the claim repeats all proof checks under both locks.
+func (s *AttemptStore) operatorRearmDue(scope AttemptScope, track state.ReviewAttemptTrack, now time.Time) bool {
+	r, err := s.readRearm(scope)
+	if err != nil {
+		return false
 	}
-	copy := *p
-	copy.operatorRearmID = id
-	return copy.ProducePR(ctx, pr)
+	lens := &NativeClaudeLens{policy: aiexecution.Policy{RequireVerifiedRoute: true}, projectID: r.ProjectID, budgetRunID: r.BudgetRunID}
+	return s.operatorRearmReady(scope, track, r.ID, lens, now)
 }
-func (p *Producer) checkAttempt(scope AttemptScope, lens Lens, max int, observed bool) error {
-	if p.operatorRearmID == "" {
-		return p.Attempts.Check(scope, p.now(), max, observed)
-	}
-	if err := p.Attempts.available(); err != nil {
-		return err
-	}
+
+func (p *Producer) queuedRearm(scope AttemptScope, lens Lens) string {
 	native, ok := lens.(*NativeClaudeLens)
-	if !ok {
-		return ErrReviewHeld
+	if !ok || p.Attempts.available() != nil {
+		return ""
+	}
+	r, err := p.Attempts.readRearm(scope)
+	if err != nil {
+		return ""
 	}
 	st, err := state.Load(p.Attempts.StateDir)
 	if err != nil {
-		return err
+		return ""
 	}
-	if !p.Attempts.operatorRearmReady(scope, st.ReviewAttempts[scope.key()], p.operatorRearmID, native, p.now()) {
-		return ErrReviewHeld
+	if !p.Attempts.operatorRearmReady(scope, st.ReviewAttempts[scope.key()], r.ID, native, p.now()) {
+		return ""
 	}
-	return nil
+	return r.ID
+}
+func (p *Producer) checkAttempt(scope AttemptScope, lens Lens, max int, observed bool) error {
+	if p.queuedRearm(scope, lens) != "" {
+		return nil
+	}
+	return p.Attempts.Check(scope, p.now(), max, observed)
 }
 func (p *Producer) claimAttempt(scope AttemptScope, lens Lens, max int) (string, error) {
-	if p.operatorRearmID == "" {
+	grantID := p.queuedRearm(scope, lens)
+	if grantID == "" {
 		return p.Attempts.Claim(scope, p.now(), max)
 	}
 	native, ok := lens.(*NativeClaudeLens)
@@ -225,12 +231,12 @@ func (p *Producer) claimAttempt(scope AttemptScope, lens Lens, max int) (string,
 	id := uuid.NewString()
 	err = p.Attempts.update(func(st *state.State) error {
 		track := st.ReviewAttempts[scope.key()]
-		if !p.Attempts.operatorRearmReady(scope, track, p.operatorRearmID, native, p.now()) {
+		if !p.Attempts.operatorRearmReady(scope, track, grantID, native, p.now()) {
 			return ErrReviewHeld
 		}
 		// Fsync consumed authority before state persistence. Failure after this
 		// point requires inspection and can never authorize another physical send.
-		if err := writeRearmExclusive(filepath.Join(dir, scope.key()+".claimed"), operatorRearmClaim{p.operatorRearmID, id, p.now().UTC()}); err != nil {
+		if err := writeRearmExclusive(filepath.Join(dir, scope.key()+".claimed"), operatorRearmClaim{grantID, id, p.now().UTC()}); err != nil {
 			return err
 		}
 		track.Attempts = append(track.Attempts, state.ReviewAttempt{ID: id, StartedAt: p.now().UTC(), Outcome: "launch_intent", Reason: "outcome_unknown", NextAction: "reconcile_before_retry"})

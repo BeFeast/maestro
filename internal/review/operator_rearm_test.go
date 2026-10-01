@@ -53,29 +53,32 @@ func rearmFixture(t *testing.T) (*Producer, *config.Config, AttemptScope, Operat
 	return p, cfg, scope, req, calls
 }
 
-func TestNativeOperatorRearmIsExplicitOnceAndPreservesOldLimitAndHistory(t *testing.T) {
+func TestNativeOperatorRearmQueuesExactlyOnceAndPreservesOldLimitAndHistory(t *testing.T) {
 	p, cfg, scope, req, calls := rearmFixture(t)
 	before, _ := state.Load(cfg.StateDir)
 	old := before.ReviewAttempts[scope.key()]
-	id, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
+	_ = p.ProducePR(context.Background(), scope.PR)
+	if calls.Load() != 0 || p.Attempts.Due(scope, p.now(), 1) {
+		t.Fatal("held review ran without operator grant")
+	}
+	_, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := p.Attempts.Check(scope, p.now(), 5, true); err == nil || p.Attempts.Due(scope, p.now(), 5) {
-		t.Fatal("operator allowance leaked into automatic retry")
+	if err := p.Attempts.Check(scope, p.now(), 5, true); err == nil {
+		t.Fatal("operator allowance changed automatic retry policy")
 	}
 	if _, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now()); err == nil {
 		t.Fatal("duplicate allowance")
 	}
-	_ = p.ProducePR(context.Background(), scope.PR)
-	if calls.Load() != 0 {
-		t.Fatal("ordinary producer spent operator grant")
+	if !p.Attempts.Due(scope, p.now(), 1) {
+		t.Fatal("queued operator review is not due")
 	}
-	_ = p.ProducePRWithOperatorRearm(context.Background(), scope.PR, id)
+	_ = p.ProducePR(context.Background(), scope.PR)
 	if err := state.Save(cfg.StateDir, before); err != nil {
 		t.Fatal(err)
 	}
-	_ = p.ProducePRWithOperatorRearm(context.Background(), scope.PR, id)
+	_ = p.ProducePR(context.Background(), scope.PR)
 	if calls.Load() != 1 {
 		t.Fatal("grant not single-use", calls.Load())
 	}
@@ -87,9 +90,24 @@ func TestNativeOperatorRearmIsExplicitOnceAndPreservesOldLimitAndHistory(t *test
 	}
 }
 
+func TestNativeOperatorRearmExpiredGrantCannotWakeOrRun(t *testing.T) {
+	p, cfg, scope, req, calls := rearmFixture(t)
+	if _, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now()); err != nil {
+		t.Fatal(err)
+	}
+	p.Now = func() time.Time { return req.ExpiresAt.Add(time.Second) }
+	if p.Attempts.Due(scope, p.now(), 1) {
+		t.Fatal("expired grant due")
+	}
+	_ = p.ProducePR(context.Background(), scope.PR)
+	if calls.Load() != 0 {
+		t.Fatal("expired grant ran")
+	}
+}
+
 func TestNativeOperatorRearmSurvivesOldDaemonRoundTripAndPartialClaim(t *testing.T) {
 	p, cfg, scope, req, _ := rearmFixture(t)
-	id, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
+	_, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -107,7 +125,6 @@ func TestNativeOperatorRearmSurvivesOldDaemonRoundTripAndPartialClaim(t *testing
 	if !reflect.DeepEqual(before, after) {
 		t.Fatal("old daemon erased grant")
 	}
-	p.operatorRearmID = id
 	p.Attempts.persist = func(_ string, fn func(*state.State) error) error {
 		st, _ := state.Load(cfg.StateDir)
 		if err := fn(st); err != nil {
@@ -167,11 +184,10 @@ func TestNativeOperatorRearmRejectsDriftAndUnverifiedPrior(t *testing.T) {
 
 func TestNativeOperatorRearmClaimContendsAndRefusesNewRun(t *testing.T) {
 	p, cfg, scope, req, _ := rearmFixture(t)
-	id, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
+	_, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now())
 	if err != nil {
 		t.Fatal(err)
 	}
-	p.operatorRearmID = id
 	lens := p.Lenses[0].(*NativeClaudeLens)
 	lens.budgetRunID = "new-run"
 	if _, err := p.claimAttempt(scope, lens, 1); err == nil {

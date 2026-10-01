@@ -50,7 +50,6 @@ type Lens interface {
 
 // Producer publishes reviews for one repository through one forge client.
 type Producer struct {
-	operatorRearmID string
 	ExecutionPolicy aiexecution.Policy
 	// Attempts is mandatory for HTTP lenses; nil fails closed before HTTP.
 	Attempts    *AttemptStore
@@ -141,14 +140,6 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	pr, err := p.Forge.GetPR(ctx, p.Repo, prNumber)
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
-	}
-	if p.operatorRearmID != "" {
-		if len(p.Lenses) != 1 {
-			return ErrReviewHeld
-		}
-		if err := p.checkAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, p.Lenses[0].Name()}, p.Lenses[0], 1, true); err != nil {
-			return err
-		}
 	}
 	diff, err := p.Forge.GetPRDiff(ctx, p.Repo, prNumber)
 	if err != nil {

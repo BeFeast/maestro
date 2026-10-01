@@ -107,7 +107,7 @@ func (s *AttemptStore) Due(scope AttemptScope, now time.Time, max int) bool {
 		return false
 	}
 	track, ok := st.ReviewAttempts[scope.key()]
-	return ok && due(track, now, max) && s.evidenceIntact(track.Attempts[len(track.Attempts)-1])
+	return ok && ((due(track, now, max) && s.evidenceIntact(track.Attempts[len(track.Attempts)-1])) || s.operatorRearmDue(scope, track, now))
 }
 
 func (s *AttemptStore) Claim(scope AttemptScope, now time.Time, max int) (string, error) {
