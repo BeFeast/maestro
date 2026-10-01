@@ -30,6 +30,7 @@ import (
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/mirrorstore"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/selfdeploy"
 	"github.com/befeast/maestro/internal/server"
 	"github.com/befeast/maestro/internal/state"
@@ -187,6 +188,9 @@ type Options struct {
 	// importing state, or starting flows. Empty preserves whole-fleet behavior.
 	// The same immutable selection bounds hot membership and project CRUD.
 	ProjectNames []string
+	// NativePrelaunchRecoveries are explicit operator startup decisions, consumed
+	// once per daemon process by their exact project's orchestrator.
+	NativePrelaunchRecoveries []orchestrator.NativePrelaunchRecovery
 
 	// Host and Port bind the single aggregating FleetServer (#516: one web
 	// for the whole fleet, default :8786).
@@ -317,9 +321,10 @@ type Daemon struct {
 	// for those tests.
 	projectStore configwatch.ProjectStore
 
-	mu    sync.Mutex
-	fleet *server.FleetServer
-	flows map[string]*projectFlow
+	mu                        sync.Mutex
+	fleet                     *server.FleetServer
+	flows                     map[string]*projectFlow
+	nativePrelaunchRecoveries []orchestrator.NativePrelaunchRecovery
 
 	// mirror is the shared GitHub read-model mirror (#825/#826). Opened once in
 	// Run when webhook ingestion is configured — the ingestor projects accepted
@@ -450,6 +455,7 @@ func (d *Daemon) rememberShutdownStateDirs(dirs []string) {
 func New(store ConfigLoader, opts Options) *Daemon {
 	// A caller cannot widen the daemon's scope by mutating its original slice.
 	opts.ProjectNames = append([]string(nil), opts.ProjectNames...)
+	opts.NativePrelaunchRecoveries = append([]orchestrator.NativePrelaunchRecovery(nil), opts.NativePrelaunchRecoveries...)
 	if opts.RunInterval <= 0 {
 		log.Printf("[daemon] run-interval %s is not positive; clamping to default %s", opts.RunInterval, DefaultRunInterval)
 		opts.RunInterval = DefaultRunInterval
@@ -472,10 +478,11 @@ func New(store ConfigLoader, opts Options) *Daemon {
 		opts.DrainTimeout = DefaultDrainTimeout
 	}
 	d := &Daemon{
-		store:        store,
-		opts:         opts,
-		flows:        make(map[string]*projectFlow),
-		spawnLimiter: newFleetSpawnLimiter(store),
+		store:                     store,
+		opts:                      opts,
+		flows:                     make(map[string]*projectFlow),
+		spawnLimiter:              newFleetSpawnLimiter(store),
+		nativePrelaunchRecoveries: append([]orchestrator.NativePrelaunchRecovery(nil), opts.NativePrelaunchRecoveries...),
 	}
 	d.tmpfsHygiene = newTmpfsHygieneRuntime(d)
 	// #1128: the capacity sample shares the hygiene root but not its schedule.
@@ -521,6 +528,9 @@ func New(store ConfigLoader, opts Options) *Daemon {
 func (d *Daemon) Run(ctx context.Context) error {
 	named, err := d.loadNamedConfigs(ctx)
 	if err != nil {
+		return err
+	}
+	if err := validateNativePrelaunchProjects(named, d.opts.NativePrelaunchRecoveries); err != nil {
 		return err
 	}
 	if len(named) == 0 && d.projectStore == nil {

@@ -86,6 +86,34 @@ func BranchName(slotName string, issue github.Issue) string {
 // the canonical worktree but no process, it is reused in place. Mismatched or
 // invalid identities fail closed and are never deleted.
 func StartReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName string) (resultSlot string, resultErr error) {
+	return startReserved(cfg, s, repo, issue, promptBase, backendName, slotName, "")
+}
+
+// RecoverRegisteredWorkerStart explicitly resumes a failed first-generation
+// setup. It never allocates a slot, changes native identity, or authorizes a
+// registration whose acknowledgement was lost. The native receipt and exact
+// process absence are checked together under the existing per-slot lock.
+func RecoverRegisteredWorkerStart(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, slotName, expectedNativeSessionID string) (string, error) {
+	if cfg == nil || cfg.WorkerNativeSessionRegistration == nil || s == nil || expectedNativeSessionID == "" {
+		return "", &NativeRegistrationHold{Code: "native_recovery_identity_invalid", Slot: slotName}
+	}
+	sess := s.Sessions[slotName]
+	if sess == nil || sess.Status != state.StatusFailed || sess.NativeRegistrationHold == "" ||
+		sess.IssueNumber != issue.Number || sess.WorkerGeneration != 0 || sess.NativeRoleRunID != "" ||
+		sess.NativeSessionID != "" || sess.PID != 0 || sess.ProcessLeaseUnit != "" ||
+		sess.TmuxSession != "" || !sess.StartedAt.IsZero() ||
+		sess.Worktree != filepath.Join(cfg.WorktreeBase, slotName) || sess.Branch != BranchName(slotName, issue) {
+		return "", &NativeRegistrationHold{Code: "native_recovery_projection_conflict", Slot: slotName}
+	}
+	for otherSlot, other := range s.Sessions {
+		if otherSlot != slotName && other != nil && other.IssueNumber == issue.Number {
+			return "", &NativeRegistrationHold{Code: "native_recovery_sibling_conflict", Slot: slotName}
+		}
+	}
+	return startReserved(cfg, s, repo, issue, promptBase, sess.Backend, slotName, expectedNativeSessionID)
+}
+
+func startReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName, recoveryNativeSessionID string) (resultSlot string, resultErr error) {
 	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
 		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
 	}
@@ -144,7 +172,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		return "", err
 	}
 
-	native, err := prepareNativeWorker(cfg, nil, slotName, backendName, backendCfg, 1, issue.Number, worktreePath, branchName)
+	native, err := prepareNativeWorkerWithRecovery(cfg, nil, slotName, backendName, backendCfg, 1, issue.Number, worktreePath, branchName, recoveryNativeSessionID)
 	if err != nil {
 		return "", err
 	}

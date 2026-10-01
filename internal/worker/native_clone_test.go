@@ -1,6 +1,7 @@
 package worker
 
 import (
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/github"
 	"os"
 	"path/filepath"
@@ -51,5 +52,34 @@ func TestNativeCloneMaterializesAssignedPathWithoutSharedGitMetadata(t *testing.
 	}
 	if _, err := os.Stat(filepath.Join(parent, ".git")); err != nil {
 		t.Fatal("parent damaged", err)
+	}
+}
+
+func TestNativeCloneRecoveryRegistersSandboxBeforeInspectingRetainedClone(t *testing.T) {
+	if os.Getenv("MAESTRO_NATIVE_KERNEL_TESTS") != "1" {
+		t.Skip("set MAESTRO_NATIVE_KERNEL_TESTS=1 for native clone kernel fixture")
+	}
+	parent := newBranchTestRepo(t)
+	runBranchGit(t, parent, "remote", "add", "origin", "https://git.oklabs.uk/BeFeast/maestro.git")
+	runBranchGit(t, parent, "update-ref", "refs/remotes/origin/main", "HEAD")
+	ancestor := t.TempDir()
+	if err := os.Chmod(ancestor, 0775); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(ancestor, "assigned")
+	if err := materializeNativeClone(parent, path, "codex/fixture-1"); err == nil {
+		t.Fatal("writable ancestor accepted")
+	}
+	if aiexecution.NativeGitRegistered(path) {
+		t.Fatal("unsafe path registered")
+	}
+	if err := os.Chmod(ancestor, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := materializeNativeClone(parent, path, "codex/fixture-1"); err != nil {
+		t.Fatal(err)
+	}
+	if !aiexecution.NativeGitRegistered(path) || !isNativeCloneForRepo(parent, path) {
+		t.Fatal("retained clone lacks sandbox registration")
 	}
 }

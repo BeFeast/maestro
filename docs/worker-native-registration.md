@@ -57,8 +57,29 @@ No held registration is retried automatically. The source API
 the exact saved request after checking current scope and backend configuration;
 it records `registration_reconciled_not_launched`. It never starts or adopts a
 process and does not turn a recovered acknowledgement into launch authority.
-There is no new operator CLI command or automatic generation abandonment path.
+There is no automatic generation abandonment path.
 A held receipt cannot be erased, rebound or replaced by a subsequent generation.
+
+An explicit operator can recover a first-generation setup that already saved
+`registered` but never reached `launch_intent`:
+
+```sh
+maestro daemon --store /path/to/store --project exact-project-row \
+  --recover-native-prelaunch project-UUID:exact-slot:existing-native-session-UUID
+```
+
+Add the repeatable flag to the owning daemon's next startup; do not start a
+second daemon. Its project orchestrator consumes the decision once, with the
+normal controller lease, emergency/pause gates and project/fleet capacity.
+Remove the temporary flag after the recovery attempt. A flow restart does not
+repeat it; a daemon restart cannot relaunch a generation with launch intent.
+Recovery checks the failed canonical projection,
+unchanged registration/configuration, no sibling session, exact OS lease and
+tmux absence, and absence of containment launch claims. It revalidates the
+already saved acknowledgement against the authority, then runs normal setup
+under the same per-slot lock using the same native UUID and generation. It
+does not recover a lost acknowledgement, `registration_reconciled_not_launched`,
+expired binding, or any known/uncertain launch. Ordinary retries remain held.
 
 A lost launch reply is reconciled by the existing launcher. If it cannot prove
 ownership, the process lease and scratch receipt survive. Re-entering the same

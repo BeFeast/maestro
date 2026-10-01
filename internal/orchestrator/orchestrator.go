@@ -138,9 +138,11 @@ type Orchestrator struct {
 	workerStartPhaseFn func(cfg *config.Config, sess *state.Session, slotName, prompt, backendName string) error
 
 	// Testing hooks for startNewWorkers
-	listOpenIssuesFn     func(labels []string) ([]github.Issue, error)
-	workerStartFn        func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
-	workerStartClaimedFn func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
+	listOpenIssuesFn          func(labels []string) ([]github.Issue, error)
+	workerStartFn             func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend string) (string, error)
+	workerStartClaimedFn      func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
+	nativePrelaunchRecoveries []NativePrelaunchRecovery
+	nativePrelaunchRecoverFn  func(*config.Config, *state.State, string, github.Issue, string, string, string) (string, error)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -3326,6 +3328,7 @@ func (o *Orchestrator) RunOnce() error {
 	o.checkSessions(s)
 
 	// Step 2b: Respawn dead sessions whose backoff has elapsed
+	o.recoverNativePrelaunchWorkers(s)
 	retrySlots := availableSlots(o.cfg, s, len(s.ActiveSessions()))
 	o.respawnDueRetries(s, retrySlots)
 

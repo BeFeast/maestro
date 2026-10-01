@@ -42,6 +42,12 @@ func canonicalNativeOrigin(parent string) (string, error) {
 
 func materializeNativeClone(parent, worktree, branch string) error {
 	if _, err := os.Lstat(worktree); err == nil {
+		// Initial setup can stop after writing clone identity but before Git
+		// registration (for example, a writable ancestor). Recovery must install
+		// the sandbox before inspecting even that partially prepared checkout.
+		if err := aiexecution.RegisterNativeGit(worktree); err != nil {
+			return err
+		}
 		if !isNativeCloneForRepo(parent, worktree) {
 			return aiexecution.Held("containment_existing_checkout_unsupported")
 		}

@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
 	"github.com/befeast/maestro/internal/daemonresources"
+	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/tmpfshygiene"
 	"github.com/befeast/maestro/internal/webhook"
 )
@@ -30,6 +31,8 @@ func daemonCmd(args []string) {
 	storePath := fs.String("store", defaults.Store, "Path to SQLite config store")
 	var projects multiFlag
 	fs.Var(&projects, "project", "Exact config-store row to run (repeatable; omitted runs all projects)")
+	var recoverNative multiFlag
+	fs.Var(&recoverNative, "recover-native-prelaunch", "One explicit recovery attempt: project-ID:slot:native-session-UUID (repeatable)")
 	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
 	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
 	tmpfsHygieneInterval := fs.Duration("tmpfs-hygiene-interval", daemon.DefaultTmpfsHygieneInterval, "Protect-aware /tmp apply interval")
@@ -55,6 +58,10 @@ func daemonCmd(args []string) {
 	if err := daemon.ValidateProjectSelection(projects); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
+	recoveries, err := orchestrator.ParseNativePrelaunchRecoveries(recoverNative)
+	if err != nil {
+		log.Fatalf("daemon: %v", err)
+	}
 	if err := refuseUnmigratedCanonicalStore(*storePath); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
@@ -69,18 +76,19 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		ProjectNames:            projects,
-		Host:                    *host,
-		Port:                    *port,
-		RunInterval:             *runInterval,
-		SuperviseInterval:       *superviseInterval,
-		TmpfsHygieneInterval:    *tmpfsHygieneInterval,
-		TmpfsPressureInterval:   *tmpfsPressureInterval,
-		TmpfsPressureFloorBytes: *tmpfsPressureFloor,
-		TmpfsSpawnFloorBytes:    *tmpfsSpawnFloor,
-		PromptPath:              *promptPath,
-		Version:                 resolveVersion(),
-		ReadOnly:                *readOnly,
+		ProjectNames:              projects,
+		NativePrelaunchRecoveries: recoveries,
+		Host:                      *host,
+		Port:                      *port,
+		RunInterval:               *runInterval,
+		SuperviseInterval:         *superviseInterval,
+		TmpfsHygieneInterval:      *tmpfsHygieneInterval,
+		TmpfsPressureInterval:     *tmpfsPressureInterval,
+		TmpfsPressureFloorBytes:   *tmpfsPressureFloor,
+		TmpfsSpawnFloorBytes:      *tmpfsSpawnFloor,
+		PromptPath:                *promptPath,
+		Version:                   resolveVersion(),
+		ReadOnly:                  *readOnly,
 		// Centralized self-deploy debounce marker (#758): one shared location next
 		// to the config store so every flow's RequestSelfDeploy debounces on the
 		// same marker, and it survives the daemon being restarted by its own

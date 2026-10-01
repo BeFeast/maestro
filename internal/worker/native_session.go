@@ -273,6 +273,10 @@ func readNativeWorkerReceipt(dir string, generation uint64) (*NativeWorkerReceip
 }
 
 func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend string, backendCfg BackendConfig, generation uint64, issue int, worktree, branch string) (*nativeWorkerLaunch, error) {
+	return prepareNativeWorkerWithRecovery(cfg, sess, slot, backend, backendCfg, generation, issue, worktree, branch, "")
+}
+
+func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, slot, backend string, backendCfg BackendConfig, generation uint64, issue int, worktree, branch, recoveryNativeSessionID string) (*nativeWorkerLaunch, error) {
 	if cfg.WorkerNativeSessionRegistration == nil {
 		if sess != nil && sess.NativeRoleRunID != "" {
 			return nil, &NativeRegistrationHold{Code: "configuration_removed"}
@@ -329,6 +333,14 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 		if previous.ProjectID != cfg.ProjectID || previous.Slot != slot || previous.IssueNumber != issue || previous.Worktree != worktree || previous.Branch != branch || previous.Backend != backend || previous.ConfigDigest != configDigest || previous.Request.Role != role || previous.ParentRoleRunID != parent || previous.ProcessLeaseUnit != lease.Unit || previous.ProcessLeaseManager != lease.Manager {
 			return nil, &NativeRegistrationHold{Code: "identity_conflict", LaunchUncertain: previous.Status == "launch_intent" || previous.Status == "launched"}
 		}
+		if recoveryNativeSessionID != "" {
+			if err := authorizeRegisteredWorkerRecovery(cfg, client, dir, previous, lease, recoveryNativeSessionID); err != nil {
+				return nil, err
+			}
+			owner.receipt = previous
+			ok = true
+			return owner, nil
+		}
 		if previous.Status == "launch_intent" || previous.Status == "launched" {
 			owner.receipt, owner.adopt = previous, true
 			ok = true
@@ -338,6 +350,9 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 	}
 	if !errors.Is(err, os.ErrNotExist) {
 		return nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+	}
+	if recoveryNativeSessionID != "" {
+		return nil, &NativeRegistrationHold{Code: "native_recovery_receipt_missing"}
 	}
 	if generation == 1 && tmuxSessionExists(TmuxSessionName(slot)) {
 		return nil, &NativeRegistrationHold{Code: "unregistered_process_exists", LaunchUncertain: true, Slot: slot}
@@ -386,6 +401,50 @@ func prepareNativeWorker(cfg *config.Config, sess *state.Session, slot, backend 
 	owner.receipt = receipt
 	ok = true
 	return owner, nil
+}
+
+// This is an explicit operator launch decision, separate from registration
+// reconciliation. A durable registered receipt proves setup stopped before
+// launch intent. The lock remains held through the ordinary launch pipeline.
+func authorizeRegisteredWorkerRecovery(cfg *config.Config, client admissioncontrol.Client, dir string, receipt *NativeWorkerReceipt, lease tmuxsession.ProcessLease, expectedNativeSessionID string) error {
+	uncertain := receipt.Status == "launch_intent" || receipt.Status == "launched"
+	if receipt.Generation != 1 || receipt.Status != "registered" || receipt.Request.NativeSessionID != expectedNativeSessionID ||
+		receipt.PID != 0 || receipt.LogFile != "" || receipt.ParentRoleRunID != "" ||
+		receipt.OutcomeIntent != nil || receipt.Outcome != nil || receipt.Acknowledgement == nil {
+		return &NativeRegistrationHold{Code: "native_recovery_not_prelaunch", LaunchUncertain: uncertain}
+	}
+	if receipt.Request.ExpiresAt <= time.Now().Unix() {
+		return &NativeRegistrationHold{Code: "launch_not_authorized"}
+	}
+	// Any terminal marker, including a malformed one, contradicts pre-launch.
+	if _, err := os.Lstat(filepath.Join(dir, nativeReceiptName(receipt.Generation)+".terminated")); !errors.Is(err, os.ErrNotExist) {
+		return &NativeRegistrationHold{Code: "native_recovery_terminal_conflict", LaunchUncertain: true}
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		pin, err := aiexecution.ContainmentProfilePin(cfg.AIExecution, receipt.Slot, receipt.Request.Role)
+		if err != nil {
+			return err
+		}
+		if err := aiexecution.VerifyNativePrelaunchAbsence(pin, receipt.ProjectID, receipt.Request.NativeSessionID, receipt.ProcessLeaseUnit); err != nil {
+			return err
+		}
+	}
+	active, err := workerProcessLeaseActive(lease)
+	if err != nil || active {
+		return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+	}
+	absent, err := nativeWorkerPaneAbsent(TmuxSessionName(receipt.Slot))
+	if err != nil || !absent {
+		return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+	}
+	ack, err := registerNativeWorker(client, receipt.Request)
+	if err != nil {
+		return &NativeRegistrationHold{Code: "authority_unavailable"}
+	}
+	if ack != *receipt.Acknowledgement || ack.Revoked || ack.Binding.ExpiresAt <= time.Now().Unix() {
+		return &NativeRegistrationHold{Code: "acknowledgement_invalid"}
+	}
+	return nil
 }
 
 func (n *nativeWorkerLaunch) close() {

@@ -478,6 +478,7 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// reload event, not just the latest value.
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
+	orch.SetNativePrelaunchRecoveries(d.takeNativePrelaunchRecoveries(cfg.ProjectID))
 	orch.SetBinaryVersion(opts.Version)
 	// #866: let the orchestrator's standing repair-approval reconciler mirror a
 	// moot-approval stale transition into the same SQLite approval store the
