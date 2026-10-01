@@ -19,6 +19,10 @@ type NativeClaudeLens struct {
 	policy      aiexecution.Policy
 	projectID   string
 	budgetRunID string
+	// limiter is the configured auxiliary capacity owner, probed before an
+	// operator rearm grant is exercised so a hold the runner would report
+	// before any launch is observed without opening a consultation (#1233).
+	limiter aiexecution.AuxiliaryLimiter
 }
 
 // NewNativeClaudeLens installs the supported runner. There is no exported
@@ -35,6 +39,9 @@ func NewNativeClaudeLens(stream, model string, cfg *config.Config) *NativeClaude
 		l.projectID = cfg.ProjectID
 		l.budgetRunID = cfg.Supervisor.NativeSessionRegistration.BudgetRunID
 	}
+	if cfg != nil {
+		l.limiter = cfg.RuntimeAuxiliaryLimiter
+	}
 	return l
 }
 
@@ -49,13 +56,34 @@ func (l *NativeClaudeLens) Run(context.Context, string) (string, error) {
 	return "", aiexecution.Held("native_reviewer_claim_required")
 }
 func (l *NativeClaudeLens) RunClaimed(ctx context.Context, prompt, claimID string) (string, error) {
+	output, _, err := l.runClaimed(ctx, prompt, claimID)
+	return output, err
+}
+
+// runClaimed additionally reports whether the claim reached the native runner.
+// A refusal before that point is store-independent proof that nothing could
+// have launched (#1233).
+func (l *NativeClaudeLens) runClaimed(ctx context.Context, prompt, claimID string) (output string, entered bool, err error) {
 	if err := l.Available(); err != nil {
-		return "", err
+		return "", false, err
 	}
 	if uuid.Validate(claimID) != nil {
-		return "", aiexecution.Held("native_reviewer_claim_required")
+		return "", false, aiexecution.Held("native_reviewer_claim_required")
 	}
-	return l.complete(ctx, prompt, claimID)
+	output, err = l.complete(ctx, prompt, claimID)
+	return output, true, err
+}
+
+// preflight observes, without launching, what would hold a claim before any
+// native launch: the lens's own availability, then auxiliary capacity.
+func (l *NativeClaudeLens) preflight(stateDir string) rearmPreflight {
+	return func() string {
+		if err := l.Available(); err != nil {
+			code, _ := typedNativeHold(err)
+			return code
+		}
+		return auxiliaryPreflight(l.limiter, stateDir)
+	}
 }
 func managedLens(l Lens) bool {
 	switch l.(type) {

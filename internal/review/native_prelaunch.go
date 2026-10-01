@@ -143,20 +143,21 @@ func nativeReviewReceiptPreLaunch(r *supervisor.ConsultationReceipt, attemptID, 
 	return true
 }
 
-// nativeReviewPreLaunchHoldProven reports whether attemptID provably never
-// reached a native launch. A missing receipt counts only when the store itself
-// is readable (or absent): the native runner persists a receipt before it
-// reserves auxiliary capacity or launches, so no receipt means no launch. Any
-// read error, marker or recorded invocation fails closed as "possibly launched".
+// nativeReviewPreLaunchHoldProven reports whether the durable consultation
+// receipt store proves that attemptID never reached a native launch. The native
+// runner persists a receipt before it reserves auxiliary capacity or launches,
+// so a readable store holding no receipt for the identity means no launch. An
+// absent store proves nothing: a hold raised before the runner created it is
+// indistinguishable here from a wiped store, so it fails closed as "possibly
+// launched" unless the caller has store-independent proof (the runner was never
+// entered; see rearmPreLaunchHold). Any read error, marker or recorded
+// invocation fails closed the same way.
 func nativeReviewPreLaunchHoldProven(nativeDir, attemptID, projectID string) bool {
 	if uuid.Validate(attemptID) != nil || projectID == "" {
 		return false
 	}
-	if _, err := os.Lstat(nativeDir); errors.Is(err, os.ErrNotExist) {
-		return true
-	}
-	if _, err := os.Lstat(filepath.Join(nativeDir, "supervisor-consultations")); errors.Is(err, os.ErrNotExist) {
-		return true
+	if _, err := os.Lstat(filepath.Join(nativeDir, "supervisor-consultations")); err != nil {
+		return false
 	}
 	if intent, err := nativeReviewIntentFor(nativeDir, attemptID); err != nil || intent {
 		return false
