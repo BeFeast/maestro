@@ -90,7 +90,8 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 }
 
 // RecoverRegisteredWorkerStart explicitly resumes a failed first-generation
-// setup. It never allocates a slot, changes native identity, or authorizes a
+// setup, including an acknowledged host launch that provably never reached
+// the native monitor. It never allocates a slot, changes native identity, or authorizes a
 // registration whose acknowledgement was lost. The native receipt and exact
 // process absence are checked together under the existing per-slot lock.
 func RecoverRegisteredWorkerStart(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, slotName, expectedNativeSessionID string) (string, error) {

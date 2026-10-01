@@ -38,6 +38,7 @@ type fleetSpawnLimiter struct {
 	stateDirs             map[string]struct{}
 	projects              map[string]fleetProjectRegistration
 	reservations          map[uint64]fleetSpawnReservation
+	recoveryReservations  map[string]struct{}
 	auxiliaryReservations map[string]struct{}
 	auxiliaryStateDirs    map[string]struct{}
 	auxiliaryStore        auxiliaryReceiptIndex
@@ -54,6 +55,7 @@ func newFleetSpawnLimiter(store ConfigLoader) *fleetSpawnLimiter {
 		stateDirs:             make(map[string]struct{}),
 		projects:              make(map[string]fleetProjectRegistration),
 		reservations:          make(map[uint64]fleetSpawnReservation),
+		recoveryReservations:  make(map[string]struct{}),
 		auxiliaryReservations: make(map[string]struct{}),
 		auxiliaryStateDirs:    make(map[string]struct{}),
 		loadState:             state.Load,
@@ -290,6 +292,46 @@ func (l *fleetSpawnLimiter) Reserve(stateDir string) (commit func(string), relea
 		l.mu.Unlock()
 	}
 	return commit, release, true
+}
+
+// ReserveNativeRecovery reuses an already counted launch_intent, never an
+// additional slot. The durable receipt stays occupied throughout the recovery.
+func (l *fleetSpawnLimiter) ReserveNativeRecovery(stateDir, slot, nativeID string) (func(string), func(), bool) {
+	if l == nil {
+		return func(string) {}, func() {}, true
+	}
+	l.mu.Lock()
+	if !worker.NativeRecoveryOccupiesSlot(stateDir, slot, nativeID) {
+		l.mu.Unlock()
+		return l.Reserve(stateDir)
+	}
+	key := fleetWorkerKey(stateDir, slot)
+	settings, err := l.settingsLocked()
+	if err != nil {
+		l.mu.Unlock()
+		return nil, nil, false
+	}
+	occupied, err := l.workerOccupancyLocked(true)
+	if err == nil {
+		l.reconcileReservationsLocked(occupied)
+	}
+	_, counted := occupied[key]
+	_, reserved := l.recoveryReservations[key]
+	if err != nil || !counted || reserved || settings.MaxLiveWorkers > 0 && len(occupied)+len(l.reservations) > settings.MaxLiveWorkers {
+		l.mu.Unlock()
+		return nil, nil, false
+	}
+	if l.recoveryReservations == nil {
+		l.recoveryReservations = make(map[string]struct{})
+	}
+	l.recoveryReservations[key] = struct{}{}
+	l.mu.Unlock()
+	release := func() {
+		l.mu.Lock()
+		delete(l.recoveryReservations, key)
+		l.mu.Unlock()
+	}
+	return func(string) { release() }, release, true
 }
 
 const factoryDogfoodRepo = "BeFeast/maestro"

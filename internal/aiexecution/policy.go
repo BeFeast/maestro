@@ -200,6 +200,16 @@ func VerifyFile(p FileProof) error {
 // at every leaf. Matching config-only receipts cannot prove active account
 // routing or kernel containment; those still require their real observers.
 func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
+	return inspectWithObservationKey(policy, spec, cmd, nil)
+}
+
+// InspectWithObservationKey keeps host observation credentials out of both the
+// process-global environment and the native command environment.
+func InspectWithObservationKey(policy Policy, spec LaunchSpec, cmd *exec.Cmd, key string) error {
+	return inspectWithObservationKey(policy, spec, cmd, &key)
+}
+
+func inspectWithObservationKey(policy Policy, spec LaunchSpec, cmd *exec.Cmd, observationKey *string) error {
 	if err := policy.CheckCurrent(); err != nil {
 		return err
 	}
@@ -229,6 +239,7 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if DecodeStrict(b, &m) != nil || m.Version != 1 {
 		return Held("manifest_invalid")
 	}
+	stripHostObservationEnvironment(cmd, m.Runtime.ManagementKeyEnv)
 	if m.EvidenceKind != "installed" {
 		return Held("source_evidence_not_installed")
 	}
@@ -341,10 +352,14 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	if err := inspectProcess(m.Gateway); err != nil {
 		return err
 	}
-	if err := observeRuntime(m, route.CallerScopeHash); err != nil {
+	observerKey := os.Getenv(m.Runtime.ManagementKeyEnv)
+	if observationKey != nil {
+		observerKey = *observationKey
+	}
+	if err := observeRuntimeWithKey(m, route.CallerScopeHash, observerKey); err != nil {
 		return err
 	}
-	if err := observeClaudeBindings(m); err != nil {
+	if err := observeClaudeBindingsWithKey(m, observerKey); err != nil {
 		return err
 	}
 	if err := inspectProcess(m.Gateway); err != nil {
@@ -368,6 +383,23 @@ func Inspect(policy Policy, spec LaunchSpec, cmd *exec.Cmd) error {
 	// The caller must now use PrepareContainedNativeCommand; readiness itself
 	// does not attest to a process that has not yet entered its OS lease.
 	return nil
+}
+
+func stripHostObservationEnvironment(cmd *exec.Cmd, name string) {
+	if cmd == nil || name == "" {
+		return
+	}
+	env := cmd.Env
+	if env == nil {
+		env = os.Environ()
+	}
+	clean := make([]string, 0, len(env))
+	for _, entry := range env {
+		if !strings.HasPrefix(entry, name+"=") {
+			clean = append(clean, entry)
+		}
+	}
+	cmd.Env = clean
 }
 
 func inspectProcess(p ProcessProof) error {

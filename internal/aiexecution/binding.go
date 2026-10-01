@@ -151,6 +151,10 @@ func validateBindingExpectation(m Manifest) error {
 // Inspect. The nonce, process identity and both config digests must match the
 // independently observed configuration-only receipt. No provider request runs.
 func observeClaudeBindings(m Manifest) error {
+	return observeClaudeBindingsWithKey(m, os.Getenv(m.Runtime.ManagementKeyEnv))
+}
+
+func observeClaudeBindingsWithKey(m Manifest, key string) error {
 	if err := validateBindingExpectation(m); err != nil {
 		return err
 	}
@@ -174,7 +178,6 @@ func observeClaudeBindings(m Manifest) error {
 	if keyName == "" || strings.IndexFunc(keyName, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') }) >= 0 {
 		return Held("binding_management_key_unavailable")
 	}
-	key := os.Getenv(keyName)
 	if key == "" {
 		return Held("binding_management_key_unavailable")
 	}

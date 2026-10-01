@@ -78,6 +78,56 @@ func TestNativeWorkerOccupancySurvivesRestartWithoutMaskingFloor(t *testing.T) {
 	}
 }
 
+func TestNativeRecoveryReusesExactOccupiedSlotAtFleetCeiling(t *testing.T) {
+	store := &fleetConcurrencyTestStore{settings: config.FleetConcurrencySettings{MaxLiveWorkers: 2}}
+	limiter := newFleetSpawnLimiter(store)
+	type identity struct{ dir, slot, native string }
+	var identities []identity
+	for i := 0; i < 2; i++ {
+		dir := t.TempDir()
+		saveFleetRunningState(t, dir, 0)
+		slot := "slot-1"
+		native := uuid.NewString()
+		receiptDir := filepath.Join(dir, "worker-native-sessions", slot)
+		if err := os.MkdirAll(receiptDir, 0700); err != nil {
+			t.Fatal(err)
+		}
+		request := admissioncontrol.RegistrationRequest{Binding: admissioncontrol.Binding{GatewayScope: "gateway", NativeSessionID: native, FleetID: "fleet", ProjectID: "project", RunID: "budget", Role: "planner", ExpiresAt: time.Now().Unix() + 100}, ExpectedVersion: 1}
+		r := worker.NativeWorkerReceipt{SchemaVersion: 1, ProjectID: request.ProjectID, Slot: slot, Generation: 1, IssueNumber: 1, RoleRunID: uuid.NewString(), Status: "launch_intent", LogFile: filepath.Join(dir, "fixture.log"), Request: request, Acknowledgement: &admissioncontrol.Acknowledgement{Binding: request.Binding, RegistrationVersion: 1}, ProcessLeaseUnit: "fixture.service", ProcessLeaseManager: "system"}
+		b, _ := json.Marshal(r)
+		if err := os.WriteFile(filepath.Join(receiptDir, "generation-1.json"), b, 0600); err != nil {
+			t.Fatal(err)
+		}
+		limiter.RegisterStateDir(dir)
+		identities = append(identities, identity{dir, slot, native})
+	}
+	a, b := identities[0], identities[1]
+	// A persisted reservation for the same slot must be reconciled before count.
+	limiter.reservations[1] = fleetSpawnReservation{stateDir: a.dir, slot: a.slot}
+	commit, release, ok := limiter.ReserveNativeRecovery(a.dir, a.slot, a.native)
+	if !ok {
+		t.Fatal("exact occupied slot denied at cap")
+	}
+	defer release()
+	for _, wrong := range []identity{{a.dir, a.slot, uuid.NewString()}, {a.dir, "different", a.native}, a} {
+		if _, _, ok := limiter.ReserveNativeRecovery(wrong.dir, wrong.slot, wrong.native); ok {
+			t.Fatal("foreign or duplicate recovery admitted")
+		}
+	}
+	_, releaseB, ok := limiter.ReserveNativeRecovery(b.dir, b.slot, b.native)
+	if !ok {
+		t.Fatal("second exact occupied slot denied")
+	}
+	defer releaseB()
+	if _, _, ok := limiter.Reserve(a.dir); ok {
+		t.Fatal("recovery made unrelated capacity available")
+	}
+	commit(a.slot)
+	if live, err := limiter.liveLocked(); err != nil || live != 2 {
+		t.Fatal("occupancy changed", live, err)
+	}
+}
+
 func TestNativeWorkerHeldPhaseReleasesOnlyProvenOSTerminalCapacity(t *testing.T) {
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "bin")

@@ -177,8 +177,9 @@ type Orchestrator struct {
 	// listing. fleetSpawnReserveFn is the atomic per-worker backstop: concurrent
 	// project flows and one flow's batch dispatch must each reserve one shared
 	// slot before a worker process starts.
-	fleetSpawnCeilingFn func() bool
-	fleetSpawnReserveFn func() (commit func(slot string), release func(), ok bool)
+	fleetSpawnCeilingFn          func() bool
+	fleetSpawnReserveFn          func() (commit func(slot string), release func(), ok bool)
+	fleetNativeRecoveryReserveFn func(slot, nativeID string) (commit func(string), release func(), ok bool)
 
 	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
 	// whether the host is too short on tmpfs space to accept another worker, and

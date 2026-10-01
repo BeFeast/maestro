@@ -120,6 +120,24 @@ func (l ControllerLease) Verify() error {
 	return nil
 }
 
+// VerifyInactive proves that the controller process which authorized a saved
+// host runner is gone. An unreadable /proc entry is uncertainty, not revocation.
+func (l ControllerLease) VerifyInactive() error {
+	if l.PID <= 0 || l.StartTicks == "" || l.BootID == "" {
+		return Held("controller_inactivity_unproven")
+	}
+	if _, err := os.Stat("/proc/" + strconv.Itoa(l.PID)); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return Held("controller_inactivity_unproven")
+	}
+	observed, err := controllerIdentity(l.PID)
+	if err != nil || observed.UID == l.UID && observed.BootID == l.BootID && observed.StartTicks == l.StartTicks {
+		return Held("controller_inactivity_unproven")
+	}
+	return nil
+}
+
 func (p Policy) LiveControllerLease() (ControllerLease, error) {
 	if err := p.CheckCurrent(); err != nil {
 		return ControllerLease{}, err

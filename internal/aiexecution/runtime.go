@@ -62,6 +62,10 @@ type runtimeReceipt struct {
 }
 
 func observeRuntime(m Manifest, callerScopeHash string) error {
+	return observeRuntimeWithKey(m, callerScopeHash, os.Getenv(m.Runtime.ManagementKeyEnv))
+}
+
+func observeRuntimeWithKey(m Manifest, callerScopeHash, key string) error {
 	e := m.Runtime
 	id, err := uuid.Parse(e.ProcessInstanceID)
 	if err != nil || id.String() != e.ProcessInstanceID || e.ProjectionVersion != RuntimeProjection || e.StartedAt.IsZero() || e.BuildVersion == "" || e.GitCommit == "" || !validDigest(e.ManagedAdmissionSHA256) || !validDigest(e.ExecutionConfigSHA256) || !validDigest(callerScopeHash) {
@@ -82,7 +86,6 @@ func observeRuntime(m Manifest, callerScopeHash string) error {
 	if e.ManagementKeyEnv == "" || strings.IndexFunc(e.ManagementKeyEnv, func(r rune) bool { return !(r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '_') }) >= 0 {
 		return Held("runtime_management_key_unavailable")
 	}
-	key := os.Getenv(e.ManagementKeyEnv)
 	if key == "" {
 		return Held("runtime_management_key_unavailable")
 	}

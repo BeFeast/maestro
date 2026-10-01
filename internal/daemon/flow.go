@@ -500,6 +500,9 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
 		return d.reserveFleetSpawn(orchCfg.StateDir)
 	})
+	orch.SetFleetNativeRecoveryReserve(func(slot, nativeID string) (func(string), func(), bool) {
+		return d.spawnLimiter.ReserveNativeRecovery(orchCfg.StateDir, slot, nativeID)
+	})
 	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
 	// from the shared mirror when github_mirror.source is mirror-first, falling
 	// back to the API on a miss/stale. The closure reads &orchCfg — the live,

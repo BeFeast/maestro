@@ -41,6 +41,10 @@ func (o *Orchestrator) SetNativePrelaunchRecoveries(requests []NativePrelaunchRe
 	o.nativePrelaunchRecoveries = append([]NativePrelaunchRecovery(nil), requests...)
 }
 
+func (o *Orchestrator) SetFleetNativeRecoveryReserve(fn func(slot, nativeID string) (func(string), func(), bool)) {
+	o.fleetNativeRecoveryReserveFn = fn
+}
+
 func (o *Orchestrator) recoverNativePrelaunchWorkers(s *state.State) {
 	requests := o.nativePrelaunchRecoveries
 	o.nativePrelaunchRecoveries = nil // Explicit one-shot; a failure never auto-replays.
@@ -58,7 +62,7 @@ func (o *Orchestrator) recoverNativePrelaunchWorker(s *state.State, request Nati
 	if s.PauseActive() || s.DrainActive() || o.emergencyHaltFn != nil && o.emergencyHaltFn() {
 		return fmt.Errorf("operator pause/drain/emergency active")
 	}
-	if availableSlots(o.cfg, s, len(s.ActiveSessions())) <= 0 || o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
+	if availableSlots(o.cfg, s, len(s.ActiveSessions())) <= 0 || o.fleetNativeRecoveryReserveFn == nil && o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
 		return fmt.Errorf("worker capacity unavailable")
 	}
 	if o.spawnResourceHoldFn != nil {
@@ -86,7 +90,14 @@ func (o *Orchestrator) recoverNativePrelaunchWorker(s *state.State, request Nati
 			}
 		}
 	}
-	permit, ok := o.reserveFleetSpawn()
+	var permit *fleetSpawnPermit
+	var ok bool
+	if o.fleetNativeRecoveryReserveFn != nil {
+		commit, release, granted := o.fleetNativeRecoveryReserveFn(request.Slot, request.NativeSessionID)
+		permit, ok = &fleetSpawnPermit{commitFn: commit, releaseFn: release}, granted
+	} else {
+		permit, ok = o.reserveFleetSpawn()
+	}
 	if !ok {
 		return fmt.Errorf("fleet capacity unavailable")
 	}

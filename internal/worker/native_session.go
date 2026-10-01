@@ -65,13 +65,22 @@ type NativeWorkerReceipt struct {
 	AccountingReady     bool                                 `json:"accounting_ready"`
 	OutcomeIntent       *admissioncontrol.SealRequest        `json:"outcome_intent,omitempty"`
 	Outcome             *admissioncontrol.NativeOutcome      `json:"outcome,omitempty"`
+	PrelaunchRecoveries []NativePrelaunchRecoveryRecord      `json:"prelaunch_recoveries,omitempty"`
+}
+
+type NativePrelaunchRecoveryRecord struct {
+	AuthorizedAt         time.Time `json:"authorized_at"`
+	PreviousStatus       string    `json:"previous_status"`
+	ReceiptSHA256        string    `json:"receipt_sha256"`
+	ExecutionProofSHA256 string    `json:"execution_proof_sha256,omitempty"`
 }
 
 type nativeWorkerLaunch struct {
-	dir     string
-	receipt *NativeWorkerReceipt
-	unlock  func()
-	adopt   bool
+	dir              string
+	receipt          *NativeWorkerReceipt
+	unlock           func()
+	adopt            bool
+	recoverPrelaunch bool
 }
 
 var registerNativeWorker = func(client admissioncontrol.Client, request admissioncontrol.RegistrationRequest) (admissioncontrol.Acknowledgement, error) {
@@ -338,6 +347,7 @@ func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, sl
 				return nil, err
 			}
 			owner.receipt = previous
+			owner.recoverPrelaunch = previous.Status == "launch_intent"
 			ok = true
 			return owner, nil
 		}
@@ -404,17 +414,28 @@ func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, sl
 }
 
 // This is an explicit operator launch decision, separate from registration
-// reconciliation. A durable registered receipt proves setup stopped before
-// launch intent. The lock remains held through the ordinary launch pipeline.
+// reconciliation. A registered receipt proves setup stopped before launch;
+// a failed host intent additionally needs revoked controller, absent host
+// runner, absent native claims and absent exact OS runtime. The lock remains
+// held through the ordinary launch pipeline.
 func authorizeRegisteredWorkerRecovery(cfg *config.Config, client admissioncontrol.Client, dir string, receipt *NativeWorkerReceipt, lease tmuxsession.ProcessLease, expectedNativeSessionID string) error {
 	uncertain := receipt.Status == "launch_intent" || receipt.Status == "launched"
-	if receipt.Generation != 1 || receipt.Status != "registered" || receipt.Request.NativeSessionID != expectedNativeSessionID ||
-		receipt.PID != 0 || receipt.LogFile != "" || receipt.ParentRoleRunID != "" ||
+	failedHost := receipt.Status == "launch_intent" && cfg.AIExecution.RequireVerifiedRoute && receipt.LogFile == filepath.Join(state.LogDir(cfg.StateDir), receipt.Slot+".log")
+	if receipt.Generation != 1 || (receipt.Status != "registered" && !failedHost) || receipt.Request.NativeSessionID != expectedNativeSessionID ||
+		receipt.PID != 0 || (!failedHost && receipt.LogFile != "") || receipt.ParentRoleRunID != "" ||
 		receipt.OutcomeIntent != nil || receipt.Outcome != nil || receipt.Acknowledgement == nil {
 		return &NativeRegistrationHold{Code: "native_recovery_not_prelaunch", LaunchUncertain: uncertain}
 	}
 	if receipt.Request.ExpiresAt <= time.Now().Unix() {
 		return &NativeRegistrationHold{Code: "launch_not_authorized"}
+	}
+	proofDigest := ""
+	if failedHost {
+		var err error
+		proofDigest, err = verifyPreviousHostRunnerRevoked(cfg, receipt)
+		if err != nil {
+			return err
+		}
 	}
 	// Any terminal marker, including a malformed one, contradicts pre-launch.
 	if _, err := os.Lstat(filepath.Join(dir, nativeReceiptName(receipt.Generation)+".terminated")); !errors.Is(err, os.ErrNotExist) {
@@ -444,7 +465,103 @@ func authorizeRegisteredWorkerRecovery(cfg *config.Config, client admissioncontr
 	if ack != *receipt.Acknowledgement || ack.Revoked || ack.Binding.ExpiresAt <= time.Now().Unix() {
 		return &NativeRegistrationHold{Code: "acknowledgement_invalid"}
 	}
+	// Save the explicit recovery decision before runner/proof regeneration.
+	// A failed host launch remains launch_intent; no historical state is reset.
+	before, err := readOwnedRegularNoFollow(filepath.Join(dir, nativeReceiptName(receipt.Generation)), 64<<10)
+	if err != nil {
+		return &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: uncertain}
+	}
+	sum := sha256.Sum256(before)
+	archivePrefix := fmt.Sprintf("prelaunch-recovery-g%d-%d", receipt.Generation, len(receipt.PrelaunchRecoveries)+1)
+	if err := writeFileAtomicMode(dir, filepath.Join(dir, archivePrefix+".receipt.json"), string(before), 0600); err != nil {
+		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: uncertain}
+	}
+	if failedHost {
+		proof, err := readOwnedRegularNoFollow(filepath.Join(cfg.StateDir, receipt.Slot+"-run.sh.execution.json"), 128<<10)
+		proofSum := sha256.Sum256(proof)
+		if err != nil || hex.EncodeToString(proofSum[:]) != proofDigest || writeFileAtomicMode(dir, filepath.Join(dir, archivePrefix+".execution.json"), string(proof), 0600) != nil {
+			return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		}
+	}
+	if syncNativeDir(dir) != nil {
+		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: uncertain}
+	}
+	receipt.PrelaunchRecoveries = append(receipt.PrelaunchRecoveries, NativePrelaunchRecoveryRecord{AuthorizedAt: time.Now().UTC(), PreviousStatus: receipt.Status, ReceiptSHA256: hex.EncodeToString(sum[:]), ExecutionProofSHA256: proofDigest})
+	if err := persistNativeWorkerReceipt(dir, receipt); err != nil {
+		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: uncertain}
+	}
 	return nil
+}
+
+func verifyPreviousHostRunnerRevoked(cfg *config.Config, receipt *NativeWorkerReceipt) (string, error) {
+	b, err := readOwnedRegularNoFollow(filepath.Join(cfg.StateDir, receipt.Slot+"-run.sh.execution.json"), 128<<10)
+	var proof workerExecutionProof
+	if err != nil || aiexecution.DecodeStrict(b, &proof) != nil || (proof.Version != 1 && proof.Version != 2) || !proof.Policy.RequireVerifiedRoute ||
+		proof.Spec.Registration == nil || *proof.Spec.Registration != *receipt.Acknowledgement || proof.Spec.ProjectID != receipt.ProjectID || proof.RuntimeKey != receipt.Slot || proof.ProcessLeaseUnit != receipt.ProcessLeaseUnit || proof.Worktree != receipt.Worktree {
+		return "", &NativeRegistrationHold{Code: "native_recovery_previous_proof_invalid", LaunchUncertain: true}
+	}
+	if err := proof.ControllerLease.VerifyInactive(); err != nil {
+		return "", err
+	}
+	if err := verifyHostRunnerAbsent(filepath.Join(cfg.StateDir, receipt.Slot+"-run.sh")); err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(b)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// A vanished tmux pane does not exclude an orphaned _worker-exec process that
+// already passed its controller check. Inspect exact runner/proof arguments
+// before authorizing another host launch for the same native identity.
+func verifyHostRunnerAbsent(runnerPath string) error {
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return &NativeRegistrationHold{Code: "native_host_process_unknown", LaunchUncertain: true}
+	}
+	for _, entry := range entries {
+		pid, err := strconv.Atoi(entry.Name())
+		if err != nil || pid <= 0 {
+			continue
+		}
+		root := filepath.Join("/proc", entry.Name())
+		info, err := os.Stat(root)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return &NativeRegistrationHold{Code: "native_host_process_unknown", LaunchUncertain: true}
+		}
+		st, ok := info.Sys().(*syscall.Stat_t)
+		if !ok {
+			return &NativeRegistrationHold{Code: "native_host_process_unknown", LaunchUncertain: true}
+		}
+		if st.Uid != 0 && st.Uid != uint32(os.Getuid()) {
+			continue
+		}
+		args, err := os.ReadFile(filepath.Join(root, "cmdline"))
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			return &NativeRegistrationHold{Code: "native_host_process_unknown", LaunchUncertain: true}
+		}
+		for _, arg := range bytes.Split(args, []byte{0}) {
+			if string(arg) == runnerPath || string(arg) == runnerPath+".execution.json" {
+				return &NativeRegistrationHold{Code: "native_host_process_exists", LaunchUncertain: true}
+			}
+		}
+	}
+	return nil
+}
+
+// NativeRecoveryOccupiesSlot allows the fleet limiter to reuse the exact
+// durable reservation; it grants no launch authority or process-absence proof.
+func NativeRecoveryOccupiesSlot(stateDir, slot, nativeID string) bool {
+	if state.ValidateSlotID(slot) != nil || uuid.Validate(nativeID) != nil {
+		return false
+	}
+	r, err := readNativeWorkerReceipt(nativeReceiptDir(stateDir, slot), 1)
+	return err == nil && r.Status == "launch_intent" && r.Slot == slot && r.Request.NativeSessionID == nativeID && r.PID == 0 && r.OutcomeIntent == nil
 }
 
 func (n *nativeWorkerLaunch) close() {
@@ -470,7 +587,7 @@ func (n *nativeWorkerLaunch) beginLaunch(logFile string) error {
 	if n == nil {
 		return nil
 	}
-	if n.adopt || n.receipt.Status != "registered" || n.receipt.Request.ExpiresAt <= time.Now().Unix() {
+	if n.adopt || (n.receipt.Status != "registered" && !(n.recoverPrelaunch && n.receipt.Status == "launch_intent" && n.receipt.LogFile == logFile)) || n.receipt.Request.ExpiresAt <= time.Now().Unix() {
 		return &NativeRegistrationHold{Code: "launch_not_authorized", LaunchUncertain: n.adopt}
 	}
 	if !filepath.IsAbs(logFile) {

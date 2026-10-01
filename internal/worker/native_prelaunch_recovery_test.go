@@ -1,14 +1,20 @@
 package worker
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"testing"
 	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
+	"github.com/befeast/maestro/internal/aiexecution"
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
 )
@@ -33,6 +39,88 @@ func registeredPrelaunchFixture(t *testing.T) (*nativeFixture, *NativeWorkerRece
 		return *r.Acknowledgement, nil
 	}
 	return f, r, &calls
+}
+
+func TestNativeHostRecoveryRejectsOrphanedExactRunner(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "prior-run.sh")
+	cmd := exec.Command("/bin/sleep", "30")
+	cmd.Args[0] = path
+	if err := cmd.Start(); err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = cmd.Process.Kill(); _ = cmd.Wait() }()
+	err := verifyHostRunnerAbsent(path)
+	expectNativeHold(t, err, "native_host_process_exists", true)
+}
+
+func TestNativeFailedHostRecoveryRetainsIntentAndArchivesProof(t *testing.T) {
+	f, receipt, calls := registeredPrelaunchFixture(t)
+	f.cfg.AIExecution = observerTestPolicy(t, f.cfg.StateDir)
+	f.cfg.WorkerRuntime = config.WorkerRuntimeConfig{Mode: config.WorkerRuntimeModeIsolated, Scope: config.WorkerRuntimeScopeSystem}
+	profileBytes, err := os.ReadFile(os.Getenv("MAESTRO_TEST_HOST_OBSERVER_PROFILE"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var profile aiexecution.NativeContainmentProfile
+	if err := json.Unmarshal(profileBytes, &profile); err != nil {
+		t.Fatal(err)
+	}
+	f.cfg.ProjectID, receipt.ProjectID, receipt.Request.ProjectID, receipt.Acknowledgement.Binding.ProjectID = profile.ProjectID, profile.ProjectID, profile.ProjectID, profile.ProjectID
+	receipt.Status = "launch_intent"
+	receipt.LogFile = filepath.Join(state.LogDir(f.cfg.StateDir), f.slot+".log")
+	lease, err := workerProcessLease(f.cfg, f.slot, 1)
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt.ProcessLeaseUnit = lease.Unit
+	controller, err := f.cfg.AIExecution.LiveControllerLease()
+	if err != nil {
+		t.Fatal(err)
+	}
+	controller.StartTicks = "prior-process-identity"
+	proof := workerExecutionProof{Version: 1, Policy: f.cfg.AIExecution, ControllerLease: controller, RuntimeKey: f.slot, Worktree: receipt.Worktree, ProcessLeaseUnit: lease.Unit, Spec: aiexecution.LaunchSpec{ProjectID: receipt.ProjectID, Registration: receipt.Acknowledgement}}
+	b, _ := json.Marshal(proof)
+	proofPath := filepath.Join(f.cfg.StateDir, f.slot+"-run.sh.execution.json")
+	if err := os.WriteFile(proofPath, b, 0600); err != nil {
+		t.Fatal(err)
+	}
+	dir := nativeReceiptDir(f.cfg.StateDir, f.slot)
+	if err := writeNativeWorkerReceipt(dir, receipt); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(filepath.Join(dir, nativeReceiptName(1)))
+	client, err := nativeClient(f.cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := authorizeRegisteredWorkerRecovery(f.cfg, client, dir, receipt, lease, receipt.Request.NativeSessionID); err != nil {
+		t.Fatal(err)
+	}
+	if *calls != 1 || receipt.Status != "launch_intent" || len(receipt.PrelaunchRecoveries) != 1 {
+		t.Fatal("history reset", receipt.Status, *calls)
+	}
+	sum := sha256.Sum256(before)
+	if receipt.PrelaunchRecoveries[0].ReceiptSHA256 != hex.EncodeToString(sum[:]) {
+		t.Fatal("receipt hash mismatch")
+	}
+	archived, _ := os.ReadFile(filepath.Join(dir, "prelaunch-recovery-g1-1.receipt.json"))
+	if !reflect.DeepEqual(archived, before) {
+		t.Fatal("prior receipt not archived")
+	}
+	archived, _ = os.ReadFile(filepath.Join(dir, "prelaunch-recovery-g1-1.execution.json"))
+	if !reflect.DeepEqual(archived, b) {
+		t.Fatal("prior proof not archived")
+	}
+	n := &nativeWorkerLaunch{dir: dir, receipt: receipt, recoverPrelaunch: true}
+	if err := n.beginLaunch(receipt.LogFile); err != nil {
+		t.Fatal(err)
+	}
+	if receipt.Status != "launch_intent" || receipt.Generation != 1 {
+		t.Fatal("recovery changed generation/status")
+	}
+	if slots, err := NativePendingSlots(f.cfg.StateDir, nil); err != nil || len(slots) != 1 || slots[0] != f.slot {
+		t.Fatal("archives changed pending occupancy", slots, err)
+	}
 }
 
 func TestNativeWorkerExplicitPrelaunchRecoveryPreservesIdentity(t *testing.T) {
