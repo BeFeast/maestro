@@ -145,6 +145,11 @@ func ObserveNativeWorkerTermination(cfg *config.Config, slot string, generation 
 	if r.ProjectID != cfg.ProjectID || r.Slot != slot || r.Generation != generation || r.Request.NativeSessionID != nativeID || r.Acknowledgement == nil || (r.Status != "launched" && r.Status != "launch_intent") {
 		return nil, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
 	}
+	return observeNativeWorkerTerminationLocked(cfg, r)
+}
+
+// The caller holds the receipt lock and has checked the requested identity.
+func observeNativeWorkerTerminationLocked(cfg *config.Config, r *NativeWorkerReceipt) (*aiexecution.NativeProcessTermination, error) {
 	pin, err := nativeProfileFromReceipt(cfg, r)
 	if err != nil {
 		return nil, err
@@ -153,20 +158,20 @@ func ObserveNativeWorkerTermination(cfg *config.Config, slot string, generation 
 	if active, err := workerProcessLeaseActive(lease); err != nil || active {
 		return nil, &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
 	}
-	if absent, err := nativeWorkerPaneAbsent(TmuxSessionName(slot)); err != nil || !absent {
+	if absent, err := nativeWorkerPaneAbsent(TmuxSessionName(r.Slot)); err != nil || !absent {
 		return nil, &NativeRegistrationHold{Code: "native_host_runtime_unknown", LaunchUncertain: true}
 	}
-	if err := verifyHostRunnerAbsent(filepath.Join(cfg.StateDir, slot+"-run.sh")); err != nil {
+	if err := verifyHostRunnerAbsent(filepath.Join(cfg.StateDir, r.Slot+"-run.sh")); err != nil {
 		return nil, err
 	}
-	proof, err := verifyNativeWorkerTermination(pin, nativeID, r.ProcessLeaseUnit)
+	proof, err := verifyNativeWorkerTermination(pin, r.Request.NativeSessionID, r.ProcessLeaseUnit)
 	if err != nil {
 		return nil, err
 	}
 	if proof == nil {
 		return nil, &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
 	}
-	if err := aiexecution.ValidateNativeProcessTermination(*proof, pin, nativeID, r.ProcessLeaseUnit); err != nil {
+	if err := aiexecution.ValidateNativeProcessTermination(*proof, pin, r.Request.NativeSessionID, r.ProcessLeaseUnit); err != nil {
 		return nil, err
 	}
 	return proof, nil

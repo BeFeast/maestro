@@ -1055,23 +1055,32 @@ func ReconcileNativeWorkerTermination(cfg *config.Config, slot string, sess *sta
 		if err != nil {
 			return err
 		}
-		if r.ProjectID != cfg.ProjectID || r.Status != "launched" || r.ProcessLeaseUnit != sess.ProcessLeaseUnit || r.ProcessLeaseManager != sess.ProcessLeaseManager {
+		if r.ProjectID != cfg.ProjectID || r.Status != "launched" {
 			return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
 		}
-		lease, has, err := sessionProcessLease(sess)
-		if err != nil || !has {
-			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
-		}
-		active, err := workerProcessLeaseActive(lease)
-		if err != nil || active {
-			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
-		}
-		absent, err := nativeWorkerPaneAbsent(TmuxSessionName(slot))
-		if err != nil || !absent {
-			return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
-		}
-		if err := markNativeWorkerTerminated(sess); err != nil {
-			return err
+		if sess.ProcessLeaseUnit == "" && sess.ProcessLeaseManager == "" {
+			if err := reconcileSealedNativeWorkerTermination(cfg, dir, r, sess); err != nil {
+				return err
+			}
+		} else {
+			if r.ProcessLeaseUnit != sess.ProcessLeaseUnit || r.ProcessLeaseManager != sess.ProcessLeaseManager {
+				return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+			}
+			lease, has, err := sessionProcessLease(sess)
+			if err != nil || !has {
+				return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+			}
+			active, err := workerProcessLeaseActive(lease)
+			if err != nil || active {
+				return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+			}
+			absent, err := nativeWorkerPaneAbsent(TmuxSessionName(slot))
+			if err != nil || !absent {
+				return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+			}
+			if err := markNativeWorkerTerminated(sess); err != nil {
+				return err
+			}
 		}
 	}
 	sess.PID = 0

@@ -18,6 +18,34 @@ import (
 var observeNativeWorkerLaunch = aiexecution.ObserveNativeProcessLaunch
 var verifyNativeWorkerTermination = aiexecution.VerifyNativeProcessTermination
 
+// Recover only the lost local termination projection of a normally settled
+// generation. Authority settlement alone never proves that its process ended.
+// This preserves the sealed outcome, session status, retry history and PR;
+// deciding to repair or retry remains a separate operation.
+func reconcileSealedNativeWorkerTermination(cfg *config.Config, dir string, r *NativeWorkerReceipt, sess *state.Session) error {
+	if !cfg.AIExecution.RequireVerifiedRoute || r.Status != "launched" || r.Acknowledgement == nil ||
+		r.ProjectID != cfg.ProjectID || r.Generation != sess.WorkerGeneration || r.RoleRunID != sess.NativeRoleRunID ||
+		r.Request.NativeSessionID != sess.NativeSessionID || r.IssueNumber != sess.IssueNumber ||
+		r.Worktree != sess.Worktree || r.Branch != sess.Branch || sess.NativeReceiptDir != dir ||
+		sess.ProcessLeaseUnit != "" || sess.ProcessLeaseManager != "" ||
+		persistedNativeGenerationOutcome(cfg, r) != nil || r.Outcome.OperatorRetirement != nil {
+		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	}
+	proof, err := observeNativeWorkerTerminationLocked(cfg, r)
+	if err != nil {
+		return err
+	}
+	r.NativeProcessEvidence = proof
+	if err := persistNativeWorkerReceipt(dir, r); err != nil {
+		return err
+	}
+	// Use the exact verified receipt lease for the marker without restoring a
+	// live lease to the session or weakening markNativeWorkerTerminated's fence.
+	terminal := *sess
+	setSessionProcessLease(&terminal, tmuxsession.ProcessLease{Unit: r.ProcessLeaseUnit, Manager: r.ProcessLeaseManager})
+	return markNativeWorkerTerminated(&terminal)
+}
+
 func nativeProfileFromReceipt(cfg *config.Config, r *NativeWorkerReceipt) (aiexecution.FileProof, error) {
 	b, err := readOwnedRegularNoFollow(filepath.Join(cfg.StateDir, r.Slot+"-run.sh.execution.json"), 128<<10)
 	var proof workerExecutionProof
