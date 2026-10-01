@@ -1661,21 +1661,27 @@ type fleetModelPolicy struct {
 	ResolvedRoute    []string                      `json:"resolved_route"`
 	SelectionReason  string                        `json:"selection_reason"`
 	Backends         []fleetEffectiveBackendConfig `json:"backends"`
+	Catalog          fleetModelCatalog             `json:"catalog"`
 	Routing          fleetEffectiveRoutingConfig   `json:"routing"`
 }
 
 type fleetEffectiveBackendConfig struct {
-	Name             string  `json:"name"`
-	Enabled          bool    `json:"enabled"`
-	Provider         string  `json:"provider,omitempty"`
-	Model            string  `json:"model,omitempty"`
-	Variant          string  `json:"variant,omitempty"`
-	Effort           string  `json:"effort,omitempty"`
-	PromptMode       string  `json:"prompt_mode,omitempty"`
-	NonAgentic       bool    `json:"non_agentic,omitempty"`
-	PriceConfigured  bool    `json:"price_configured"`
-	InputUSDPerMtok  float64 `json:"input_usd_per_mtok,omitempty"`
-	OutputUSDPerMtok float64 `json:"output_usd_per_mtok,omitempty"`
+	Name             string   `json:"name"`
+	Enabled          bool     `json:"enabled"`
+	Provider         string   `json:"provider,omitempty"`
+	Model            string   `json:"model,omitempty"`
+	Harness          string   `json:"harness"`
+	CommandModel     string   `json:"command_model,omitempty"`
+	References       []string `json:"references"`
+	CatalogStatus    string   `json:"catalog_status"`
+	CatalogProvider  string   `json:"catalog_provider,omitempty"`
+	Variant          string   `json:"variant,omitempty"`
+	Effort           string   `json:"effort,omitempty"`
+	PromptMode       string   `json:"prompt_mode,omitempty"`
+	NonAgentic       bool     `json:"non_agentic,omitempty"`
+	PriceConfigured  bool     `json:"price_configured"`
+	InputUSDPerMtok  float64  `json:"input_usd_per_mtok,omitempty"`
+	OutputUSDPerMtok float64  `json:"output_usd_per_mtok,omitempty"`
 	// PricingClass / Metered surface the #838 pricing classification so an
 	// operator can see which backends the metered guard treats as per-token.
 	PricingClass string `json:"pricing_class,omitempty"`
@@ -4325,12 +4331,14 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 		return fleetEffectiveConfig{}
 	}
 	backends := make([]fleetEffectiveBackendConfig, 0, len(cfg.Model.Backends))
+	catalog := readFleetModelCatalog()
+	references := fleetBackendReferences(cfg)
 	priced := 0
 	for name, def := range cfg.Model.Backends {
 		if def.Pricing.Configured() {
 			priced++
 		}
-		backends = append(backends, fleetEffectiveBackendConfig{
+		entry := fleetEffectiveBackendConfig{
 			Name:             name,
 			Enabled:          def.IsEnabled(),
 			Provider:         strings.TrimSpace(def.Provider),
@@ -4344,7 +4352,15 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			OutputUSDPerMtok: def.Pricing.OutputUSDPerMtok,
 			PricingClass:     strings.TrimSpace(def.PricingClass),
 			Metered:          def.IsMetered(),
-		})
+		}
+		entry.Harness = fleetBackendHarness(name, def)
+		entry.CommandModel = fleetBackendCommandModel(def)
+		entry.References = references[name]
+		if entry.References == nil {
+			entry.References = []string{}
+		}
+		entry.CatalogStatus, entry.CatalogProvider = catalog.lookup(firstNonempty(entry.CommandModel, entry.Model))
+		backends = append(backends, entry)
 	}
 	sort.Slice(backends, func(i, j int) bool { return backends[i].Name < backends[j].Name })
 
@@ -4362,6 +4378,7 @@ func buildFleetEffectiveConfig(cfg *config.Config) fleetEffectiveConfig {
 			ResolvedRoute:    append([]string(nil), modelRoute.Backends...),
 			SelectionReason:  modelRoute.SelectionReason,
 			Backends:         backends,
+			Catalog:          catalog,
 			Routing: fleetEffectiveRoutingConfig{
 				Mode:                strings.TrimSpace(cfg.Routing.Mode),
 				RouterModel:         strings.TrimSpace(cfg.Routing.RouterModel),

@@ -2581,20 +2581,7 @@ function EffectiveConfigView({ project, onEdit }) {
             <TagList values={[lane.default, ...(lane.fallbackBackends || [])]} />
           </div>
         ))}
-        <div className="settings-backends">
-          {(cfg.modelPolicy?.backends || []).map(backend => (
-            <div key={backend.name} className="settings-backend">
-              <div>
-                <strong className="mono">{backend.name}</strong>
-                <div className="dim" style={{ fontSize: 11 }}>
-                  {[backend.provider, backend.model, backend.variant, backend.effort].filter(Boolean).join(" · ") || "metadata not set"}
-                </div>
-              </div>
-              <Pill tone={backend.enabled ? "ok" : "idle"} noDot>{backend.enabled ? "enabled" : "disabled"}</Pill>
-              <span className="mono dim" style={{ fontSize: 11 }}>{backend.priceConfigured ? "priced" : "unpriced"}</span>
-            </div>
-          ))}
-        </div>
+        <ModelBackendCatalog policy={cfg.modelPolicy} />
       </div>
 
       <div className="settings-section">
@@ -2642,6 +2629,61 @@ function EffectiveConfigView({ project, onEdit }) {
           Request edit
         </button>
       </div>
+    </div>
+  );
+}
+
+export function ModelBackendCatalog({ policy }) {
+  const backends = policy?.backends || [];
+  const referenced = backends.filter(backend => backend.references?.length > 0);
+  const retained = backends.filter(backend => Array.isArray(backend.references) && backend.references.length === 0);
+  const unknown = backends.filter(backend => !Array.isArray(backend.references));
+  const catalog = policy?.catalog;
+  const rows = list => list.map(backend => (
+    <div key={backend.name} className="settings-backend">
+      <div>
+        <strong className="mono">{backend.name}</strong>
+        <div style={{ fontSize: 12 }}>
+          <span>{backend.harness || "unknown harness"}</span>
+          {" → "}<span className="mono">{backend.commandModel || backend.model || "model not specified"}</span>
+        </div>
+        <div className="dim" style={{ fontSize: 11 }}>
+          {backend.catalogProvider ? `Model provider: ${backend.catalogProvider}` : backend.provider ? `Provider metadata: ${backend.provider}` : "Provider metadata not set"}
+          {[backend.variant, backend.effort].filter(Boolean).map(value => ` · ${value}`)}
+        </div>
+        {backend.commandModel && backend.model && backend.commandModel !== backend.model && (
+          <div style={{ fontSize: 11, color: "var(--watch)" }}>Configured model metadata differs: {backend.model}</div>
+        )}
+        {!!backend.references?.length && (
+          <div className="mono dim" style={{ fontSize: 10.5 }}>{backend.references.join(" · ")}</div>
+        )}
+      </div>
+      <div>
+        <Pill tone="idle" noDot>{backend.catalogStatus === "listed" ? "In current catalog" : backend.catalogStatus === "not_listed" ? "Outside current catalog" : "Catalog unverified"}</Pill>
+        <div className="dim" style={{ fontSize: 10.5, marginTop: 4 }}>{backend.enabled ? "Selection enabled" : "Selection disabled"}</div>
+      </div>
+      <span className="mono dim" style={{ fontSize: 11 }}>{backend.priceConfigured ? "pricing configured" : "pricing unknown"}</span>
+    </div>
+  ));
+  return (
+    <div className="settings-backends">
+      <div className="settings-section-title">Referenced by this project ({referenced.length})</div>
+      {referenced.length ? rows(referenced) : <div className="dim">No backend references reported.</div>}
+      {retained.length > 0 && (
+        <details style={{ marginTop: 12 }}>
+          <summary>Not referenced by this project ({retained.length})</summary>
+          <div className="dim" style={{ fontSize: 11.5, margin: "8px 0" }}>Retained definitions may be used by other projects, issue labels or history.</div>
+          {rows(retained)}
+        </details>
+      )}
+      {unknown.length > 0 && <details style={{ marginTop: 12 }}><summary>Reference information unavailable ({unknown.length})</summary>{rows(unknown)}</details>}
+      <details style={{ marginTop: 12 }}>
+        <summary>Current model catalog{catalog?.status === "available" ? ` (${catalog.models.length})` : " unavailable"}</summary>
+        <div className="dim" style={{ fontSize: 11.5, margin: "8px 0" }}>
+          {catalog?.status === "available" ? "Catalog membership describes the chosen model list. Availability and authorization are checked when a request runs." : "The canonical model list could not be loaded. Existing project routes are shown above."}
+        </div>
+        {catalog?.status === "available" && catalog.models.map(model => <div className="kv" key={model.id}><span className="mono">{model.id}</span><span>{model.provider}</span></div>)}
+      </details>
     </div>
   );
 }

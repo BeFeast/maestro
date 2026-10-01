@@ -803,6 +803,13 @@ function mapEffectiveConfig(raw) {
       resolvedRoute: arrayOfString(policy.resolved_route),
       selectionReason: String(policy.selection_reason || ""),
       backends: Array.isArray(policy.backends) ? policy.backends.map(mapEffectiveBackend) : [],
+      catalog: {
+        status: String(policy.catalog?.status || "unavailable"),
+        updatedAt: String(policy.catalog?.updated_at || ""),
+        models: Array.isArray(policy.catalog?.models) ? policy.catalog.models.map(model => ({
+          id: String(model.id || ""), provider: String(model.provider || ""), tier: String(model.tier || ""),
+        })) : [],
+      },
       routing: {
         mode: String((policy.routing || {}).mode || ""),
         routerModel: String((policy.routing || {}).router_model || ""),
@@ -885,6 +892,11 @@ function mapEffectiveBackend(raw) {
     enabled: raw?.enabled !== false,
     provider: String(raw?.provider || ""),
     model: String(raw?.model || ""),
+    harness: String(raw?.harness || ""),
+    commandModel: String(raw?.command_model || ""),
+    references: Array.isArray(raw?.references) ? raw.references.map(String) : null,
+    catalogStatus: String(raw?.catalog_status || "unavailable"),
+    catalogProvider: String(raw?.catalog_provider || ""),
     variant: String(raw?.variant || ""),
     effort: String(raw?.effort || ""),
     promptMode: String(raw?.prompt_mode || ""),
