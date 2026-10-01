@@ -1476,6 +1476,14 @@ type SupervisorOrderedQueueConfig struct {
 	Enabled    bool  `yaml:"enabled" json:"enabled"`
 	Issues     []int `yaml:"issues" json:"issues,omitempty"`
 	DoneIssues []int `yaml:"done_issues" json:"done_issues,omitempty"`
+
+	// enabledSet records an explicit `enabled:` key in YAML so Active can tell
+	// `enabled: false` (operator deactivated the queue but kept the issue list
+	// for a later re-enable, #1234) apart from the legacy shorthand of listing
+	// issues without a flag. Programmatic literals keep the shorthand. It is
+	// set by SupervisorConfig.UnmarshalYAML rather than a nested unmarshaler so
+	// ParseStrict's methodless KnownFields probe still covers this subtree.
+	enabledSet bool
 }
 
 // SupervisorDynamicWaveConfig enables policy-driven issue selection without a
@@ -1540,7 +1548,13 @@ func (d SupervisorDependencyUnblockConfig) AnnounceWithCommentEnabled() bool {
 	return *d.AnnounceWithComment
 }
 
+// Active reports whether the ordered queue governs issue selection. An explicit
+// `enabled:` key in YAML is authoritative; without one, a non-empty issue list
+// implies enabled (legacy shorthand, also used by programmatic literals).
 func (q SupervisorOrderedQueueConfig) Active() bool {
+	if q.enabledSet {
+		return q.Enabled
+	}
 	return q.Enabled || len(q.Issues) > 0
 }
 
@@ -1564,6 +1578,14 @@ func (s *SupervisorConfig) UnmarshalYAML(value *yaml.Node) error {
 		for i := 0; i+1 < len(value.Content); i += 2 {
 			if value.Content[i].Value == "excluded_labels" {
 				s.excludedLabelsSet = true
+				break
+			}
+		}
+	}
+	if queue := yamlMappingValue(value, "ordered_queue"); queue != nil && queue.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(queue.Content); i += 2 {
+			if queue.Content[i].Value == "enabled" {
+				s.OrderedQueue.enabledSet = true
 				break
 			}
 		}

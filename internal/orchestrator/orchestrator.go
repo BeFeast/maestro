@@ -9617,7 +9617,16 @@ func (o *Orchestrator) applyOrderedQueueFilter(s *state.State, issues []github.I
 			continue
 		}
 
-		if reason := o.orderedQueueIssueNumberPauseReason(s, issueNumber); reason != "" {
+		// #1234: a supervisor-selected repair (approved/awaiting_dispatch
+		// spawn_repair_worker / spawn_review_repair reservation) targets the
+		// very session this issue already owns. The session-level pause
+		// reasons below (active session, open PR, retry exhausted) describe
+		// that session and would starve the dispatch that consumes the
+		// approval, so the queue head stays eligible and the per-issue loop's
+		// exact-session revalidation decides whether the repair is safe.
+		if o.supervisorSelectedRepairSpawn(s, issueNumber) {
+			log.Printf("[orch] ordered queue: issue #%d has a selected repair dispatch; session-level pause reasons do not apply", issueNumber)
+		} else if reason := o.orderedQueueIssueNumberPauseReason(s, issueNumber); reason != "" {
 			log.Printf("[orch] ordered queue paused: %s", reason)
 			return nil, true
 		}

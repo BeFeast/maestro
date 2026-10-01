@@ -369,3 +369,71 @@ func TestSpawnRepairDispatch_CurrentGreenNonDraftStalesRepair(t *testing.T) {
 		t.Fatalf("repair approval = %q, want stale", got)
 	}
 }
+
+// #1234: an ordered queue whose head issue already owns a session must not
+// pause on that session's own open PR / active claim when the supervisor has
+// reserved an in-place repair for it; otherwise the awaiting_dispatch approval
+// is never consumed and every cycle logs "already has an active session".
+func TestOrderedQueue_SelectedRepairKeepsHeadEligibleDespiteOwnSessionPauseReasons(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Issues: []int{7}}
+	issues := []github.Issue{makeIssue(7, "repair exact PR", "maestro-ready")}
+	o, _, _ := newStartWorkersOrchestrator(cfg, issues)
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	filtered, ordered := o.applyOrderedQueueFilter(s, issues)
+	if !ordered || len(filtered) != 1 || filtered[0].Number != 7 {
+		t.Fatalf("ordered queue filter with repair reservation = (%v, %v), want head issue #7 eligible", filtered, ordered)
+	}
+
+	// Control: without the repair reservation the same state still pauses on
+	// the session-level reasons, so the bypass is scoped to the repair path.
+	s.Approvals = nil
+	filtered, ordered = o.applyOrderedQueueFilter(s, issues)
+	if !ordered || len(filtered) != 0 {
+		t.Fatalf("ordered queue filter without reservation = (%v, %v), want paused", filtered, ordered)
+	}
+}
+
+func TestSpawnRepairDispatch_OrderedQueueHeadConsumesAwaitingDispatchApproval(t *testing.T) {
+	const head = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	cfg := cfgWithBackends("codex", "codex")
+	cfg.Supervisor.OrderedQueue = config.SupervisorOrderedQueueConfig{Issues: []int{7}}
+	o, freshStarts, _ := newStartWorkersOrchestrator(cfg, []github.Issue{makeIssue(7, "repair exact PR", "maestro-ready")})
+	o.hasOpenPRForIssueFn = func(int) (bool, error) { return true, nil }
+	o.ghPRHeadSHAFn = func(int) (string, error) { return head, nil }
+	o.ghPRCheckRollupFn = func(int) (github.PRCheckRollup, error) {
+		return github.PRCheckRollup{HeadSHA: head, Verdict: "success", Complete: true}, nil
+	}
+	o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
+	o.ghPRReviewGateVerdictFn = func(int, []string) (github.ReviewGateVerdict, error) {
+		return github.ReviewGateVerdict{
+			Passed: false,
+			Streams: []github.ReviewStreamVerdict{{
+				Name: "greptile", Passed: false,
+				Findings: []github.ReviewComment{{Path: "main.go", Line: 7, Body: "correctness", User: "greptile"}},
+			}},
+		}, nil
+	}
+	respawns := 0
+	o.respawnInPlaceFn = func(_ *config.Config, slot string, sess *state.Session, _ string, _ github.Issue, _, _ string) error {
+		if slot != "slot-7" {
+			t.Fatalf("respawn slot = %q, want slot-7", slot)
+		}
+		respawns++
+		sess.Status = state.StatusRunning
+		return nil
+	}
+
+	s := repairGateTestState(time.Now().UTC(), head)
+	o.startNewWorkers(s, 1)
+
+	if respawns != 1 || len(*freshStarts) != 0 || len(s.Sessions) != 1 {
+		t.Fatalf("ordered queue starved its own repair: respawns=%d fresh=%v sessions=%d", respawns, *freshStarts, len(s.Sessions))
+	}
+	if got := approvalStatus(t, s, "repair-7"); got != state.ApprovalStatusSuperseded {
+		t.Fatalf("repair approval = %q, want consumed/superseded", got)
+	}
+}
