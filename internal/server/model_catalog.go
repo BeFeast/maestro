@@ -146,7 +146,9 @@ func fleetBackendReferences(cfg *config.Config) map[string][]string {
 	}
 	add(cfg.Supervisor.Backend, "supervisor.backend")
 	add(cfg.Supervisor.ReviewRepair.Backend, "supervisor.review_repair.backend")
-	add(cfg.Routing.RouterModel, "routing.router_model")
+	if cfg.Routing.Mode == "auto" {
+		add(cfg.Routing.RouterModel, "routing.router_model")
+	}
 	for key, name := range cfg.Routing.TaskTypeBackends {
 		add(name, "routing.task_type_backends."+key)
 	}

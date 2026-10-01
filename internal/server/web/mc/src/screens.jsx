@@ -2636,9 +2636,8 @@ function EffectiveConfigView({ project, onEdit }) {
 
 export function ModelBackendCatalog({ policy }) {
   const backends = policy?.backends || [];
-  const referenced = backends.filter(backend => backend.references?.length > 0);
-  const retained = backends.filter(backend => Array.isArray(backend.references) && backend.references.length === 0);
-  const unknown = backends.filter(backend => !Array.isArray(backend.references));
+  const enabled = backends.filter(backend => backend.enabled !== false);
+  const disabled = backends.filter(backend => backend.enabled === false);
   const catalog = policy?.catalog;
   const rows = list => list.map(backend => (
     <div key={backend.name} className="settings-backend">
@@ -2658,6 +2657,9 @@ export function ModelBackendCatalog({ policy }) {
         {!!backend.references?.length && (
           <div className="mono dim" style={{ fontSize: 10.5 }}>{backend.references.join(" · ")}</div>
         )}
+        {!Array.isArray(backend.references) && (
+          <div className="dim" style={{ fontSize: 10.5 }}>Project reference information unavailable</div>
+        )}
       </div>
       <div>
         <Pill tone="idle" noDot>{backend.catalogStatus === "listed" ? "In current catalog" : backend.catalogStatus === "not_listed" ? "Outside current catalog" : "Catalog unverified"}</Pill>
@@ -2668,16 +2670,15 @@ export function ModelBackendCatalog({ policy }) {
   ));
   return (
     <div className="settings-backends">
-      <div className="settings-section-title">Referenced by this project ({referenced.length})</div>
-      {referenced.length ? rows(referenced) : <div className="dim">No backend references reported.</div>}
-      {retained.length > 0 && (
+      <div className="settings-section-title">Enabled backends ({enabled.length})</div>
+      {enabled.length ? rows(enabled) : <div className="dim">No backends enabled for selection.</div>}
+      {disabled.length > 0 && (
         <details style={{ marginTop: 12 }}>
-          <summary>Not referenced by this project ({retained.length})</summary>
-          <div className="dim" style={{ fontSize: 11.5, margin: "8px 0" }}>Retained definitions may be used by other projects, issue labels or history.</div>
-          {rows(retained)}
+          <summary>Disabled backends ({disabled.length})</summary>
+          <div className="dim" style={{ fontSize: 11.5, margin: "8px 0" }}>Retained for historical attribution and configuration inspection. Unavailable for new selection.</div>
+          {rows(disabled)}
         </details>
       )}
-      {unknown.length > 0 && <details style={{ marginTop: 12 }}><summary>Reference information unavailable ({unknown.length})</summary>{rows(unknown)}</details>}
       <details style={{ marginTop: 12 }}>
         <summary>Current model catalog{catalog?.status === "available" ? ` (${catalog.models.length})` : " unavailable"}</summary>
         <div className="dim" style={{ fontSize: 11.5, margin: "8px 0" }}>

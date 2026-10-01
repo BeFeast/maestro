@@ -95,6 +95,7 @@ func TestBackendReferencesCoverWorkerAuxiliaryAndRoutingChoices(t *testing.T) {
 	cfg := &config.Config{Model: config.ModelConfig{Default: "default", FallbackBackends: []string{"fallback"}, ProviderLanes: []config.ProviderLane{{Default: "lane", FallbackBackends: []string{"lane-fallback"}}}}}
 	cfg.Supervisor.Backend = "supervisor"
 	cfg.Supervisor.ReviewRepair.Backend = "repair"
+	cfg.Routing.Mode = "auto"
 	cfg.Routing.RouterModel = "router"
 	cfg.Routing.TaskTypeBackends = map[string]string{"feature": "task"}
 	cfg.Routing.Tiers = map[string]config.RoutingTier{"top": {Backend: "tier"}}
@@ -104,5 +105,23 @@ func TestBackendReferencesCoverWorkerAuxiliaryAndRoutingChoices(t *testing.T) {
 		if len(refs[name]) != 1 {
 			t.Fatalf("reference missing: %s", name)
 		}
+	}
+}
+
+func TestBackendReferencesOmitInactiveRouter(t *testing.T) {
+	for _, mode := range []string{"", "manual", "policy"} {
+		t.Run(mode, func(t *testing.T) {
+			cfg := &config.Config{}
+			cfg.Model.Default = "worker"
+			cfg.Routing.Mode = mode
+			cfg.Routing.RouterModel = "obsolete-router"
+			refs := fleetBackendReferences(cfg)
+			if len(refs["obsolete-router"]) != 0 {
+				t.Fatalf("inactive router reported as a reference in %q mode: %v", mode, refs)
+			}
+			if len(refs["worker"]) != 1 {
+				t.Fatalf("worker reference lost: %v", refs)
+			}
+		})
 	}
 }
