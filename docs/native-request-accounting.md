@@ -40,6 +40,32 @@ Both protocols retain durable output checkpoints, OS termination proof,
 no-replay fencing and persistence-before-release. Lost authority replies hold;
 the exact seal may be reconciled later without repeating inference.
 
+## Explicit retirement of unknown usage
+
+An operator may retire a sealed request generation after verifying that its
+native process has terminated and every admitted attempt has a complete,
+successful transport observation. This is a separate control RPC, `retire_native`,
+enabled only for an explicit authority `--retirement-uid`. The daemon's ordinary
+reconciliation does not issue it. Incomplete, cancelled or failed transports and
+request-cap violations cannot use this path.
+
+The result `operator_retired_unknown` retains the entire prior held snapshot,
+all physical/terminal/unresolved counts, consumed request units and conservative
+daily exposure. Money remains unknown. Its `operator_retirement` proof binds the
+authenticated operator UID, reason, exact attempt observation digests, native
+termination attestation, and original request and snapshot digests. Retirement
+does not reinterpret old usage, refund a request, change the run or raise caps.
+The authority also prevents replay of an old retired request in a new generation.
+
+Maestro checks the strict version-2 proof when reading both RPC and persisted
+outcomes. `ScheduleNativeOperatorRecovery` verifies the saved termination proof
+against the operator attestation and queues one successor generation through the
+existing operator-restart path. It preserves automatic retry counters and failure
+history; a durable scheduling record prevents reuse after the retry is consumed.
+Capture and reconcile termination before replacing the original execution profile.
+Disable the authority's retirement capability after the scoped recovery while
+retaining its new outcome reader and replay protection.
+
 ## Verification and activation
 
 Protocol fixtures cover exact Unix framing, version/basis mismatch, corrupt or

@@ -67,6 +67,7 @@ type NativeWorkerReceipt struct {
 	Outcome               *admissioncontrol.NativeOutcome       `json:"outcome,omitempty"`
 	PrelaunchRecoveries   []NativePrelaunchRecoveryRecord       `json:"prelaunch_recoveries,omitempty"`
 	NativeProcessEvidence *aiexecution.NativeProcessTermination `json:"native_process_evidence,omitempty"`
+	OperatorRecovery      *NativeOperatorRecoveryRecord         `json:"operator_recovery,omitempty"`
 }
 
 type NativePrelaunchRecoveryRecord struct {
@@ -278,6 +279,9 @@ func readNativeWorkerReceipt(dir string, generation uint64) (*NativeWorkerReceip
 		return nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
 	}
 	if err := validateNativeWorkerOutcome(&r); err != nil {
+		return nil, err
+	}
+	if err := validateNativeOperatorRecovery(&r); err != nil {
 		return nil, err
 	}
 	if r.NativeProcessEvidence != nil {

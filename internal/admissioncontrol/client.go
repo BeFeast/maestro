@@ -112,6 +112,8 @@ func (c Client) call(id, op string, args any) ([]byte, error) {
 		version = request.ProtocolVersion()
 	case SealRequest:
 		version = request.ProtocolVersion()
+	case RetireRequest:
+		version = request.ProtocolVersion()
 	}
 	deadline := time.Now().Add(c.Timeout)
 	conn, err := net.DialTimeout("unix", c.SocketPath, c.Timeout)

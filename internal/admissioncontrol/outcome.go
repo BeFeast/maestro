@@ -24,23 +24,24 @@ func (r SealRequest) Valid() bool {
 // NativeOutcome is an immutable authority snapshot. Only Sealed plus a strictly
 // validated allow result permits recovery; registration and local exit cannot.
 type NativeOutcome struct {
-	SchemaVersion         int     `json:"schema_version,omitempty"`
-	AdmissionBasis        string  `json:"admission_basis,omitempty"`
-	MoneyStatus           string  `json:"money_status,omitempty"`
-	Binding               Binding `json:"binding"`
-	RegistrationVersion   int64   `json:"registration_version"`
-	Sealed                bool    `json:"sealed"`
-	Outcome               string  `json:"outcome"`
-	NextGenerationAllowed bool    `json:"next_generation_allowed"`
-	PhysicalAttempts      int64   `json:"physical_attempts"`
-	TerminalAttempts      int64   `json:"terminal_attempts"`
-	UnresolvedAttempts    int64   `json:"unresolved_attempts"`
-	BoundViolations       int64   `json:"bound_violations"`
-	CapViolations         int64   `json:"cap_violations,omitempty"`
-	HoldCode              *string `json:"hold_code"`
-	AttemptsDigest        string  `json:"attempts_digest"`
-	SnapshotDigest        string  `json:"snapshot_digest"`
-	EvidenceID            string  `json:"evidence_id"`
+	SchemaVersion         int                 `json:"schema_version,omitempty"`
+	AdmissionBasis        string              `json:"admission_basis,omitempty"`
+	MoneyStatus           string              `json:"money_status,omitempty"`
+	Binding               Binding             `json:"binding"`
+	RegistrationVersion   int64               `json:"registration_version"`
+	Sealed                bool                `json:"sealed"`
+	Outcome               string              `json:"outcome"`
+	NextGenerationAllowed bool                `json:"next_generation_allowed"`
+	PhysicalAttempts      int64               `json:"physical_attempts"`
+	TerminalAttempts      int64               `json:"terminal_attempts"`
+	UnresolvedAttempts    int64               `json:"unresolved_attempts"`
+	BoundViolations       int64               `json:"bound_violations"`
+	CapViolations         int64               `json:"cap_violations,omitempty"`
+	HoldCode              *string             `json:"hold_code"`
+	AttemptsDigest        string              `json:"attempts_digest"`
+	SnapshotDigest        string              `json:"snapshot_digest"`
+	EvidenceID            string              `json:"evidence_id"`
+	OperatorRetirement    *OperatorRetirement `json:"operator_retirement,omitempty"`
 }
 
 func (o NativeOutcome) MarshalJSON() ([]byte, error) {
@@ -65,6 +66,12 @@ func outcomeFields(data json.RawMessage, binding Binding) bool {
 	keys := []string{"binding", "registration_version", "sealed", "outcome", "next_generation_allowed", "physical_attempts", "terminal_attempts", "unresolved_attempts", "hold_code", "attempts_digest", "snapshot_digest", "evidence_id"}
 	if binding.AdmissionBasis == "requests" {
 		keys = append(keys, "schema_version", "admission_basis", "money_status", "cap_violations")
+		var tag struct {
+			Outcome string `json:"outcome"`
+		}
+		if json.Unmarshal(data, &tag) == nil && tag.Outcome == "operator_retired_unknown" {
+			keys = append(keys, "operator_retirement")
+		}
 	} else {
 		keys = append(keys, "bound_violations")
 	}
@@ -84,6 +91,15 @@ func (o *NativeOutcome) UnmarshalJSON(data []byte) error {
 		return invalid
 	}
 	type plain NativeOutcome
+	// Check the proof before decoding its prior outcome, so nested retirement
+	// cannot recurse through persisted or remote data.
+	var raw map[string]json.RawMessage
+	if json.Unmarshal(data, &raw) != nil {
+		return invalid
+	}
+	if proof, exists := raw["operator_retirement"]; exists && !retirementFields(proof) {
+		return invalid
+	}
 	var decoded plain
 	if json.Unmarshal(data, &decoded) != nil || !ValidAdmissionBasis(decoded.Binding.AdmissionBasis) || !outcomeFields(data, decoded.Binding) {
 		return invalid
@@ -149,6 +165,9 @@ func outcomeDigest(outcome NativeOutcome) (string, error) {
 // Expiry and current policy do not invalidate an already sealed old registration.
 func ValidateNativeOutcome(outcome NativeOutcome, request SealRequest) error {
 	invalid := &Hold{Code: "invalid_response"}
+	if outcome.OperatorRetirement != nil || outcome.Outcome == "operator_retired_unknown" {
+		return validateOperatorRetirement(outcome, request)
+	}
 	violations, violationCode, completed, evidencePrefix := outcome.BoundViolations, "bound_violation", "settled", "native-outcome-v1:"
 	if request.AdmissionBasis == "requests" {
 		if outcome.SchemaVersion != 2 || outcome.AdmissionBasis != "requests" || outcome.MoneyStatus != "unknown" || outcome.BoundViolations != 0 {
@@ -220,7 +239,7 @@ func decodeNativeOutcome(data []byte, request SealRequest) (NativeOutcome, error
 			return invalid()
 		}
 		switch hold.Code {
-		case "registration_invalid", "registration_missing", "registration_conflict", "identity_conflict", "authority_unavailable", "invalid_frame", "invalid_request", "unsupported_version", "operation_forbidden", "caller_forbidden", "outcome_conflict", "admission_basis_conflict":
+		case "registration_invalid", "registration_missing", "registration_conflict", "identity_conflict", "authority_unavailable", "invalid_frame", "invalid_request", "unsupported_version", "operation_forbidden", "caller_forbidden", "outcome_conflict", "admission_basis_conflict", "retirement_invalid", "retirement_conflict":
 			return NativeOutcome{}, &hold
 		default:
 			return invalid()
