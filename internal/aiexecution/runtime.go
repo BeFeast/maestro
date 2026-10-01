@@ -166,8 +166,16 @@ func inspectListener(pid int, ip net.IP, port int) error {
 			}
 			hexIP, hexPort, ok := strings.Cut(fields[1], ":")
 			n, err := strconv.ParseInt(hexPort, 16, 32)
-			if ok && err == nil && int(n) == port && procListenerMatches(hexIP, ip) {
-				return nil
+			if ok && err == nil && int(n) == port {
+				if procListenerMatches(hexIP, ip) {
+					return nil
+				}
+				// /proc does not expose IPV6_V6ONLY. An owned IPv6 wildcard
+				// can serve IPv4 only when exact-inode kernel diagnostics prove
+				// that socket's option is disabled; never infer from sysctl.
+				if table == "tcp6" && hexIP == strings.Repeat("0", 32) && ip.To4() != nil && dualStackListener(fields[9], port) {
+					return nil
+				}
 			}
 		}
 	}
