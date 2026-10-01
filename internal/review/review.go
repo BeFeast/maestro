@@ -50,6 +50,7 @@ type Lens interface {
 
 // Producer publishes reviews for one repository through one forge client.
 type Producer struct {
+	operatorRearmID string
 	ExecutionPolicy aiexecution.Policy
 	// Attempts is mandatory for HTTP lenses; nil fails closed before HTTP.
 	Attempts    *AttemptStore
@@ -141,6 +142,14 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
 	}
+	if p.operatorRearmID != "" {
+		if len(p.Lenses) != 1 {
+			return ErrReviewHeld
+		}
+		if err := p.checkAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, p.Lenses[0].Name()}, p.Lenses[0], 1, true); err != nil {
+			return err
+		}
+	}
 	diff, err := p.Forge.GetPRDiff(ctx, p.Repo, prNumber)
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
@@ -200,7 +209,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 			if max == 0 {
 				max = 1
 			}
-			if err := p.Attempts.Check(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, p.now(), max, observed); err != nil {
+			if err := p.checkAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, lens, max, observed); err != nil {
 				if !observed {
 					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
 				}
@@ -215,7 +224,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 				if max == 0 {
 					max = 1
 				}
-				id, err := p.Attempts.Claim(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, p.now(), max)
+				id, err := p.claimAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, lens, max)
 				if err != nil {
 					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
 					errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))

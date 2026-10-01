@@ -13,10 +13,12 @@ import (
 // requested model and per-head durable attempt claim; no fallback is inferred.
 // The native receipt runner is supplied by the configured controller adapter.
 type NativeClaudeLens struct {
-	Stream   string
-	Model    string
-	complete func(context.Context, string, string) (string, error)
-	policy   aiexecution.Policy
+	Stream      string
+	Model       string
+	complete    func(context.Context, string, string) (string, error)
+	policy      aiexecution.Policy
+	projectID   string
+	budgetRunID string
 }
 
 // NewNativeClaudeLens installs the supported runner. There is no exported
@@ -26,9 +28,14 @@ func NewNativeClaudeLens(stream, model string, cfg *config.Config) *NativeClaude
 	if cfg != nil {
 		policy = cfg.AIExecution
 	}
-	return &NativeClaudeLens{Stream: stream, Model: model, policy: policy, complete: func(ctx context.Context, prompt, claimID string) (string, error) {
+	l := &NativeClaudeLens{Stream: stream, Model: model, policy: policy, complete: func(ctx context.Context, prompt, claimID string) (string, error) {
 		return supervisor.CompleteNativeReview(ctx, cfg, model, claimID, prompt)
 	}}
+	if cfg != nil && cfg.Supervisor.NativeSessionRegistration != nil {
+		l.projectID = cfg.ProjectID
+		l.budgetRunID = cfg.Supervisor.NativeSessionRegistration.BudgetRunID
+	}
+	return l
 }
 
 func (l *NativeClaudeLens) Name() string { return l.Stream }
