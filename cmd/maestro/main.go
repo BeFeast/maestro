@@ -59,6 +59,7 @@ Commands:
   pause         Pause issue selection for a project (in-flight workers finish normally)
   resume        Resume issue selection for a paused project
   emergency     Fleet-wide EMERGENCY STOP: halt all LLM calls in one action (stop-llm/stop-all/resume/status)
+  auxiliary     Reconcile abandoned auxiliary (supervisor/review) consultations over every indexed receipt root (reconcile [--db] [--root])
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
@@ -383,6 +384,8 @@ func main() {
 		resumeCmd(args)
 	case "emergency":
 		emergencyCmd(args)
+	case "auxiliary":
+		auxiliaryCmd(args)
 	case "stop":
 		stopCmd(args)
 	case "kill":

@@ -2,7 +2,6 @@ package daemon
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log"
 	"os"
@@ -12,12 +11,14 @@ import (
 	"time"
 
 	"github.com/befeast/maestro/internal/aiexecution"
-	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/google/uuid"
 )
 
-type auxiliaryReceiptIndex interface {
+// AuxiliaryReceiptIndex is the durable index of every project state dir that
+// ever reserved auxiliary capacity (maestro.db auxiliary_receipt_roots). It
+// outlives project removal so an abandoned launch keeps counting (#1232).
+type AuxiliaryReceiptIndex interface {
 	RememberAuxiliaryStateDir(context.Context, string) error
 	AuxiliaryStateDirs(context.Context) ([]string, error)
 }
@@ -128,51 +129,4 @@ func describeAuxiliaryOccupancy(durable []supervisor.AuxiliaryOccupant, reserved
 		return "(no occupants recorded)"
 	}
 	return strings.Join(parts, "; ")
-}
-
-var reconcileNativeConsultation = supervisor.ReconcileNativeConsultation
-
-// reconcileAbandonedAuxiliaryConsultations runs the supported replay path over
-// the project's supervisor and native-review receipt roots once, when the flow
-// is registered (daemon start and hot add). A consultation abandoned by a
-// previous daemon keeps its launch marker, and therefore fleet auxiliary
-// capacity, until that path seals it; it is otherwise reachable only from a
-// same-role supervise cycle, which a paused project or supervisor.enabled=false
-// never runs (#1232). Nothing is launched: a fresh identity only replays the
-// prior unresolved role and returns native_prior_outcome_reconciled.
-func reconcileAbandonedAuxiliaryConsultations(cfg *config.Config, name string) {
-	if cfg == nil || strings.TrimSpace(cfg.StateDir) == "" || cfg.Supervisor.NativeSessionRegistration == nil {
-		return
-	}
-	roots := []struct{ dir, role string }{{cfg.StateDir, "supervisor"}, {filepath.Join(cfg.StateDir, "native-reviews"), "reviewer"}}
-	for _, root := range roots {
-		if !auxiliaryRootHasConsultations(root.dir) {
-			continue
-		}
-		local := *cfg
-		local.StateDir = root.dir
-		identity := supervisor.ConsultationIdentity{ID: uuid.NewString(), ProjectID: cfg.ProjectID, Role: root.role}
-		_, err := reconcileNativeConsultation(&local, identity, "")
-		var hold *aiexecution.Hold
-		switch {
-		case err == nil:
-			log.Printf("[%s] auxiliary reconcile: %s root %s had no unresolved native consultation", name, root.role, root.dir)
-		case errors.As(err, &hold) && hold.Code == "native_prior_outcome_reconciled":
-			log.Printf("[%s] auxiliary reconcile: sealed abandoned %s consultation under %s; capacity released", name, root.role, root.dir)
-		case errors.As(err, &hold) && hold.Code == "native_receipt_missing":
-		default:
-			log.Printf("[%s] auxiliary reconcile: %s root %s still held: %v", name, root.role, root.dir, err)
-		}
-	}
-}
-
-// auxiliaryRootHasConsultations avoids creating receipt directories for roots
-// that never ran a consultation; the store lock would MkdirAll them.
-func auxiliaryRootHasConsultations(dir string) bool {
-	for _, name := range []string{"launch.json", "current.json"} {
-		if _, err := os.Lstat(filepath.Join(dir, "supervisor-consultations", name)); err == nil {
-			return true
-		}
-	}
-	return false
 }

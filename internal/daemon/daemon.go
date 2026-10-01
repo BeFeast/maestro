@@ -724,6 +724,16 @@ func (d *Daemon) Run(ctx context.Context) error {
 		flow := d.startFlow(ctx, storeNames[i], projects[i])
 		log.Printf("[daemon] started flow %q (repo=%s state_dir=%s)", flow.name, flow.cfg.Repo, flow.cfg.StateDir)
 	}
+	// #1232: indexed auxiliary receipt roots that no started flow owns (removed
+	// projects) still count against fleet.max_auxiliary_runs. Reconcile them
+	// once with a config derived from their receipts, or name what holds them.
+	configured := make([]*config.Config, 0, len(projects))
+	for i := range projects {
+		if cfg := projects[i].Cfg(); cfg != nil {
+			configured = append(configured, cfg)
+		}
+	}
+	orphanAuxiliaryDone := d.reconcileOrphanAuxiliaryRoots(ctx, configured)
 
 	// Expose the fleet only after the flows are started so callers that observe
 	// d.Fleet() can rely on the flows being live.
@@ -822,6 +832,7 @@ func (d *Daemon) Run(ctx context.Context) error {
 		}
 	}
 	drainWatch := func() {
+		<-orphanAuxiliaryDone
 		if stopWatch != nil {
 			stopWatch()
 		}

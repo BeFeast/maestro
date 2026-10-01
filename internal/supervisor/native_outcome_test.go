@@ -359,3 +359,61 @@ func TestNativeOutcomeMissingMarkerCannotBypassHeldReceiptAndUnverifiedOSCannotS
 		t.Fatal("missing marker erased native financial hold")
 	}
 }
+
+func TestReconcileAbandonedRootDerivesConfigFromReceiptAndMatchingAuthority(t *testing.T) {
+	cfg, count, aux := outcomeTestConfig(t)
+	held := true
+	seals := 0
+	sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		seals++
+		return nativeOutcomeFixture(request, held), nil
+	}
+	// The previous daemon left this consultation sealed-pending; the project is
+	// then removed, so only its receipts and the fleet's authority remain.
+	_, _ = NewBackendLLMClient(cfg).(*backendLLMClient).CompleteConsultation(newConsultationIdentity(cfg, "old-cycle"), "old prompt")
+	if pending, err := PendingAuxiliaryRuns(cfg.StateDir); err != nil || len(pending) != 1 {
+		t.Fatal("fixture did not leave an occupied root", pending, err)
+	}
+	held = false
+	real := *cfg.Supervisor.NativeSessionRegistration
+	otherUID := *real.AuthorityUID + 1
+	stranger := config.NativeSessionRegistrationConfig{ControlSocket: real.ControlSocket, AuthorityUID: &otherUID}
+	if _, _, err := DeriveAbandonedConsultationConfig(cfg.StateDir, []config.NativeSessionRegistrationConfig{stranger}, aux); err == nil {
+		t.Fatal("foreign authority accepted")
+	} else if hold, ok := err.(*aiexecution.Hold); !ok || hold.Code != "native_authority_unknown" {
+		t.Fatal(err)
+	}
+	derived, role, err := DeriveAbandonedConsultationConfig(cfg.StateDir, []config.NativeSessionRegistrationConfig{stranger, real}, aux)
+	// This fixture's invocation carries no process lease, so the project ran
+	// without require_verified_route; the derived policy mirrors that.
+	if err != nil || role != "supervisor" || derived.ProjectID != cfg.ProjectID || derived.StateDir != cfg.StateDir || derived.AIExecution.RequireVerifiedRoute {
+		t.Fatalf("derived=%+v role=%q err=%v", derived, role, err)
+	}
+	r := derived.Supervisor.NativeSessionRegistration
+	if r.ControlSocket != real.ControlSocket || *r.AuthorityUID != *real.AuthorityUID || r.FleetID != real.FleetID || r.GatewayScope != real.GatewayScope ||
+		r.BudgetRunID != real.BudgetRunID || r.ExpectedPolicyVersion != real.ExpectedPolicyVersion || nativeAuthorityPin(derived) != nativeAuthorityPin(cfg) {
+		t.Fatalf("derived registration drifted from the receipt: %+v", r)
+	}
+	if _, err := ReconcileAbandonedRoot(cfg.StateDir, []config.NativeSessionRegistrationConfig{stranger}, aux); err == nil || seals != 1 || aux.released.Load() != 0 {
+		t.Fatal("foreign authority sealed or released", err, seals)
+	}
+	role, err = ReconcileAbandonedRoot(cfg.StateDir, []config.NativeSessionRegistrationConfig{real}, aux)
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "native_prior_outcome_reconciled" || role != "supervisor" || seals != 2 || nativeCalls(t, count) != 1 || aux.released.Load() != 1 {
+		t.Fatalf("derived replay err=%v seals=%d released=%d", err, seals, aux.released.Load())
+	}
+	if pending, err := PendingAuxiliaryRuns(cfg.StateDir); err != nil || len(pending) != 0 {
+		t.Fatal("capacity still occupied after derived replay", pending, err)
+	}
+	// An empty or marker-only root has nothing to replay.
+	empty := t.TempDir()
+	if err := os.Chmod(empty, 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(filepath.Join(empty, "supervisor-consultations"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := DeriveAbandonedConsultationConfig(empty, []config.NativeSessionRegistrationConfig{real}, aux); !errors.As(err, &hold) || hold.Code != "native_receipt_missing" {
+		t.Fatal(err)
+	}
+}

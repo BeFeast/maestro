@@ -235,3 +235,11 @@ func TestNativeCompletedSnapshotSurvivesProfileRotationButUnresolvedDoesNot(t *t
 		})
 	}
 }
+
+func TestDeriveAbandonedConsultationConfigRestoresVerifiedRouteFromLeasedReceipt(t *testing.T) {
+	cfg, _, aux, _, _ := plannedNativeFixture(t)
+	derived, role, err := DeriveAbandonedConsultationConfig(cfg.StateDir, []config.NativeSessionRegistrationConfig{*cfg.Supervisor.NativeSessionRegistration}, aux)
+	if err != nil || role != "supervisor" || !derived.AIExecution.RequireVerifiedRoute {
+		t.Fatalf("leased planned invocation did not restore the strict posture: %+v role=%q err=%v", derived, role, err)
+	}
+}

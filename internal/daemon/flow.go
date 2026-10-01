@@ -106,17 +106,6 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 
 	var wg sync.WaitGroup
 	wg.Add(2)
-	if cfg != nil {
-		// #1232: one-shot reconcile of consultations a previous daemon abandoned
-		// under this project's auxiliary receipt roots, independent of pause or
-		// supervisor.enabled. Tracked in the flow WaitGroup so stopFlow drains it.
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			defer recoverFlow(flow, "auxiliary-reconcile")
-			reconcileAbandonedAuxiliaryConsultations(cfg, flow.name)
-		}()
-	}
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "orchestrator")
@@ -129,6 +118,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "supervise")
+		// #1232: one-shot reconcile of consultations a previous daemon abandoned
+		// under this project's auxiliary receipt roots, independent of pause or
+		// supervisor.enabled. It runs synchronously before the first supervise
+		// cycle so the two never contend for the consultation store lock.
+		reconcileAbandonedAuxiliaryConsultations(fctx, cfg, flow.name)
 		// flow.name is the unique fleet display name; the supervise loop keys
 		// its decision/cycle logs on it so two same-basename repos are
 		// distinguishable in the journal, matching the watchdog (#764). It reads

@@ -316,3 +316,124 @@ func TestNativeWorkerExecHoldSurfacesOnlyBoundedHoldCode(t *testing.T) {
 		t.Fatalf("unsafe token surfaced: %q", got)
 	}
 }
+
+func TestNativeRuntimeReconcilePersistsSealIntentBeforeAuthority(t *testing.T) {
+	fx := abandonedLaunchGap(t)
+	f := fx.f
+	intentPath := filepath.Join(fx.dir, "launch-abandoned-g2-1.intent.json")
+	before, _ := os.ReadFile(filepath.Join(fx.dir, nativeReceiptName(2)))
+	sum := sha256.Sum256(before)
+	readIntent := func() NativeLaunchAbandonmentIntent {
+		t.Helper()
+		b, err := os.ReadFile(intentPath)
+		if err != nil {
+			t.Fatal("seal intent not durable before the authority call", err)
+		}
+		var intent NativeLaunchAbandonmentIntent
+		if err := json.Unmarshal(b, &intent); err != nil {
+			t.Fatal(err)
+		}
+		return intent
+	}
+	// The authority is reached only after the exact seal request is on disk;
+	// a lost reply then leaves the intent (and the receipt) for the retry.
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		fx.seals++
+		intent := readIntent()
+		if intent.OutcomeIntent != request || intent.RoleRunID != fx.next.RoleRunID || intent.NativeSessionID != fx.next.Request.NativeSessionID ||
+			intent.ParentRoleRunID != fx.parent.RoleRunID || intent.Generation != 2 || intent.Slot != f.slot || intent.ReceiptSHA256 != hex.EncodeToString(sum[:]) {
+			t.Fatalf("intent does not pin the sealed receipt: %+v", intent)
+		}
+		return admissioncontrol.NativeOutcome{}, errors.New("lost reply")
+	}
+	expectNativeHold(t, ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot), "outcome_authority_unavailable", true)
+	first := readIntent()
+	if _, err := os.Lstat(filepath.Join(fx.dir, nativeReceiptName(2))); err != nil {
+		t.Fatal("held receipt was archived", err)
+	}
+	// The retry reuses the persisted intent: same prefix, same request, no
+	// second intent file, and the archived outcome record echoes it.
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		fx.seals++
+		if request != first.OutcomeIntent {
+			t.Fatal("retry sealed a different request")
+		}
+		return fixtureNativeOutcome(request, false), nil
+	}
+	if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil || fx.seals != 2 {
+		t.Fatal(err, fx.seals)
+	}
+	if again := readIntent(); again != first {
+		t.Fatal("intent rewritten on retry")
+	}
+	if _, err := os.Lstat(filepath.Join(fx.dir, "launch-abandoned-g2-2.intent.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("retry allocated a second archive prefix", err)
+	}
+	recordBytes, err := os.ReadFile(filepath.Join(fx.dir, "launch-abandoned-g2-1.outcome.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var record NativeLaunchAbandonmentRecord
+	if err := json.Unmarshal(recordBytes, &record); err != nil || record.OutcomeIntent != first.OutcomeIntent || record.RoleRunID != first.RoleRunID {
+		t.Fatalf("outcome record does not echo the persisted intent: %+v %v", record, err)
+	}
+}
+
+func TestNativeRuntimeCrashReplayMatchesOnlyTheArchivedSuccessor(t *testing.T) {
+	fx := abandonedLaunchGap(t)
+	f := fx.f
+	if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil {
+		t.Fatal(err)
+	}
+	proofPath := filepath.Join(f.cfg.StateDir, f.slot+"-run.sh.execution.json")
+	sess := f.st.Sessions[f.slot]
+	relaunchHold := func(name string) {
+		t.Helper()
+		sess.NativeRegistrationHold = "unresolved_launch"
+		if err := state.Save(f.cfg.StateDir, f.st); err != nil {
+			t.Fatal(err)
+		}
+		t.Log(name)
+	}
+	// An execution proof naming a different successor (another launch of the
+	// same parent) must not replay the archive that only shares the parent.
+	relaunchHold("different successor")
+	var proof workerExecutionProof
+	if err := json.Unmarshal(fx.proof, &proof); err != nil {
+		t.Fatal(err)
+	}
+	other := *proof.Spec.Registration
+	other.Binding.NativeSessionID = uuid.NewString()
+	proof.Spec.Registration = &other
+	otherBytes, _ := json.Marshal(proof)
+	if err := os.WriteFile(proofPath, otherBytes, 0600); err != nil {
+		t.Fatal(err)
+	}
+	expectNativeHold(t, ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot), "native_generation_sealed", true)
+	if sess.NativeRegistrationHold != "unresolved_launch" {
+		t.Fatal("hold cleared from an archive of a different successor")
+	}
+	// A missing proof cannot identify the successor either.
+	relaunchHold("missing proof")
+	if err := os.Remove(proofPath); err != nil {
+		t.Fatal(err)
+	}
+	expectNativeHold(t, ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot), "native_generation_sealed", true)
+	// The exact proof of the archived successor replays the cleared projection.
+	relaunchHold("exact proof")
+	if err := os.WriteFile(proofPath, fx.proof, 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil || sess.NativeRegistrationHold != "" || fx.seals != 1 {
+		t.Fatal("exact archived successor was not replayed", err, fx.seals)
+	}
+	// An archive whose receipt bytes no longer match its record is corrupt,
+	// not evidence.
+	relaunchHold("tampered archive")
+	archive := filepath.Join(fx.dir, "launch-abandoned-g2-1.receipt.json")
+	archived, _ := os.ReadFile(archive)
+	if err := os.WriteFile(archive, append(archived, '\n'), 0600); err != nil {
+		t.Fatal(err)
+	}
+	expectNativeHold(t, ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot), "receipt_invalid", true)
+}

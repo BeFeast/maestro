@@ -321,8 +321,10 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 	r, err := readNativeWorkerReceipt(dir, next)
 	if errors.Is(err, os.ErrNotExist) {
 		// A crash between archiving and saving the cleared projection leaves
-		// only the archive; replay the projection from that exact record.
-		recorded, err := nativeLaunchAbandonmentRecorded(dir, next, sess.NativeRoleRunID)
+		// only the archive; replay the projection from that exact record. The
+		// successor is identified by the slot's execution proof, which still
+		// names its native session, not by any archive sharing the parent.
+		recorded, err := nativeLaunchAbandonmentRecorded(cfg, dir, slot, next, sess)
 		if err != nil {
 			return err
 		}
@@ -378,7 +380,20 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 	if err != nil {
 		return err
 	}
-	seal := admissioncontrol.SealRequest{Binding: r.Request.Binding, RegistrationVersion: r.Acknowledgement.RegistrationVersion}
+	before, err := readOwnedRegularNoFollow(filepath.Join(dir, nativeReceiptName(next)), 64<<10)
+	if err != nil {
+		return &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+	}
+	receiptSum, proofSum := sha256.Sum256(before), sha256.Sum256(proofBytes)
+	// Persist the exact seal request before contacting the authority, as the
+	// ordinary outcome path does through the receipt's outcome_intent: a crash
+	// after the request was sent must leave durable evidence of which binding
+	// was retired, so the retry re-seals the same registration idempotently.
+	prefix, intent, err := nativeLaunchAbandonmentIntent(dir, slot, next, r, hex.EncodeToString(receiptSum[:]))
+	if err != nil {
+		return err
+	}
+	seal := intent.OutcomeIntent
 	outcome, err := sealNativeWorker(client, seal)
 	if err != nil {
 		return &NativeRegistrationHold{Code: "outcome_authority_unavailable", LaunchUncertain: true}
@@ -391,22 +406,6 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 	}
 	// Archive before any destructive step. The receipt itself is renamed, not
 	// deleted, after its sidecars are durable.
-	before, err := readOwnedRegularNoFollow(filepath.Join(dir, nativeReceiptName(next)), 64<<10)
-	if err != nil {
-		return &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
-	}
-	index := 1
-	for {
-		if _, err := os.Lstat(filepath.Join(dir, nativeLaunchAbandonmentPrefix(next, index)+".receipt.json")); errors.Is(err, os.ErrNotExist) {
-			break
-		}
-		index++
-		if index > 64 {
-			return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
-		}
-	}
-	prefix := nativeLaunchAbandonmentPrefix(next, index)
-	receiptSum, proofSum := sha256.Sum256(before), sha256.Sum256(proofBytes)
 	record := NativeLaunchAbandonmentRecord{SchemaVersion: 1, AbandonedAt: time.Now().UTC(), Slot: slot, Generation: next,
 		RoleRunID: r.RoleRunID, ParentRoleRunID: r.ParentRoleRunID, NativeSessionID: r.Request.NativeSessionID, ProcessLeaseUnit: r.ProcessLeaseUnit,
 		PreviousStatus: r.Status, ReceiptSHA256: hex.EncodeToString(receiptSum[:]), ExecutionProofSHA256: hex.EncodeToString(proofSum[:]),
@@ -467,9 +466,91 @@ func releaseAbandonedWorkerScratch(cfg *config.Config, slot string, lease tmuxse
 	return nil
 }
 
-// nativeLaunchAbandonmentRecorded reports whether generation was already
-// archived as an abandoned launch of a child of parentRoleRunID.
-func nativeLaunchAbandonmentRecorded(dir string, generation uint64, parentRoleRunID string) (bool, error) {
+// NativeLaunchAbandonmentIntent is the durable sidecar persisted before the
+// authority seal of an abandoned launch. It pins the exact receipt and seal
+// request so a crash after the request leaves auditable evidence and the retry
+// re-seals the same binding.
+type NativeLaunchAbandonmentIntent struct {
+	SchemaVersion   int                          `json:"schema_version"`
+	IntendedAt      time.Time                    `json:"intended_at"`
+	Slot            string                       `json:"slot"`
+	Generation      uint64                       `json:"generation"`
+	RoleRunID       string                       `json:"role_run_id"`
+	ParentRoleRunID string                       `json:"parent_role_run_id"`
+	NativeSessionID string                       `json:"native_session_id"`
+	ReceiptSHA256   string                       `json:"receipt_sha256"`
+	OutcomeIntent   admissioncontrol.SealRequest `json:"outcome_intent"`
+}
+
+func (i *NativeLaunchAbandonmentIntent) matches(slot string, generation uint64, r *NativeWorkerReceipt, receiptSHA string) bool {
+	return i.SchemaVersion == 1 && i.Slot == slot && i.Generation == generation && i.RoleRunID == r.RoleRunID && i.ParentRoleRunID == r.ParentRoleRunID &&
+		i.NativeSessionID == r.Request.NativeSessionID && i.ReceiptSHA256 == receiptSHA &&
+		i.OutcomeIntent == admissioncontrol.SealRequest{Binding: r.Request.Binding, RegistrationVersion: r.Acknowledgement.RegistrationVersion}
+}
+
+// nativeLaunchAbandonmentIntent selects the archive prefix for receipt r and
+// makes its seal intent durable. An intent already persisted for this exact
+// receipt (a previous attempt crashed or was held after writing it) is reused,
+// so the same prefix and seal request carry over; an intent for a different
+// receipt is never overwritten.
+func nativeLaunchAbandonmentIntent(dir, slot string, generation uint64, r *NativeWorkerReceipt, receiptSHA string) (string, *NativeLaunchAbandonmentIntent, error) {
+	for index := 1; index <= 64; index++ {
+		prefix := nativeLaunchAbandonmentPrefix(generation, index)
+		if _, err := os.Lstat(filepath.Join(dir, prefix+".receipt.json")); !errors.Is(err, os.ErrNotExist) {
+			continue
+		}
+		path := filepath.Join(dir, prefix+".intent.json")
+		if _, err := os.Lstat(path); err == nil {
+			b, err := readOwnedRegularNoFollow(path, 64<<10)
+			if err != nil {
+				return "", nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+			}
+			var existing NativeLaunchAbandonmentIntent
+			if aiexecution.DecodeStrict(b, &existing) != nil {
+				return "", nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+			}
+			if existing.matches(slot, generation, r, receiptSHA) {
+				return prefix, &existing, nil
+			}
+			continue
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return "", nil, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+		}
+		intent := &NativeLaunchAbandonmentIntent{SchemaVersion: 1, IntendedAt: time.Now().UTC(), Slot: slot, Generation: generation,
+			RoleRunID: r.RoleRunID, ParentRoleRunID: r.ParentRoleRunID, NativeSessionID: r.Request.NativeSessionID, ReceiptSHA256: receiptSHA,
+			OutcomeIntent: admissioncontrol.SealRequest{Binding: r.Request.Binding, RegistrationVersion: r.Acknowledgement.RegistrationVersion}}
+		b, err := json.Marshal(intent)
+		if err != nil {
+			return "", nil, &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		}
+		if writeFileAtomicMode(dir, path, string(b), 0600) != nil || syncNativeDir(dir) != nil {
+			return "", nil, &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		}
+		return prefix, intent, nil
+	}
+	return "", nil, &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+}
+
+// nativeLaunchAbandonmentRecorded reports whether the successor of the session's
+// projected role run was already archived as an abandoned launch. The successor
+// receipt is gone, so its identity comes from the slot's execution proof, which
+// the abandonment left in place: the archive must carry that proof's digest and
+// native session, and its archived receipt must be the record's exact bytes with
+// the expected role run, native session, parent, slot and project. An archive
+// that merely shares the parent never replays.
+func nativeLaunchAbandonmentRecorded(cfg *config.Config, dir, slot string, generation uint64, sess *state.Session) (bool, error) {
+	proofBytes, err := readOwnedRegularNoFollow(filepath.Join(cfg.StateDir, slot+"-run.sh.execution.json"), 128<<10)
+	if err != nil {
+		return false, nil
+	}
+	var proof workerExecutionProof
+	if aiexecution.DecodeStrict(proofBytes, &proof) != nil || proof.Spec.Registration == nil || proof.RuntimeKey != slot || proof.Spec.ProjectID != cfg.ProjectID {
+		return false, nil
+	}
+	nativeID := proof.Spec.Registration.Binding.NativeSessionID
+	proofSum := sha256.Sum256(proofBytes)
+	proofSHA := hex.EncodeToString(proofSum[:])
+	invalid := &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
 	for index := 1; index <= 64; index++ {
 		prefix := nativeLaunchAbandonmentPrefix(generation, index)
 		if _, err := os.Lstat(filepath.Join(dir, prefix+".receipt.json")); errors.Is(err, os.ErrNotExist) {
@@ -477,16 +558,29 @@ func nativeLaunchAbandonmentRecorded(dir string, generation uint64, parentRoleRu
 		}
 		b, err := readOwnedRegularNoFollow(filepath.Join(dir, prefix+".outcome.json"), 64<<10)
 		if err != nil {
-			return false, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+			return false, invalid
 		}
 		var record NativeLaunchAbandonmentRecord
 		if aiexecution.DecodeStrict(b, &record) != nil || record.SchemaVersion != 1 || record.Generation != generation ||
 			admissioncontrol.ValidateNativeOutcome(record.Outcome, record.OutcomeIntent) != nil || record.Outcome.PhysicalAttempts != 0 {
-			return false, &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+			return false, invalid
 		}
-		if record.ParentRoleRunID == parentRoleRunID {
-			return true, nil
+		if record.NativeSessionID != nativeID || record.ExecutionProofSHA256 != proofSHA || record.ParentRoleRunID != sess.NativeRoleRunID || record.Slot != slot {
+			continue
 		}
+		archived, err := readOwnedRegularNoFollow(filepath.Join(dir, prefix+".receipt.json"), 64<<10)
+		if err != nil {
+			return false, invalid
+		}
+		archivedSum := sha256.Sum256(archived)
+		var receipt NativeWorkerReceipt
+		if hex.EncodeToString(archivedSum[:]) != record.ReceiptSHA256 || aiexecution.DecodeStrict(archived, &receipt) != nil ||
+			receipt.RoleRunID != record.RoleRunID || receipt.Request.NativeSessionID != nativeID || receipt.ParentRoleRunID != sess.NativeRoleRunID ||
+			receipt.Slot != slot || receipt.ProjectID != cfg.ProjectID || receipt.Generation != generation ||
+			record.OutcomeIntent.Binding != receipt.Request.Binding {
+			return false, invalid
+		}
+		return true, nil
 	}
 	return false, nil
 }
