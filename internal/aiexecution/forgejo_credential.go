@@ -34,6 +34,11 @@ func NativeForgejoCredential(operation, repo, token string, input io.Reader, out
 		if !ok || len(line) > 4096 {
 			return Held("containment_git_credential_request_invalid")
 		}
+		// Git may send multiple capabilities and HTTP authentication challenges.
+		// They do not select credentials; only the exact scalar destination below does.
+		if k == "capability[]" || k == "wwwauth[]" {
+			continue
+		}
 		if _, exists := fields[k]; exists {
 			return Held("containment_git_credential_request_invalid")
 		}
