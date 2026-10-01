@@ -20,7 +20,7 @@ func NativeForgejoCredential(operation, repo, token string, input io.Reader, out
 	fields := map[string]string{}
 	scanner := bufio.NewScanner(io.LimitReader(input, 8193))
 	scanner.Buffer(make([]byte, 1024), 8193)
-	terminated, bytesRead := false, 0
+	bytesRead := 0
 	for scanner.Scan() {
 		line := scanner.Text()
 		bytesRead += len(line) + 1
@@ -28,7 +28,6 @@ func NativeForgejoCredential(operation, repo, token string, input io.Reader, out
 			return Held("containment_git_credential_request_invalid")
 		}
 		if line == "" {
-			terminated = true
 			break
 		}
 		k, v, ok := strings.Cut(line, "=")
@@ -40,7 +39,9 @@ func NativeForgejoCredential(operation, repo, token string, input io.Reader, out
 		}
 		fields[k] = v
 	}
-	if scanner.Err() != nil || !terminated {
+	// Git credential helpers accept either a blank line or EOF as the
+	// terminator. Git itself closes helper stdin after writing the fields.
+	if scanner.Err() != nil {
 		return Held("containment_git_credential_request_invalid")
 	}
 	if fields["protocol"] != "https" || fields["host"] != "git.oklabs.uk" || fields["path"] != repo+".git" || fields["username"] != "" && fields["username"] != "oauth2" {
