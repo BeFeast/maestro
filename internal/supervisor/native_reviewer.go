@@ -59,7 +59,7 @@ func CompleteNativeReview(ctx context.Context, cfg *config.Config, model, claimI
 	if len(def.ExtraArgs) != 0 {
 		return "", aiexecution.Held("native_reviewer_arguments_unsupported")
 	}
-	def.ExtraArgs = []string{"--bare", "--tools", "", "--max-turns", "1"}
+	def.ExtraArgs = []string{"--bare", "--tools", "", "--max-turns", "1", "--permission-mode", "dontAsk", "--permission-prompts", "none"}
 	local.Model.Backends = map[string]config.BackendDef{base: def}
 	local.Supervisor.Backend = base
 	local.StateDir = filepath.Join(cfg.StateDir, "native-reviews")

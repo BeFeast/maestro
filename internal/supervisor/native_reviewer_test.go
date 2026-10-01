@@ -41,6 +41,18 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			fixture.cfg = &receiptCfg
 			def := cfg.Model.Backends["primary"]
 			def.Cmd = strings.TrimSuffix(def.Cmd, " fail")
+			argvPath := filepath.Join(cfg.LocalPath, "reviewer-argv")
+			if mode == "success" {
+				claudePath := filepath.Join(cfg.LocalPath, "claude")
+				script, readErr := os.ReadFile(claudePath)
+				if readErr != nil {
+					t.Fatal(readErr)
+				}
+				script = []byte(strings.Replace(string(script), "#!/bin/sh\n", "#!/bin/sh\nprintf '%s\\n' \"$@\" > '"+argvPath+"'\n", 1))
+				if err := os.WriteFile(claudePath, script, 0700); err != nil {
+					t.Fatal(err)
+				}
+			}
 			if mode == "failed" {
 				def.Cmd += " fail"
 			}
@@ -93,6 +105,12 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			}
 			if mode == "success" && string(record.Data) != "done" {
 				t.Fatal("successful output lost")
+			}
+			if mode == "success" {
+				args, readErr := os.ReadFile(argvPath)
+				if readErr != nil || !strings.Contains(string(args), "--bare\n--tools\n\n--max-turns\n1\n--permission-mode\ndontAsk\n--permission-prompts\nnone\n") {
+					t.Fatalf("reviewer permissions/tools changed: args=%q err=%v", args, readErr)
+				}
 			}
 			if mode == "cancelled" && string(record.Data) != "partial-output" {
 				t.Fatalf("partial output lost: %q", record.Data)

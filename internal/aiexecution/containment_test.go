@@ -82,6 +82,38 @@ func TestNativeToolsExcludeAgentsAndAuxiliaryTools(t *testing.T) {
 	}
 }
 
+func TestNativeAuxiliaryPermissionsDenyPromptAndBypassOverrides(t *testing.T) {
+	id := uuid.NewString()
+	base := []string{"claude", "-p", "--model", "claude-opus-5", "--session-id", id}
+	for _, role := range []string{"supervisor", "reviewer"} {
+		for _, extra := range [][]string{nil, {"--permission-mode", "dontAsk", "--permission-prompts", "none"}, {"--permission-mode=dontAsk", "--permission-prompts=none"}} {
+			args, err := containedNativeArguments(append(append([]string(nil), base...), extra...), id, role)
+			if err != nil || !strings.HasSuffix(strings.Join(args, "|"), "--tools||--max-turns|1|--permission-mode|dontAsk|--permission-prompts|none") {
+				t.Fatalf("role=%s args=%v err=%v", role, args, err)
+			}
+		}
+		for _, extra := range [][]string{
+			{"--permission-mode", "auto"}, {"--permission-mode", "bypassPermissions"},
+			{"--permission-mode=acceptEdits"}, {"--permission-mode", "manual"},
+			{"--permission-mode", "plan"}, {"--permission-mode", ""},
+			{"--permission-prompts", "host"}, {"--permission-prompts=other"},
+			{"--permission-mode"}, {"--permission-prompts"},
+			{"--permission-mode", "dontAsk", "--permission-mode=auto"},
+			{"--permission-prompts", "none", "--permission-prompts=host"},
+			{"--dangerously-skip-permissions"}, {"--tools", "Read"}, {"--tools", "Agent"},
+		} {
+			if _, err := containedNativeArguments(append(append([]string(nil), base...), extra...), id, role); err == nil {
+				t.Fatalf("role=%s accepted override %v", role, extra)
+			}
+		}
+	}
+	for _, extra := range [][]string{{"--permission-mode", "dontAsk"}, {"--permission-prompts", "none"}} {
+		if _, err := containedNativeArguments(append(append([]string(nil), base...), extra...), id, "implementer"); err == nil {
+			t.Fatal("auxiliary-only permission option accepted on worker", extra)
+		}
+	}
+}
+
 func TestNativeEnvironmentDoesNotInheritProviderOrHostCredentials(t *testing.T) {
 	p := NativeContainmentProfile{GatewayURL: "http://192.0.2.1:8317", ForgejoRepository: "BeFeast/maestro", ForgejoTokenSHA256: digest([]byte("maestro-native-forgejo:v1\x00scoped"))}
 	base := []string{"ANTHROPIC_AUTH_TOKEN=managed", "ANTHROPIC_BASE_URL=" + p.GatewayURL, "ANTHROPIC_API_KEY=unmanaged", "CLAUDE_CODE_OAUTH_TOKEN=unmanaged", "HTTP_PROXY=http://proxy", "SSH_AUTH_SOCK=/run/ssh", "GH_TOKEN=broad", "GIT_CONFIG_COUNT=1", "GIT_CONFIG_KEY_0=core.fsmonitor", "GIT_CONFIG_VALUE_0=bad", "FORGEJO_TOKEN=scoped", "MAESTRO_FORGEJO_REPOSITORY_TOKEN=broad"}

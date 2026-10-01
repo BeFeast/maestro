@@ -369,14 +369,23 @@ func containedNativeArguments(args []string, nativeID, role string) ([]string, e
 			if eq {
 				return nil, Held("containment_arguments_invalid")
 			}
+			if aux && name == "--dangerously-skip-permissions" {
+				return nil, Held("containment_arguments_unsupported")
+			}
 			out = append(out, name)
-		case "--model", "--session-id", "--effort", "--output-format", "--max-turns", "--tools":
+		case "--model", "--session-id", "--effort", "--output-format", "--max-turns", "--tools", "--permission-mode", "--permission-prompts":
 			if !eq {
 				i++
 				if i >= len(args) {
 					return nil, Held("containment_arguments_invalid")
 				}
 				value = args[i]
+			}
+			if name == "--permission-mode" || name == "--permission-prompts" {
+				if !aux || name == "--permission-mode" && value != "dontAsk" || name == "--permission-prompts" && value != "none" {
+					return nil, Held("containment_arguments_unsupported")
+				}
+				continue
 			}
 			if name == "--session-id" {
 				session++
@@ -412,7 +421,9 @@ func containedNativeArguments(args []string, nativeID, role string) ([]string, e
 	}
 	out = append(out, "--bare", "--tools", tools)
 	if aux {
-		out = append(out, "--max-turns", "1")
+		// Tool-free auxiliary calls deny anything that would prompt. Do not
+		// inherit the CLI's auto permission mode or permit a bypass override.
+		out = append(out, "--max-turns", "1", "--permission-mode", "dontAsk", "--permission-prompts", "none")
 	}
 	return out, nil
 }
