@@ -3285,6 +3285,15 @@ func (o *Orchestrator) RunOnce() error {
 	}
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
+	if o.cfg.AIExecution.RequireVerifiedRoute {
+		for slot, sess := range s.Sessions {
+			if sess != nil && sess.NativeRegistrationHold == "unresolved_launch" {
+				if err := worker.ReconcileNativeWorkerRuntime(o.cfg, s, slot); err != nil {
+					log.Printf("[orch] exact native runtime reconciliation held for %s: %v", slot, err)
+				}
+			}
+		}
+	}
 
 	// Storage/process ownership is reconciled before any session-status or
 	// scheduling decision. An orphaned exact lease is stopped and cleaned here;

@@ -44,28 +44,29 @@ func NativeHold(err error) (*NativeRegistrationHold, bool) {
 }
 
 type NativeWorkerReceipt struct {
-	SchemaVersion       int                                  `json:"schema_version"`
-	ProjectID           string                               `json:"project_id"`
-	Slot                string                               `json:"slot"`
-	Generation          uint64                               `json:"generation"`
-	IssueNumber         int                                  `json:"issue_number"`
-	RoleRunID           string                               `json:"role_run_id"`
-	ParentRoleRunID     string                               `json:"parent_role_run_id,omitempty"`
-	Worktree            string                               `json:"worktree"`
-	Branch              string                               `json:"branch"`
-	Backend             string                               `json:"backend"`
-	ConfigDigest        string                               `json:"config_digest"`
-	Status              string                               `json:"status"`
-	Request             admissioncontrol.RegistrationRequest `json:"request"`
-	Acknowledgement     *admissioncontrol.Acknowledgement    `json:"acknowledgement,omitempty"`
-	ProcessLeaseUnit    string                               `json:"process_lease_unit"`
-	ProcessLeaseManager string                               `json:"process_lease_manager"`
-	LogFile             string                               `json:"log_file,omitempty"`
-	PID                 int                                  `json:"pid,omitempty"`
-	AccountingReady     bool                                 `json:"accounting_ready"`
-	OutcomeIntent       *admissioncontrol.SealRequest        `json:"outcome_intent,omitempty"`
-	Outcome             *admissioncontrol.NativeOutcome      `json:"outcome,omitempty"`
-	PrelaunchRecoveries []NativePrelaunchRecoveryRecord      `json:"prelaunch_recoveries,omitempty"`
+	SchemaVersion         int                                   `json:"schema_version"`
+	ProjectID             string                                `json:"project_id"`
+	Slot                  string                                `json:"slot"`
+	Generation            uint64                                `json:"generation"`
+	IssueNumber           int                                   `json:"issue_number"`
+	RoleRunID             string                                `json:"role_run_id"`
+	ParentRoleRunID       string                                `json:"parent_role_run_id,omitempty"`
+	Worktree              string                                `json:"worktree"`
+	Branch                string                                `json:"branch"`
+	Backend               string                                `json:"backend"`
+	ConfigDigest          string                                `json:"config_digest"`
+	Status                string                                `json:"status"`
+	Request               admissioncontrol.RegistrationRequest  `json:"request"`
+	Acknowledgement       *admissioncontrol.Acknowledgement     `json:"acknowledgement,omitempty"`
+	ProcessLeaseUnit      string                                `json:"process_lease_unit"`
+	ProcessLeaseManager   string                                `json:"process_lease_manager"`
+	LogFile               string                                `json:"log_file,omitempty"`
+	PID                   int                                   `json:"pid,omitempty"`
+	AccountingReady       bool                                  `json:"accounting_ready"`
+	OutcomeIntent         *admissioncontrol.SealRequest         `json:"outcome_intent,omitempty"`
+	Outcome               *admissioncontrol.NativeOutcome       `json:"outcome,omitempty"`
+	PrelaunchRecoveries   []NativePrelaunchRecoveryRecord       `json:"prelaunch_recoveries,omitempty"`
+	NativeProcessEvidence *aiexecution.NativeProcessTermination `json:"native_process_evidence,omitempty"`
 }
 
 type NativePrelaunchRecoveryRecord struct {
@@ -76,6 +77,7 @@ type NativePrelaunchRecoveryRecord struct {
 }
 
 type nativeWorkerLaunch struct {
+	cfg              *config.Config
 	dir              string
 	receipt          *NativeWorkerReceipt
 	unlock           func()
@@ -278,6 +280,18 @@ func readNativeWorkerReceipt(dir string, generation uint64) (*NativeWorkerReceip
 	if err := validateNativeWorkerOutcome(&r); err != nil {
 		return nil, err
 	}
+	if r.NativeProcessEvidence != nil {
+		proof := *r.NativeProcessEvidence
+		var err error
+		if proof.LocalStatus == "launch_intent" {
+			err = aiexecution.ValidateNativeProcessLaunch(proof, proof.Profile, r.Request.NativeSessionID, r.ProcessLeaseUnit)
+		} else {
+			err = aiexecution.ValidateNativeProcessTermination(proof, proof.Profile, r.Request.NativeSessionID, r.ProcessLeaseUnit)
+		}
+		if err != nil || r.Status != "launched" {
+			return nil, &NativeRegistrationHold{Code: "native_process_evidence_invalid", LaunchUncertain: true}
+		}
+	}
 	return &r, nil
 }
 
@@ -322,7 +336,7 @@ func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, sl
 	if err != nil {
 		return nil, err
 	}
-	owner := &nativeWorkerLaunch{dir: dir, unlock: unlock}
+	owner := &nativeWorkerLaunch{cfg: cfg, dir: dir, unlock: unlock}
 	ok := false
 	defer func() {
 		if !ok {
@@ -607,7 +621,20 @@ func (n *nativeWorkerLaunch) complete(pid int, lease tmuxsession.ProcessLease) e
 	if pid <= 0 || lease.Unit != n.receipt.ProcessLeaseUnit || lease.Manager != n.receipt.ProcessLeaseManager {
 		return &NativeRegistrationHold{Code: "process_identity_conflict", LaunchUncertain: true}
 	}
-	n.receipt.PID = pid
+	if n.cfg != nil && n.cfg.AIExecution.RequireVerifiedRoute {
+		pin, err := nativeProfileFromReceipt(n.cfg, n.receipt)
+		if err != nil {
+			return err
+		}
+		proof, monitorPID, err := observeNativeWorkerLaunch(pin, n.receipt.ProjectID, n.receipt.Request.NativeSessionID, lease.Unit)
+		if err != nil {
+			return err
+		}
+		n.receipt.NativeProcessEvidence = proof
+		n.receipt.PID = monitorPID
+	} else {
+		n.receipt.PID = pid
+	}
 	n.receipt.Status = "launched"
 	if err := persistNativeWorkerReceipt(n.dir, n.receipt); err != nil {
 		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
@@ -651,9 +678,11 @@ func (n *nativeWorkerLaunch) adoptExisting(cfg *config.Config, slot string) (int
 	if err != nil || !active {
 		return 0, lease, &NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true}
 	}
-	owned, err := workerProcessLeaseAnchored(lease, pid)
-	if err != nil || !owned {
-		return 0, lease, &NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true}
+	if !cfg.AIExecution.RequireVerifiedRoute {
+		owned, err := workerProcessLeaseAnchored(lease, pid)
+		if err != nil || !owned {
+			return 0, lease, &NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true}
+		}
 	}
 	scratch, err := recoverWorkerScratchLease(cfg, slot, lease)
 	if err != nil {
@@ -944,6 +973,14 @@ func ValidateNativeWorkerRuntime(cfg *config.Config, slot string, sess *state.Se
 	}
 	if validateExactWorktreeIdentity(cfg.LocalPath, r.Worktree, r.Branch) != nil {
 		return &NativeRegistrationHold{Code: "native_workspace_conflict", LaunchUncertain: true}
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		pin, err := nativeProfileFromReceipt(cfg, r)
+		if err != nil {
+			return err
+		}
+		_, _, err = observeNativeWorkerLaunch(pin, r.ProjectID, r.Request.NativeSessionID, r.ProcessLeaseUnit)
+		return err
 	}
 	lease := tmuxsession.ProcessLease{Unit: r.ProcessLeaseUnit, Manager: r.ProcessLeaseManager}
 	active, err := workerProcessLeaseActive(lease)

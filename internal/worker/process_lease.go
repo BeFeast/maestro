@@ -51,7 +51,12 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 	lease.Runtime = runtime
 	lease.HostRunner = cfg.AIExecution.RequireVerifiedRoute
 	pid, err := startOrReconcileTmuxSession(tmuxName, worktree, runnerPath, lease, previousPID)
-	if err == nil {
+	if err == nil && cfg.AIExecution.RequireVerifiedRoute {
+		err = waitNativeWorkerLaunch(cfg, slotName, generation, 30*time.Second)
+		if err == nil {
+			return pid, lease, nil
+		}
+	} else if err == nil {
 		ready, readyErr := confirmWorkerProcessLease(lease, pid, processLeaseStartWait)
 		switch {
 		case readyErr != nil:
