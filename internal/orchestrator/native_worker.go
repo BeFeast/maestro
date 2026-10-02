@@ -26,6 +26,19 @@ func retainNativeWorkerHold(sess *state.Session, err error) bool {
 	return true
 }
 
+// nativeRuntimeReconcileHold reports whether a native hold is resolved by the
+// exact runtime reconciliation at cycle start (worker.ReconcileNativeWorkerRuntime):
+// the successor-launch gap (#1235) and the pre-launch wedge in which an
+// in-place respawn registered a successor and then held on the projected
+// generation's missing terminal marker or unsettled outcome.
+func nativeRuntimeReconcileHold(code string) bool {
+	switch code {
+	case "unresolved_launch", "native_process_identity_missing", "previous_outcome_unknown":
+		return true
+	}
+	return false
+}
+
 // nativeWorkerExecHoldSuffix appends the hold code the host runner wrote to the
 // worker log, so an unresolved_launch journal line names the actual refusal
 // (for example containment_forgejo_authorization_unverified) instead of only
