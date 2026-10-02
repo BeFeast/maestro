@@ -85,6 +85,10 @@ type Orchestrator struct {
 	// missingReviewNotified remembers PRs already reported as merged past an
 	// absent review gate, so the alert fires once per PR.
 	missingReviewNotified map[int]bool
+	// parkedNativeHoldNotified remembers, per slot, the parked native hold
+	// (code, role run, generation) already reported, so the operator is told
+	// once instead of on every retention.
+	parkedNativeHoldNotified map[string]string
 	// reviewProduceInFlight guards one llm-review producer run per PR in this
 	// process (#1162 S5); cross-process dedup is the posted statuses.
 	reviewProduceMu       sync.Mutex
@@ -3150,7 +3154,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
 			if hold, ok := worker.NativeHold(respawnErr); ok {
-				retainNativeWorkerHold(sess, respawnErr)
+				o.retainNativeWorkerHold(slotName, sess, respawnErr)
 				restoreNativeHeldSession(sess, beforeNative)
 				if hold.LaunchUncertain {
 					permit.Commit(slotName)
@@ -4301,7 +4305,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				o.updateTokensUsedFromWorkerLog(slotName, sess)
 				promptBase := o.selectPrompt(issue)
 				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
-					if retainNativeWorkerHold(sess, respawnErr) {
+					if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 						restoreNativeHeldSession(sess, beforeNative)
 						continue
 					}
@@ -4395,7 +4399,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
-				if retainNativeWorkerHold(sess, respawnErr) {
+				if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 					restoreNativeHeldSession(sess, beforeNative)
 					continue
 				}
@@ -4479,7 +4483,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
-				if retainNativeWorkerHold(sess, respawnErr) {
+				if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 					restoreNativeHeldSession(sess, beforeNative)
 					continue
 				}
@@ -5295,7 +5299,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						if retainNativeWorkerHold(sess, err) {
+						if o.retainNativeWorkerHold(slotName, sess, err) {
 							restoreNativeHeldSession(sess, beforeNative)
 							continue
 						}
@@ -5359,7 +5363,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						if retainNativeWorkerHold(sess, err) {
+						if o.retainNativeWorkerHold(slotName, sess, err) {
 							restoreNativeHeldSession(sess, beforeNative)
 							continue
 						}
@@ -5507,7 +5511,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								}
 								promptBase := o.selectPrompt(issue)
 								if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
-									if retainNativeWorkerHold(sess, respawnErr) {
+									if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 										restoreNativeHeldSession(sess, beforeNative)
 										continue
 									}
@@ -5567,7 +5571,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									// for non-policy/shadow sessions — base o.cfg unchanged).
 									respawnCfg := o.tierOverrideConfigForSession(sess)
 									if respawnErr := o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
-										if retainNativeWorkerHold(sess, respawnErr) {
+										if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 											restoreNativeHeldSession(sess, beforeNative)
 											continue
 										}
@@ -9906,7 +9910,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		err = o.respawnPreservingWorktreeWithConfig(repairCfg, slot, sess, issue, promptBase, backend)
 	}
 	if err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slot, sess, err) {
 			return false
 		}
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)

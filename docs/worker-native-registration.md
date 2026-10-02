@@ -104,6 +104,71 @@ deduplicates adoption and keeps unresolved launch capacity across daemon restart
 The live-worker floor still counts actual running projections, excluding holds;
 an uncertain receipt cannot hide a floor alert.
 
+Before a respawn, in-place continuation, phase transition or repair registers a
+successor, the termination fence requires the projected generation's
+`.terminated` receipt. When the session no longer owns that generation's lease,
+the fence proves, seals and records the termination itself, or holds
+`native_process_identity_missing` until it can. When the projected generation's
+own receipts cannot be trusted, the fence holds the slot instead of failing the
+session. The receipt read reports its own holds, and the fence adds two for
+files it cannot read (`worker.NativeProjectedReceiptHoldCodes`):
+
+- `projected_receipt_missing`: the projected `generation-<n>.json` receipt does
+  not exist.
+- `projected_receipt_undecodable`: the receipt or its `.terminated` marker
+  exists but cannot be read, or the marker is not valid JSON.
+- `receipt_invalid`: the receipt fails strict validation, or the marker is not
+  an owner-only regular file of bounded size (the receipt's own integrity
+  check).
+- `outcome_receipt_invalid`: the receipt's outcome intent or sealed outcome
+  fails validation (an outcome without its intent, an intent on a generation
+  that never launched, or a binding, registration version or digest that does
+  not match).
+- `operator_recovery_receipt_invalid`: the receipt carries an operator recovery
+  record that does not match an `operator_retired_unknown` outcome for the next
+  generation.
+- `native_process_evidence_invalid`: the receipt's process launch or
+  termination evidence fails validation, or the receipt is not `launched`.
+- `native_identity_conflict`: the receipt directory, slot, role run or native
+  session differs from the session's, or the marker decodes but records a
+  different role run, native session, generation or OS lease.
+
+These holds are launch-uncertain and park the slot: no reconciliation clears
+them, and every respawn, retry, phase transition and repair skips the held
+session. The session keeps its status, retry counts, feedback, phase and
+generation, and the issue claim stays held, so no other slot picks the issue up
+and the slot keeps its capacity, across daemon restarts too. The orchestrator
+sends one operator notification when it first retains one of these holds for a
+slot's generation; later cycles stay silent.
+
+There is no release path for a parked hold today, automatic or by command. No
+CLI command or daemon flag clears it: `--recover-native-prelaunch` only re-runs
+setup of a first generation still at `registered`, and restoring or repairing
+the receipt files does not release the slot, because nothing re-attempts a held
+session. A supported operator release that verifies the receipt and marker
+before clearing the hold is tracked in #1256. Do not clear the hold by editing
+daemon state.
+
+What the operator inspects meanwhile:
+
+- the daemon log: `native worker generation held: <code>` names the hold; when
+  the fence classifies a file or marker error itself, the worker line
+  `has no trustworthy projected receipt before its successor` also carries the
+  underlying error;
+- the receipt directory `state_dir/worker-native-sessions/<slot>/`: the
+  projected `generation-<n>.json` receipt and its `.terminated` marker, compared
+  with the session's role-run UUID, native session UUID, generation and process
+  lease, and their owner and mode (owner-only, owned by the daemon user);
+- whether the projected generation's process lease is still active: the marker
+  is the only local proof that it ended.
+
+Typical causes are a deleted or truncated file, a restore or copy that changed
+owner or mode, a marker from another generation, or a second writer on the same
+state directory. Restore files only from authoritative copies, owner-only and
+owned by the daemon user. Never hand-write or edit a receipt or marker to
+satisfy the fence: a forged marker lets a successor run beside a live
+predecessor.
+
 Native holds remain attached to the canonical session/issue claim. They retain
 retry counts, feedback, prior phase, Advisor rounds and generation identity;
 they do not trigger provider fallback or generic worker-failure handling. The

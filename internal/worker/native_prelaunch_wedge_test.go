@@ -833,3 +833,203 @@ func TestTerminationFenceLeavesSessionProjectionUntouched(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+// The fence must hold, never fail, when the projected generation's receipt is
+// absent, or the receipt or its terminal marker cannot be trusted: the daemon
+// records a non-hold respawn error as a failed session, while a hold retains
+// the session and parks the slot for the operator. Each fault keeps its own
+// code: a marker that decodes but names another identity is the existing
+// native_identity_conflict, a marker failing the receipt integrity check is the
+// existing receipt_invalid, and only an unreadable or undecodable file is
+// projected_receipt_undecodable. A receipt whose outcome, operator recovery or
+// process evidence section fails validation keeps the receipt read's own hold.
+// Nothing is observed, sealed or minted meanwhile. Together the modes produce
+// every code in NativeProjectedReceiptHoldCodes, the set the orchestrator parks
+// and reports.
+func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testing.T) {
+	produced := map[string]bool{}
+	for _, mode := range []string{"receipt_missing", "receipt_undecodable", "terminal_marker_undecodable", "terminal_marker_identity_conflict", "terminal_marker_invalid_mode", "outcome_invalid", "operator_recovery_invalid", "process_evidence_invalid"} {
+		t.Run(mode, func(t *testing.T) {
+			f, parent, _ := cleanExitWithoutMarker(t)
+			sess := f.st.Sessions[f.slot]
+			dir := sess.NativeReceiptDir
+			previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+			sealNativeWorker = func(admissioncontrol.Client, admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				t.Fatal("sealed a generation whose receipt cannot be read")
+				return admissioncontrol.NativeOutcome{}, nil
+			}
+			verifyNativeWorkerTermination = func(aiexecution.FileProof, string, string) (*aiexecution.NativeProcessTermination, error) {
+				t.Fatal("observed a generation whose receipt cannot be read")
+				return nil, nil
+			}
+			var want string
+			switch mode {
+			case "receipt_missing":
+				if err := os.Remove(filepath.Join(dir, nativeReceiptName(1))); err != nil {
+					t.Fatal(err)
+				}
+				want = "projected_receipt_missing"
+			case "receipt_undecodable":
+				// Strict decoding of the receipt itself already reports the
+				// generic receipt hold; it must keep reaching the caller as one.
+				if err := os.WriteFile(filepath.Join(dir, nativeReceiptName(1)), []byte(`{"schema_version":`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "receipt_invalid"
+			case "terminal_marker_undecodable":
+				if err := os.WriteFile(filepath.Join(dir, nativeReceiptName(1)+".terminated"), []byte(`{"generation":`), 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "projected_receipt_undecodable"
+			case "terminal_marker_identity_conflict":
+				// A well-formed marker for another native session of the same
+				// generation is not proof that this generation ended.
+				other := terminationFor(parent)
+				other.NativeSessionID = uuid.NewString()
+				b, _ := json.Marshal(other)
+				if err := os.WriteFile(filepath.Join(dir, nativeReceiptName(1)+".terminated"), b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "native_identity_conflict"
+			case "terminal_marker_invalid_mode":
+				// The exact marker, but not owner-only: the receipt integrity
+				// check fails, as it would for the receipt itself.
+				path := filepath.Join(dir, nativeReceiptName(1)+".terminated")
+				b, _ := json.Marshal(terminationFor(parent))
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+				want = "receipt_invalid"
+			case "outcome_invalid":
+				// A settled outcome without the intent it answers.
+				corrupt := *parent
+				corrupt.Outcome = &admissioncontrol.NativeOutcome{}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "outcome_receipt_invalid"
+			case "operator_recovery_invalid":
+				// An operator recovery record without the retired outcome it
+				// consumes.
+				corrupt := *parent
+				corrupt.OperatorRecovery = &NativeOperatorRecoveryRecord{NextGeneration: 2, ScheduledAt: time.Now().UTC()}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "operator_recovery_receipt_invalid"
+			case "process_evidence_invalid":
+				// Process evidence that proves neither a launch nor a termination.
+				corrupt := *parent
+				corrupt.NativeProcessEvidence = &aiexecution.NativeProcessTermination{Version: 1, NativeSessionID: parent.Request.NativeSessionID, Unit: parent.ProcessLeaseUnit, LocalStatus: "terminated"}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "native_process_evidence_invalid"
+			}
+			produced[want] = true
+			before := *sess
+			err := ensureNativeGenerationTerminalBeforeSuccessor(f.cfg, f.slot, sess)
+			expectNativeHold(t, err, want, true)
+			if hold, _ := NativeHold(err); hold.Slot != f.slot {
+				t.Fatalf("hold not attributed to the slot: %+v", hold)
+			}
+			if !reflect.DeepEqual(before, *sess) {
+				t.Fatalf("held fence modified the session projection:\n before=%+v\n after=%+v", before, *sess)
+			}
+			// The respawn entry point returns the same hold, so the daemon
+			// retains the held session instead of failing it.
+			f.cfg.WorkerLaunchContext = &config.WorkerLaunchContext{Role: "repair", ParentRoleRunID: sess.NativeRoleRunID}
+			err = RespawnInPlace(f.cfg, f.slot, sess, f.cfg.Repo, f.issue, "repair prompt", "claude")
+			expectNativeHold(t, err, want, true)
+			if _, statErr := os.Lstat(filepath.Join(dir, nativeReceiptName(2))); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatal("successor registered on top of an unreadable projected receipt", statErr)
+			}
+			if len(f.registered) != 1 || f.spawned != 0 || f.stopped != 0 || sess.WorkerGeneration != 1 || sess.Status != state.StatusPROpen || sess.PRNumber != 20 {
+				t.Fatalf("registered=%d spawned=%d stopped=%d gen=%d status=%s", len(f.registered), f.spawned, f.stopped, sess.WorkerGeneration, sess.Status)
+			}
+		})
+	}
+	for _, code := range NativeProjectedReceiptHoldCodes() {
+		if !produced[code] {
+			t.Errorf("no fence fault produces parked code %s", code)
+		}
+	}
+}
+
+// A launch_intent projected generation under a wedge hold never had its launch
+// adopted by the session, so no lease path observes it. The hold reconciliation
+// must take the ordinary launch/state gap recovery for it instead of
+// re-reporting previous_outcome_unknown every cycle: adopt the exact live
+// launch, or record its verified termination, and clear the hold.
+func TestNativeRuntimeReconcileObservesLaunchIntentGenerationUnderWedgeHold(t *testing.T) {
+	for _, mode := range []string{"live", "terminated"} {
+		for _, hold := range []string{"native_process_identity_missing", "previous_outcome_unknown"} {
+			t.Run(mode+"/"+hold, func(t *testing.T) {
+				f, parent, pin := cleanExitWithoutMarker(t)
+				sess := f.st.Sessions[f.slot]
+				dir := sess.NativeReceiptDir
+				previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+				parent.Status, parent.PID = "launch_intent", 0
+				if err := writeNativeWorkerReceipt(dir, parent); err != nil {
+					t.Fatal(err)
+				}
+				sess.Status, sess.PRNumber, sess.FinishedAt = state.StatusRunning, 0, nil
+				sess.NativeRegistrationHold = hold
+				if err := state.Save(f.cfg.StateDir, f.st); err != nil {
+					t.Fatal(err)
+				}
+				sealNativeWorker = func(admissioncontrol.Client, admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+					t.Fatal("gap recovery sealed the generation")
+					return admissioncontrol.NativeOutcome{}, nil
+				}
+				live := mode == "live"
+				f.live = live
+				observeNativeWorkerLaunch = func(got aiexecution.FileProof, projectID, nativeID, unit string) (*aiexecution.NativeProcessTermination, int, error) {
+					if got != pin || projectID != parent.ProjectID || nativeID != parent.Request.NativeSessionID || unit != parent.ProcessLeaseUnit {
+						t.Fatal("observed a different native identity")
+					}
+					if !live {
+						return nil, 0, errors.New("inactive")
+					}
+					return nativeRuntimeProof(parent, pin, false), 9898, nil
+				}
+				verifyNativeWorkerTermination = func(got aiexecution.FileProof, nativeID, unit string) (*aiexecution.NativeProcessTermination, error) {
+					if live {
+						t.Fatal("live launch queried for termination")
+					}
+					if got != pin || nativeID != parent.Request.NativeSessionID || unit != parent.ProcessLeaseUnit {
+						t.Fatal("wrong original process identity")
+					}
+					return nativeRuntimeProof(parent, pin, true), nil
+				}
+				if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil {
+					t.Fatal("launch_intent generation under a wedge hold was not observed:", err)
+				}
+				after, err := readNativeWorkerReceipt(dir, 1)
+				if err != nil || after.Status != "launched" || after.NativeProcessEvidence == nil || after.OutcomeIntent != nil {
+					t.Fatalf("receipt not projected from the observation: %+v %v", after, err)
+				}
+				if sess.NativeRegistrationHold != "" || sess.WorkerGeneration != 1 || sess.NativeRoleRunID != parent.RoleRunID || sess.ProcessLeaseUnit != parent.ProcessLeaseUnit || f.spawned != 0 || f.stopped != 0 {
+					t.Fatalf("hold not cleared by the observation: %+v", sess)
+				}
+				terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if live {
+					if sess.Status != state.StatusRunning || sess.PID != 4242 || after.PID != 9898 || terminal {
+						t.Fatalf("live launch not adopted: %+v terminal=%v", sess, terminal)
+					}
+				} else if sess.Status != state.StatusDead || sess.PID != 0 || !terminal {
+					t.Fatalf("termination not recorded: %+v terminal=%v", sess, terminal)
+				}
+				if saved, err := state.Load(f.cfg.StateDir); err != nil || saved.Sessions[f.slot].NativeRegistrationHold != "" {
+					t.Fatal("cleared hold not durable", err)
+				}
+			})
+		}
+	}
+}
