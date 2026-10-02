@@ -125,13 +125,18 @@ func ReconcileNativeWorkerRuntime(cfg *config.Config, s *state.State, slot strin
 		}
 		return &NativeRegistrationHold{Code: "native_generation_sealed", LaunchUncertain: true}
 	}
-	if wedge {
+	if wedge && r.Status == "launched" {
 		// The session still owns the exact lease of the unsealed projected
 		// generation: StopProcess and the lease termination path prove and mark
 		// that termination, and the seal follows it. Observing a live launch
 		// here could re-project an already terminal or pr_open session.
 		return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 	}
+	// A launch_intent projected generation under a wedge hold never had its
+	// launch adopted by the session, so no lease path observes it and the hold
+	// would be sticky. It takes the ordinary launch/state gap recovery below,
+	// which adopts the exact live launch or records its verified termination
+	// and clears the hold either way.
 	pin, err := nativeProfileFromReceipt(cfg, r)
 	if err != nil {
 		return err
@@ -571,6 +576,10 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 // every cycle and clears the hold once the generation is sealed and terminal,
 // so a transient failure is never sticky. Only an identity conflict and an
 // authority settlement that denies a next generation are reported as such.
+// An absent projected receipt (projected_receipt_missing), or a receipt or
+// terminal marker that cannot be read or decoded (projected_receipt_undecodable),
+// is likewise a hold, never a plain error: the callers' error path records a
+// failed respawn, which this gap is not.
 func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot string, sess *state.Session) error {
 	if cfg == nil || sess == nil || sess.NativeRoleRunID == "" || cfg.WorkerNativeSessionRegistration == nil || sess.WorkerGeneration == 0 {
 		return nil
@@ -582,7 +591,21 @@ func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot stri
 	}
 	terminal, err := NativeSessionProcessTerminal(cfg.StateDir, slot, sess)
 	if err != nil {
-		return err
+		if hold, ok := NativeHold(err); ok {
+			return &NativeRegistrationHold{Code: hold.Code, LaunchUncertain: hold.LaunchUncertain, Slot: slot, cause: err}
+		}
+		// The projected generation's receipt is absent, or the receipt or its
+		// terminal marker cannot be read or decoded. No successor exists yet,
+		// so this is not a failure of the successor launch but an unproven
+		// projected generation: hold the slot, so the daemon retains the
+		// session and re-inspects the receipt directory every cycle, instead
+		// of returning an error the callers record as a failed respawn.
+		code := "projected_receipt_undecodable"
+		if errors.Is(err, os.ErrNotExist) {
+			code = "projected_receipt_missing"
+		}
+		log.Printf("[worker] native generation %d of %s has no readable projected receipt before its successor: %v", sess.WorkerGeneration, slot, err)
+		return &NativeRegistrationHold{Code: code, LaunchUncertain: true, Slot: slot, cause: err}
 	}
 	if terminal {
 		return nil
