@@ -401,11 +401,12 @@ func TestFirstQueueActionCandidate_RequireLintPassWithholdsReadyLabel(t *testing
 	reader := &fakeReader{issues: []github.Issue{issue}}
 	eng := specGroomEngine(t, reader, passVerdict)
 	eng.cfg.Supervisor.ReadyLabel = "maestro-ready"
+	eng.cfg.Supervisor.AutoPromoteReady = true
 	eng.cfg.Supervisor.SpecGroom.RequireLintPass = true
 	st := state.NewState()
 
 	// No passing lint recorded → the ready-label queue action is withheld.
-	cand, err := eng.firstQueueActionCandidate(st, []github.Issue{issue})
+	cand, _, err := eng.firstQueueActionCandidate(st, []github.Issue{issue}, []github.Issue{issue}, PolicyRuleIssueLabels)
 	if err != nil {
 		t.Fatalf("firstQueueActionCandidate: %v", err)
 	}
@@ -415,7 +416,7 @@ func TestFirstQueueActionCandidate_RequireLintPassWithholdsReadyLabel(t *testing
 
 	// Record a passing lint → the label is now permitted.
 	st.RecordSpecLint(7, specgroom.BodyHash("the body"), true, eng.now())
-	cand, err = eng.firstQueueActionCandidate(st, []github.Issue{issue})
+	cand, _, err = eng.firstQueueActionCandidate(st, []github.Issue{issue}, []github.Issue{issue}, PolicyRuleIssueLabels)
 	if err != nil {
 		t.Fatalf("firstQueueActionCandidate: %v", err)
 	}

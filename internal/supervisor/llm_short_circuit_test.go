@@ -164,6 +164,7 @@ func TestDecideWithLLM_SpawnCandidate_CallsLLM(t *testing.T) {
 func TestDecideWithLLM_LabelIssueReadyWithMutations_SkipsLLM(t *testing.T) {
 	cfg := testConfig(t)
 	cfg.IssueLabels = []string{"maestro-ready"}
+	cfg.Supervisor.AutoPromoteReady = true
 	cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
 	reader := &fakeReader{issues: []github.Issue{testIssue(308, "implement supervisor")}}
 	llm := idleLLM()

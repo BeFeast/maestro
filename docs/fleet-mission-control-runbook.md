@@ -216,6 +216,17 @@ Use this order during normal operations:
 
 Maestro supports a fixed ordered queue and a dynamic wave policy. Use one ordered queue for tightly sequenced work. Use dynamic wave for continuous operations where Mission Control should explain why the next runnable issue was selected or skipped.
 
+Without either policy the supervisor runs the default queue policy. It only dispatches open issues that already carry the ready label (`issue_labels` / `supervisor.ready_label`). It does not add the ready label to other open issues unless `supervisor.auto_promote_ready: true` is set (default `false`), and this holds whether or not the supervisor LLM is enabled:
+
+| Rule | Behavior |
+|---|---|
+| `supervisor.auto_promote_ready: false` (default) | No ready-label promotion under the default policy. Label issues by hand, or use `ordered_queue` / `dynamic_wave` to drive promotion |
+| `supervisor.auto_promote_ready: true` | The first unlabeled open issue that passes the dispatch guards is labelled ready. `add_ready_label` must be in `safe_actions` to apply without an approval |
+| Priority | With `auto_promote_ready`, an issue whose priority label (`p0`..`p3`, unlabeled ranks last) is below the highest-priority open issue already carrying the ready label is not promoted |
+| Validation | `auto_promote_ready` is rejected together with an active `ordered_queue` or `dynamic_wave` (they own promotion), and it requires `supervisor.ready_label` or `issue_labels` |
+
+On every promotion path (default policy, ordered queue, dynamic wave, dependency unblock) an issue carrying an `exclude_labels` / `supervisor.excluded_labels` entry, or whose title marks it as an epic/parent (`Epic:` prefix, also after leading tags such as `[P2]`, or an `(epic)` / `[epic]` marker; case-insensitive), never gets the ready label. The only exception is the supervisor blocked label that the same unblock decision removes. Each withheld promotion is written once per issue to the daemon log (`withholding add_ready_label from issue #N: <reason>`) and added to the decision reasons.
+
 Ordered queue policy:
 
 | Rule | Behavior |
@@ -234,7 +245,7 @@ Dynamic wave policy:
 | Priority order | `p0`, `p1`, `p2`, `p3`, then unlabeled, with lower issue number as tie breaker |
 | Runnable project statuses | Defaults to `Todo`, `To Do`, `Ready`, `Backlog`, and `New`, unless `supervisor.dynamic_wave.runnable_project_statuses` is set |
 | Excluded labels | Built-ins include `blocked`, `wontfix`, `question`, `duplicate`, and `invalid`, plus `exclude_labels`, `supervisor.excluded_labels`, and `supervisor.blocked_label` |
-| Held/meta skips | Mission parents, mission issues awaiting decomposition, epic-like titles, and `epic`/`meta` labels are counted separately from exclusions |
+| Held/meta skips | Mission parents, mission issues awaiting decomposition, epic-marked titles (`Epic:` prefix, `(epic)`, `[epic]`), and `epic`/`meta` labels are counted separately from exclusions |
 | Blocker-dependency skips | Open blockers detected by `blocker_patterns` are counted separately from label-based blocked policy |
 | Other skips | Already running, done, and retry exhausted |
 | Ready label | `supervisor.ready_label` is treated as a queue label and is added to selected work only when `add_ready_label` is allowed |
@@ -369,7 +380,7 @@ Safe response:
 
 1. Run `maestro supervise --config-store ~/.maestro/maestro.db --config-store-project <project> --once --dry-run --json` and read the queue summary.
 2. If there are no open issues, add or wait for work.
-3. If issues are missing the ready label, add the configured `supervisor.ready_label` or let the supervisor add it when `add_ready_label` is allowed.
+3. If issues are missing the ready label, add the configured `supervisor.ready_label` by hand. The supervisor adds it only under `ordered_queue`, `dynamic_wave`, or `supervisor.auto_promote_ready: true`, and only when `add_ready_label` is allowed.
 4. If issues are excluded, remove the blocking/excluded label only after confirming the issue is actually runnable.
 5. If issues are held as parent/meta work, decompose or retitle/relabel only when the issue should become executable work.
 6. If issues are blocked by dependencies, close or resolve the blocker issue before expecting a worker to start.
