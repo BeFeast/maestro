@@ -385,6 +385,82 @@ func nativeLaunchMarker(store *consultationStore, receipt *ConsultationReceipt) 
 	return true, nil
 }
 
+// nativePreLaunchReceiptSealed reports, from the replay path, that the
+// current receipt was an abandoned pre-launch record and has been closed. No
+// capacity was held by it and nothing was launched.
+const nativePreLaunchReceiptSealed = "native_prelaunch_receipt_sealed"
+
+// abandonedPreLaunchReceipt is the durable shape of a consultation that was
+// persisted and then held before any launch: still "prepared", never closed,
+// zero candidates, zero invocations and no planned invocation. The runner
+// writes a launch_intent candidate and launch.json before it starts a
+// process, so this shape cannot have launched. Daemons before the
+// auxiliary-denial fix (#1233 review) left it whenever ReserveAuxiliary
+// refused; a crash between the first persist and the first candidate leaves
+// the same shape.
+func abandonedPreLaunchReceipt(r *ConsultationReceipt, projectID, role string) bool {
+	return r != nil && r.Identity.ProjectID == projectID && r.Identity.Role == role &&
+		r.Status == "prepared" && r.EndedAt == nil && !r.NativeOutcomeComplete && r.PlannedInvocation == nil &&
+		len(r.Candidates) == 0 && len(r.Invocations) == 0
+}
+
+// AbandonedPreLaunchReceipt reports whether the current receipt under
+// stateDir is an abandoned pre-launch record (see abandonedPreLaunchReceipt)
+// for roleRunID with no launch or registration marker. It is the read-only
+// predicate behind the reconcile seal; it takes no lock and writes nothing.
+func AbandonedPreLaunchReceipt(stateDir, roleRunID, projectID, role string) (bool, error) {
+	if uuid.Validate(roleRunID) != nil || projectID == "" || (role != "supervisor" && role != "reviewer") {
+		return false, aiexecution.Held("native_receipt_invalid")
+	}
+	for _, marker := range []string{"launch.json", "registration.json"} {
+		if _, err := readAuxiliaryReceipt(stateDir, marker); err == nil {
+			return false, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	data, err := readAuxiliaryReceipt(stateDir, "current.json")
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	var receipt ConsultationReceipt
+	if aiexecution.DecodeStrict(data, &receipt) != nil || receipt.SchemaVersion != 1 || uuid.Validate(receipt.Identity.ID) != nil {
+		return false, aiexecution.Held("native_receipt_invalid")
+	}
+	return receipt.Identity.ID == roleRunID && abandonedPreLaunchReceipt(&receipt, projectID, role), nil
+}
+
+// sealAbandonedPreLaunchReceipt closes prior in place (status failed,
+// ended_at now) when it is an abandoned pre-launch record and no launch or
+// registration marker survives. The caller holds the consultation store lock,
+// so a live runner (which keeps the lock from its first persist to its final
+// one) can never be observed in this shape. Nothing is deleted: the closed
+// receipt stays current.json until the next consultation archives it as
+// <id>.json. No capacity is released because none was reserved.
+func sealAbandonedPreLaunchReceipt(store *consultationStore, prior *ConsultationReceipt, projectID, role string) (bool, error) {
+	if !abandonedPreLaunchReceipt(prior, projectID, role) {
+		return false, nil
+	}
+	root := filepath.Dir(store.dir)
+	for _, marker := range []string{"launch.json", "registration.json"} {
+		if _, err := readAuxiliaryReceipt(root, marker); err == nil {
+			return false, nil
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return false, err
+		}
+	}
+	end := time.Now().UTC()
+	prior.EndedAt = &end
+	prior.Status = "failed"
+	if err := store.save(prior); err != nil {
+		return false, &ConsultationHold{Code: "receipt_persistence_failed"}
+	}
+	return true, nil
+}
+
 // ReconcileNativeConsultation restores only the same role-run and input. It
 // never acquires another permit, starts a process, or walks the fallback chain.
 func ReconcileNativeConsultation(cfg *config.Config, identity ConsultationIdentity, prompt string) (ConsultationResult, error) {
@@ -420,6 +496,13 @@ func replayNativeConsultation(cfg *config.Config, identity ConsultationIdentity,
 			return result, false, aiexecution.Held("native_receipt_invalid")
 		}
 		if !hasNativeSession(&prior) {
+			sealed, sealErr := sealAbandonedPreLaunchReceipt(store, &prior, cfg.ProjectID, identity.Role)
+			if sealErr != nil {
+				return result, false, sealErr
+			}
+			if sealed {
+				return result, false, aiexecution.Held(nativePreLaunchReceiptSealed)
+			}
 			return result, false, nil
 		}
 		if prior.Identity.ProjectID != cfg.ProjectID || prior.Identity.Role != identity.Role {

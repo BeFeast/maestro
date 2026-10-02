@@ -207,7 +207,13 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 	}
 	if c.cfg.Supervisor.NativeSessionRegistration != nil {
 		if previous, found, err := replayNativeConsultation(c.cfg, identity, prompt); found || err != nil {
-			return previous, err
+			// An abandoned pre-launch receipt sealed on the way in never
+			// launched and holds no capacity; the live consultation proceeds
+			// (the store archives the closed receipt when it opens).
+			var hold *aiexecution.Hold
+			if !errors.As(err, &hold) || hold.Code != nativePreLaunchReceiptSealed {
+				return previous, err
+			}
 		}
 	}
 	store, unlock, err := openConsultationStore(c.cfg.StateDir)
@@ -244,14 +250,6 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 	}
 	launchIntentWritten := false
 	var releaseAux func()
-	if c.cfg.RuntimeAuxiliaryLimiter != nil {
-		releaseAux, err = c.cfg.RuntimeAuxiliaryLimiter.ReserveAuxiliary(c.cfg.StateDir, identity.ID)
-		if err != nil {
-			return result, err
-		}
-	} else if c.cfg.AIExecution.RequireVerifiedRoute || c.executionRole() == "reviewer" {
-		return result, aiexecution.Held("auxiliary_controller_unavailable")
-	}
 	defer func() {
 		if releaseAux != nil && !launchIntentWritten {
 			releaseAux()
@@ -301,6 +299,22 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			}
 		}
 	}()
+	// Capacity is reserved only after the finaliser above is registered
+	// (#1233 review). A refused reservation (auxiliary_capacity_exhausted,
+	// auxiliary_controller_unavailable) is a typed hold before any launch and
+	// must leave a closed receipt: status failed, ended_at set, zero candidates
+	// and invocations. That is the shape review.NativeReviewPreLaunchHoldProof
+	// and the operator-rearm settlement require to prove nothing launched; a
+	// receipt left "prepared" is indistinguishable from an interrupted launch
+	// and silently spends the operator grant.
+	if c.cfg.RuntimeAuxiliaryLimiter != nil {
+		releaseAux, err = c.cfg.RuntimeAuxiliaryLimiter.ReserveAuxiliary(c.cfg.StateDir, identity.ID)
+		if err != nil {
+			return result, err
+		}
+	} else if c.cfg.AIExecution.RequireVerifiedRoute || c.executionRole() == "reviewer" {
+		return result, aiexecution.Held("auxiliary_controller_unavailable")
+	}
 	candidates, err := supervisorBackendCandidates(c.cfg, c.backendHealth, time.Now().UTC())
 	eligible := map[string]bool{}
 	for _, candidate := range candidates {

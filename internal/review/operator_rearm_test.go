@@ -279,6 +279,19 @@ func writeNativeReviewFile(t *testing.T, dir, name string, value any) {
 	}
 }
 
+// nativeRunnerConfig is the configured project as supervisor.CompleteNativeReview
+// sees it: the review store's state dir, the test's limiter as the auxiliary
+// capacity owner and a claude-kind backend that is never started because the
+// reservation is refused first.
+func nativeRunnerConfig(cfg *config.Config, limiter aiexecution.AuxiliaryLimiter) *config.Config {
+	runner := *cfg
+	runner.RuntimeAuxiliaryLimiter = limiter
+	runner.Model = config.ModelConfig{Default: "native", Backends: map[string]config.BackendDef{"native": {Cmd: "/bin/false", Provider: "claude", Model: "claude-opus-5"}}}
+	return &runner
+}
+
+// preLaunchReceipt is the closed pre-launch shape for the modes that simulate
+// a run which reached a launch (marker or invocation added by the caller).
 func preLaunchReceipt(id, projectID string, now time.Time) supervisor.ConsultationReceipt {
 	ended := now
 	return supervisor.ConsultationReceipt{
@@ -350,12 +363,17 @@ func TestNativeOperatorRearmPreLaunchHoldLeavesGrantUnclaimed(t *testing.T) {
 			var claimed string
 			lens := p.Lenses[0].(*NativeClaudeLens)
 			lens.limiter = limiter
-			lens.complete = func(_ context.Context, _ string, id string) (supervisor.NativeReviewResult, error) {
+			lens.complete = func(ctx context.Context, prompt string, id string) (supervisor.NativeReviewResult, error) {
 				calls.Add(1)
 				claimed = id
 				switch mode {
 				case "prelaunch_receipt":
-					writeNativeReviewFile(t, nativeReviewDir(t, cfg.StateDir), "current.json", preLaunchReceipt(id, cfg.ProjectID, p.now()))
+					// The real native runner, refused by the limiter after the
+					// claim's preflight saw capacity: the receipt it leaves is
+					// the proof the settlement reads (#1233 review), not a
+					// fixture.
+					limiter.set("auxiliary_capacity_exhausted")
+					return supervisor.CompleteNativeReview(ctx, nativeRunnerConfig(cfg, limiter), "claude-opus-5", id, prompt)
 				case "store_without_receipt":
 					nativeReviewDir(t, cfg.StateDir)
 				case "launch_marker":
