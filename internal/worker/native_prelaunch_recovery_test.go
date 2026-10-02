@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"syscall"
 	"testing"
 	"time"
 
@@ -222,6 +223,63 @@ func TestNativeWorkerExplicitPrelaunchRecoveryRefusesUncertainOrChangedEvidence(
 			if _, err := os.Stat(filepath.Join(dir, nativeReceiptName(2))); !os.IsNotExist(err) {
 				t.Fatal("refused recovery created a generation")
 			}
+		})
+	}
+}
+
+// fakeHostProcTable points verifyHostRunnerAbsent at a private process table
+// with one process directory owned by the test user, whose cmdline read fails
+// with readErr (nil reads cmdline).
+func fakeHostProcTable(t *testing.T, cmdline string, readErr error) {
+	t.Helper()
+	root := t.TempDir()
+	if err := os.Mkdir(filepath.Join(root, "4242"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "4242", "cmdline"), []byte(cmdline), 0600); err != nil {
+		t.Fatal(err)
+	}
+	oldRoot, oldRead := hostProcRoot, readHostProcFile
+	t.Cleanup(func() { hostProcRoot, readHostProcFile = oldRoot, oldRead })
+	hostProcRoot = root
+	readHostProcFile = func(path string) ([]byte, error) {
+		if readErr != nil && path == filepath.Join(root, "4242", "cmdline") {
+			return nil, &os.PathError{Op: "read", Path: path, Err: readErr}
+		}
+		return os.ReadFile(path)
+	}
+}
+
+// A process that exits between the /proc listing and the cmdline read makes
+// the open succeed and the read fail with ESRCH once it is reaped. That
+// process no longer exists, exactly like the ENOENT case, so it cannot be an
+// orphaned runner; only other read failures leave the host process unknown.
+// Before, ESRCH held native_host_process_unknown and flaked recovery tests.
+func TestVerifyHostRunnerAbsentTreatsReapedProcessAsAbsent(t *testing.T) {
+	runner := filepath.Join(t.TempDir(), "prior-run.sh")
+	for _, tc := range []struct {
+		name    string
+		cmdline string
+		readErr error
+		want    string
+	}{
+		{"reaped_esrch", "", syscall.ESRCH, ""},
+		{"vanished_enoent", "", syscall.ENOENT, ""},
+		{"unrelated_process", "/bin/sleep\x0030\x00", nil, ""},
+		{"exact_runner", runner + "\x00", nil, "native_host_process_exists"},
+		{"unreadable_eacces", "", syscall.EACCES, "native_host_process_unknown"},
+		{"unreadable_eio", "", syscall.EIO, "native_host_process_unknown"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fakeHostProcTable(t, tc.cmdline, tc.readErr)
+			err := verifyHostRunnerAbsent(runner)
+			if tc.want == "" {
+				if err != nil {
+					t.Fatalf("err=%v, want the runner proven absent", err)
+				}
+				return
+			}
+			expectNativeHold(t, err, tc.want, true)
 		})
 	}
 }

@@ -540,11 +540,18 @@ func verifyPreviousHostRunnerRevoked(cfg *config.Config, receipt *NativeWorkerRe
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// hostProcRoot and readHostProcFile are the process table verifyHostRunnerAbsent
+// scans; tests substitute them.
+var (
+	hostProcRoot     = "/proc"
+	readHostProcFile = os.ReadFile
+)
+
 // A vanished tmux pane does not exclude an orphaned _worker-exec process that
 // already passed its controller check. Inspect exact runner/proof arguments
 // before authorizing another host launch for the same native identity.
 func verifyHostRunnerAbsent(runnerPath string) error {
-	entries, err := os.ReadDir("/proc")
+	entries, err := os.ReadDir(hostProcRoot)
 	if err != nil {
 		return &NativeRegistrationHold{Code: "native_host_process_unknown", LaunchUncertain: true}
 	}
@@ -553,7 +560,7 @@ func verifyHostRunnerAbsent(runnerPath string) error {
 		if err != nil || pid <= 0 {
 			continue
 		}
-		root := filepath.Join("/proc", entry.Name())
+		root := filepath.Join(hostProcRoot, entry.Name())
 		info, err := os.Stat(root)
 		if os.IsNotExist(err) {
 			continue
@@ -568,8 +575,10 @@ func verifyHostRunnerAbsent(runnerPath string) error {
 		if st.Uid != 0 && st.Uid != uint32(os.Getuid()) {
 			continue
 		}
-		args, err := os.ReadFile(filepath.Join(root, "cmdline"))
-		if os.IsNotExist(err) {
+		args, err := readHostProcFile(filepath.Join(root, "cmdline"))
+		// A process reaped between the listing and the read is absent: the
+		// open fails with ENOENT, or it succeeds and the read fails with ESRCH.
+		if os.IsNotExist(err) || errors.Is(err, syscall.ESRCH) {
 			continue
 		}
 		if err != nil {
