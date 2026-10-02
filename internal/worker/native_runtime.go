@@ -96,6 +96,23 @@ func ReconcileNativeWorkerRuntime(cfg *config.Config, s *state.State, slot strin
 	if r.ProjectID != cfg.ProjectID || r.Slot != slot || r.IssueNumber != sess.IssueNumber || r.Worktree != sess.Worktree || r.Branch != sess.Branch || (r.Status != "launch_intent" && r.Status != "launched") || r.Acknowledgement == nil {
 		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
 	}
+	wedge := nativePrelaunchWedgeHold(sess.NativeRegistrationHold)
+	if wedge && r.Status == "launched" && sess.ProcessLeaseUnit == "" && sess.ProcessLeaseManager == "" &&
+		(r.OutcomeIntent == nil || previousNativeGenerationOutcome(cfg, r) != nil) {
+		// A wedge hold on a lease-less projected generation whose seal has not
+		// completed: the termination fence held before it could prove, seal and
+		// record this generation (lock contention, authority unavailable, an
+		// observation that did not verify yet), or the seal attempt persisted
+		// its intent and lost the reply. Nothing else seals an unsealed
+		// generation under a hold, so the hold would be sticky; repeat the
+		// fence's own sequence here, under the lock, every cycle. Unproven
+		// termination keeps the hold with nothing persisted.
+		sealed, err := sealNativeGenerationTerminationLocked(cfg, dir, slot, sess, r)
+		if err != nil {
+			return err
+		}
+		return reconcileAbandonedNativeLaunch(cfg, s, slot, sess, dir, sealed)
+	}
 	if r.OutcomeIntent != nil {
 		// The projected generation is already sealed. An unresolved_launch hold
 		// on top of it means the successor launch intent was persisted but the
@@ -103,15 +120,16 @@ func ReconcileNativeWorkerRuntime(cfg *config.Config, s *state.State, slot strin
 		// wedge hold means the successor was registered and the respawn then
 		// held on this generation's termination. Inspect that successor receipt
 		// instead of re-reporting the sealed parent.
-		if sess.NativeRegistrationHold == "unresolved_launch" || nativePrelaunchWedgeHold(sess.NativeRegistrationHold) {
+		if sess.NativeRegistrationHold == "unresolved_launch" || wedge {
 			return reconcileAbandonedNativeLaunch(cfg, s, slot, sess, dir, r)
 		}
 		return &NativeRegistrationHold{Code: "native_generation_sealed", LaunchUncertain: true}
 	}
-	if nativePrelaunchWedgeHold(sess.NativeRegistrationHold) {
-		// The projected generation is not sealed yet: the ordinary hold path
-		// seals it once its termination is proven. Observing a live launch here
-		// could re-project an already terminal or pr_open session.
+	if wedge {
+		// The session still owns the exact lease of the unsealed projected
+		// generation: StopProcess and the lease termination path prove and mark
+		// that termination, and the seal follows it. Observing a live launch
+		// here could re-project an already terminal or pr_open session.
 		return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 	}
 	pin, err := nativeProfileFromReceipt(cfg, r)
@@ -313,12 +331,26 @@ func nativeLaunchAbandonmentPrefix(generation uint64, index int) string {
 	return fmt.Sprintf("launch-abandoned-g%d-%d", generation, index)
 }
 
-// nativePrelaunchWedgeHold reports the holds of the pre-launch wedge: an
-// in-place respawn (or fallover/phase successor) registered generation+1 and
-// then held before launching it because the projected generation had no
-// terminal marker at StopProcess (native_process_identity_missing) or no
-// settled outcome at that moment (previous_outcome_unknown). Both are
-// resolved from the sealed, terminal projected generation.
+// nativePrelaunchWedgeHold reports the holds under which a retained slot may
+// carry a never-launched successor registration, or none at all, on top of a
+// projected generation whose termination still has to be proven and sealed:
+//
+//   - native_process_identity_missing: the termination fence held before any
+//     successor existed, or (before the fence) StopProcess held on the
+//     missing terminal marker after generation+1 was registered.
+//   - previous_outcome_unknown: raised before any successor exists by
+//     prepareNativeWorker and by the fence when the projected generation's
+//     settlement is unavailable or denies a next generation; raised after a
+//     successor was registered by Stop's destructive-outcome check in the
+//     fallover respawn. Without a successor the reconciliation reduces to the
+//     same clearance the daemon's own previous_outcome_unknown branch performs
+//     (sealed with next_generation_allowed and terminal), plus sealing a
+//     lease-less unsealed generation once its termination is proven; with a
+//     registered successor it is the pre-launch wedge.
+//
+// Both are resolved only from a sealed, terminal projected generation; every
+// successor abandonment additionally needs the full absence proof and an
+// authority seal confirming zero physical attempts.
 func nativePrelaunchWedgeHold(code string) bool {
 	return code == "native_process_identity_missing" || code == "previous_outcome_unknown"
 }
@@ -524,11 +556,21 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 // therefore proven and recorded here, before any successor identity exists:
 // observe the original pinned runtime (never signalling), seal the exact
 // binding (what prepareNativeWorker does next anyway), then persist the
-// termination evidence and marker through the ordinary sealed-termination
-// reconciliation. Anything unproven returns the same
+// termination evidence and marker, all under the receipt lock. The session
+// projection itself is never modified here: status, PID, pane and lease are
+// left to the successor launch (or to StopProcess), so a phase transition of a
+// running session cannot flip it to dead.
+//
+// Anything that stops short of a recorded termination returns the same
 // native_process_identity_missing hold StopProcess would return, with nothing
-// minted; the ordinary hold path keeps proving termination and
-// ReconcileNativeWorkerRuntime clears the hold once it is sealed and terminal.
+// minted. That covers genuinely unproven termination (active lease, surviving
+// pane or host runner, no verified termination proof, no verified route) as
+// well as transient failures before the proof is recorded (receipt lock
+// contention, authority unavailable, persistence errors): the daemon routes
+// this hold to ReconcileNativeWorkerRuntime, which repeats the same sequence
+// every cycle and clears the hold once the generation is sealed and terminal,
+// so a transient failure is never sticky. Only an identity conflict and an
+// authority settlement that denies a next generation are reported as such.
 func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot string, sess *state.Session) error {
 	if cfg == nil || sess == nil || sess.NativeRoleRunID == "" || cfg.WorkerNativeSessionRegistration == nil || sess.WorkerGeneration == 0 {
 		return nil
@@ -546,57 +588,95 @@ func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot stri
 		return nil
 	}
 	missing := func(cause error) error {
+		log.Printf("[worker] native generation %d of %s is not recorded terminal before its successor: %v", sess.WorkerGeneration, slot, cause)
 		return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot, cause: cause}
 	}
-	// Verified terminal process state precedes the seal
-	// (docs/strict-ai-execution.md); nothing is persisted by this observation.
-	if err := observeNativeGenerationTerminal(cfg, slot, sess); err != nil {
-		return missing(err)
-	}
-	receipt, err := ReconcileNativeWorkerOutcome(cfg, slot, sess.WorkerGeneration)
+	dir, unlock, err := lockNativeWorker(cfg, slot)
 	if err != nil {
-		return err
-	}
-	if receipt.RoleRunID != sess.NativeRoleRunID || receipt.Request.NativeSessionID != sess.NativeSessionID {
-		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true, Slot: slot}
-	}
-	if err := previousNativeGenerationOutcome(cfg, receipt); err != nil {
-		return err
-	}
-	if err := ReconcileNativeWorkerTermination(cfg, slot, sess); err != nil {
 		return missing(err)
 	}
-	if terminal, err := NativeSessionProcessTerminal(cfg.StateDir, slot, sess); err != nil || !terminal {
+	defer unlock()
+	r, err := readNativeWorkerReceipt(dir, sess.WorkerGeneration)
+	if err != nil {
+		return missing(err)
+	}
+	if _, err := sealNativeGenerationTerminationLocked(cfg, dir, slot, sess, r); err != nil {
+		if hold, ok := NativeHold(err); ok && (hold.Code == "native_identity_conflict" || hold.Code == "previous_outcome_unknown") {
+			return &NativeRegistrationHold{Code: hold.Code, LaunchUncertain: hold.LaunchUncertain, Slot: slot, cause: err}
+		}
 		return missing(err)
 	}
 	return nil
 }
 
-// observeNativeGenerationTerminal proves, without persisting or signalling
-// anything, that the session's projected launched generation has no active
-// exact lease, pane or host runner and that its original pinned runtime
-// reports termination. Only the strict verified route can observe that.
-func observeNativeGenerationTerminal(cfg *config.Config, slot string, sess *state.Session) error {
-	dir, unlock, err := lockNativeWorker(cfg, slot)
+// sealNativeGenerationTerminationLocked proves, seals and records the exact OS
+// termination of the session's projected launched generation r, in that order
+// (verified terminal process state precedes the seal, docs/strict-ai-execution.md):
+//
+//  1. observe the original pinned runtime without persisting or signalling
+//     anything: exact lease inactive, pane and host runner absent, verified
+//     termination proof. Only the strict verified route can observe that. A
+//     generation that already carries the terminal marker was proven earlier
+//     and is not re-observed.
+//  2. seal the exact binding at the authority (idempotent; a persisted seal
+//     intent from an earlier attempt is reused) and require a settlement that
+//     allows a next generation.
+//  3. persist the termination evidence on the receipt and write the terminal
+//     marker, exactly as the sealed-termination reconciliation does.
+//
+// The caller holds the receipt lock. The session projection is not modified;
+// only the receipt directory is. Every failure leaves the receipt in a state
+// the same call reconciles on the next attempt.
+func sealNativeGenerationTerminationLocked(cfg *config.Config, dir, slot string, sess *state.Session, r *NativeWorkerReceipt) (*NativeWorkerReceipt, error) {
+	if sess == nil || sess.NativeReceiptDir != dir || sess.ProcessLeaseUnit != "" || sess.ProcessLeaseManager != "" ||
+		r == nil || r.ProjectID != cfg.ProjectID || r.Slot != slot || r.Generation != sess.WorkerGeneration || r.Status != "launched" || r.Acknowledgement == nil ||
+		r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID ||
+		r.IssueNumber != sess.IssueNumber || r.Worktree != sess.Worktree || r.Branch != sess.Branch {
+		return nil, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true, Slot: slot}
+	}
+	terminal, err := nativeWorkerTerminated(dir, r)
 	if err != nil {
-		return err
+		return nil, &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot, cause: err}
 	}
-	defer unlock()
-	if sess.NativeReceiptDir != dir {
-		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	var proof *aiexecution.NativeProcessTermination
+	if !terminal {
+		if !cfg.AIExecution.RequireVerifiedRoute {
+			return nil, &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot,
+				cause: &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}}
+		}
+		proof, err = observeNativeWorkerTerminationLocked(cfg, r)
+		if err != nil {
+			return nil, &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot, cause: err}
+		}
 	}
-	r, err := readNativeWorkerReceipt(dir, sess.WorkerGeneration)
+	sealed, err := reconcileNativeWorkerOutcomeLocked(cfg, dir, r)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	if r.ProjectID != cfg.ProjectID || r.Slot != slot || r.Status != "launched" || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID {
-		return &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true}
+	if sealed.RoleRunID != sess.NativeRoleRunID || sealed.Request.NativeSessionID != sess.NativeSessionID {
+		return nil, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true, Slot: slot}
 	}
-	if !cfg.AIExecution.RequireVerifiedRoute {
-		return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+	if previousNativeGenerationOutcome(cfg, sealed) != nil || sealed.Outcome.OperatorRetirement != nil {
+		return nil, &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 	}
-	_, err = observeNativeWorkerTerminationLocked(cfg, r)
-	return err
+	if terminal {
+		return sealed, nil
+	}
+	sealed.NativeProcessEvidence = proof
+	if err := persistNativeWorkerReceipt(dir, sealed); err != nil {
+		return nil, &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true, Slot: slot}
+	}
+	// Use the exact verified receipt lease for the marker without restoring a
+	// live lease to the session or weakening markNativeWorkerTerminated's fence.
+	marked := *sess
+	setSessionProcessLease(&marked, tmuxsession.ProcessLease{Unit: sealed.ProcessLeaseUnit, Manager: sealed.ProcessLeaseManager})
+	if err := markNativeWorkerTerminated(&marked); err != nil {
+		return nil, err
+	}
+	if terminal, err := nativeWorkerTerminated(dir, sealed); err != nil || !terminal {
+		return nil, &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot, cause: err}
+	}
+	return sealed, nil
 }
 
 func releaseAbandonedWorkerScratch(cfg *config.Config, slot string, lease tmuxsession.ProcessLease) error {

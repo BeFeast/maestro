@@ -16,6 +16,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
+	"github.com/gofrs/flock"
 	"github.com/google/uuid"
 )
 
@@ -137,7 +138,9 @@ func TestRespawnInPlaceProvesTerminationBeforeRegisteringSuccessor(t *testing.T)
 	}
 	t.Logf("launch held after registration with %s", hold.Code)
 	// f.registered already carries generation 1 from the fixture's own start.
-	if seals != 1 || verified != 2 || len(f.registered) != 2 || f.spawned != 0 || f.stopped != 0 {
+	// The exact termination is observed once, before the seal, and that proof
+	// is the evidence recorded with the marker.
+	if seals != 1 || verified != 1 || len(f.registered) != 2 || f.spawned != 0 || f.stopped != 0 {
 		t.Fatalf("seals=%d verified=%d registered=%d spawned=%d stopped=%d", seals, verified, len(f.registered), f.spawned, f.stopped)
 	}
 	if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || !terminal {
@@ -289,6 +292,9 @@ func prelaunchWedge(t *testing.T, hold string, status state.SessionStatus) *prel
 		t.Fatal(err)
 	}
 	fx := &prelaunchWedgeFixture{f: f, dir: dir, parent: parent, next: &next, proof: proofBytes}
+	// The settlement of the projected generation is read from the receipt, not
+	// stubbed: a held parent outcome must keep the wedge held.
+	previousNativeGenerationOutcome = persistedNativeGenerationOutcome
 	oldSeal, oldAbsence, oldObserve := sealNativeWorker, verifyNativeWorkerPrelaunchAbsence, observeNativeWorkerLaunch
 	t.Cleanup(func() {
 		sealNativeWorker = oldSeal
@@ -454,9 +460,19 @@ func TestNativeRuntimeReconcileKeepsPrelaunchWedgeHeldWithoutProof(t *testing.T)
 				}
 				want = "native_process_identity_missing"
 			case "parent_unsealed":
+				// The terminal parent is sealed by the hold path itself; a
+				// settlement that denies a next generation keeps the
+				// successor registration untouched.
 				fx.parent.OutcomeIntent, fx.parent.Outcome = nil, nil
 				if err := writeNativeWorkerReceipt(fx.dir, fx.parent); err != nil {
 					t.Fatal(err)
+				}
+				sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+					fx.seals++
+					if request.NativeSessionID != fx.parent.Request.NativeSessionID {
+						t.Fatal("successor sealed before the parent settlement was known")
+					}
+					return fixtureNativeOutcome(request, true), nil
 				}
 				want, uncertain = "previous_outcome_unknown", false
 			case "lease_active":
@@ -526,9 +542,294 @@ func TestNativeRuntimeReconcileKeepsPrelaunchWedgeHeldWithoutProof(t *testing.T)
 			if f.st.Sessions[f.slot].NativeRegistrationHold != hold || f.spawned != 0 || f.stopped != 0 {
 				t.Fatal("hold cleared or process touched without proof")
 			}
-			if mode != "attempts_recorded" && mode != "authority_unavailable" && fx.seals != 0 {
+			if mode != "attempts_recorded" && mode != "authority_unavailable" && mode != "parent_unsealed" && fx.seals != 0 {
 				t.Fatal("authority sealed before local absence was proven")
 			}
+			if mode == "parent_unsealed" {
+				if parent, err := readNativeWorkerReceipt(fx.dir, 1); err != nil || fx.seals != 1 || parent.Outcome == nil || parent.Outcome.NextGenerationAllowed {
+					t.Fatalf("terminal unsealed parent not sealed by the hold path: seals=%d err=%v", fx.seals, err)
+				}
+			}
 		})
+	}
+}
+
+// A transient failure inside the termination fence (receipt lock contention,
+// authority unavailable at the seal) must not wedge the slot: the respawn
+// holds with nothing minted, and the daemon's hold reconciliation proves,
+// seals and records the projected generation on a later cycle and clears the
+// hold, after which the respawn mints the successor normally. Before this the
+// fence left native_process_identity_missing on an UNSEALED generation that
+// nothing sealed afterwards.
+func TestTerminationFenceTransientFailureIsReconciledByHoldPath(t *testing.T) {
+	for _, mode := range []string{"lock_contention", "authority_unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			f, parent, pin := cleanExitWithoutMarker(t)
+			sess := f.st.Sessions[f.slot]
+			dir := sess.NativeReceiptDir
+			previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+			seals, verified := 0, 0
+			authorityDown := mode == "authority_unavailable"
+			sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				seals++
+				if request.NativeSessionID != parent.Request.NativeSessionID {
+					t.Fatal("sealed a different registration")
+				}
+				if verified == 0 {
+					t.Fatal("sealed before the exact OS termination was observed")
+				}
+				if authorityDown {
+					return admissioncontrol.NativeOutcome{}, errors.New("socket down")
+				}
+				return fixtureNativeOutcome(request, false), nil
+			}
+			verifyNativeWorkerTermination = func(got aiexecution.FileProof, nativeID, unit string) (*aiexecution.NativeProcessTermination, error) {
+				verified++
+				if got != pin || nativeID != parent.Request.NativeSessionID || unit != parent.ProcessLeaseUnit {
+					t.Fatal("wrong original process identity")
+				}
+				return nativeRuntimeProof(parent, pin, true), nil
+			}
+			var lock *flock.Flock
+			if mode == "lock_contention" {
+				lock = flock.New(filepath.Join(dir, ".lock"))
+				if ok, err := lock.TryLock(); err != nil || !ok {
+					t.Fatal("could not hold the receipt lock", err)
+				}
+				t.Cleanup(func() { _ = lock.Unlock() })
+			}
+			f.cfg.WorkerLaunchContext = &config.WorkerLaunchContext{Role: "repair", ParentRoleRunID: sess.NativeRoleRunID}
+			err := RespawnInPlace(f.cfg, f.slot, sess, f.cfg.Repo, f.issue, "repair prompt", "claude")
+			expectNativeHold(t, err, "native_process_identity_missing", true)
+			// Nothing minted, nothing marked; the registration fixture would have
+			// failed the test had a successor reached the authority.
+			if _, statErr := os.Lstat(filepath.Join(dir, nativeReceiptName(2))); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatal("successor registered during a transient fence failure", statErr)
+			}
+			if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || terminal {
+				t.Fatal("terminal marker written without a completed seal", err)
+			}
+			held, err := readNativeWorkerReceipt(dir, 1)
+			if err != nil || held.Outcome != nil || held.NativeProcessEvidence != nil {
+				t.Fatalf("receipt advanced past the failure: %+v %v", held, err)
+			}
+			switch mode {
+			case "lock_contention":
+				if seals != 0 || verified != 0 || held.OutcomeIntent != nil {
+					t.Fatalf("lock contention observed or sealed anyway: seals=%d verified=%d intent=%v", seals, verified, held.OutcomeIntent)
+				}
+			case "authority_unavailable":
+				// The seal intent is durable so the retry re-seals the same binding.
+				if seals != 1 || verified != 1 || held.OutcomeIntent == nil {
+					t.Fatalf("seals=%d verified=%d intent=%v", seals, verified, held.OutcomeIntent)
+				}
+			}
+			if sess.WorkerGeneration != 1 || sess.Status != state.StatusPROpen || sess.PRNumber != 20 || len(f.registered) != 1 || f.spawned != 0 || f.stopped != 0 {
+				t.Fatalf("projection changed by a held fence: %+v registered=%d", sess, len(f.registered))
+			}
+			// The daemon retains the hold on the restored snapshot and routes it to
+			// the runtime reconciliation on the next cycle.
+			sess.NativeRegistrationHold = "native_process_identity_missing"
+			if err := state.Save(f.cfg.StateDir, f.st); err != nil {
+				t.Fatal(err)
+			}
+			// Still transient: held again, nothing persisted beyond the intent.
+			err = ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot)
+			if mode == "lock_contention" {
+				expectNativeHold(t, err, "generation_in_progress", false)
+			} else {
+				expectNativeHold(t, err, "outcome_authority_unavailable", false)
+			}
+			if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || terminal || sess.NativeRegistrationHold != "native_process_identity_missing" {
+				t.Fatal("hold path recorded termination without a completed seal", err)
+			}
+			// Transient condition gone: the hold path proves, seals, records and clears.
+			if lock != nil {
+				if err := lock.Unlock(); err != nil {
+					t.Fatal(err)
+				}
+			}
+			authorityDown = false
+			if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil {
+				t.Fatal("hold path did not reconcile once the transient failure cleared", err)
+			}
+			if sess.NativeRegistrationHold != "" || sess.WorkerGeneration != 1 || sess.Status != state.StatusPROpen || sess.PRNumber != 20 || sess.NativeRoleRunID != parent.RoleRunID {
+				t.Fatalf("hold not cleared cleanly: %+v", sess)
+			}
+			if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || !terminal {
+				t.Fatal("terminal marker not recorded by the hold path", err)
+			}
+			sealed, err := readNativeWorkerReceipt(dir, 1)
+			if err != nil || sealed.Outcome == nil || !sealed.Outcome.NextGenerationAllowed || sealed.NativeProcessEvidence == nil || sealed.NativeProcessEvidence.LocalStatus == "launch_intent" {
+				t.Fatalf("projected generation not sealed with termination evidence: %+v %v", sealed, err)
+			}
+			if saved, err := state.Load(f.cfg.StateDir); err != nil || saved.Sessions[f.slot].NativeRegistrationHold != "" {
+				t.Fatal("cleared hold not durable", err)
+			}
+			if _, statErr := os.Lstat(filepath.Join(dir, nativeReceiptName(2))); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatal("hold path minted a successor", statErr)
+			}
+			// The ordinary respawn now mints generation 2 on top of the proven
+			// terminal generation and stops at the synthetic route's execution
+			// proof, as in TestRespawnInPlaceProvesTerminationBeforeRegisteringSuccessor.
+			registerNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.RegistrationRequest) (admissioncontrol.Acknowledgement, error) {
+				f.registered = append(f.registered, request)
+				return admissioncontrol.Acknowledgement{Binding: request.Binding, RegistrationVersion: 1}, nil
+			}
+			err = RespawnInPlace(f.cfg, f.slot, sess, f.cfg.Repo, f.issue, "repair prompt", "claude")
+			hold, ok := NativeHold(err)
+			if !ok || hold.Code == "native_process_identity_missing" || hold.LaunchUncertain {
+				t.Fatalf("respawn after reconciliation held with %+v (%v)", hold, err)
+			}
+			if next, err := readNativeWorkerReceipt(dir, 2); err != nil || next.Status != "registered" || next.ParentRoleRunID != parent.RoleRunID {
+				t.Fatalf("successor missing or malformed: %+v %v", next, err)
+			}
+			// lock_contention: observed and sealed once, by the successful hold
+			// path. authority_unavailable: the fence and the first hold-path
+			// attempt each observed and lost the seal reply before the third
+			// attempt sealed. The respawn itself re-sealed nothing.
+			wantSeals := 1
+			if mode == "authority_unavailable" {
+				wantSeals = 3
+			}
+			if seals != wantSeals || verified != wantSeals || len(f.registered) != 2 {
+				t.Fatalf("seals=%d verified=%d registered=%d want %d", seals, verified, len(f.registered), wantSeals)
+			}
+		})
+	}
+}
+
+// Fail-closed: a wedge hold on an unsealed generation whose termination cannot
+// be proven stays held with nothing sealed, persisted or marked.
+func TestNativeRuntimeReconcileKeepsUnsealedWedgeHeldWithoutTerminationProof(t *testing.T) {
+	for _, mode := range []string{"lease_active", "pane_present", "proof_unverified", "verified_route_off"} {
+		t.Run(mode, func(t *testing.T) {
+			f, parent, _ := cleanExitWithoutMarker(t)
+			sess := f.st.Sessions[f.slot]
+			dir := sess.NativeReceiptDir
+			previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+			sealNativeWorker = func(admissioncontrol.Client, admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				t.Fatal("sealed a generation whose termination was not proven")
+				return admissioncontrol.NativeOutcome{}, nil
+			}
+			verifyNativeWorkerTermination = func(aiexecution.FileProof, string, string) (*aiexecution.NativeProcessTermination, error) {
+				return nil, errors.New("journal unavailable")
+			}
+			switch mode {
+			case "lease_active":
+				workerProcessLeaseActive = func(tmuxsession.ProcessLease) (bool, error) { return true, nil }
+			case "pane_present":
+				nativeWorkerPaneAbsent = func(string) (bool, error) { return false, nil }
+			case "verified_route_off":
+				f.cfg.AIExecution.RequireVerifiedRoute = false
+			}
+			sess.NativeRegistrationHold = "native_process_identity_missing"
+			sess.Status = state.StatusDead
+			if err := state.Save(f.cfg.StateDir, f.st); err != nil {
+				t.Fatal(err)
+			}
+			err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot)
+			if mode == "verified_route_off" {
+				if err != nil {
+					t.Fatal("runtime reconciliation ran without the verified route", err)
+				}
+			} else {
+				expectNativeHold(t, err, "native_process_identity_missing", true)
+			}
+			if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || terminal {
+				t.Fatal("terminal marker written without proof", err)
+			}
+			if r, err := readNativeWorkerReceipt(dir, 1); err != nil || r.OutcomeIntent != nil || r.Outcome != nil || r.NativeProcessEvidence != nil {
+				t.Fatalf("receipt changed without proof: %+v %v", r, err)
+			}
+			if sess.NativeRegistrationHold != "native_process_identity_missing" || sess.Status != state.StatusDead || sess.WorkerGeneration != 1 || sess.NativeRoleRunID != parent.RoleRunID {
+				t.Fatalf("projection changed without proof: %+v", sess)
+			}
+		})
+	}
+}
+
+// The terminal, still unsealed parent of a registered successor (the seal was
+// lost after the marker was written) is sealed by the hold path before the
+// successor is abandoned.
+func TestNativeRuntimeReconcileSealsTerminalUnsealedParentBeforeAbandoningSuccessor(t *testing.T) {
+	fx := prelaunchWedge(t, "native_process_identity_missing", state.StatusDead)
+	f := fx.f
+	fx.parent.OutcomeIntent, fx.parent.Outcome = nil, nil
+	if err := writeNativeWorkerReceipt(fx.dir, fx.parent); err != nil {
+		t.Fatal(err)
+	}
+	previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+	var order []string
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		fx.seals++
+		switch request.NativeSessionID {
+		case fx.parent.Request.NativeSessionID:
+			order = append(order, "parent")
+		case fx.next.Request.NativeSessionID:
+			order = append(order, "successor")
+		default:
+			t.Fatal("sealed an unknown registration")
+		}
+		return fixtureNativeOutcome(request, false), nil
+	}
+	verifyNativeWorkerTermination = func(aiexecution.FileProof, string, string) (*aiexecution.NativeProcessTermination, error) {
+		t.Fatal("re-observed a generation that already carries the terminal marker")
+		return nil, nil
+	}
+	if err := ReconcileNativeWorkerRuntime(f.cfg, f.st, f.slot); err != nil {
+		t.Fatal(err)
+	}
+	sess := f.st.Sessions[f.slot]
+	if sess.NativeRegistrationHold != "" || !reflect.DeepEqual(order, []string{"parent", "successor"}) || fx.absence != 1 || sess.WorkerGeneration != 1 || sess.Status != state.StatusDead {
+		t.Fatalf("hold=%q order=%v absence=%d sess=%+v", sess.NativeRegistrationHold, order, fx.absence, sess)
+	}
+	if parent, err := readNativeWorkerReceipt(fx.dir, 1); err != nil || parent.Outcome == nil || !parent.Outcome.NextGenerationAllowed {
+		t.Fatalf("parent not sealed: %+v %v", parent, err)
+	}
+	if _, err := os.Lstat(filepath.Join(fx.dir, nativeReceiptName(2))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("successor registration not archived", err)
+	}
+	if _, err := os.Lstat(filepath.Join(fx.dir, nativeLaunchAbandonmentPrefix(2, 1)+".receipt.json")); err != nil {
+		t.Fatal("abandonment archive missing", err)
+	}
+}
+
+// The fence never touches the session projection: a running session that
+// reaches a phase transition without its exact lease (StartPhase) keeps its
+// status, timestamps and runtime fields, and only the receipt directory
+// records the proven termination.
+func TestTerminationFenceLeavesSessionProjectionUntouched(t *testing.T) {
+	f, parent, pin := cleanExitWithoutMarker(t)
+	sess := f.st.Sessions[f.slot]
+	previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		return fixtureNativeOutcome(request, false), nil
+	}
+	verifyNativeWorkerTermination = func(aiexecution.FileProof, string, string) (*aiexecution.NativeProcessTermination, error) {
+		return nativeRuntimeProof(parent, pin, true), nil
+	}
+	sess.Status = state.StatusRunning
+	sess.PID, sess.TmuxSession = 4040, TmuxSessionName(f.slot)
+	sess.FinishedAt, sess.WorkerEndedAt = nil, nil
+	started := time.Now().Add(-2 * time.Hour).UTC()
+	sess.StartedAt = started
+	before := *sess
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(f.cfg, f.slot, sess); err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(before, *sess) {
+		t.Fatalf("fence modified the session projection:\n before=%+v\n after=%+v", before, *sess)
+	}
+	if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || !terminal {
+		t.Fatal("terminal marker not recorded", err)
+	}
+	// Idempotent: a recorded generation is not re-observed or re-sealed.
+	verifyNativeWorkerTermination = func(aiexecution.FileProof, string, string) (*aiexecution.NativeProcessTermination, error) {
+		t.Fatal("re-observed a recorded generation")
+		return nil, nil
+	}
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(f.cfg, f.slot, sess); err != nil {
+		t.Fatal(err)
 	}
 }
