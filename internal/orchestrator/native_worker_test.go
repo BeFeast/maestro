@@ -13,6 +13,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
@@ -252,5 +253,122 @@ func TestNativeWorkerParkedHoldNotificationScope(t *testing.T) {
 	o.retainNativeWorkerHold("fixture-1", sess, parkedHold)
 	if got := parked(); len(got) != 3 {
 		t.Fatalf("parked hold notifications = %q, want one per slot and generation", got)
+	}
+}
+
+// nativeHoldRoutingState holds one slot per routing shape at cycle start.
+func nativeHoldRoutingState() *state.State {
+	s := state.NewState()
+	s.Sessions["fixture-1"] = &state.Session{IssueNumber: 21, Status: state.StatusFailed, NativeRegistrationHold: "binding_inventory_incomplete", Worktree: "/worktrees/fixture-1", Branch: "feat/fixture-1-21"}
+	s.Sessions["fixture-2"] = &state.Session{IssueNumber: 22, Status: state.StatusDead, NativeRegistrationHold: "native_process_identity_missing", WorkerGeneration: 3, NativeRoleRunID: "00000000-0000-4000-8000-000000000003"}
+	s.Sessions["fixture-3"] = &state.Session{IssueNumber: 23, Status: state.StatusFailed, NativeRegistrationHold: "unresolved_launch"}
+	s.Sessions["fixture-4"] = &state.Session{IssueNumber: 24, Status: state.StatusRunning}
+	s.Sessions["fixture-5"] = &state.Session{IssueNumber: 25, Status: state.StatusFailed, NativeRegistrationHold: "setup_failed", ReleasedForRedispatch: true}
+	s.Sessions["fixture-6"] = &state.Session{IssueNumber: 26, Status: state.StatusPROpen, NativeRegistrationHold: "setup_failed", WorkerGeneration: 2, NativeRoleRunID: "00000000-0000-4000-8000-000000000006"}
+	return s
+}
+
+func nativeHoldRoutingOrchestrator(t *testing.T, runtime, expiry map[string]int) *Orchestrator {
+	t.Helper()
+	cfg := &config.Config{StateDir: t.TempDir(), AIExecution: aiexecution.Policy{RequireVerifiedRoute: true}}
+	return &Orchestrator{cfg: cfg, notifier: &notify.Notifier{},
+		nativeRuntimeReconcileFn: func(_ *config.Config, _ *state.State, slot string) error {
+			runtime[slot]++
+			return &worker.NativeRegistrationHold{Code: "native_launch_abandonment_unproven"}
+		},
+		nativePrelaunchExpiryFn: func(_ *config.Config, s *state.State, slot string) (bool, error) {
+			expiry[slot]++
+			sess := s.Sessions[slot]
+			sess.NativeRegistrationHold = ""
+			sess.ReleasedForRedispatch = true
+			sess.WorkerOutcome = state.WorkerOutcomeNativePrelaunchAbandoned
+			return true, nil
+		}}
+}
+
+// Each held slot reaches exactly one reconciler per cycle: wedge/launch-gap
+// holds the exact runtime reconciliation, a failed first-generation hold the
+// expired pre-launch reconciliation; everything else is left alone. A released
+// slot is not routed again on the next cycle (idempotent).
+func TestNativeHoldsAtCycleStartRouteEachSlotOnce(t *testing.T) {
+	runtime, expiry := map[string]int{}, map[string]int{}
+	o := nativeHoldRoutingOrchestrator(t, runtime, expiry)
+	s := nativeHoldRoutingState()
+	if !s.IssueHasNonFreshClaim(21) {
+		t.Fatal("fixture: the held failed slot must claim its issue")
+	}
+	o.reconcileNativeHoldsAtCycleStart(s)
+	wantRuntime := map[string]int{"fixture-2": 1, "fixture-3": 1}
+	wantExpiry := map[string]int{"fixture-1": 1}
+	if len(runtime) != len(wantRuntime) || runtime["fixture-2"] != 1 || runtime["fixture-3"] != 1 {
+		t.Fatalf("runtime routing=%v want %v", runtime, wantRuntime)
+	}
+	if len(expiry) != len(wantExpiry) || expiry["fixture-1"] != 1 {
+		t.Fatalf("expiry routing=%v want %v", expiry, wantExpiry)
+	}
+	if s.IssueHasNonFreshClaim(21) {
+		t.Fatal("released slot still claims its issue")
+	}
+	o.reconcileNativeHoldsAtCycleStart(s)
+	if expiry["fixture-1"] != 1 || len(expiry) != 1 || runtime["fixture-2"] != 2 || runtime["fixture-3"] != 2 {
+		t.Fatalf("second cycle: runtime=%v expiry=%v", runtime, expiry)
+	}
+}
+
+// Releasing a held issue re-enables dispatch, so it waits while the project
+// is paused, drained or emergency-stopped; runtime reconciliation of wedge
+// holds (which never releases an issue) still runs.
+func TestNativeHoldsAtCycleStartDeferExpiredPrelaunchWhileStopped(t *testing.T) {
+	for _, mode := range []string{"paused", "drained", "emergency"} {
+		t.Run(mode, func(t *testing.T) {
+			runtime, expiry := map[string]int{}, map[string]int{}
+			o := nativeHoldRoutingOrchestrator(t, runtime, expiry)
+			s := nativeHoldRoutingState()
+			switch mode {
+			case "paused":
+				s.Paused = true
+			case "drained":
+				s.SpawnDrain = true
+			case "emergency":
+				o.SetEmergencyHalt(func() bool { return true })
+			}
+			o.reconcileNativeHoldsAtCycleStart(s)
+			if len(expiry) != 0 {
+				t.Fatalf("expired prelaunch reconciled while %s: %v", mode, expiry)
+			}
+			if sess := s.Sessions["fixture-1"]; sess.NativeRegistrationHold != "binding_inventory_incomplete" || sess.ReleasedForRedispatch || !s.IssueHasNonFreshClaim(21) {
+				t.Fatalf("held slot changed while %s: %+v", mode, sess)
+			}
+			if runtime["fixture-2"] != 1 || runtime["fixture-3"] != 1 {
+				t.Fatalf("runtime reconciliation skipped while %s: %v", mode, runtime)
+			}
+		})
+	}
+}
+
+func TestNativeHoldsAtCycleStartRequireVerifiedRoute(t *testing.T) {
+	runtime, expiry := map[string]int{}, map[string]int{}
+	o := nativeHoldRoutingOrchestrator(t, runtime, expiry)
+	o.cfg.AIExecution = aiexecution.Policy{}
+	o.reconcileNativeHoldsAtCycleStart(nativeHoldRoutingState())
+	if len(runtime) != 0 || len(expiry) != 0 {
+		t.Fatalf("reconciled without the verified route: runtime=%v expiry=%v", runtime, expiry)
+	}
+}
+
+// A typed hold from the expired pre-launch reconciliation keeps the slot held
+// and claimed; the next cycle tries again.
+func TestNativeHoldsAtCycleStartKeepHoldOnExpiredPrelaunchFailure(t *testing.T) {
+	runtime, expiry := map[string]int{}, map[string]int{}
+	o := nativeHoldRoutingOrchestrator(t, runtime, expiry)
+	o.nativePrelaunchExpiryFn = func(_ *config.Config, _ *state.State, slot string) (bool, error) {
+		expiry[slot]++
+		return false, &worker.NativeRegistrationHold{Code: "outcome_authority_unavailable", LaunchUncertain: true}
+	}
+	s := nativeHoldRoutingState()
+	o.reconcileNativeHoldsAtCycleStart(s)
+	o.reconcileNativeHoldsAtCycleStart(s)
+	if expiry["fixture-1"] != 2 || s.Sessions["fixture-1"].NativeRegistrationHold != "binding_inventory_incomplete" || !s.IssueHasNonFreshClaim(21) {
+		t.Fatalf("expiry=%v session=%+v", expiry, s.Sessions["fixture-1"])
 	}
 }

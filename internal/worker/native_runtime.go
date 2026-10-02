@@ -443,9 +443,43 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 		(launchIntent && r.LogFile != filepath.Join(state.LogDir(cfg.StateDir), slot+".log")) || (registered && r.LogFile != "") {
 		return &NativeRegistrationHold{Code: "native_launch_abandonment_unproven", LaunchUncertain: true}
 	}
+	prefix, err := abandonNeverLaunchedNativeRegistrationLocked(cfg, dir, slot, r, launchIntent, hold)
+	if err != nil {
+		return err
+	}
+	log.Printf("[worker] native launch abandoned for %s: generation %d (%s) sealed with zero attempts and archived as %s; hold %s cleared", slot, next, r.Status, prefix, hold)
+	sess.NativeRegistrationHold = ""
+	return state.Save(cfg.StateDir, s)
+}
+
+// abandonNeverLaunchedNativeRegistrationLocked retires one registration that
+// provably never produced a process and archives its receipt. The caller holds
+// the receipt lock and has already established that r is the exact
+// never-launched registration it means to retire (identity, status, no PID, no
+// outcome, no evidence, log file as expected for launchIntent). In order:
+//
+//  1. no terminal marker (any marker contradicts "never launched");
+//  2. absence proofs: no surviving monitor claim (VerifyNativePrelaunchAbsence
+//     against the exact execution proof for launch_intent, or the live policy
+//     pin for a registered receipt that never reached a proof), inactive OS
+//     lease, absent pane and absent host runner;
+//  3. the exact seal request is persisted as an intent sidecar, then sealed at
+//     the authority, which must confirm no_dispatch with zero physical
+//     attempts and allow a next generation;
+//  4. the outcome record (and, for launch_intent, the execution proof) is
+//     archived, the exact orphaned scratch lease is released and the receipt is
+//     renamed to <prefix>.receipt.json.
+//
+// Every failure leaves the receipt in place and returns a typed hold; the same
+// call repeats idempotently (the persisted intent is reused). It never launches
+// or signals a process and never touches the session projection; it returns
+// the archive prefix.
+func abandonNeverLaunchedNativeRegistrationLocked(cfg *config.Config, dir, slot string, r *NativeWorkerReceipt, launchIntent bool, hold string) (string, error) {
+	next := r.Generation
+	var err error
 	// Any terminal marker, including a malformed one, contradicts "never launched".
 	if _, err := os.Lstat(filepath.Join(dir, nativeReceiptName(next)+".terminated")); !errors.Is(err, os.ErrNotExist) {
-		return &NativeRegistrationHold{Code: "native_recovery_terminal_conflict", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "native_recovery_terminal_conflict", LaunchUncertain: true}
 	}
 	// Absence proofs: no surviving monitor claim, inactive OS lease, absent
 	// pane and absent host runner. A launch_intent receipt is additionally
@@ -459,38 +493,38 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 	if launchIntent {
 		proofBytes, err = readOwnedRegularNoFollow(proofPath, 128<<10)
 		if err != nil {
-			return &NativeRegistrationHold{Code: "native_runtime_proof_invalid", LaunchUncertain: true}
+			return "", &NativeRegistrationHold{Code: "native_runtime_proof_invalid", LaunchUncertain: true}
 		}
 		pin, err = nativeProfileFromReceipt(cfg, r)
 	} else {
 		pin, err = aiexecution.ContainmentProfilePin(cfg.AIExecution, slot, r.Request.Role)
 	}
 	if err != nil {
-		return err
+		return "", err
 	}
 	if err := verifyNativeWorkerPrelaunchAbsence(pin, r.ProjectID, r.Request.NativeSessionID, r.ProcessLeaseUnit); err != nil {
-		return err
+		return "", err
 	}
 	lease := tmuxsession.ProcessLease{Unit: r.ProcessLeaseUnit, Manager: r.ProcessLeaseManager}
 	if active, err := workerProcessLeaseActive(lease); err != nil || active {
-		return &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "native_process_unknown", LaunchUncertain: true}
 	}
 	if absent, err := nativeWorkerPaneAbsent(TmuxSessionName(slot)); err != nil || !absent {
-		return &NativeRegistrationHold{Code: "native_host_runtime_unknown", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "native_host_runtime_unknown", LaunchUncertain: true}
 	}
 	if err := verifyHostRunnerAbsent(filepath.Join(cfg.StateDir, slot+"-run.sh")); err != nil {
-		return err
+		return "", err
 	}
 	// Retire the registration at the authority. Sealing is idempotent and must
 	// confirm zero physical attempts: any recorded request contradicts the local
 	// absence evidence and keeps the receipt held for operator inspection.
 	client, err := nativeClient(cfg)
 	if err != nil {
-		return err
+		return "", err
 	}
 	before, err := readOwnedRegularNoFollow(filepath.Join(dir, nativeReceiptName(next)), 64<<10)
 	if err != nil {
-		return &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_invalid", LaunchUncertain: true}
 	}
 	receiptSum := sha256.Sum256(before)
 	proofSHA := ""
@@ -504,18 +538,18 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 	// was retired, so the retry re-seals the same registration idempotently.
 	prefix, intent, err := nativeLaunchAbandonmentIntent(dir, slot, next, r, hex.EncodeToString(receiptSum[:]))
 	if err != nil {
-		return err
+		return "", err
 	}
 	seal := intent.OutcomeIntent
 	outcome, err := sealNativeWorker(client, seal)
 	if err != nil {
-		return &NativeRegistrationHold{Code: "outcome_authority_unavailable", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "outcome_authority_unavailable", LaunchUncertain: true}
 	}
 	if admissioncontrol.ValidateNativeOutcome(outcome, seal) != nil {
-		return &NativeRegistrationHold{Code: "outcome_response_invalid", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "outcome_response_invalid", LaunchUncertain: true}
 	}
 	if !outcome.NextGenerationAllowed || outcome.PhysicalAttempts != 0 || outcome.Outcome != "no_dispatch" || outcome.OperatorRetirement != nil {
-		return &NativeRegistrationHold{Code: "native_launch_abandonment_contradicted", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "native_launch_abandonment_contradicted", LaunchUncertain: true}
 	}
 	// Archive before any destructive step. The receipt itself is renamed, not
 	// deleted, after its sidecars are durable.
@@ -525,30 +559,28 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 		OutcomeIntent: seal, Outcome: outcome, WorkerExecHold: NativeWorkerExecHold(r.LogFile), ClearedHold: hold}
 	recordBytes, err := json.Marshal(record)
 	if err != nil {
-		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
 	}
 	if proofBytes != nil && writeFileAtomicMode(dir, filepath.Join(dir, prefix+".execution.json"), string(proofBytes), 0600) != nil {
-		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
 	}
 	if writeFileAtomicMode(dir, filepath.Join(dir, prefix+".outcome.json"), string(recordBytes), 0600) != nil ||
 		syncNativeDir(dir) != nil {
-		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
 	}
 	// Release only the exact scratch manifest of this never-launched lease. A
 	// missing manifest means it was already released; anything ambiguous stays
 	// for the exact lease reconciler, which no longer sees a native hold here.
 	if err := releaseAbandonedWorkerScratch(cfg, slot, lease); err != nil {
-		return err
+		return "", err
 	}
 	if err := os.Rename(filepath.Join(dir, nativeReceiptName(next)), filepath.Join(dir, prefix+".receipt.json")); err != nil {
-		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
 	}
 	if err := syncNativeDir(dir); err != nil {
-		return &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
+		return "", &NativeRegistrationHold{Code: "receipt_persistence_failed", LaunchUncertain: true}
 	}
-	log.Printf("[worker] native launch abandoned for %s: generation %d (%s) sealed with zero attempts and archived as %s; hold %s cleared", slot, next, r.Status, prefix, hold)
-	sess.NativeRegistrationHold = ""
-	return state.Save(cfg.StateDir, s)
+	return prefix, nil
 }
 
 // ensureNativeGenerationTerminalBeforeSuccessor fences every path that mints

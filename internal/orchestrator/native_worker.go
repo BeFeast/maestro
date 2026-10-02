@@ -103,6 +103,50 @@ func nativeRuntimeReconcileHold(code string) bool {
 	return false
 }
 
+// reconcileNativeHoldsAtCycleStart runs the exact native hold reconcilers once
+// per cycle, before any lease, status or scheduling decision (and therefore
+// also on the first cycle after a daemon restart). Each slot reaches at most
+// one reconciler per cycle:
+//
+//   - the launch/state gap and pre-launch wedge holds go to the exact runtime
+//     reconciliation (worker.ReconcileNativeWorkerRuntime);
+//   - any other hold on a failed first-generation start goes to the expired
+//     pre-launch reconciliation (worker.ReconcileExpiredNativePrelaunch), which
+//     retires a registration that expired or was revoked before launch and
+//     releases the issue for redispatch. Releasing re-enables dispatch, so it
+//     only runs while the project is not paused, drained or emergency-stopped.
+//
+// Only the verified route records the evidence these reconcilers need.
+func (o *Orchestrator) reconcileNativeHoldsAtCycleStart(s *state.State) {
+	if o.cfg == nil || s == nil || !o.cfg.AIExecution.RequireVerifiedRoute {
+		return
+	}
+	runtimeFn := o.nativeRuntimeReconcileFn
+	if runtimeFn == nil {
+		runtimeFn = worker.ReconcileNativeWorkerRuntime
+	}
+	expiryFn := o.nativePrelaunchExpiryFn
+	if expiryFn == nil {
+		expiryFn = worker.ReconcileExpiredNativePrelaunch
+	}
+	releaseAllowed := !s.PauseActive() && !s.DrainActive() && (o.emergencyHaltFn == nil || !o.emergencyHaltFn())
+	for _, slot := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slot]
+		switch {
+		case sess == nil:
+		case nativeRuntimeReconcileHold(sess.NativeRegistrationHold):
+			if err := runtimeFn(o.cfg, s, slot); err != nil {
+				log.Printf("[orch] exact native runtime reconciliation held for %s: %v%s", slot, err, nativeWorkerExecHoldSuffix(sess))
+			}
+		case releaseAllowed && worker.NativePrelaunchExpiryCandidate(sess):
+			hold := sess.NativeRegistrationHold
+			if _, err := expiryFn(o.cfg, s, slot); err != nil {
+				log.Printf("[orch] expired native prelaunch reconciliation held for %s (hold %s): %v", slot, hold, err)
+			}
+		}
+	}
+}
+
 // nativeWorkerExecHoldSuffix appends the hold code the host runner wrote to the
 // worker log, so an unresolved_launch journal line names the actual refusal
 // (for example containment_forgejo_authorization_unverified) instead of only

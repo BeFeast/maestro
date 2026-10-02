@@ -103,6 +103,13 @@ const (
 	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
 	// must not consume the per-issue retry budget.
 	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
+	// WorkerOutcomeNativePrelaunchAbandoned marks a failed first-generation
+	// native session whose registration expired (or was revoked) before any
+	// launch: the authority sealed it with zero physical attempts, its receipt
+	// was archived and the issue was released for a fresh dispatch. Nothing
+	// ran, so it is not evidence that the issue is hard and must not consume
+	// the per-issue retry budget.
+	WorkerOutcomeNativePrelaunchAbandoned = "native_prelaunch_abandoned"
 )
 
 const (
@@ -5321,7 +5328,7 @@ func sessionProvesFailedAttempt(sess *Session) bool {
 		return false
 	}
 	switch sess.WorkerOutcome {
-	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled, WorkerOutcomeNativePrelaunchAbandoned:
 		return false
 	}
 	return true
