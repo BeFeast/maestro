@@ -2696,6 +2696,10 @@ type Config struct {
 	Server                          ServerConfig                     `yaml:"server"`
 	Supervisor                      SupervisorConfig                 `yaml:"supervisor"`
 	Repo                            string                           `yaml:"repo"`
+	// RuntimeNativeLaneReadiness is installed by the supported controller. It
+	// probes the managed lane before any native registration so a lane that is
+	// not ready pauses launches instead of holding sessions.
+	RuntimeNativeLaneReadiness aiexecution.LaneReadiness `yaml:"-" json:"-"`
 	// ProjectID is the optional stable UUID identifying this project durably,
 	// independent of the mutable repo/state/store names (#869). Empty for legacy
 	// rows; validated as a canonical UUID when present and kept immutable across

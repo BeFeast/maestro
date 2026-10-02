@@ -277,6 +277,10 @@ type Session struct {
 	NativeRoleRunID        string `json:"native_role_run_id,omitempty"`
 	NativeParentRoleRunID  string `json:"native_parent_role_run_id,omitempty"`
 	NativeRole             string `json:"native_role,omitempty"`
+	// NativeLaneDeferred is in-memory only: a launch in this call paused
+	// before registration because the managed lane was not ready. The caller
+	// restores its pre-call snapshot; nothing is persisted, no retry is spent.
+	NativeLaneDeferred string `json:"-"`
 	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
 	// Unit/scope intentionally duplicate the process receipt so reconciliation
 	// can reject corrupted cross-ownership without inventing another owner.

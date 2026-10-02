@@ -120,6 +120,12 @@ func startReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	defer func() {
+		if h, ok := NativeHold(resultErr); ok && h.Deferred {
+			// Paused before registration: no session, receipt or hold is
+			// created, and an existing held projection keeps its own code.
+			h.Slot = slotName
+			return
+		}
 		if h, ok := NativeHold(resultErr); ok {
 			h.Slot = slotName
 			resultSlot = slotName

@@ -473,7 +473,13 @@ func (s *AttemptStore) NativeRearmQueued(cfg *config.Config, scope AttemptScope,
 		return false
 	}
 	lens := &NativeClaudeLens{policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: cfg.Supervisor.NativeSessionRegistration.BudgetRunID}
-	preflight := func() string { return auxiliaryPreflight(cfg.RuntimeAuxiliaryLimiter, s.StateDir) }
+	preflight := func() string {
+		if err := nativeLaneReadiness(cfg.RuntimeNativeLaneReadiness, cfg.AIExecution); err != nil {
+			code, _ := typedNativeHold(err)
+			return code
+		}
+		return auxiliaryPreflight(cfg.RuntimeAuxiliaryLimiter, s.StateDir)
+	}
 	return s.operatorRearmReady(scope, st.ReviewAttempts[scope.key()], r.ID, lens, preflight, now)
 }
 

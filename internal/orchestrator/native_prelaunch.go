@@ -55,6 +55,35 @@ func (o *Orchestrator) recoverNativePrelaunchWorkers(s *state.State) {
 	}
 }
 
+// resumeLaneHeldPrelaunchWorkers resumes first-generation registrations that
+// a managed-lane binding hold stopped before launch intent, once the lane is
+// observed ready again. It uses the explicit recovery path unchanged
+// (capacity, issue and PR checks, fleet permit, exact receipt and absence
+// proofs); a failure leaves the session as it was or re-holds it with the new
+// code. Bounded per registration; launch-intent holds stay operator decisions.
+func (o *Orchestrator) resumeLaneHeldPrelaunchWorkers(s *state.State) {
+	if o.cfg == nil || o.cfg.RuntimeNativeLaneReadiness == nil || o.cfg.WorkerNativeSessionRegistration == nil || s == nil {
+		return
+	}
+	for _, slot := range sortedStateSessionNames(s) {
+		sess := s.Sessions[slot]
+		selectFn := o.nativeLaneHeldPrelaunchFn
+		if selectFn == nil {
+			selectFn = worker.NativeLaneHeldPrelaunch
+		}
+		id, ok := selectFn(o.cfg, slot, sess)
+		if !ok {
+			continue
+		}
+		code := sess.NativeRegistrationHold
+		if err := o.recoverNativePrelaunchWorker(s, NativePrelaunchRecovery{ProjectID: o.cfg.ProjectID, Slot: slot, NativeSessionID: id}); err != nil {
+			log.Printf("[orch] native lane ready; resuming %s held by %s is deferred: %v", slot, code, err)
+			continue
+		}
+		log.Printf("[orch] native lane ready; resumed %s held by %s from its registered pre-launch receipt", slot, code)
+	}
+}
+
 func (o *Orchestrator) recoverNativePrelaunchWorker(s *state.State, request NativePrelaunchRecovery) error {
 	if request.ProjectID != o.cfg.ProjectID {
 		return fmt.Errorf("project identity mismatch")
@@ -69,6 +98,9 @@ func (o *Orchestrator) recoverNativePrelaunchWorker(s *state.State, request Nati
 		if hold, _ := o.spawnResourceHoldFn(); hold {
 			return fmt.Errorf("host resource hold")
 		}
+	}
+	if hold, code := o.nativeLaneHold(); hold {
+		return fmt.Errorf("native lane not ready: %s", code)
 	}
 	sess := s.Sessions[request.Slot]
 	if sess == nil || sess.Status != state.StatusFailed || sess.NativeRegistrationHold == "" {

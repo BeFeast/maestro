@@ -144,6 +144,9 @@ type Orchestrator struct {
 	workerStartClaimedFn      func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
 	nativePrelaunchRecoveries []NativePrelaunchRecovery
 	nativePrelaunchRecoverFn  func(*config.Config, *state.State, string, github.Issue, string, string, string) (string, error)
+	// nativeLaneHeldPrelaunchFn selects lane-held registered first spawns
+	// (worker.NativeLaneHeldPrelaunch); tests substitute it.
+	nativeLaneHeldPrelaunchFn func(*config.Config, string, *state.Session) (string, bool)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -2946,6 +2949,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 	}
 
 	respawned := 0
+	// The lane is probed once, lazily, after the terminal settlement above and
+	// only when a due retry is about to respawn.
+	laneChecked := false
 	for _, slotName := range slotNames {
 		if respawned >= slots {
 			log.Printf("[orch] retry queue still has pending session(s), but retry slots are exhausted")
@@ -2981,6 +2987,13 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			continue
 		}
 		clearOperatorGateHold(sess)
+		if !laneChecked {
+			laneChecked = true
+			if hold, code := o.nativeLaneHold(); hold {
+				log.Printf("[orch] retry respawns paused: native lane not ready: %s — retrying next cycle", code)
+				return
+			}
+		}
 
 		beforeNative := nativeSessionSnapshot(o.cfg, sess)
 
@@ -3761,6 +3774,7 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		o.cfg.AIExecution = newCfg.AIExecution
 	}
 	o.cfg.RuntimeAuxiliaryLimiter = newCfg.RuntimeAuxiliaryLimiter
+	o.cfg.RuntimeNativeLaneReadiness = newCfg.RuntimeNativeLaneReadiness
 	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
 		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
 		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes
@@ -10590,6 +10604,12 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			return
 		}
 	}
+	// Managed-lane readiness: the same kind of pause, before listing, routing
+	// or any claim, so a lane that is not ready costs no router call either.
+	if hold, code := o.nativeLaneHold(); hold {
+		log.Printf("[orch] spawn paused: native lane not ready: %s — retrying next cycle", code)
+		return
+	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`
@@ -10611,6 +10631,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			s.PausedAt.Format(time.RFC3339), s.RunningSessionCount())
 		return
 	}
+	// The lane was just observed ready: first spawns that a binding hold
+	// stopped before launch intent resume before new work is selected.
+	o.resumeLaneHeldPrelaunchWorkers(s)
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
@@ -10966,6 +10989,21 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		}
 		if err != nil {
+			if hold, ok := worker.NativeHold(err); ok && hold.Deferred {
+				// Paused before registration: roll back every pre-start claim
+				// of this dispatch so the issue is dispatchable next cycle.
+				permit.Release()
+				log.Printf("[orch] issue #%d native lane not ready: %s — retrying next cycle", issue.Number, hold.Code)
+				if freshClaim != nil {
+					if supersedeErr := o.supersedeFreshDispatch(s, freshClaim, "native_lane_deferred", time.Now().UTC()); supersedeErr != nil {
+						log.Printf("[orch] supersede deferred fresh dispatch for issue #%d on %s: %v (lease remains authoritative)", issue.Number, freshClaim.Slot, supersedeErr)
+					}
+				}
+				if reviewRepair != nil && repairTarget != nil {
+					o.releaseReviewRepairSlot(s, repairTarget, reviewRepair)
+				}
+				continue
+			}
 			if hold, ok := worker.NativeHold(err); ok {
 				heldSlot := hold.Slot
 				if heldSlot == "" && freshClaim != nil {

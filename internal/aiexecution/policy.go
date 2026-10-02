@@ -216,35 +216,9 @@ func inspectWithObservationKey(policy Policy, spec LaunchSpec, cmd *exec.Cmd, ob
 	if !policy.RequireVerifiedRoute {
 		return nil
 	}
-	if !filepath.IsAbs(policy.ManifestPath) || !validDigest(policy.ManifestSHA256) {
-		return Held("manifest_pin_required")
-	}
-	f, err := os.Open(policy.ManifestPath)
+	m, err := loadPinnedManifest(policy, cmd)
 	if err != nil {
-		return Held("manifest_unavailable")
-	}
-	defer f.Close()
-	info, err := f.Stat()
-	if err != nil || !info.Mode().IsRegular() || info.Size() > 128<<10 {
-		return Held("manifest_unavailable")
-	}
-	b, err := io.ReadAll(io.LimitReader(f, (128<<10)+1))
-	if err != nil || len(b) > 128<<10 {
-		return Held("manifest_unavailable")
-	}
-	if digest(b) != policy.ManifestSHA256 {
-		return Held("manifest_drift")
-	}
-	var m Manifest
-	if DecodeStrict(b, &m) != nil || m.Version != 1 {
-		return Held("manifest_invalid")
-	}
-	stripHostObservationEnvironment(cmd, m.Runtime.ManagementKeyEnv)
-	if m.EvidenceKind != "installed" {
-		return Held("source_evidence_not_installed")
-	}
-	if m.ExpiresAt.IsZero() || !time.Now().Before(m.ExpiresAt) {
-		return Held("proof_expired")
+		return err
 	}
 	route, roleOK := m.Routes[spec.Role]
 	if !roleOK {
@@ -383,6 +357,106 @@ func inspectWithObservationKey(policy Policy, spec LaunchSpec, cmd *exec.Cmd, ob
 	// The caller must now use PrepareContainedNativeCommand; readiness itself
 	// does not attest to a process that has not yet entered its OS lease.
 	return nil
+}
+
+// loadPinnedManifest reads the hash-pinned installed manifest. cmd, when not
+// nil, loses the host observation key as soon as its name is known, before any
+// later check can return.
+func loadPinnedManifest(policy Policy, cmd *exec.Cmd) (Manifest, error) {
+	var m Manifest
+	if !filepath.IsAbs(policy.ManifestPath) || !validDigest(policy.ManifestSHA256) {
+		return m, Held("manifest_pin_required")
+	}
+	f, err := os.Open(policy.ManifestPath)
+	if err != nil {
+		return m, Held("manifest_unavailable")
+	}
+	defer f.Close()
+	info, err := f.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Size() > 128<<10 {
+		return m, Held("manifest_unavailable")
+	}
+	b, err := io.ReadAll(io.LimitReader(f, (128<<10)+1))
+	if err != nil || len(b) > 128<<10 {
+		return m, Held("manifest_unavailable")
+	}
+	if digest(b) != policy.ManifestSHA256 {
+		return m, Held("manifest_drift")
+	}
+	if DecodeStrict(b, &m) != nil || m.Version != 1 {
+		return Manifest{}, Held("manifest_invalid")
+	}
+	stripHostObservationEnvironment(cmd, m.Runtime.ManagementKeyEnv)
+	if m.EvidenceKind != "installed" {
+		return Manifest{}, Held("source_evidence_not_installed")
+	}
+	if m.ExpiresAt.IsZero() || !time.Now().Before(m.ExpiresAt) {
+		return Manifest{}, Held("proof_expired")
+	}
+	return m, nil
+}
+
+// BindingReadiness is what an accepted lane observation leaves for operator
+// visibility. It is not launch evidence.
+type BindingReadiness struct {
+	// UnverifiedStandbyCredentials counts pinned credentials that are not
+	// selectable and carry no identity proof for their current token.
+	UnverifiedStandbyCredentials int
+}
+
+// ObserveBindingReadiness is the advisory pre-registration probe of the managed
+// Claude lane. It loads the same pinned manifest as Inspect, proves the pinned
+// gateway process, observes the credential bindings under the launch predicate
+// and proves the process again. It registers nothing, writes nothing and sends
+// no provider request; the only gateway write it may cause is the rate-limited
+// identity verification of a selectable but unverified OAuth credential.
+// Inspect still runs at every launch and remains the enforcement point.
+func ObserveBindingReadiness(policy Policy) error {
+	_, err := ObserveBindingReadinessReport(policy)
+	return err
+}
+
+func ObserveBindingReadinessReport(policy Policy) (BindingReadiness, error) {
+	var report BindingReadiness
+	if err := policy.CheckCurrent(); err != nil {
+		return report, err
+	}
+	if !policy.RequireVerifiedRoute {
+		return report, nil
+	}
+	m, err := loadPinnedManifest(policy, nil)
+	if err != nil {
+		return report, err
+	}
+	if err := inspectProcess(m.Gateway); err != nil {
+		return report, err
+	}
+	verdict, err := observeClaudeBindingsReport(m, os.Getenv(m.Runtime.ManagementKeyEnv))
+	if err != nil {
+		return report, err
+	}
+	if err := inspectProcess(m.Gateway); err != nil {
+		return report, err
+	}
+	report.UnverifiedStandbyCredentials = verdict.unverifiedStandby
+	return report, nil
+}
+
+// LaneReadiness is the runtime seam for the pre-registration lane probe. The
+// supported controller installs one backed by ObserveBindingReadiness, which
+// is a no-op unless the policy requires a verified route; without a seam no
+// probe runs and Inspect is unchanged.
+type LaneReadiness interface {
+	ObserveLaneReadiness(Policy) error
+}
+
+// LaneHoldCode returns the typed code of a readiness failure. Anything that is
+// not a typed hold is reported as unobservable, never as ready.
+func LaneHoldCode(err error) string {
+	if code := holdCode(err); code != "" {
+		return code
+	}
+	return "binding_readiness_unobservable"
 }
 
 func stripHostObservationEnvironment(cmd *exec.Cmd, name string) {
