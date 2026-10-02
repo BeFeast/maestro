@@ -173,6 +173,10 @@ func observeClaudeBindingsWithKey(m Manifest, key string) error {
 // control-plane verifier once, rate limited per credential set, and observes
 // again. The verifier response is never evidence: only the re-observed
 // inventory is evaluated, under the same predicate.
+//
+// Every request here carries the management key, so the pinned gateway PID is
+// proven to own the loopback listener immediately before each of them, and
+// once more after the last response.
 func observeClaudeBindingsReport(m Manifest, key string) (bindingVerdict, error) {
 	var none bindingVerdict
 	if err := validateBindingExpectation(m); err != nil {
@@ -191,7 +195,8 @@ func observeClaudeBindingsReport(m Manifest, key string) (bindingVerdict, error)
 	if ip == nil || !ip.IsLoopback() || err != nil || port <= 0 || port > 65535 {
 		return none, Held("binding_observation_route_unsupported")
 	}
-	if err := inspectListener(m.Gateway.PID, ip, port); err != nil {
+	proveListener := func() error { return inspectListener(m.Gateway.PID, ip, port) }
+	if err := proveListener(); err != nil {
 		return none, err
 	}
 	keyName := m.Runtime.ManagementKeyEnv
@@ -201,19 +206,25 @@ func observeClaudeBindingsReport(m Manifest, key string) (bindingVerdict, error)
 	if key == "" {
 		return none, Held("binding_management_key_unavailable")
 	}
+	// The proof above precedes the first keyed GET; key validation in between
+	// is local.
 	verdict, err := fetchClaudeBindings(m, *u, key)
 	if err != nil && verdict.unverifiedActiveOAuth && holdCode(err) == "binding_credential_unverified" && claudeIdentityVerification.allow(bindingCredentialSetKey(m), time.Now()) {
-		// Re-prove the endpoint owner before sending the management key again.
-		if listenerErr := inspectListener(m.Gateway.PID, ip, port); listenerErr != nil {
+		// The verify POST and the second GET both carry the key: the listener
+		// may have changed hands during either earlier exchange.
+		if listenerErr := proveListener(); listenerErr != nil {
 			return none, listenerErr
 		}
 		requestClaudeIdentityVerification(*u, key)
+		if listenerErr := proveListener(); listenerErr != nil {
+			return none, listenerErr
+		}
 		verdict, err = fetchClaudeBindings(m, *u, key)
 	}
 	if err != nil {
 		return verdict, err
 	}
-	return verdict, inspectListener(m.Gateway.PID, ip, port)
+	return verdict, proveListener()
 }
 
 func fetchClaudeBindings(m Manifest, u url.URL, key string) (bindingVerdict, error) {
@@ -334,8 +345,9 @@ type bindingVerdict struct {
 	// unverifiedActiveOAuth: the hold is an auth_active OAuth credential
 	// without an identity proof for its current token.
 	unverifiedActiveOAuth bool
-	// unverifiedStandby counts inactive credentials without a proof. Their
-	// state is accepted; see evaluateClaudeBindingInventory.
+	// unverifiedStandby counts inactive OAuth credentials awaiting an identity
+	// proof. The launch predicate accepts them, provisioning does not; see
+	// evaluateClaudeBindingInventory and ValidateClaudeBindingReceipt.
 	unverifiedStandby int
 }
 
@@ -344,21 +356,33 @@ func verifyClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) erro
 	return err
 }
 
-// standbyEvidenceConsistent checks evidence a credential carries even while it
-// is not selectable. An observed identity must be the pinned one, a proof
-// generation exists exactly when an identity does, and a static key digest is
-// configuration, so it must match whether or not the key is active.
-func standbyEvidenceConsistent(want BindingCredentialPin, got claudeBindingCredential) bool {
-	switch want.BindingMode {
-	case OAuthAccountBindingMode:
-		return (got.AccountIdentitySHA256 == "" || got.AccountIdentitySHA256 == want.AccountIdentitySHA256) &&
-			(got.AccountIdentitySHA256 == "") == (got.VerifiedGeneration == 0) &&
-			(got.CredentialSHA256 == "" || validDigest(got.CredentialSHA256))
-	case "":
-		return got.CredentialSHA256 == want.CredentialSHA256 && got.AccountIdentitySHA256 == "" && got.VerifiedGeneration == 0
-	default:
+// awaitingIdentityProof is the only credential state in which the pinned
+// gateway cannot compare a credential with the pin it enforces: an OAuth
+// credential whose current token has no identity proof. The gateway caches a
+// proof under (auth ID, exact token digest, configured account identity) and
+// stores it only when the provider profile matches that configured identity,
+// so a reported account_identity_sha256 is always the enforced pin and always
+// comes with pin_matches. An exact key is static configuration whose
+// comparison needs no proof, so it never awaits one, standby or not.
+func awaitingIdentityProof(want BindingCredentialPin, got claudeBindingCredential) bool {
+	return want.BindingMode == OAuthAccountBindingMode && !got.PinMatches && got.AccountIdentitySHA256 == "" && got.VerifiedGeneration == 0 &&
+		(got.CredentialSHA256 == "" || validDigest(got.CredentialSHA256))
+}
+
+// credentialAbsent is the projection of a configured credential slot with no
+// loaded auth at all: the configured reference, alias and route keys only, no
+// kind, token, proof, auth generation or registration, no registered model.
+func credentialAbsent(got claudeBindingCredential) bool {
+	if got.CredentialKind != "" || got.CredentialSHA256 != "" || got.BindingMode != "" || got.AccountIdentitySHA256 != "" || got.VerifiedGeneration != 0 ||
+		got.PinMatches || got.AuthActive || got.AuthGeneration != 0 || got.AuthRegistrationEpoch != 0 {
 		return false
 	}
+	for _, model := range got.Models {
+		if model.Registered || model.ResolvedModel != "" || model.ModelSHA256 != "" {
+			return false
+		}
+	}
+	return true
 }
 
 func bindingModelKey(routeID, model string) string { return routeID + "\x00" + model }
@@ -386,13 +410,29 @@ func verifyBindingModels(want BindingCredentialPin, got claudeBindingCredential)
 // credential set is the pinned one and in which every pinned (route, model)
 // key is served by at least one credential that is selectable now
 // (auth_active) and whose identity proof matches its pin. A credential that is
-// not selectable (quota block, expired token, cooldown) may stay as a standby,
-// but only with consistent evidence and the approved model definitions, so it
-// can never re-enter selection with an unreviewed account, key or model. A
-// selectable credential without a proof holds. The gateway additionally
-// verifies the identity of every managed physical attempt before any
-// upstream byte, so a standby that returns to selection cannot be used
-// unverified.
+// not selectable (quota block, expired token, cooldown) may stay as a standby
+// with the approved model definitions, so it can never re-enter selection with
+// an unreviewed model. A selectable credential without a proof holds. The
+// gateway additionally verifies the identity of every managed physical
+// attempt against its enforced pin before any upstream byte, so a standby
+// that returns to selection cannot be used unverified.
+//
+// Pin equality. Whenever the gateway can compare a credential with the pin it
+// enforces, it must report the match (pin_matches) and the observed fields
+// must equal the manifest pin: every exact key and every OAuth credential that
+// carries an identity proof, active or not. Only an OAuth credential awaiting
+// a proof for its current token cannot be compared, because the projection
+// exposes the enforced account identity only through a proof. For that
+// standby, manifest pin == enforced pin rests on two facts instead. The
+// enforced pins belong to the immutable startup admission snapshot of the
+// manifest's exact gateway process instance; that snapshot's canonical digest
+// is managed_admission_sha256, which must equal the manifest's, with the
+// configuration apply complete and without drift. And ValidateClaudeBindingReceipt,
+// the provisioning contract, accepts a manifest only against a receipt of
+// that instance and digest in which every credential proved its pin. A pin
+// proved once cannot change while the instance and digest stay the same, and
+// a change of either holds every launch (binding_observation_binding_mismatch,
+// binding_config_drift).
 //
 // Known limits of the projection, both availability-only: auth_active is one
 // conjunction over all of a credential's pinned routes while the gateway blocks
@@ -400,8 +440,8 @@ func verifyBindingModels(want BindingCredentialPin, got claudeBindingCredential)
 // still selectable on the others; and a standby whose current token failed
 // verification looks the same as one whose token expired. In both cases the
 // gateway holds the attempts it would route there (managed_admission_hold)
-// instead of sending them. An absent standby auth (no generation, no
-// registered models) is not tolerated: what it would register is unknown.
+// instead of sending them. An absent pinned credential (no loaded auth) is
+// not tolerated: what it would register is unknown (binding_credential_absent).
 func evaluateClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) (bindingVerdict, error) {
 	var v bindingVerdict
 	if !receipt.ConfigApplyComplete || receipt.ManagedAdmissionSHA256 != m.Runtime.ManagedAdmissionSHA256 || receipt.ExecutionConfigSHA256 != m.Runtime.ExecutionConfigSHA256 {
@@ -419,32 +459,34 @@ func evaluateClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) (b
 	if len(i.Credentials) != len(expected) {
 		return v, Held("binding_credential_set_mismatch")
 	}
-	// Static slot pins and model definitions hold for every credential,
-	// standby included.
+	// Slot pins, pin equality and model definitions hold for every
+	// credential, standby included.
 	pins := make([]BindingCredentialPin, len(i.Credentials))
+	verified := make([]bool, len(i.Credentials))
 	for k, got := range i.Credentials {
 		want, ok := expected[got.AuthRef]
+		if ok && got.AccountAlias == want.AccountAlias && credentialAbsent(got) {
+			return v, Held("binding_credential_absent")
+		}
 		if !ok || got.AccountAlias != want.AccountAlias || got.CredentialKind != want.CredentialKind || got.BindingMode != want.BindingMode ||
-			!validCredentialExpectation(want) || got.AuthGeneration == 0 || got.AuthRegistrationEpoch == 0 || got.ModelRegistrationEpoch == 0 ||
-			!standbyEvidenceConsistent(want, got) {
+			!validCredentialExpectation(want) || got.AuthGeneration == 0 || got.AuthRegistrationEpoch == 0 || got.ModelRegistrationEpoch == 0 {
 			return v, Held("binding_credential_mismatch")
 		}
 		delete(expected, got.AuthRef) // a duplicate auth_ref finds no pin
 		pins[k] = want
+		// A comparable credential must match, and a claimed match must agree
+		// with the observed fields.
+		verified[k] = got.PinMatches && credentialObservationMatches(want, got)
+		if !verified[k] && !awaitingIdentityProof(want, got) {
+			return v, Held("binding_credential_mismatch")
+		}
 		if err := verifyBindingModels(want, got); err != nil {
 			return v, err
 		}
 	}
-	verified := make([]bool, len(i.Credentials))
-	for k, got := range i.Credentials {
-		verified[k] = got.PinMatches && credentialObservationMatches(pins[k], got)
-		if got.PinMatches && !verified[k] {
-			return v, Held("binding_credential_mismatch") // the gateway claims a match the fields contradict
-		}
-	}
 	for k, got := range i.Credentials {
 		if got.AuthActive && !verified[k] {
-			v.unverifiedActiveOAuth = pins[k].BindingMode == OAuthAccountBindingMode
+			v.unverifiedActiveOAuth = true // only an OAuth credential can await a proof
 			return v, Held("binding_credential_unverified")
 		}
 	}
@@ -480,9 +522,16 @@ func evaluateClaudeBindingInventory(m Manifest, receipt claudeBindingReceipt) (b
 	return v, nil
 }
 
-// ValidateClaudeBindingReceipt shares the launch-time inventory contract with
-// offline provisioning tools. The caller must independently verify freshness,
-// nonce, authenticated transport and PID ownership of the observed endpoint.
+// ValidateClaudeBindingReceipt is the provisioning contract for a manifest's
+// binding pins. It applies the launch predicate and additionally requires
+// every pinned credential, standby included, to prove its pin in this
+// receipt: a manifest must not be installed with an account identity that was
+// never compared with the pin the gateway enforces under the manifest's
+// process instance and managed admission digest. The launch predicate relies
+// on that comparison for a standby awaiting a proof (see
+// evaluateClaudeBindingInventory). The caller must independently verify
+// freshness, nonce, authenticated transport and PID ownership of the observed
+// endpoint.
 func ValidateClaudeBindingReceipt(m Manifest, raw []byte) error {
 	if err := validateBindingExpectation(m); err != nil {
 		return err
@@ -494,5 +543,12 @@ func ValidateClaudeBindingReceipt(m Manifest, raw []byte) error {
 	if receipt.SchemaVersion != 1 || receipt.ProjectionVersion != ClaudeBindingProjection || receipt.ObservationScope != "credential_selection_only" || receipt.ProcessInstanceID != m.Runtime.ProcessInstanceID {
 		return Held("binding_observation_binding_mismatch")
 	}
-	return verifyClaudeBindingInventory(m, receipt)
+	v, err := evaluateClaudeBindingInventory(m, receipt)
+	if err != nil {
+		return err
+	}
+	if v.unverifiedStandby > 0 {
+		return Held("binding_credential_unverified")
+	}
+	return nil
 }

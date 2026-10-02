@@ -60,7 +60,22 @@ func coldActive(c *claudeBindingCredential) {
 	c.CredentialSHA256 = strings.Repeat("6", 64)
 }
 
-func validateReceipt(t *testing.T, m Manifest, r claudeBindingReceipt) error {
+// admitAtLaunch applies the launch predicate after the observer's strict
+// decoding. Provisioning (ValidateClaudeBindingReceipt) is stricter.
+func admitAtLaunch(t *testing.T, m Manifest, r claudeBindingReceipt) error {
+	t.Helper()
+	raw, err := json.Marshal(r)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded claudeBindingReceipt
+	if err := DecodeStrict(raw, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	return verifyClaudeBindingInventory(m, decoded)
+}
+
+func provision(t *testing.T, m Manifest, r claudeBindingReceipt) error {
 	t.Helper()
 	raw, err := json.Marshal(r)
 	if err != nil {
@@ -102,7 +117,7 @@ func TestBindingAcceptsConsistentStandbyWhileAnotherAccountServes(t *testing.T) 
 		t.Run(name, func(t *testing.T) {
 			m, r := dualOAuthBindingFixture()
 			mutate(&m, &r)
-			if err := validateReceipt(t, m, r); err != nil {
+			if err := admitAtLaunch(t, m, r); err != nil {
 				t.Fatalf("serving lane with a consistent standby held: %v", err)
 			}
 		})
@@ -114,14 +129,17 @@ func TestBindingAcceptsConsistentStandbyWhileAnotherAccountServes(t *testing.T) 
 		m.Bindings.Credentials = append(m.Bindings.Credentials, second)
 		standby := r.Inventory.Credentials[0]
 		standby.AuthRef, standby.AccountAlias, standby.CredentialSHA256 = second.AuthRef, second.AccountAlias, second.CredentialSHA256
-		standby.AuthActive, standby.PinMatches = false, false
+		standby.AuthActive = false // a blocked static key still matches its pin
 		r.Inventory.Credentials = append(r.Inventory.Credentials, standby)
 		r.Inventory.SelectionPinsMatch = false
-		if err := validateReceipt(t, m, r); err != nil {
+		if err := admitAtLaunch(t, m, r); err != nil {
 			t.Fatalf("exact key standby held: %v", err)
 		}
+		if err := provision(t, m, r); err != nil {
+			t.Fatalf("exact key standby proves its pin, provisioning held: %v", err)
+		}
 		r.Inventory.Credentials[1].CredentialSHA256 = strings.Repeat("7", 64)
-		wantHold(t, validateReceipt(t, m, r), "binding_credential_mismatch")
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_mismatch")
 	})
 }
 
@@ -157,7 +175,7 @@ func TestBindingHoldsUnservedUnprovenOrInconsistentLane(t *testing.T) {
 			coldActive(&r.Inventory.Credentials[0])
 			standbyB(r)
 		}},
-		{"unverified pin claim on active account", "binding_credential_unverified", func(_ *Manifest, r *claudeBindingReceipt) {
+		{"active identity without the gateway's pin match", "binding_credential_mismatch", func(_ *Manifest, r *claudeBindingReceipt) {
 			r.Inventory.Credentials[0].PinMatches = false
 			standbyB(r)
 		}},
@@ -186,7 +204,7 @@ func TestBindingHoldsUnservedUnprovenOrInconsistentLane(t *testing.T) {
 			r.Inventory.Credentials = r.Inventory.Credentials[:1]
 			r.Inventory.SelectionPinsMatch = false
 		}},
-		{"absent standby auth", "binding_credential_mismatch", func(_ *Manifest, r *claudeBindingReceipt) {
+		{"absent standby auth", "binding_credential_absent", func(_ *Manifest, r *claudeBindingReceipt) {
 			c := &r.Inventory.Credentials[1]
 			*c = claudeBindingCredential{AuthRef: c.AuthRef, AccountAlias: c.AccountAlias, ModelRegistrationEpoch: 1, Models: c.Models}
 			for k := range c.Models {
@@ -325,7 +343,7 @@ func TestBindingHoldsUnservedUnprovenOrInconsistentLane(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			m, r := dualOAuthBindingFixture()
 			tc.mutate(&m, &r)
-			wantHold(t, validateReceipt(t, m, r), tc.code)
+			wantHold(t, admitAtLaunch(t, m, r), tc.code)
 		})
 	}
 }
@@ -438,6 +456,7 @@ type bindingTestServer struct {
 	receipts []claudeBindingReceipt // successive GET answers; the last one repeats
 	verify   int
 	onVerify func()
+	onGet    func(n int)
 }
 
 func (s *bindingTestServer) ServeHTTP(w http.ResponseWriter, req *http.Request) {
@@ -463,6 +482,9 @@ func (s *bindingTestServer) ServeHTTP(w http.ResponseWriter, req *http.Request) 
 		_, _ = w.Write([]byte(`{"verified":true}`))
 	case req.Method == http.MethodGet && req.URL.Path == "/v8/management/observability/admission/claude-bindings":
 		n := int(s.gets.Add(1))
+		if s.onGet != nil {
+			s.onGet(n)
+		}
 		s.mu.Lock()
 		r := s.receipts[len(s.receipts)-1]
 		if n <= len(s.receipts) {
@@ -486,17 +508,21 @@ func resetIdentityVerificationLimiter(t *testing.T) {
 	claudeIdentityVerification.mu.Unlock()
 }
 
+// rotatedTokenLane is a serving account whose token just rotated (no proof
+// yet) beside an expired standby: cold before verification, verified after.
+func rotatedTokenLane() (Manifest, claudeBindingReceipt, claudeBindingReceipt) {
+	m, verified := dualOAuthBindingFixture()
+	liveStandby(&verified.Inventory.Credentials[1])
+	verified.Inventory.SelectionPinsMatch = false
+	cold := verified
+	cold.Inventory.Credentials = append([]claudeBindingCredential(nil), verified.Inventory.Credentials...)
+	coldActive(&cold.Inventory.Credentials[0])
+	verified.Inventory.Credentials[0].CredentialSHA256 = cold.Inventory.Credentials[0].CredentialSHA256
+	return m, cold, verified
+}
+
 func TestBindingObservationVerifiesRotatedTokenOnceThenReobserves(t *testing.T) {
-	rotated := func() (Manifest, claudeBindingReceipt, claudeBindingReceipt) {
-		m, verified := dualOAuthBindingFixture()
-		liveStandby(&verified.Inventory.Credentials[1])
-		verified.Inventory.SelectionPinsMatch = false
-		cold := verified
-		cold.Inventory.Credentials = append([]claudeBindingCredential(nil), verified.Inventory.Credentials...)
-		coldActive(&cold.Inventory.Credentials[0])
-		verified.Inventory.Credentials[0].CredentialSHA256 = cold.Inventory.Credentials[0].CredentialSHA256
-		return m, cold, verified
-	}
+	rotated := rotatedTokenLane
 	t.Run("verified after one request", func(t *testing.T) {
 		resetIdentityVerificationLimiter(t)
 		m, cold, verified := rotated()
@@ -546,7 +572,7 @@ func TestBindingObservationVerifiesRotatedTokenOnceThenReobserves(t *testing.T) 
 	})
 	t.Run("only an unverified selectable OAuth credential asks", func(t *testing.T) {
 		resetIdentityVerificationLimiter(t)
-		m, r := bindingFixture() // exact key mode
+		m, r := bindingFixture() // exact key mode: comparable without a proof
 		r.Inventory.Credentials[0].PinMatches = false
 		r.Inventory.SelectionPinsMatch = false
 		dm, dr := dualOAuthBindingFixture()
@@ -557,7 +583,7 @@ func TestBindingObservationVerifiesRotatedTokenOnceThenReobserves(t *testing.T) 
 			m    Manifest
 			r    claudeBindingReceipt
 			code string
-		}{{m, r, "binding_credential_unverified"}, {dm, dr, "binding_route_unserved"}} {
+		}{{m, r, "binding_credential_mismatch"}, {dm, dr, "binding_route_unserved"}} {
 			t.Setenv(tc.m.Runtime.ManagementKeyEnv, "synthetic-management-key")
 			s := &bindingTestServer{t: t, receipts: []claudeBindingReceipt{tc.r}}
 			srv := httptest.NewServer(s)
@@ -687,6 +713,134 @@ func TestObserveBindingReadinessIsAPureProbe(t *testing.T) {
 		wantHold(t, err, "manifest_drift")
 		if s.gets.Load() != 0 {
 			t.Fatal("observed with a drifted manifest")
+		}
+	})
+}
+
+// The gateway enforces its configured pins, not the manifest's. A manifest
+// that pins another standby account under the same managed admission digest
+// must never be provisioned, and wherever the gateway can compare a standby
+// with its enforced pin the comparison must be reported and must agree.
+func TestBindingStandbyPinMustEqualEnforcedPin(t *testing.T) {
+	foreignStandby := func() (Manifest, claudeBindingReceipt) {
+		m, r := dualOAuthBindingFixture()
+		// Same admission digest and observation; only the manifest's reviewed
+		// identity for the standby differs from the one the gateway enforces.
+		m.Bindings.Credentials[1].AccountIdentitySHA256 = strings.Repeat("7", 64)
+		if m.Runtime.ManagedAdmissionSHA256 != r.ManagedAdmissionSHA256 {
+			t.Fatal("fixture must keep the admission digest")
+		}
+		return m, r
+	}
+	t.Run("standby awaiting a proof cannot be provisioned", func(t *testing.T) {
+		m, r := foreignStandby()
+		liveStandby(&r.Inventory.Credentials[1])
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, provision(t, m, r), "binding_credential_unverified")
+		// The launch predicate cannot compare it and relies on provisioning
+		// under the same process instance and admission digest.
+		if err := admitAtLaunch(t, m, r); err != nil {
+			t.Fatalf("launch held a standby it cannot compare: %v", err)
+		}
+	})
+	t.Run("correct manifest with the same standby is not provisionable either", func(t *testing.T) {
+		m, r := dualOAuthBindingFixture()
+		liveStandby(&r.Inventory.Credentials[1])
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, provision(t, m, r), "binding_credential_unverified")
+	})
+	t.Run("proved standby exposes the enforced identity", func(t *testing.T) {
+		m, r := foreignStandby()
+		r.Inventory.Credentials[1].AuthActive = false // quota block keeps the proof
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, provision(t, m, r), "binding_credential_mismatch")
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_mismatch")
+	})
+	t.Run("reported identity without the gateway's pin match", func(t *testing.T) {
+		m, r := dualOAuthBindingFixture()
+		r.Inventory.Credentials[1].AuthActive, r.Inventory.Credentials[1].PinMatches = false, false
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_mismatch")
+	})
+	t.Run("exact key standby the gateway does not match", func(t *testing.T) {
+		m, r := bindingFixture()
+		second := m.Bindings.Credentials[0]
+		second.AuthRef, second.AccountAlias, second.CredentialSHA256 = strings.Repeat("9", 64), "fixture-account-b", strings.Repeat("8", 64)
+		m.Bindings.Credentials = append(m.Bindings.Credentials, second)
+		standby := r.Inventory.Credentials[0]
+		standby.AuthRef, standby.AccountAlias, standby.CredentialSHA256 = second.AuthRef, second.AccountAlias, second.CredentialSHA256
+		standby.AuthActive, standby.PinMatches = false, false
+		r.Inventory.Credentials = append(r.Inventory.Credentials, standby)
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_mismatch")
+	})
+	t.Run("every pin proved is provisionable with a blocked standby", func(t *testing.T) {
+		m, r := dualOAuthBindingFixture()
+		r.Inventory.Credentials[1].AuthActive = false
+		r.Inventory.SelectionPinsMatch = false
+		if err := provision(t, m, r); err != nil {
+			t.Fatalf("fully proved lane with a quota standby was not provisionable: %v", err)
+		}
+	})
+}
+
+// absentCredential is the projection of a configured slot whose auth is not
+// loaded: the gateway still lists the configured route keys, unregistered.
+func absentCredential(c *claudeBindingCredential) {
+	*c = claudeBindingCredential{AuthRef: c.AuthRef, AccountAlias: c.AccountAlias, ModelRegistrationEpoch: c.ModelRegistrationEpoch, Models: append([]claudeBindingModel(nil), c.Models...)}
+	for k := range c.Models {
+		c.Models[k].ResolvedModel, c.Models[k].Registered, c.Models[k].ModelSHA256 = "", false, ""
+	}
+}
+
+func TestBindingAbsentPinnedCredentialHasItsOwnHold(t *testing.T) {
+	for _, slot := range []int{0, 1} {
+		m, r := dualOAuthBindingFixture()
+		absentCredential(&r.Inventory.Credentials[slot])
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_absent")
+		wantHold(t, provision(t, m, r), "binding_credential_absent")
+	}
+	t.Run("exact key slot", func(t *testing.T) {
+		m, r := bindingFixture()
+		absentCredential(&r.Inventory.Credentials[0])
+		r.Inventory.Credentials[0].ModelRegistrationEpoch = 0
+		r.Inventory.SelectionPinsMatch = false
+		wantHold(t, admitAtLaunch(t, m, r), "binding_credential_absent")
+	})
+	for name, mutate := range map[string]func(*claudeBindingCredential){
+		"alias drift":          func(c *claudeBindingCredential) { c.AccountAlias = "other-account" },
+		"unknown auth ref":     func(c *claudeBindingCredential) { c.AuthRef = strings.Repeat("7", 64) },
+		"registered model":     func(c *claudeBindingCredential) { c.Models[0].Registered = true },
+		"resolved model":       func(c *claudeBindingCredential) { c.Models[0].ResolvedModel = c.Models[0].Model },
+		"token without a kind": func(c *claudeBindingCredential) { c.CredentialSHA256 = strings.Repeat("6", 64) },
+		"auth generation":      func(c *claudeBindingCredential) { c.AuthGeneration = 1 },
+		"auth epoch":           func(c *claudeBindingCredential) { c.AuthRegistrationEpoch = 1 },
+		"pin claim":            func(c *claudeBindingCredential) { c.PinMatches = true },
+		"active":               func(c *claudeBindingCredential) { c.AuthActive = true },
+	} {
+		t.Run("not cleanly absent: "+name, func(t *testing.T) {
+			m, r := dualOAuthBindingFixture()
+			absentCredential(&r.Inventory.Credentials[1])
+			mutate(&r.Inventory.Credentials[1])
+			r.Inventory.SelectionPinsMatch = false
+			wantHold(t, admitAtLaunch(t, m, r), "binding_credential_mismatch")
+		})
+	}
+	t.Run("lane readiness reports it", func(t *testing.T) {
+		resetIdentityVerificationLimiter(t)
+		m, r := dualOAuthBindingFixture()
+		absentCredential(&r.Inventory.Credentials[1])
+		r.Inventory.SelectionPinsMatch = false
+		t.Setenv(m.Runtime.ManagementKeyEnv, "synthetic-management-key")
+		s := &bindingTestServer{t: t, receipts: []claudeBindingReceipt{r}}
+		srv := httptest.NewServer(s)
+		defer srv.Close()
+		m.GatewayURL = srv.URL
+		err := observeClaudeBindings(m)
+		wantHold(t, err, "binding_credential_absent")
+		if LaneHoldCode(err) != "binding_credential_absent" || s.posts.Load() != 0 {
+			t.Fatalf("lane code %q, verification requests %d", LaneHoldCode(err), s.posts.Load())
 		}
 	})
 }
