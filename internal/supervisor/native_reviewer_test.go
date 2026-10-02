@@ -80,8 +80,8 @@ func TestNativeReviewerExactModelAndEveryLocalOutcomeHeld(t *testing.T) {
 			claim := uuid.NewString()
 			out, err := CompleteNativeReview(ctx, cfg, "claude-opus-5", claim, "synthetic diff")
 			var hold *aiexecution.Hold
-			if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || out != "" {
-				t.Fatalf("output=%q error=%v", out, err)
+			if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || out.Output != "" || out.AccountingPending {
+				t.Fatalf("output=%+v error=%v", out, err)
 			}
 			if aux.acquired.Load() != 1 || aux.released.Load() != 0 || nativeCalls(t, count) != 1 {
 				t.Fatal("unsettled launch released or fell back")

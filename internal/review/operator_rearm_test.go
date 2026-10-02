@@ -15,6 +15,7 @@ import (
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/supervisor"
 )
 
 func rearmFixture(t *testing.T) (*Producer, *config.Config, AttemptScope, OperatorRearmRequest, *atomic.Int32) {
@@ -43,9 +44,9 @@ func rearmFixture(t *testing.T) (*Producer, *config.Config, AttemptScope, Operat
 		return proof, nil
 	}
 	calls := &atomic.Int32{}
-	lens := &NativeClaudeLens{Stream: scope.Lens, Model: "claude-opus-5", policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: "original-budget-run", complete: func(context.Context, string, string) (string, error) {
+	lens := &NativeClaudeLens{Stream: scope.Lens, Model: "claude-opus-5", policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: "original-budget-run", complete: func(context.Context, string, string) (supervisor.NativeReviewResult, error) {
 		calls.Add(1)
-		return "", errors.New("bounded second failure")
+		return supervisor.NativeReviewResult{}, errors.New("bounded second failure")
 	}}
 	p.Lenses = []Lens{lens}
 	p.ExecutionPolicy = cfg.AIExecution

@@ -77,6 +77,12 @@ type backendLLMClient struct {
 	memory *supervisorBackendMemory
 	// receiptSave is an injected persistence fault seam for offline tests.
 	receiptSave func(*ConsultationReceipt) error
+	// acceptPendingOutcome lets a complete successful native output be
+	// returned while the authority still reports the exited session's attempt
+	// as claimed but unaccounted (#1239). Only the one-shot reviewer lane sets
+	// it: the receipt stays unsealed and held exactly as a lost seal would be,
+	// so the regular reconcile finishes accounting without a second attempt.
+	acceptPendingOutcome bool
 }
 
 const (
@@ -259,6 +265,11 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 		}
 		var nativeHold *aiexecution.Hold
 		if errors.As(retErr, &nativeHold) && nativeHold.Code == "native_outcome_unverified" {
+			return
+		}
+		if result.AccountingPending {
+			// The verdict is surfaced, but the receipt is not complete: marker,
+			// permit and current.json stay held until the seal settles.
 			return
 		}
 		if hasNativeInvocations(receipt) && !nativeInvocationsAllowed(receipt) {
@@ -535,7 +546,18 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 			return result, err
 		}
 		if invocation.NativeSession != nil && launched {
-			if err := sealNativeInvocations(c.cfg, receipt, persist); err != nil {
+			if err := sealNativeInvocations(c.executionContext, c.cfg, receipt, persist, nativeSettleWindow); err != nil {
+				var hold *aiexecution.Hold
+				if c.acceptPendingOutcome && runErr == nil && invocation.Status == "succeeded" && errors.As(err, &hold) && hold.Code == "native_outcome_unverified" && nativeOutcomeAccountingPending(receipt) {
+					// Every binding is sealed; only settlement of the exited
+					// session's attempt is outstanding. Surface the complete
+					// verdict and leave the receipt for the regular reconcile.
+					log.Printf("[supervisor] native %s output complete; authority accounting pending, receipt retained for reconcile", identity.Role)
+					c.memory.recordSuccess(candidate.name)
+					result.Output = strings.TrimSpace(string(out))
+					result.AccountingPending = true
+					return result, nil
+				}
 				return result, err
 			}
 		}

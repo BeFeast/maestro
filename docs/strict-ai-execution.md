@@ -114,6 +114,22 @@ a prior unresolved role first reconciles that role and returns
 inference. The next cycle can then proceed normally. A different prompt or
 reviewer model cannot reuse an old result.
 
+Sealing an exited session can race the authority's own settlement: the usage
+tap accounts a physical attempt a few seconds after process exit, so the seal
+may still report it as claimed (`outcome_unknown`, `unresolved_attempts > 0`).
+Live completion therefore re-seals the same exact binding with backoff for a
+bounded window (60 s) before treating the outcome as unresolved; recovery
+seals once per cycle. If the window elapses with attempts still unresolved,
+the receipt stays held exactly as before. The one-shot reviewer lane is the
+single exception: when every binding carries a validated seal, the only hold
+reason is settlement latency and the local output is a complete, untruncated
+success, the verdict is returned flagged `accounting pending`. The review
+producer posts it with that note and records the attempt as
+`review_completed_accounting_pending`; the native receipt, launch marker and
+auxiliary permit remain held until the regular reconcile observes the settled
+seal, and no second attempt is spent on it. Nothing is synthesized locally and
+no outcome history is removed.
+
 The controller independently validates the durable completed role receipt and
 checkpoint before dropping a retained in-memory permit. Durable pending native
 receipts still consume capacity if a launch marker is missing. The strict

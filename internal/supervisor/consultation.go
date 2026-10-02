@@ -44,6 +44,12 @@ type ConsultationClient interface {
 type ConsultationResult struct {
 	Output  string
 	Receipt *ConsultationReceipt
+	// AccountingPending marks a complete, durable native output whose single
+	// exited session the authority has sealed but not yet accounted. The
+	// receipt, launch marker and auxiliary permit stay held for the regular
+	// reconcile; the caller may use the output but must not treat the run as
+	// financially complete or spend another attempt on it.
+	AccountingPending bool
 }
 
 type ConsultationHold struct{ Code string }

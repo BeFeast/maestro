@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -22,6 +23,101 @@ import (
 
 var sealNativeConsultation = func(client admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
 	return client.SealNative(request)
+}
+
+// nativeSettleWindow bounds how long a live completion keeps re-sealing an
+// exited session whose physical attempts the authority still reports as
+// claimed but not yet accounted. The usage tap settles them a few seconds
+// after process exit (#1239: ~20s, while the daemon sealed immediately and
+// held a complete verdict). Repeating the exact seal is the documented safe
+// retry; replay/reconcile paths pass a zero window and seal once per cycle.
+var (
+	nativeSettleWindow     = 60 * time.Second
+	nativeSettleBackoff    = time.Second
+	nativeSettleBackoffMax = 10 * time.Second
+)
+
+// nativeOutcomeUnresolved reports a validated seal whose only hold reason is
+// settlement latency: attempts exist, none violated a cap, and the authority
+// has not retired the registration. Everything else is a different hold.
+func nativeOutcomeUnresolved(outcome admissioncontrol.NativeOutcome) bool {
+	return outcome.Sealed && outcome.Outcome == "held" && outcome.HoldCode != nil && *outcome.HoldCode == "outcome_unknown" &&
+		outcome.UnresolvedAttempts > 0 && outcome.CapViolations == 0 && outcome.BoundViolations == 0 && outcome.OperatorRetirement == nil
+}
+
+// awaitNativeSettlement re-seals the same exact binding while the authority
+// reports claimed-but-unaccounted attempts, until they settle, the window
+// elapses or the execution context ends. It returns the latest validated
+// snapshot: a transient reply failure keeps the previous one and nothing is
+// ever synthesized locally.
+func awaitNativeSettlement(ctx context.Context, client admissioncontrol.Client, request admissioncontrol.SealRequest, outcome admissioncontrol.NativeOutcome, window time.Duration) admissioncontrol.NativeOutcome {
+	if window <= 0 || !nativeOutcomeUnresolved(outcome) {
+		return outcome
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	deadline := time.Now().Add(window)
+	delay := nativeSettleBackoff
+	if delay <= 0 {
+		delay = time.Second
+	}
+	for nativeOutcomeUnresolved(outcome) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		if delay > remaining {
+			delay = remaining
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			return outcome
+		case <-timer.C:
+		}
+		next, err := sealNativeConsultation(client, request)
+		if err == nil && admissioncontrol.ValidateNativeOutcome(next, request) == nil {
+			outcome = next
+		}
+		if delay < nativeSettleBackoffMax {
+			delay *= 2
+		}
+	}
+	return outcome
+}
+
+// nativeOutcomeAccountingPending reports a receipt whose every invocation
+// carries a validated authority seal and whose only unresolved evidence is
+// settlement latency for an exited session with a complete, untruncated
+// successful output. It is not permission to launch, release occupancy or
+// drop the launch marker: nativeInvocationsAllowed stays false until the
+// regular reconcile observes the settled seal. It only lets a complete local
+// verdict be surfaced instead of being held behind accounting (#1239).
+func nativeOutcomeAccountingPending(receipt *ConsultationReceipt) bool {
+	if receipt.PlannedInvocation != nil || len(receipt.Invocations) == 0 || len(receipt.Invocations) > 32 {
+		return false
+	}
+	seen := map[string]bool{}
+	pending := false
+	for i := range receipt.Invocations {
+		inv := &receipt.Invocations[i]
+		if inv.Number != i+1 || seen[inv.ID] || !validNativeInvocation(receipt, inv) || inv.NativeSession.Outcome == nil {
+			return false
+		}
+		seen[inv.ID] = true
+		outcome := *inv.NativeSession.Outcome
+		switch {
+		case outcome.NextGenerationAllowed:
+		case nativeOutcomeUnresolved(outcome):
+			pending = true
+		default:
+			return false
+		}
+	}
+	last := receipt.Invocations[len(receipt.Invocations)-1]
+	return pending && last.Status == "succeeded" && last.OutputCheckpoint != nil && last.OutputCheckpoint.Complete && !last.OutputCheckpoint.Truncated
 }
 
 func nativeHash(value any) string {
@@ -113,7 +209,10 @@ func nativeInvocationsAllowed(receipt *ConsultationReceipt) bool {
 	return true
 }
 
-func sealNativeInvocations(cfg *config.Config, receipt *ConsultationReceipt, persist func() error) error {
+// sealNativeInvocations seals every saved binding. A positive settle window
+// applies only to live completion; recovery seals once and leaves the rest to
+// the next cycle.
+func sealNativeInvocations(ctx context.Context, cfg *config.Config, receipt *ConsultationReceipt, persist func() error, settle time.Duration) error {
 	client, err := registrationClient(cfg)
 	if err != nil {
 		return aiexecution.Held("native_outcome_unverified")
@@ -152,6 +251,7 @@ func sealNativeInvocations(cfg *config.Config, receipt *ConsultationReceipt, per
 		if err != nil || admissioncontrol.ValidateNativeOutcome(outcome, *native.OutcomeIntent) != nil {
 			return aiexecution.Held("native_outcome_unverified")
 		}
+		outcome = awaitNativeSettlement(ctx, client, *native.OutcomeIntent, outcome, settle)
 		native.Outcome = &outcome
 		if err := persist(); err != nil {
 			return &ConsultationHold{Code: "receipt_persistence_failed"}
@@ -415,7 +515,7 @@ func replayNativeConsultation(cfg *config.Config, identity ConsultationIdentity,
 		if !current || !marker {
 			return result, true, aiexecution.Held("native_launch_receipt_missing")
 		}
-		if err := sealNativeInvocations(cfg, receipt, persist); err != nil {
+		if err := sealNativeInvocations(context.Background(), cfg, receipt, persist, 0); err != nil {
 			return result, true, err
 		}
 		receipt.NativeOutcomeComplete = true
