@@ -127,15 +127,27 @@ func TestAuxiliaryReconcileSkipsInvalidProjectRow(t *testing.T) {
 			if stdout.String() != wantStdout {
 				t.Fatalf("stdout=%q want %q", stdout.String(), wantStdout)
 			}
-			lines := strings.Split(strings.TrimRight(stderr.String(), "\n"), "\n")
-			if len(lines) != 1 || !strings.HasPrefix(lines[0], "[maestro] auxiliary reconcile: skipping project broken: ") || !strings.Contains(lines[0], "disabled") {
-				t.Fatalf("stderr=%q want one skip warning naming the broken row", stderr.String())
-			}
+			assertAuxiliaryUnloadableRowWarning(t, stderr.String())
 		})
 	}
 }
 
-func TestAuxiliaryReconcileFailsWhenNoProjectRowLoads(t *testing.T) {
+// assertAuxiliaryUnloadableRowWarning requires exactly one stderr line for the
+// broken row. It must name the row and the reason without implying the row's
+// roots are left alone: they are replayed from their receipts.
+func assertAuxiliaryUnloadableRowWarning(t *testing.T, stderr string) {
+	t.Helper()
+	lines := strings.Split(strings.TrimRight(stderr, "\n"), "\n")
+	if len(lines) != 1 || !strings.HasPrefix(lines[0], "[maestro] auxiliary reconcile: project broken config could not be loaded (") ||
+		!strings.Contains(lines[0], "disabled") || !strings.HasSuffix(lines[0], "); its indexed roots are reconciled from their receipts") {
+		t.Fatalf("stderr=%q want one warning naming the broken row and how its roots are reconciled", stderr)
+	}
+}
+
+// When no project row loads, the indexed roots are still replayed from their
+// receipts, exactly like the roots of a removed project, with or without
+// --root, and the exit status follows the reconciled roots.
+func TestAuxiliaryReconcileWithNoLoadableProjectRow(t *testing.T) {
 	dir, err := filepath.EvalSymlinks(t.TempDir())
 	if err != nil {
 		t.Fatal(err)
@@ -148,27 +160,48 @@ func TestAuxiliaryReconcileFailsWhenNoProjectRowLoads(t *testing.T) {
 	writeSettledAuxiliaryReceipt(t, stateDir)
 	seedAuxiliaryReconcileStore(t, dbPath, stateDir, false, true)
 
+	want := "root=" + stateDir + " role=supervisor result=clear\nroots=1 held=0\n"
+	for name, extra := range map[string][]string{"all": nil, "root": {"--root", stateDir}} {
+		t.Run(name, func(t *testing.T) {
+			var stdout, stderr bytes.Buffer
+			args := append([]string{"reconcile", "--db", dbPath}, extra...)
+			if code := runAuxiliaryReconcile(args, &stdout, &stderr); code != 0 {
+				t.Fatalf("exit=%d stdout=%q stderr=%q, want 0 once a root was reconciled", code, stdout.String(), stderr.String())
+			}
+			if stdout.String() != want {
+				t.Fatalf("stdout=%q want %q", stdout.String(), want)
+			}
+			assertAuxiliaryUnloadableRowWarning(t, stderr.String())
+		})
+	}
+}
+
+// With no loadable project row and no indexed root that has receipts, nothing
+// was reconciled: exit 1 and say exactly that.
+func TestAuxiliaryReconcileFailsWhenNothingWasReconciled(t *testing.T) {
+	dir, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// --db is explicit, but the flag default still inspects the stores under
+	// HOME; pin it so the test never reads a real operator store.
+	t.Setenv("HOME", dir)
+	dbPath := filepath.Join(dir, "config.db")
+	stateDir := filepath.Join(dir, "empty-state")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	seedAuxiliaryReconcileStore(t, dbPath, stateDir, false, true)
+
 	var stdout, stderr bytes.Buffer
 	if code := runAuxiliaryReconcile([]string{"reconcile", "--db", dbPath}, &stdout, &stderr); code != 1 {
-		t.Fatalf("exit=%d stdout=%q stderr=%q, want 1 when every row was skipped", code, stdout.String(), stderr.String())
+		t.Fatalf("exit=%d stdout=%q stderr=%q, want 1 when nothing was reconciled", code, stdout.String(), stderr.String())
 	}
-	if stdout.Len() != 0 || !strings.Contains(stderr.String(), "skipping project broken") || !strings.Contains(stderr.String(), "all 1 project rows were skipped") {
+	lines := strings.Split(strings.TrimRight(stderr.String(), "\n"), "\n")
+	if stdout.Len() != 0 || len(lines) != 2 || lines[1] != "[maestro] auxiliary reconcile: no project row could be loaded and no indexed root was reconciled" {
 		t.Fatalf("stdout=%q stderr=%q", stdout.String(), stderr.String())
 	}
-
-	// --root names one indexed root; it is replayed from its receipt even when
-	// no project row loads, exactly like the root of a removed project.
-	stdout.Reset()
-	stderr.Reset()
-	if code := runAuxiliaryReconcile([]string{"reconcile", "--db", dbPath, "--root", stateDir}, &stdout, &stderr); code != 0 {
-		t.Fatalf("exit=%d stdout=%q stderr=%q", code, stdout.String(), stderr.String())
-	}
-	if want := "root=" + stateDir + " role=supervisor result=clear\nroots=1 held=0\n"; stdout.String() != want {
-		t.Fatalf("stdout=%q want %q", stdout.String(), want)
-	}
-	if !strings.Contains(stderr.String(), "skipping project broken") {
-		t.Fatalf("stderr=%q", stderr.String())
-	}
+	assertAuxiliaryUnloadableRowWarning(t, lines[0]+"\n")
 }
 
 func TestAuxiliaryReconcileSkipWarningIsOneLine(t *testing.T) {

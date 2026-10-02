@@ -25,7 +25,8 @@ import (
 // path the daemon uses at flow start. An abandoned consultation whose receipt
 // and authority still match is sealed and its launch marker cleared; anything
 // else is reported with the identity, intent and age that keep it occupied.
-// Nothing is launched. Exit status is 1 when any root remains held.
+// Nothing is launched. Exit status is 1 when any root remains held, or when no
+// project row could be loaded and no indexed root was reconciled.
 func auxiliaryCmd(args []string) {
 	os.Exit(runAuxiliaryReconcile(args, os.Stdout, os.Stderr))
 }
@@ -65,7 +66,7 @@ func runAuxiliaryReconcile(args []string, stdout, stderr io.Writer) int {
 	}
 	defer store.Close()
 	ctx := context.Background()
-	configured, err := loadAuxiliaryReconcileProjects(ctx, store, only, stderr)
+	configured, err := loadAuxiliaryReconcileProjects(ctx, store, stderr)
 	if err != nil {
 		fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: %v\n", err)
 		return 1
@@ -73,6 +74,12 @@ func runAuxiliaryReconcile(args []string, stdout, stderr io.Writer) int {
 	reports, err := daemon.ReconcileIndexedAuxiliaryRoots(ctx, store, configured, nil, only, false)
 	if err != nil {
 		fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: %v\n", err)
+		return 1
+	}
+	if len(configured) == 0 && len(reports) == 0 {
+		// Every row was skipped and no indexed root had receipts to replay:
+		// nothing was reconciled, unlike a store whose rows load.
+		fmt.Fprintln(stderr, "[maestro] auxiliary reconcile: no project row could be loaded and no indexed root was reconciled")
 		return 1
 	}
 	held := 0
@@ -98,15 +105,16 @@ func runAuxiliaryReconcile(args []string, stdout, stderr io.Writer) int {
 
 // loadAuxiliaryReconcileProjects loads the project rows one at a time. A row
 // that no longer loads — a routing tier pointing at a backend that has since
-// been disabled, for instance — is skipped with one warning line instead of
-// aborting the reconcile of every other root, which is what the all-or-nothing
-// store.LoadAll did. Every loadable config is returned even under --root: a
-// root of a removed project is replayed against the native authorities of all
-// configured projects, so the set cannot be narrowed to the row owning the
-// root. A root whose own row was skipped is replayed from its receipt, the
-// same way a removed project's root is. Without --root, an empty result means
-// no root can be reconciled under a project config and is an error.
-func loadAuxiliaryReconcileProjects(ctx context.Context, store *configstore.Store, only string, stderr io.Writer) ([]*config.Config, error) {
+// been disabled, for instance — gets one warning line instead of aborting the
+// reconcile of every other root, which is what the all-or-nothing
+// store.LoadAll did. Its roots are not skipped: without their project config
+// they are replayed from their receipts, the same way a removed project's
+// roots are, so the warning says so. Every loadable config is returned even
+// under --root: a root of a removed project is replayed against the native
+// authorities of all configured projects, so the set cannot be narrowed to the
+// row owning the root. An empty result is not an error here; the indexed roots
+// are still replayed from their receipts.
+func loadAuxiliaryReconcileProjects(ctx context.Context, store *configstore.Store, stderr io.Writer) ([]*config.Config, error) {
 	names, err := store.ProjectNames(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("load projects: %w", err)
@@ -115,18 +123,13 @@ func loadAuxiliaryReconcileProjects(ctx context.Context, store *configstore.Stor
 		return nil, errors.New("load projects: no projects in config store")
 	}
 	var configured []*config.Config
-	skipped := 0
 	for _, name := range names {
 		cfg, err := store.Load(ctx, name)
 		if err != nil {
-			skipped++
-			fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: skipping project %s: %s\n", name, singleLineError(err))
+			fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: project %s config could not be loaded (%s); its indexed roots are reconciled from their receipts\n", name, singleLineError(err))
 			continue
 		}
 		configured = append(configured, cfg)
-	}
-	if len(configured) == 0 && only == "" {
-		return nil, fmt.Errorf("load projects: all %d project rows were skipped; no root can be reconciled", skipped)
 	}
 	return configured, nil
 }
