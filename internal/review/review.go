@@ -34,6 +34,7 @@ import (
 
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/forge"
+	"github.com/befeast/maestro/internal/supervisor"
 )
 
 // Lens runs one review model. Implementations: ChatLens (any OpenAI-compatible
@@ -80,6 +81,9 @@ type Producer struct {
 const (
 	defaultPendingStaleAfter = 30 * time.Minute
 	defaultMaxDiffBytes      = 400000
+	// accountingPendingNote is appended to a native lens's final status when
+	// its verdict was posted before the authority settled the attempt.
+	accountingPendingNote = "; accounting pending: native attempt settlement awaited"
 )
 
 // promptTemplate is the shared review prompt, byte-identical to the bash
@@ -444,8 +448,11 @@ func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, p
 	var output string
 	var err error
 	entered := true
+	accountingPending := false
 	if native, ok := lens.(*NativeClaudeLens); ok {
-		output, entered, err = native.runClaimed(ctx, prompt, claimID)
+		var verdict supervisor.NativeReviewResult
+		verdict, entered, err = native.runClaimed(ctx, prompt, claimID)
+		output, accountingPending = verdict.Output, verdict.AccountingPending && err == nil
 	} else {
 		output, err = lens.Run(ctx, prompt)
 	}
@@ -466,7 +473,14 @@ func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, p
 		}
 	}
 	if claimID != "" {
-		if saveErr := p.Attempts.Finish(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, claimID, p.now(), err); saveErr != nil {
+		scope := AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}
+		var saveErr error
+		if accountingPending {
+			saveErr = p.Attempts.FinishAccountingPending(scope, claimID, p.now())
+		} else {
+			saveErr = p.Attempts.Finish(scope, claimID, p.now(), err)
+		}
+		if saveErr != nil {
 			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt persistence failed")
 			return fmt.Errorf("review receipt persistence failed: %w", saveErr)
 		}
@@ -480,6 +494,14 @@ func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, p
 		}
 		p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, description)
 		return fmt.Errorf("run: %w", err)
+	}
+	if accountingPending {
+		// The verdict is complete and durable; only the authority's settlement
+		// of the single native attempt is outstanding (#1239). The receipt
+		// stays with the daemon's regular reconcile — posting here never
+		// spends a second attempt. The note keeps that visible on the status.
+		p.logf("%s: verdict complete, native attempt accounting pending; receipt retained for reconcile", lens.Name())
+		truncNote += accountingPendingNote
 	}
 	findings, ok := parseOutput(output)
 	if !ok {

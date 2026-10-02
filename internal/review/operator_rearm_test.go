@@ -46,9 +46,9 @@ func rearmFixture(t *testing.T) (*Producer, *config.Config, AttemptScope, Operat
 		return proof, nil
 	}
 	calls := &atomic.Int32{}
-	lens := &NativeClaudeLens{Stream: scope.Lens, Model: "claude-opus-5", policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: "original-budget-run", complete: func(context.Context, string, string) (string, error) {
+	lens := &NativeClaudeLens{Stream: scope.Lens, Model: "claude-opus-5", policy: cfg.AIExecution, projectID: cfg.ProjectID, budgetRunID: "original-budget-run", complete: func(context.Context, string, string) (supervisor.NativeReviewResult, error) {
 		calls.Add(1)
-		return "", errors.New("bounded second failure")
+		return supervisor.NativeReviewResult{}, errors.New("bounded second failure")
 	}}
 	p.Lenses = []Lens{lens}
 	p.ExecutionPolicy = cfg.AIExecution
@@ -350,7 +350,7 @@ func TestNativeOperatorRearmPreLaunchHoldLeavesGrantUnclaimed(t *testing.T) {
 			var claimed string
 			lens := p.Lenses[0].(*NativeClaudeLens)
 			lens.limiter = limiter
-			lens.complete = func(_ context.Context, _ string, id string) (string, error) {
+			lens.complete = func(_ context.Context, _ string, id string) (supervisor.NativeReviewResult, error) {
 				calls.Add(1)
 				claimed = id
 				switch mode {
@@ -367,12 +367,12 @@ func TestNativeOperatorRearmPreLaunchHoldLeavesGrantUnclaimed(t *testing.T) {
 					r.Invocations = []supervisor.InvocationReceipt{{ID: uuid.NewString(), Number: 1, Status: "failed"}}
 					writeNativeReviewFile(t, nativeReviewDir(t, cfg.StateDir), "current.json", r)
 				case "opaque_error":
-					return "", errors.New("opaque CLI exit")
+					return supervisor.NativeReviewResult{}, errors.New("opaque CLI exit")
 				}
 				// Capacity was taken between the preflight probe and the
 				// runner's own reservation.
 				limiter.set("auxiliary_capacity_exhausted")
-				return "", aiexecution.Held("auxiliary_capacity_exhausted")
+				return supervisor.NativeReviewResult{}, aiexecution.Held("auxiliary_capacity_exhausted")
 			}
 			if err := p.ProducePR(context.Background(), scope.PR); err == nil {
 				t.Fatal("held run reported success")
@@ -417,9 +417,9 @@ func TestNativeOperatorRearmPreLaunchHoldLeavesGrantUnclaimed(t *testing.T) {
 			if p.Attempts.NativeRearmQueued(cfg, scope, p.now()) || p.Attempts.Due(scope, p.now(), 1) {
 				t.Fatal("retained grant dispatched while capacity is still exhausted")
 			}
-			lens.complete = func(context.Context, string, string) (string, error) {
+			lens.complete = func(context.Context, string, string) (supervisor.NativeReviewResult, error) {
 				calls.Add(1)
-				return "", errors.New("bounded second failure")
+				return supervisor.NativeReviewResult{}, errors.New("bounded second failure")
 			}
 			_ = p.ProducePR(context.Background(), scope.PR)
 			if calls.Load() != 1 || rearmSidecar(t, cfg.StateDir, scope, ".launching") {
@@ -552,10 +552,10 @@ func TestNativeOperatorRearmBoundsBlindRetryUntilOperatorReissue(t *testing.T) {
 	before, _ := state.Load(cfg.StateDir)
 	var calls atomic.Int32
 	lens := p.Lenses[0].(*NativeClaudeLens)
-	lens.complete = func(_ context.Context, _ string, id string) (string, error) {
+	lens.complete = func(_ context.Context, _ string, id string) (supervisor.NativeReviewResult, error) {
 		calls.Add(1)
 		nativeReviewDir(t, cfg.StateDir)
-		return "", &supervisor.ConsultationHold{Code: "receipt_persistence_failed"}
+		return supervisor.NativeReviewResult{}, &supervisor.ConsultationHold{Code: "receipt_persistence_failed"}
 	}
 	rearmDir := filepath.Join(cfg.StateDir, "review-rearms")
 	for cycle := 1; cycle <= 2; cycle++ {
@@ -591,9 +591,9 @@ func TestNativeOperatorRearmBoundsBlindRetryUntilOperatorReissue(t *testing.T) {
 	if _, err := p.Attempts.AuthorizeNativeRearm(cfg, scope, req, p.now()); err == nil {
 		t.Fatal("duplicate allowance while the re-issued grant is fresh")
 	}
-	lens.complete = func(context.Context, string, string) (string, error) {
+	lens.complete = func(context.Context, string, string) (supervisor.NativeReviewResult, error) {
 		calls.Add(1)
-		return "", errors.New("bounded second failure")
+		return supervisor.NativeReviewResult{}, errors.New("bounded second failure")
 	}
 	if !p.Attempts.NativeRearmQueued(cfg, scope, p.now()) {
 		t.Fatal("re-issued grant not queued")

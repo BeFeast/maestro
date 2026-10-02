@@ -15,7 +15,7 @@ import (
 type NativeClaudeLens struct {
 	Stream      string
 	Model       string
-	complete    func(context.Context, string, string) (string, error)
+	complete    func(context.Context, string, string) (supervisor.NativeReviewResult, error)
 	policy      aiexecution.Policy
 	projectID   string
 	budgetRunID string
@@ -32,7 +32,7 @@ func NewNativeClaudeLens(stream, model string, cfg *config.Config) *NativeClaude
 	if cfg != nil {
 		policy = cfg.AIExecution
 	}
-	l := &NativeClaudeLens{Stream: stream, Model: model, policy: policy, complete: func(ctx context.Context, prompt, claimID string) (string, error) {
+	l := &NativeClaudeLens{Stream: stream, Model: model, policy: policy, complete: func(ctx context.Context, prompt, claimID string) (supervisor.NativeReviewResult, error) {
 		return supervisor.CompleteNativeReview(ctx, cfg, model, claimID, prompt)
 	}}
 	if cfg != nil && cfg.Supervisor.NativeSessionRegistration != nil {
@@ -55,23 +55,28 @@ func (l *NativeClaudeLens) Available() error {
 func (l *NativeClaudeLens) Run(context.Context, string) (string, error) {
 	return "", aiexecution.Held("native_reviewer_claim_required")
 }
-func (l *NativeClaudeLens) RunClaimed(ctx context.Context, prompt, claimID string) (string, error) {
-	output, _, err := l.runClaimed(ctx, prompt, claimID)
-	return output, err
+
+// RunClaimed returns the verdict text plus whether the authority accounting
+// of its single physical attempt is still pending (#1239). A pending result is
+// a complete verdict; only the durable attempt reason and the status note
+// differ, so the operator can see which reviews await settlement.
+func (l *NativeClaudeLens) RunClaimed(ctx context.Context, prompt, claimID string) (supervisor.NativeReviewResult, error) {
+	verdict, _, err := l.runClaimed(ctx, prompt, claimID)
+	return verdict, err
 }
 
 // runClaimed additionally reports whether the claim reached the native runner.
 // A refusal before that point is store-independent proof that nothing could
 // have launched (#1233).
-func (l *NativeClaudeLens) runClaimed(ctx context.Context, prompt, claimID string) (output string, entered bool, err error) {
+func (l *NativeClaudeLens) runClaimed(ctx context.Context, prompt, claimID string) (verdict supervisor.NativeReviewResult, entered bool, err error) {
 	if err := l.Available(); err != nil {
-		return "", false, err
+		return supervisor.NativeReviewResult{}, false, err
 	}
 	if uuid.Validate(claimID) != nil {
-		return "", false, aiexecution.Held("native_reviewer_claim_required")
+		return supervisor.NativeReviewResult{}, false, aiexecution.Held("native_reviewer_claim_required")
 	}
-	output, err = l.complete(ctx, prompt, claimID)
-	return output, true, err
+	verdict, err = l.complete(ctx, prompt, claimID)
+	return verdict, true, err
 }
 
 // preflight observes, without launching, what would hold a claim before any

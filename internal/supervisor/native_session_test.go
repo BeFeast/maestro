@@ -33,6 +33,12 @@ func nativeConfig(t *testing.T) (*config.Config, string, *registrationFixture) {
 		t.Skip("Linux authenticated control RPC")
 	}
 	cfg, count := receiptConfig(t)
+	// Live completion polls the authority for up to nativeSettleWindow when a
+	// seal reports unaccounted attempts. Fixtures seal once; a test that
+	// exercises the wait sets its own short window.
+	window, backoff := nativeSettleWindow, nativeSettleBackoff
+	nativeSettleWindow = 0
+	t.Cleanup(func() { nativeSettleWindow, nativeSettleBackoff = window, backoff })
 	old := strings.TrimSuffix(cfg.Model.Backends["primary"].Cmd, " fail")
 	claude := filepath.Join(cfg.LocalPath, "claude")
 	if err := os.Rename(old, claude); err != nil {

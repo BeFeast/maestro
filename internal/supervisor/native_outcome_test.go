@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
 	"github.com/befeast/maestro/internal/aiexecution"
@@ -319,22 +320,122 @@ func TestNativeOutcomeReviewerSameClaimRestoresExactModelOutput(t *testing.T) {
 		return nativeOutcomeFixture(request, true), nil
 	}
 	claim := uuid.NewString()
+	// #1239: the reviewer exited with a complete verdict while the authority
+	// still reported its single attempt as claimed. The verdict is returned
+	// with accounting pending; receipt, marker and permit stay held.
 	output, err := CompleteNativeReview(context.Background(), cfg, "claude-opus-5", claim, "diff")
-	if err == nil || output != "" || aux.released.Load() != 0 {
-		t.Fatal("review not held")
+	if err != nil || output.Output != "done" || !output.AccountingPending || aux.released.Load() != 0 || nativeCalls(t, count) != 1 {
+		t.Fatalf("pending verdict not surfaced: output=%+v err=%v released=%d", output, err, aux.released.Load())
+	}
+	receipt := loadReceipt(t, &receiptCfg)
+	if receipt.NativeOutcomeComplete || receipt.EndedAt != nil || nativeInvocationsAllowed(&receipt) || receipt.Invocations[0].NativeSession.Outcome == nil || receipt.Invocations[0].NativeSession.Outcome.UnresolvedAttempts != 1 {
+		t.Fatalf("pending receipt sealed as complete: %+v", receipt)
+	}
+	if _, err := os.Stat(filepath.Join(receiptCfg.StateDir, "supervisor-consultations", "launch.json")); err != nil {
+		t.Fatal("launch marker dropped while accounting pending", err)
+	}
+	if pending, err := PendingAuxiliaryRuns(cfg.StateDir); err != nil || len(pending) != 1 {
+		t.Fatalf("pending receipt released occupancy: %v %v", pending, err)
+	}
+	// A different claim cannot bypass the unsettled prior and launches nothing.
+	_, err = CompleteNativeReview(context.Background(), cfg, "claude-opus-5", uuid.NewString(), "other diff")
+	var hold *aiexecution.Hold
+	if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || nativeCalls(t, count) != 1 || aux.acquired.Load() != 1 {
+		t.Fatal("fresh claim bypassed pending accounting", err)
 	}
 	sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
 		return nativeOutcomeFixture(request, false), nil
 	}
+	// Later reconcile of the same claim settles the receipt without inference.
 	output, err = CompleteNativeReview(context.Background(), cfg, "claude-opus-5", claim, "diff")
-	if err != nil || output != "done" || nativeCalls(t, count) != 1 || aux.acquired.Load() != 1 || aux.released.Load() != 1 {
+	if err != nil || output.Output != "done" || output.AccountingPending || nativeCalls(t, count) != 1 || aux.acquired.Load() != 1 || aux.released.Load() != 1 {
 		t.Fatal("review replay generated", err)
 	}
+	receipt = loadReceipt(t, &receiptCfg)
+	if !receipt.NativeOutcomeComplete || receipt.Status != "succeeded" || !nativeInvocationsAllowed(&receipt) {
+		t.Fatalf("settled receipt not completed: %+v", receipt)
+	}
+	if err := NativeAuxiliaryOutcomeComplete(receiptCfg.StateDir, claim); err != nil {
+		t.Fatal(err)
+	}
 	_, err = CompleteNativeReview(context.Background(), cfg, "other-model", claim, "diff")
-	var hold *aiexecution.Hold
 	if !errors.As(err, &hold) || hold.Code != "native_input_conflict" {
 		t.Fatal("foreign model reused review", err)
 	}
+}
+
+func TestNativeOutcomeLiveSealWaitsForLateSettlement(t *testing.T) {
+	cfg, count, aux := outcomeTestConfig(t)
+	nativeSettleWindow, nativeSettleBackoff = 2*time.Second, 5*time.Millisecond
+	calls := 0
+	var first admissioncontrol.SealRequest
+	sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		calls++
+		if calls == 1 {
+			first = request
+		} else if request != first {
+			t.Fatal("settlement poll changed native identity")
+		}
+		if calls == 2 {
+			return admissioncontrol.NativeOutcome{}, errors.New("transient reply loss")
+		}
+		return nativeOutcomeFixture(request, calls < 4), nil
+	}
+	id := newConsultationIdentity(cfg, "late-settlement")
+	result, err := NewBackendLLMClient(cfg).(*backendLLMClient).CompleteConsultation(id, "same prompt")
+	if err != nil || result.Output != "done" || result.AccountingPending || calls != 4 || aux.released.Load() != 1 || nativeCalls(t, count) != 1 {
+		t.Fatalf("result=%+v err=%v calls=%d released=%d", result, err, calls, aux.released.Load())
+	}
+	receipt := loadReceipt(t, cfg)
+	if !receipt.NativeOutcomeComplete || receipt.Invocations[0].NativeSession.Outcome.UnresolvedAttempts != 0 || !nativeInvocationsAllowed(&receipt) {
+		t.Fatal("settled seal not persisted")
+	}
+	if _, err := os.Stat(filepath.Join(cfg.StateDir, "supervisor-consultations", "launch.json")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("launch marker retained after settled seal", err)
+	}
+}
+
+func TestNativeOutcomeUnsettledWindowStaysHeldWithoutCompleteVerdict(t *testing.T) {
+	t.Run("supervisor", func(t *testing.T) {
+		cfg, count, aux := outcomeTestConfig(t)
+		nativeSettleWindow, nativeSettleBackoff = 60*time.Millisecond, 5*time.Millisecond
+		calls := 0
+		sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+			calls++
+			return nativeOutcomeFixture(request, true), nil
+		}
+		id := newConsultationIdentity(cfg, "never-settles")
+		result, err := NewBackendLLMClient(cfg).(*backendLLMClient).CompleteConsultation(id, "same prompt")
+		var hold *aiexecution.Hold
+		if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || result.Output != "" || result.AccountingPending || aux.released.Load() != 0 || calls < 2 || nativeCalls(t, count) != 1 {
+			t.Fatalf("supervisor surfaced unsettled output: result=%+v err=%v calls=%d", result, err, calls)
+		}
+		receipt := loadReceipt(t, cfg)
+		if receipt.NativeOutcomeComplete || receipt.Invocations[0].NativeSession.Outcome == nil || receipt.Invocations[0].NativeSession.Outcome.UnresolvedAttempts != 1 {
+			t.Fatalf("held seal not persisted: %+v", receipt)
+		}
+		if _, err := os.Stat(filepath.Join(cfg.StateDir, "supervisor-consultations", "launch.json")); err != nil {
+			t.Fatal("launch marker dropped on unsettled seal", err)
+		}
+	})
+	t.Run("reviewer_local_failure", func(t *testing.T) {
+		cfg, count, fixture := nativeConfig(t)
+		aux := &auxiliaryFixture{}
+		cfg.RuntimeAuxiliaryLimiter = aux
+		receiptCfg := *cfg
+		receiptCfg.StateDir = filepath.Join(cfg.StateDir, "native-reviews")
+		fixture.cfg = &receiptCfg
+		old := sealNativeConsultation
+		t.Cleanup(func() { sealNativeConsultation = old })
+		sealNativeConsultation = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+			return nativeOutcomeFixture(request, true), nil
+		}
+		output, err := CompleteNativeReview(context.Background(), cfg, "claude-opus-5", uuid.NewString(), "diff")
+		var hold *aiexecution.Hold
+		if !errors.As(err, &hold) || hold.Code != "native_outcome_unverified" || output.Output != "" || output.AccountingPending || aux.released.Load() != 0 || nativeCalls(t, count) != 1 {
+			t.Fatalf("failed reviewer output surfaced as pending verdict: output=%+v err=%v", output, err)
+		}
+	})
 }
 
 func TestNativeOutcomeMissingMarkerCannotBypassHeldReceiptAndUnverifiedOSCannotSeal(t *testing.T) {

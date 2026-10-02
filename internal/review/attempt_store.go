@@ -299,6 +299,18 @@ func (s *AttemptStore) writeEvidence(id string, terminal *GatewayTerminalError, 
 // Finish commits a safe outcome before publication/recovery. Any failure leaves
 // the launch intent, so loss of an outcome cannot create permission to replay.
 func (s *AttemptStore) Finish(scope AttemptScope, id string, now time.Time, runErr error) error {
+	return s.finish(scope, id, now, runErr, false)
+}
+
+// FinishAccountingPending commits a completed verdict whose native attempt the
+// authority has not yet accounted (#1239). The attempt is spent exactly like a
+// completed one — the review exists — and the distinct reason records that the
+// native receipt was still awaiting settlement when it was published.
+func (s *AttemptStore) FinishAccountingPending(scope AttemptScope, id string, now time.Time) error {
+	return s.finish(scope, id, now, nil, true)
+}
+
+func (s *AttemptStore) finish(scope AttemptScope, id string, now time.Time, runErr error, accountingPending bool) error {
 	if !scope.valid() || uuid.Validate(id) != nil {
 		return fmt.Errorf("invalid review outcome identity")
 	}
@@ -307,6 +319,9 @@ func (s *AttemptStore) Finish(scope AttemptScope, id string, now time.Time, runE
 	}
 	var terminal *GatewayTerminalError
 	code := "review_completed"
+	if accountingPending {
+		code = "review_completed_accounting_pending"
+	}
 	if runErr != nil {
 		code = "outcome_unknown"
 		if errors.As(runErr, &terminal) {
