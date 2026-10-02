@@ -91,3 +91,53 @@ func TestMergePaused_LatestWriteWins(t *testing.T) {
 		}
 	})
 }
+
+// #1238: the orchestrator holds every worker launch while paused, so a launch
+// recommendation left unconsumed by the pause must not TTL-expire. Its TTL
+// clock stops while paused and restarts at resume; recommendations the pause
+// does not hold keep their normal TTL.
+func TestRecordSupervisorDecisionWithPolicy_PauseHoldsLaunchRecommendationTTL(t *testing.T) {
+	const ttl = 2 * time.Hour
+	base := time.Date(2026, 10, 1, 23, 40, 0, 0, time.UTC)
+	repair := SupervisorDecision{
+		ID:                "sup-repair",
+		RecommendedAction: approvalActionSpawnRepairWorker,
+		Target:            &SupervisorTarget{Issue: 517, PR: 520, Session: "rep-1"},
+		Summary:           "Start a repair worker for issue #517",
+	}
+
+	s := NewState()
+	s.RecordSupervisorDecisionWithPolicy(repair, DefaultSupervisorDecisionLimit, time.Hour, ttl, base)
+	s.SetPaused(base.Add(time.Minute))
+
+	held := s.RecordSupervisorDecisionWithPolicy(repair, DefaultSupervisorDecisionLimit, time.Hour, ttl, base.Add(5*time.Hour))
+	if held.Disposition != nil {
+		t.Fatalf("paused launch recommendation disposition = %+v, want still unconsumed", held.Disposition)
+	}
+
+	resumedAt := base.Add(6 * time.Hour)
+	s.ClearPaused(resumedAt)
+	afterResume := s.RecordSupervisorDecisionWithPolicy(repair, DefaultSupervisorDecisionLimit, time.Hour, ttl, resumedAt.Add(time.Minute))
+	if afterResume.Disposition != nil || s.SupervisorRecommendationDropped(repair) {
+		t.Fatalf("launch recommendation expired right after resume: %+v", afterResume.Disposition)
+	}
+
+	expired := s.RecordSupervisorDecisionWithPolicy(repair, DefaultSupervisorDecisionLimit, time.Hour, ttl, resumedAt.Add(ttl))
+	if expired.Disposition == nil || expired.Disposition.Reason != RecommendationDispositionTTLExpired {
+		t.Fatalf("disposition one TTL after resume = %+v, want ttl expiry", expired.Disposition)
+	}
+
+	monitor := SupervisorDecision{
+		ID:                "sup-monitor",
+		RecommendedAction: "monitor_open_pr",
+		Target:            &SupervisorTarget{Issue: 18, PR: 21},
+		Summary:           "Monitor PR #21",
+	}
+	other := NewState()
+	other.RecordSupervisorDecisionWithPolicy(monitor, DefaultSupervisorDecisionLimit, time.Hour, ttl, base)
+	other.SetPaused(base.Add(time.Minute))
+	monitored := other.RecordSupervisorDecisionWithPolicy(monitor, DefaultSupervisorDecisionLimit, time.Hour, ttl, base.Add(ttl))
+	if monitored.Disposition == nil || monitored.Disposition.Reason != RecommendationDispositionTTLExpired {
+		t.Fatalf("non-launch recommendation disposition = %+v, want its normal ttl expiry while paused", monitored.Disposition)
+	}
+}
