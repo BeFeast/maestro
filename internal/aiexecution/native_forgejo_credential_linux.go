@@ -14,7 +14,7 @@ func readNativeForgejoCredential(p NativeContainmentProfile) (string, error) {
 		Repository string `json:"repository"`
 		Token      string `json:"token"`
 	}
-	if DecodeStrict(b, &credential) != nil || credential.Version != 1 || credential.Repository != p.ForgejoRepository || credential.Token == "" || strings.ContainsAny(credential.Token, " \t\r\n\x00") || !validDigest(p.ForgejoTokenSHA256) || digest([]byte("maestro-native-forgejo:v1\x00"+credential.Token)) != p.ForgejoTokenSHA256 {
+	if DecodeStrict(b, &credential) != nil || credential.Version != 1 || credential.Repository != p.ForgejoRepository || credential.Token == "" || strings.ContainsAny(credential.Token, " \t\r\n\x00") || !validDigest(p.ForgejoTokenSHA256) || NativeForgejoCredentialSHA256(credential.Token) != p.ForgejoTokenSHA256 {
 		return "", Held("containment_forgejo_credential_unverified")
 	}
 	return credential.Token, nil

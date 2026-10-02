@@ -140,6 +140,45 @@ func mergeRefusalOutOfDate(body string) bool {
 	return false
 }
 
+// ErrMergeDenied marks the one 405 merge refusal that is terminal for the
+// acting credential: Forgejo's ErrUserNotAllowedToMerge answer, the documented
+// message "User not allowed to merge PR". The server sends it when the actor
+// may not merge into the base branch at all (no write access, or not on the
+// branch protection's merge whitelist). Retrying the same head with the same
+// credential cannot succeed, so the github layer maps the sentinel onto
+// ErrMergeDeniedForActor and the orchestrator stops asking (#1247).
+//
+// Every other 405 keeps its historical behaviour (the raw error the caller
+// retries): branch-protection refusals ("not allowed to merge [reason: ...]",
+// which clear when approvals or statuses land), "Work in progress PRs cannot
+// be merged", "Please try again later", and the EMPTY-message 405 Forgejo
+// sends for an already-merged pull.
+var ErrMergeDenied = errors.New("merge denied for this actor")
+
+// mergeRefusalActorDeniedMessage is the message Forgejo's MergePullRequest
+// handler sends for ErrUserNotAllowedToMerge.
+const mergeRefusalActorDeniedMessage = "User not allowed to merge PR"
+
+// mergeRefusalActorDenied reports whether a 405 body is Forgejo's
+// ErrUserNotAllowedToMerge answer. The comparison is an exact,
+// case-insensitive match on the APIError message (or on the whole trimmed
+// body when it is not APIError JSON) — never a substring search, so the
+// branch-protection family "not allowed to merge [reason: ...]" can never be
+// mistaken for an actor refusal.
+func mergeRefusalActorDenied(body string) bool {
+	body = strings.TrimSpace(body)
+	if body == "" {
+		return false
+	}
+	var apiErr struct {
+		Message *string `json:"message"`
+	}
+	if err := json.Unmarshal([]byte(body), &apiErr); err == nil && apiErr.Message != nil {
+		return strings.EqualFold(strings.TrimSpace(*apiErr.Message), mergeRefusalActorDeniedMessage)
+	}
+	return strings.EqualFold(body, mergeRefusalActorDeniedMessage)
+}
+
 // MergeOptions selects the merge behavior for MergePull. The wire casing of
 // MergePullRequestOption is mixed and pinned verbatim in the payload: `Do`
 // is Go-cased, `head_commit_id`/`delete_branch_after_merge` are snake.
@@ -159,8 +198,10 @@ type MergeOptions struct {
 
 // MergePull merges one pull request. A 405/409 refusal whose body indicates
 // the out-of-date/head-mismatch family comes back wrapped with
-// ErrMergeOutOfDate (the full HTTP status and body text stay in the chain);
-// every other refusal — including a bodyless 405 — is the raw loud error.
+// ErrMergeOutOfDate (the full HTTP status and body text stay in the chain).
+// A 405 whose message is exactly "User not allowed to merge PR" comes back
+// wrapped with ErrMergeDenied. Every other refusal — a bodyless 405 included —
+// is the raw loud error.
 func (c *Client) MergePull(ctx context.Context, repo string, index int, opts MergeOptions) error {
 	if strings.TrimSpace(opts.Do) == "" {
 		return fmt.Errorf("merge pull %s#%d: merge strategy (Do) is required", repo, index)
@@ -174,10 +215,13 @@ func (c *Client) MergePull(ctx context.Context, repo string, index int, opts Mer
 	}
 	if _, err := c.do(ctx, http.MethodPost, fmt.Sprintf("/repos/%s/pulls/%d/merge", repo, index), payload); err != nil {
 		var se *StatusError
-		if errors.As(err, &se) &&
-			(se.StatusCode == http.StatusMethodNotAllowed || se.StatusCode == http.StatusConflict) &&
-			mergeRefusalOutOfDate(se.Body) {
-			return fmt.Errorf("merge pull %s#%d: %w: %w", repo, index, ErrMergeOutOfDate, err)
+		if errors.As(err, &se) {
+			switch {
+			case (se.StatusCode == http.StatusMethodNotAllowed || se.StatusCode == http.StatusConflict) && mergeRefusalOutOfDate(se.Body):
+				return fmt.Errorf("merge pull %s#%d: %w: %w", repo, index, ErrMergeOutOfDate, err)
+			case se.StatusCode == http.StatusMethodNotAllowed && mergeRefusalActorDenied(se.Body):
+				return fmt.Errorf("merge pull %s#%d: %w: %w", repo, index, ErrMergeDenied, err)
+			}
 		}
 		return fmt.Errorf("merge pull %s#%d: %w", repo, index, err)
 	}

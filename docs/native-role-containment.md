@@ -110,6 +110,17 @@ plus a pinned `server_probe` receipt. This is trusted R9 provisioning evidence
 after real server-side negative probes. It is not created by this launcher and
 cannot be replaced by hashing the existing broad administrator credential.
 
+Auto-merge reads the same pinned attestations before a merge call (#1247).
+When one is bound to its profile, unexpired, names the project's repository,
+carries the digest of the exact Forgejo token auto-merge acts with, and says
+`merge_denied=true`, the merge API is not called: the PR is parked behind a
+`merge-denied:<worker_login>` operator gate with one journal line and one
+notification. Independently, a Forgejo 405 "User not allowed to merge PR"
+latches the refused head for that credential, so the merge is attempted once
+per head and credential instead of every cycle. Missing, unreadable or unbound
+evidence changes nothing, and every other merge refusal keeps its existing
+handling.
+
 ## Validation and remaining operational acceptance
 
 Source tests cover envelope boundaries, finite arguments/env, credential

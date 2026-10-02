@@ -3508,6 +3508,15 @@ func formatFailureAnnotations(anns []checkAnnotation) string {
 // legacy needle so pre-existing strings.Contains consumers keep matching.
 var ErrMergeNotUpToDate = errors.New("pr head/base is not up to date for merge")
 
+// ErrMergeDeniedForActor marks a merge refusal that retrying the same head
+// with the same credential can never clear: the forge answered that the
+// acting user may not merge this pull at all (Forgejo 405 "User not allowed to
+// merge PR"). Branch-protection refusals that clear once approvals or statuses
+// land are NOT this sentinel. The forgejo transport maps forgejo.ErrMergeDenied
+// onto it; the orchestrator latches the refused head per credential instead of
+// asking again every cycle (#1247). The gh path never produces it.
+var ErrMergeDeniedForActor = errors.New("merge denied for this actor")
+
 // mergeNotUpToDateNeedle is the historical gh stderr fragment ("the head
 // branch is not up to date with the base branch") the orchestrator classified
 // on before the sentinel existed; the gh path still detects on it verbatim.

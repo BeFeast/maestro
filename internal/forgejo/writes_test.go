@@ -267,8 +267,83 @@ func TestMergePull_Bodyless405StaysRaw(t *testing.T) {
 	if err == nil {
 		t.Fatal("a 405 refusal must surface as an error")
 	}
-	if errors.Is(err, ErrMergeOutOfDate) {
+	if errors.Is(err, ErrMergeOutOfDate) || errors.Is(err, ErrMergeDenied) {
 		t.Fatalf("a bodyless 405 must stay unclassified, got: %v", err)
+	}
+}
+
+func TestMergePull_405UserNotAllowedIsMergeDenied(t *testing.T) {
+	// The #1247 refusal: the acting credential may not merge into the base
+	// branch at all, so Forgejo answers 405 "User not allowed to merge PR"
+	// (ErrUserNotAllowedToMerge) for every head. Terminal for this actor —
+	// never the AutoRebase family.
+	c, _ := staticWrites(t, 405, `{"message":"User not allowed to merge PR","url":"https://forge.example/api/swagger"}`)
+	err := c.MergePull(context.Background(), "owner/repo", 9, MergeOptions{Do: "squash", HeadCommitID: "abc"})
+	if !errors.Is(err, ErrMergeDenied) {
+		t.Fatalf("a 405 user-not-allowed refusal must wrap ErrMergeDenied, got: %v", err)
+	}
+	if errors.Is(err, ErrMergeOutOfDate) {
+		t.Fatalf("a 405 user-not-allowed refusal must not look out-of-date, got: %v", err)
+	}
+	// Classification adds, never replaces: the raw status/body and the typed
+	// StatusError stay in the chain.
+	if !strings.Contains(err.Error(), "HTTP 405") || !strings.Contains(err.Error(), "User not allowed to merge PR") {
+		t.Fatalf("error must keep the raw status and body, got: %v", err)
+	}
+	var se *StatusError
+	if !errors.As(err, &se) || se.StatusCode != 405 {
+		t.Fatalf("StatusError must survive the wrap chain, got: %v", err)
+	}
+}
+
+// TestMergePull_Forgejo405BodiesClassification pins the classification of the
+// 405 bodies Forgejo's MergePullRequest handler actually sends (APIError JSON,
+// {"message", "url"}). Only ErrUserNotAllowedToMerge is terminal for the
+// actor. Every other 405 keeps today's behaviour: branch-protection refusals
+// clear when approvals/statuses land, "try again later" clears on its own, the
+// empty-message reply is an already-merged pull the caller re-reads, and
+// "behind the base branch" is deliberately NOT pulled into the out-of-date
+// family here (#1247 keeps that path unchanged).
+func TestMergePull_Forgejo405BodiesClassification(t *testing.T) {
+	cases := []struct {
+		name          string
+		status        int
+		body          string
+		wantDenied    bool
+		wantOutOfDate bool
+	}{
+		{"user not allowed", 405, `{"message":"User not allowed to merge PR","url":""}`, true, false},
+		{"user not allowed, other casing", 405, `{"message":"user NOT allowed to merge pr","url":""}`, true, false},
+		{"user not allowed, padded message", 405, `{"message":"  User not allowed to merge PR\n","url":""}`, true, false},
+		{"user not allowed, plain-text body", 405, `User not allowed to merge PR`, true, false},
+		{"user not allowed on a 409 stays raw", 409, `{"message":"User not allowed to merge PR","url":""}`, false, false},
+		{"user not allowed as a substring stays raw", 405, `{"message":"proxy: User not allowed to merge PR (cached)","url":""}`, false, false},
+		{"already merged (empty message)", 405, `{"message":"","url":""}`, false, false},
+		{"work in progress", 405, `{"message":"Work in progress PRs cannot be merged","url":""}`, false, false},
+		{"not mergeable yet", 405, `{"message":"Please try again later","url":""}`, false, false},
+		{"not enough approvals", 405, `{"message":"not allowed to merge [reason: Does not have enough approvals]","url":""}`, false, false},
+		{"required status checks", 405, `{"message":"not allowed to merge [reason: Not all required status checks successful]","url":""}`, false, false},
+		{"requested changes", 405, `{"message":"not allowed to merge [reason: There are requested changes]","url":""}`, false, false},
+		{"official review requests", 405, `{"message":"not allowed to merge [reason: There are official review requests]","url":""}`, false, false},
+		{"protected files", 405, `{"message":"not allowed to merge [reason: Changed protected files]","url":""}`, false, false},
+		{"behind base branch stays raw", 405, `{"message":"not allowed to merge [reason: The head branch is behind the base branch]","url":""}`, false, false},
+		{"unsigned merge", 405, `{"message":"wont sign: never","url":""}`, false, false},
+		{"head commit out of date", 405, `{"message":"head commit is out of date","url":""}`, false, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c, _ := staticWrites(t, tc.status, tc.body)
+			err := c.MergePull(context.Background(), "owner/repo", 9, MergeOptions{Do: "squash", HeadCommitID: "abc"})
+			if err == nil {
+				t.Fatal("a refusal must surface as an error")
+			}
+			if got := errors.Is(err, ErrMergeDenied); got != tc.wantDenied {
+				t.Fatalf("errors.Is(err, ErrMergeDenied) = %v, want %v (err = %v)", got, tc.wantDenied, err)
+			}
+			if got := errors.Is(err, ErrMergeOutOfDate); got != tc.wantOutOfDate {
+				t.Fatalf("errors.Is(err, ErrMergeOutOfDate) = %v, want %v (err = %v)", got, tc.wantOutOfDate, err)
+			}
+		})
 	}
 }
 
