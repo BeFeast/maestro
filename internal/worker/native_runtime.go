@@ -609,6 +609,127 @@ func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot stri
 	return nil
 }
 
+// ReconcileNativeWorkerExit seals the projected generation of a native session
+// whose worker has already exited (#1243). After a clean exit the session moves
+// running -> pr_open/retry_exhausted/done and the scratch-lease reconciler
+// releases its exact lease, but nothing writes the terminal marker or seals the
+// binding until the next respawn of that slot runs the termination fence
+// (ensureNativeGenerationTerminalBeforeSuccessor). Until then NativePendingSlots
+// counts the slot as a live worker, so the fleet ceiling can block the very
+// respawn that would seal it, and stale-worktree cleanup refuses the unsettled
+// outcome.
+//
+// The daemon runs this at the start of every cycle, before any capacity
+// decision. It repeats the fence's exact sequence (sealNativeGenerationTerminationLocked)
+// under the receipt lock: observe the original pinned runtime without
+// signalling anything, seal the exact binding at the admission authority, then
+// persist the termination evidence and the terminal marker. Only a session that
+// is no longer running, owns no process lease and projects a launched
+// generation qualifies; the session projection itself is never modified.
+// Anything short of a recorded, settled termination (unproven OS termination,
+// authority unavailable or not allowing a next generation, lock contention)
+// returns a typed hold and leaves the generation counted as live; the next
+// cycle repeats the attempt. sealed reports that this call recorded the
+// termination.
+func ReconcileNativeWorkerExit(cfg *config.Config, s *state.State, slot string) (sealed bool, err error) {
+	if cfg == nil || s == nil || cfg.WorkerNativeSessionRegistration == nil || !cfg.AIExecution.RequireVerifiedRoute {
+		return false, nil
+	}
+	sess := s.Sessions[slot]
+	if sess == nil || sess.NativeRoleRunID == "" || sess.WorkerGeneration == 0 || !nativeWorkerExitStatus(sess.Status) {
+		return false, nil
+	}
+	// A hold-free session is the clean-exit shape. native_generation_sealed is
+	// what the cycle's seal-started guard stamps when an earlier attempt
+	// persisted its seal intent and lost the authority reply before the marker
+	// was written; the existing hold path settles that generation only once the
+	// marker exists, so the attempt is repeated here. Every other hold has its
+	// own reconciliation.
+	hold := sess.NativeRegistrationHold
+	if hold != "" && hold != "native_generation_sealed" {
+		return false, nil
+	}
+	if _, hasLease, leaseErr := sessionProcessLease(sess); leaseErr != nil || hasLease {
+		// An exact lease is proven, marked and released by the lease
+		// termination path first; a malformed one is reported there.
+		return false, nil
+	}
+	held := func(cause error) error {
+		if h, ok := NativeHold(cause); ok {
+			h.Slot = slot
+			return h
+		}
+		return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot, cause: cause}
+	}
+	dir := nativeReceiptDir(cfg.StateDir, slot)
+	if sess.NativeReceiptDir != dir {
+		return false, &NativeRegistrationHold{Code: "native_identity_conflict", LaunchUncertain: true, Slot: slot}
+	}
+	// Lock-free precheck: most exited sessions are already recorded and
+	// settled, and need neither the receipt lock nor any observation.
+	r, err := readNativeWorkerReceipt(dir, sess.WorkerGeneration)
+	if err != nil {
+		return false, held(err)
+	}
+	if need, err := nativeWorkerExitNeedsSeal(cfg, dir, r, hold); err != nil || !need {
+		if err != nil {
+			return false, held(err)
+		}
+		return false, nil
+	}
+	dir, unlock, err := lockNativeWorker(cfg, slot)
+	if err != nil {
+		return false, held(err)
+	}
+	defer unlock()
+	r, err = readNativeWorkerReceipt(dir, sess.WorkerGeneration)
+	if err != nil {
+		return false, held(err)
+	}
+	if need, err := nativeWorkerExitNeedsSeal(cfg, dir, r, hold); err != nil || !need {
+		if err != nil {
+			return false, held(err)
+		}
+		return false, nil
+	}
+	if _, err := sealNativeGenerationTerminationLocked(cfg, dir, slot, sess, r); err != nil {
+		return false, held(err)
+	}
+	log.Printf("[worker] native generation %d of %s sealed and recorded terminal after its worker exited (session %s)", r.Generation, slot, sess.Status)
+	return true, nil
+}
+
+// nativeWorkerExitStatus reports the session statuses a worker exit produces.
+// A running or queued projection still owns (or is about to own) its process.
+func nativeWorkerExitStatus(status state.SessionStatus) bool {
+	switch status {
+	case state.StatusPROpen, state.StatusCodeLanded, state.StatusDone, state.StatusFailed,
+		state.StatusConflictFailed, state.StatusDead, state.StatusRetryExhausted:
+		return true
+	}
+	return false
+}
+
+// nativeWorkerExitNeedsSeal reports whether the projected generation r of an
+// exited session still lacks a recorded termination or, for a hold-free
+// session, a settlement that allows a next generation. A receipt that never
+// reached launched occupies no capacity this path may release: launch_intent
+// is never released by absence. A terminal generation under a hold is left to
+// the existing hold path.
+func nativeWorkerExitNeedsSeal(cfg *config.Config, dir string, r *NativeWorkerReceipt, hold string) (bool, error) {
+	if r.Status != "launched" {
+		return false, nil
+	}
+	terminal, err := nativeWorkerTerminated(dir, r)
+	if err != nil {
+		return false, err
+	}
+	if !terminal {
+		return true, nil
+	}
+	return hold == "" && persistedNativeGenerationOutcome(cfg, r) != nil, nil
+}
+
 // sealNativeGenerationTerminationLocked proves, seals and records the exact OS
 // termination of the session's projected launched generation r, in that order
 // (verified terminal process state precedes the seal, docs/strict-ai-execution.md):

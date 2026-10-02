@@ -148,6 +148,18 @@ project cannot erase its outstanding occupancy. Missing, unreadable, unsafe or
 corrupt indexed roots hold the ceiling. A removed project cannot acquire a new
 permit. No standalone managed reviewer can silently create another controller.
 
+Native worker generations count against `fleet.max_live_workers` from their
+durable receipts. A launched generation without a recorded OS termination is a
+live worker, whatever its session projection says. Once its worker has exited
+(session no longer running, exact lease released), the next project cycle seals
+it before making any capacity decision. It uses the respawn fence's sequence in
+order: verified terminal process state, the exact authority seal allowing a
+next generation, then the terminal marker. If termination is unproven or the
+authority cannot settle, the generation stays counted and the cycle retries
+next time. The ceiling never releases a slot on a guess. When the ceiling
+blocks a project that runs no worker, the cycle journals once which slots hold
+it and why, marked CRITICAL when no worker runs anywhere in the fleet.
+
 `scripts/llm-review.sh` is retired and always holds before any command/API call.
 The old GitHub workflow is now only a manual explanatory notice with no inference
 credentials, checkout, tools or automatic triggers. Product workflows are not

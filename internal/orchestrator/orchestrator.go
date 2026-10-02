@@ -181,6 +181,14 @@ type Orchestrator struct {
 	fleetSpawnCeilingFn          func() bool
 	fleetSpawnReserveFn          func() (commit func(slot string), release func(), ok bool)
 	fleetNativeRecoveryReserveFn func(slot, nativeID string) (commit func(string), release func(), ok bool)
+	// fleetSpawnStallFn explains a closed fleet ceiling for the journal (#1243):
+	// detail names every counted slot and why it is counted, stalled reports
+	// that no worker runs anywhere in the fleet. nil = no diagnostic.
+	fleetSpawnStallFn func() (detail string, stalled bool)
+
+	// nativeExitReconcileFn seals cleanly exited native generations at cycle
+	// start (#1243). nil = worker.ReconcileNativeWorkerExit; tests override it.
+	nativeExitReconcileFn func(cfg *config.Config, s *state.State, slot string) (bool, error)
 
 	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
 	// whether the host is too short on tmpfs space to accept another worker, and
@@ -251,6 +259,9 @@ type Orchestrator struct {
 	cycleClosedPRsErr   error
 	cycleIssueClosed    map[int]cycleBoolResult
 	cyclePRMerged       map[int]cycleBoolResult
+	// cycleFleetStallNoted limits the fleet ceiling stall diagnostic to one
+	// journal line per cycle (#1243).
+	cycleFleetStallNoted bool
 }
 
 // New creates a new Orchestrator
@@ -325,6 +336,66 @@ func (o *Orchestrator) SetSpawnResourceHold(fn func() (bool, string)) {
 // dispatch aborts before a worker starts.
 func (o *Orchestrator) SetFleetSpawnReserve(fn func() (commit func(slot string), release func(), ok bool)) {
 	o.fleetSpawnReserveFn = fn
+}
+
+// SetFleetSpawnStallDiagnostic wires the daemon's explanation of a closed
+// fleet ceiling (#1243). Passing nil disables the diagnostic.
+func (o *Orchestrator) SetFleetSpawnStallDiagnostic(fn func() (detail string, stalled bool)) {
+	o.fleetSpawnStallFn = fn
+}
+
+// noteFleetCeilingStall journals, at most once per cycle, which fleet slots
+// keep the live-worker ceiling closed while this project runs no worker
+// (#1243). A ceiling held only by native launch receipts without recorded
+// termination and in-flight reservations, with no worker running anywhere in
+// the fleet, cannot be reopened by any worker exit and is reported CRITICAL.
+func (o *Orchestrator) noteFleetCeilingStall(s *state.State) {
+	if o.fleetSpawnStallFn == nil || o.cycleFleetStallNoted || s == nil || s.RunningSessionCount() != 0 {
+		return
+	}
+	o.cycleFleetStallNoted = true
+	detail, stalled := o.fleetSpawnStallFn()
+	if detail == "" {
+		return
+	}
+	if stalled {
+		log.Printf("[orch] CRITICAL fleet live-worker ceiling stall: no worker is running anywhere in the fleet, so no exit can reopen capacity: %s", detail)
+		return
+	}
+	log.Printf("[orch] fleet live-worker ceiling held with no local worker running: %s", detail)
+}
+
+// reconcileNativeWorkerExits seals every cleanly exited native generation whose
+// OS termination is proven, before this cycle makes any capacity decision
+// (#1243). Without it the generation stays counted as a live worker by the
+// fleet ceiling until the next respawn of its slot, which that ceiling can
+// itself block. Each attempt uses the respawn fence's prove -> seal -> record
+// sequence; a typed hold leaves the generation counted and is journaled, and
+// the next cycle retries.
+func (o *Orchestrator) reconcileNativeWorkerExits(s *state.State) {
+	reconcile := o.nativeExitReconcileFn
+	if reconcile == nil {
+		reconcile = worker.ReconcileNativeWorkerExit
+	}
+	slots := make([]string, 0, len(s.Sessions))
+	for slot := range s.Sessions {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	for _, slot := range slots {
+		sealed, err := reconcile(o.cfg, s, slot)
+		if err != nil {
+			cause := ""
+			if inner := errors.Unwrap(err); inner != nil {
+				cause = fmt.Sprintf(" (cause: %v)", inner)
+			}
+			log.Printf("[orch] native exit seal held for %s: %v%s", slot, err, cause)
+			continue
+		}
+		if sealed {
+			log.Printf("[orch] native exit sealed for %s: generation recorded terminal and no longer occupies fleet capacity", slot)
+		}
+	}
 }
 
 type fleetSpawnPermit struct {
@@ -433,6 +504,7 @@ func (o *Orchestrator) beginCycle() {
 	o.cycleClosedPRsErr = nil
 	o.cycleIssueClosed = make(map[int]cycleBoolResult)
 	o.cyclePRMerged = make(map[int]cycleBoolResult)
+	o.cycleFleetStallNoted = false
 }
 
 // endCycle clears the per-cycle cache and deactivates memoization so any
@@ -3022,6 +3094,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			sess.NextRetryAt = &retryAt
 			log.Printf("[orch] worker %s retry deferred until %s: fleet live-worker ceiling reached",
 				slotName, retryAt.Format(time.RFC3339))
+			o.noteFleetCeilingStall(s)
 			return
 		}
 
@@ -3306,6 +3379,13 @@ func (o *Orchestrator) RunOnce() error {
 	}
 	if leaseReconcile.Attention > 0 {
 		log.Printf("[orch] worker lease reconcile surfaced %d ownership attention item(s)", leaseReconcile.Attention)
+	}
+	// A cleanly exited native generation is sealed here, after its lease was
+	// released and before any step that consults the fleet ceiling, so the
+	// ceiling never needs to guess about a generation awaiting its seal: it
+	// stops counting the slot only once termination is proven and recorded.
+	if o.cfg.AIExecution.RequireVerifiedRoute {
+		o.reconcileNativeWorkerExits(s)
 	}
 
 	// Step 0: Surface a finished self-deploy (#698) as a supervisor finding.
@@ -10577,6 +10657,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	}
 	if o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
 		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
+		o.noteFleetCeilingStall(s)
 		return
 	}
 	// Host-resource precondition (#1128): the host tmpfs is RAM-backed, so
@@ -10805,6 +10886,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		permit, permitOK := o.reserveFleetSpawn()
 		if !permitOK {
 			log.Printf("[orch] fleet live-worker ceiling reached before routing issue #%d", issue.Number)
+			o.noteFleetCeilingStall(s)
 			return
 		}
 
