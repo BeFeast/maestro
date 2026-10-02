@@ -57,6 +57,11 @@ func StartPhase(cfg *config.Config, sess *state.Session, slotName, prompt, backe
 	}
 	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
+	// Prove and record the projected generation's exact termination before any
+	// successor identity is registered (pre-launch wedge fence).
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(cfg, slotName, sess); err != nil {
+		return err
+	}
 	nextGeneration := sess.WorkerGeneration + 1
 	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, sess.IssueNumber, sess.Worktree, sess.Branch)
 	if err != nil {

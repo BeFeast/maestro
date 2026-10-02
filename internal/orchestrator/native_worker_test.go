@@ -114,3 +114,18 @@ func TestNativeWorkerRepairUsesTrustedCopiedRoleAndRetainsApprovalOnHold(t *test
 		t.Fatal("held repair automatically retried")
 	}
 }
+
+func TestNativeRuntimeReconcileHoldRoutesPrelaunchWedge(t *testing.T) {
+	for code, want := range map[string]bool{
+		"unresolved_launch":               true,
+		"native_process_identity_missing": true,
+		"previous_outcome_unknown":        true,
+		"native_generation_sealed":        false,
+		"setup_failed":                    false,
+		"":                                false,
+	} {
+		if got := nativeRuntimeReconcileHold(code); got != want {
+			t.Fatalf("nativeRuntimeReconcileHold(%q)=%v want %v", code, got, want)
+		}
+	}
+}

@@ -507,6 +507,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
 	branchName := BranchName(slotName, issue)
+	// Prove and record the projected generation's exact termination before any
+	// successor identity is registered (pre-launch wedge fence).
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(cfg, slotName, sess); err != nil {
+		return err
+	}
 	nextGeneration := sess.WorkerGeneration + 1
 	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, issue.Number, worktreePath, branchName)
 	if err != nil {
