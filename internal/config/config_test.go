@@ -183,6 +183,65 @@ supervisor:
 	}
 }
 
+// #1234: an ordered queue amended to `enabled: false` with its issue list
+// retained must be inactive; a list without an explicit flag stays active.
+func TestParse_SupervisorOrderedQueueDisabledWithRetainedIssuesIsInactive(t *testing.T) {
+	disabled, err := parse([]byte(`
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    enabled: false
+    issues: [17]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if disabled.Supervisor.OrderedQueue.Active() || disabled.Supervisor.OrderedQueueActive() {
+		t.Fatal("ordered queue with enabled: false must be inactive even with retained issues")
+	}
+	if got := disabled.Supervisor.OrderedQueue.Issues; len(got) != 1 || got[0] != 17 {
+		t.Fatalf("Issues = %v, want retained [17]", got)
+	}
+
+	implicit, err := parse([]byte(`
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    issues: [17]
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !implicit.Supervisor.OrderedQueue.Active() {
+		t.Fatal("ordered queue with issues and no enabled flag must stay active")
+	}
+
+	empty, err := parse([]byte(`
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    enabled: true
+`))
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	if !empty.Supervisor.OrderedQueue.Active() {
+		t.Fatal("ordered queue with enabled: true must be active without issues")
+	}
+
+	// The explicit-flag detection must not weaken ParseStrict's unknown-key
+	// probe for the ordered_queue subtree.
+	if _, err := ParseStrict([]byte(`
+repo: owner/repo
+supervisor:
+  ordered_queue:
+    enabled: false
+    isues: [17]
+`)); err == nil || !strings.Contains(err.Error(), "isues") {
+		t.Fatalf("ParseStrict should name the misspelled ordered_queue key, got: %v", err)
+	}
+}
+
 func TestParse_SupervisorDynamicWaveWithoutOrderedQueue(t *testing.T) {
 	yaml := `
 repo: owner/repo
