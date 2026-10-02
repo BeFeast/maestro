@@ -144,6 +144,11 @@ type Orchestrator struct {
 	workerStartClaimedFn      func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
 	nativePrelaunchRecoveries []NativePrelaunchRecovery
 	nativePrelaunchRecoverFn  func(*config.Config, *state.State, string, github.Issue, string, string, string) (string, error)
+	// nativeRuntimeReconcileFn / nativePrelaunchExpiryFn: cycle-start native
+	// hold reconcilers (worker.ReconcileNativeWorkerRuntime and
+	// worker.ReconcileExpiredNativePrelaunch); tests replace them.
+	nativeRuntimeReconcileFn func(*config.Config, *state.State, string) error
+	nativePrelaunchExpiryFn  func(*config.Config, *state.State, string) (bool, error)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -3286,15 +3291,7 @@ func (o *Orchestrator) RunOnce() error {
 	}
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
-	if o.cfg.AIExecution.RequireVerifiedRoute {
-		for slot, sess := range s.Sessions {
-			if sess != nil && nativeRuntimeReconcileHold(sess.NativeRegistrationHold) {
-				if err := worker.ReconcileNativeWorkerRuntime(o.cfg, s, slot); err != nil {
-					log.Printf("[orch] exact native runtime reconciliation held for %s: %v%s", slot, err, nativeWorkerExecHoldSuffix(sess))
-				}
-			}
-		}
-	}
+	o.reconcileNativeHoldsAtCycleStart(s)
 
 	// Storage/process ownership is reconciled before any session-status or
 	// scheduling decision. An orphaned exact lease is stopped and cleaned here;
