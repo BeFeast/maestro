@@ -201,6 +201,10 @@ type Orchestrator struct {
 	// nativeExitReconcileFn seals cleanly exited native generations at cycle
 	// start (#1243). nil = worker.ReconcileNativeWorkerExit; tests override it.
 	nativeExitReconcileFn func(cfg *config.Config, s *state.State, slot string) (bool, error)
+	// nativePhaseExitSealFn seals the exited generation of a running pipeline
+	// session whose phase transition is about to run or wait
+	// (worker.ReconcileNativePhaseExit); tests replace it.
+	nativePhaseExitSealFn func(cfg *config.Config, s *state.State, slot string) (bool, error)
 
 	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
 	// whether the host is too short on tmpfs space to accept another worker, and
@@ -404,17 +408,23 @@ func (o *Orchestrator) reconcileNativeWorkerExits(s *state.State) {
 	sort.Strings(slots)
 	for _, slot := range slots {
 		sealed, err := reconcile(o.cfg, s, slot)
-		if err != nil {
-			cause := ""
-			if inner := errors.Unwrap(err); inner != nil {
-				cause = fmt.Sprintf(" (cause: %v)", inner)
-			}
-			log.Printf("[orch] native exit seal held for %s: %v%s", slot, err, cause)
-			continue
+		journalNativeExitSeal(slot, sealed, err)
+	}
+}
+
+// journalNativeExitSeal journals one exit-seal attempt: a typed hold with its
+// cause (the generation stays counted and the next cycle retries), or a seal.
+func journalNativeExitSeal(slot string, sealed bool, err error) {
+	if err != nil {
+		cause := ""
+		if inner := errors.Unwrap(err); inner != nil {
+			cause = fmt.Sprintf(" (cause: %v)", inner)
 		}
-		if sealed {
-			log.Printf("[orch] native exit sealed for %s: generation recorded terminal and no longer occupies fleet capacity", slot)
-		}
+		log.Printf("[orch] native exit seal held for %s: %v%s", slot, err, cause)
+		return
+	}
+	if sealed {
+		log.Printf("[orch] native exit sealed for %s: generation recorded terminal and no longer occupies fleet capacity", slot)
 	}
 }
 

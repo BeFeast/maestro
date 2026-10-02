@@ -459,3 +459,74 @@ func TestStartNewWorkers_PauseAndDrainReturnBeforeLaneProbe(t *testing.T) {
 		})
 	}
 }
+
+// orderedLaneReadiness records each lane observation in a shared order log.
+type orderedLaneReadiness struct {
+	err   error
+	order *[]string
+}
+
+func (l *orderedLaneReadiness) ObserveLaneReadiness(aiexecution.Policy) error {
+	*l.order = append(*l.order, "lane")
+	return l.err
+}
+
+// #1259 x #1243: a pipeline phase worker that exited during a managed-lane
+// outage is sealed before the lane pause returns, so the exited generation is
+// recorded terminal and stops counting toward fleet occupancy while the phase
+// transition waits. The transition itself still waits for the lane, with the
+// session untouched; a seal hold is journaled and does not stop the pause.
+func TestAdvancePipeline_SealsExitedPhaseBeforeLanePause(t *testing.T) {
+	for _, mode := range []string{"sealed", "held"} {
+		t.Run(mode, func(t *testing.T) {
+			buf := captureOrchestratorLog(t)
+			cfg := pipelineConfig()
+			cfg.StateDir = t.TempDir()
+			cfg.WorkerNativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+			var order []string
+			cfg.RuntimeNativeLaneReadiness = &orderedLaneReadiness{err: aiexecution.Held("binding_route_unserved"), order: &order}
+			o := pipelineOrchestrator(cfg)
+			o.getIssueFn = func(n int) (github.Issue, error) { return makeIssue(n, "fixture issue"), nil }
+			calls := 0
+			o.workerStartPhaseFn = func(*config.Config, *state.Session, string, string, string) error { calls++; return nil }
+			o.nativePhaseExitSealFn = func(gotCfg *config.Config, st *state.State, slot string) (bool, error) {
+				if gotCfg != cfg || st.Sessions[slot] == nil || st.Sessions[slot].Status != state.StatusRunning {
+					t.Fatalf("phase exit seal got the wrong inputs for %s", slot)
+				}
+				order = append(order, "seal:"+slot)
+				if mode == "held" {
+					return false, &worker.NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slot}
+				}
+				return true, nil
+			}
+			dir := t.TempDir()
+			for _, name := range []string{pipeline.PlanFile, pipeline.ValidationFile} {
+				if err := os.WriteFile(filepath.Join(dir, name), []byte("fixture"), 0600); err != nil {
+					t.Fatal(err)
+				}
+			}
+			s := state.NewState()
+			sess := &state.Session{IssueNumber: 1257, Status: state.StatusRunning, Phase: state.PhasePlan, PlanVersion: 1, WorkerGeneration: 3,
+				NativeRoleRunID: "00000000-0000-4000-8000-000000000007", Worktree: dir}
+			s.Sessions["fixture-1"] = sess
+			before := sessionSnapshotJSON(t, sess)
+
+			if !o.advancePipeline(s, "fixture-1", sess) {
+				t.Fatal("not handled")
+			}
+			if len(order) != 2 || order[0] != "seal:fixture-1" || order[1] != "lane" {
+				t.Fatalf("order=%v, want the exited generation sealed before the lane pause", order)
+			}
+			if calls != 0 || sessionSnapshotJSON(t, sess) != before {
+				t.Fatalf("lane-paused transition calls=%d session=%+v", calls, sess)
+			}
+			out := buf.String()
+			if mode == "sealed" && !strings.Contains(out, "native exit sealed for fixture-1") {
+				t.Fatalf("seal not journaled:\n%s", out)
+			}
+			if mode == "held" && !strings.Contains(out, "native exit seal held for fixture-1: worker native registration held: native_process_identity_missing") {
+				t.Fatalf("seal hold not journaled:\n%s", out)
+			}
+		})
+	}
+}

@@ -23,6 +23,14 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	if sess.Phase == state.PhaseNone {
 		return false // not a pipeline session
 	}
+	// The phase worker has exited, but the session stays running until the
+	// next phase launches, so the cycle-start exit reconciliation never sees
+	// it. Seal the exited generation first, with the same proofs as that
+	// reconciliation and the successor's termination fence, so a transition
+	// that waits below does not keep an exited generation counted toward
+	// fleet occupancy. A hold is journaled and leaves the generation counted;
+	// the next cycle retries, and the next phase's fence still applies.
+	o.sealExitedPhaseGeneration(st, slotName)
 	// A phase transition launches a native worker and its preparation is not
 	// idempotent (Advisor artifacts are consumed). While the lane is not ready
 	// the session stays untouched and the transition is retried next cycle.
@@ -43,6 +51,17 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	default:
 		return false
 	}
+}
+
+// sealExitedPhaseGeneration seals the exited native generation of the running
+// pipeline session in slotName (worker.ReconcileNativePhaseExit).
+func (o *Orchestrator) sealExitedPhaseGeneration(st *state.State, slotName string) {
+	seal := o.nativePhaseExitSealFn
+	if seal == nil {
+		seal = worker.ReconcileNativePhaseExit
+	}
+	sealed, err := seal(o.cfg, st, slotName)
+	journalNativeExitSeal(slotName, sealed, err)
 }
 
 // handlePlanComplete checks if the planner produced artifacts and advances to

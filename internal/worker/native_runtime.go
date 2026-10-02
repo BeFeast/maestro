@@ -744,11 +744,38 @@ func NativeProjectedReceiptHold(code string) bool {
 // cycle repeats the attempt. sealed reports that this call recorded the
 // termination.
 func ReconcileNativeWorkerExit(cfg *config.Config, s *state.State, slot string) (sealed bool, err error) {
+	if s == nil || s.Sessions[slot] == nil || !nativeWorkerExitStatus(s.Sessions[slot].Status) {
+		return false, nil
+	}
+	return sealExitedNativeGeneration(cfg, s, slot)
+}
+
+// ReconcileNativePhaseExit is ReconcileNativeWorkerExit for a pipeline session
+// whose phase worker the caller observed exited (dead PID) while the session
+// projection still reads running. advancePipeline keeps such a session running
+// until the next phase launches, so the cycle-start exit reconciliation, which
+// only considers exited statuses, never seals it; while the transition waits
+// (managed lane not ready, operator pause) the exited generation would keep
+// counting toward fleet occupancy. The seal sequence, its proofs and its typed
+// holds are exactly those of ReconcileNativeWorkerExit: termination is proven
+// from the original pinned runtime, never inferred from the caller's PID
+// observation, and the session projection is not modified. The next phase's
+// termination fence then finds the generation already recorded terminal.
+func ReconcileNativePhaseExit(cfg *config.Config, s *state.State, slot string) (sealed bool, err error) {
+	if s == nil || s.Sessions[slot] == nil || s.Sessions[slot].Status != state.StatusRunning || s.Sessions[slot].Phase == state.PhaseNone {
+		return false, nil
+	}
+	return sealExitedNativeGeneration(cfg, s, slot)
+}
+
+// sealExitedNativeGeneration is the shared body of ReconcileNativeWorkerExit and
+// ReconcileNativePhaseExit; the callers qualify the session status.
+func sealExitedNativeGeneration(cfg *config.Config, s *state.State, slot string) (sealed bool, err error) {
 	if cfg == nil || s == nil || cfg.WorkerNativeSessionRegistration == nil || !cfg.AIExecution.RequireVerifiedRoute {
 		return false, nil
 	}
 	sess := s.Sessions[slot]
-	if sess == nil || sess.NativeRoleRunID == "" || sess.WorkerGeneration == 0 || !nativeWorkerExitStatus(sess.Status) {
+	if sess == nil || sess.NativeRoleRunID == "" || sess.WorkerGeneration == 0 {
 		return false, nil
 	}
 	// A hold-free session is the clean-exit shape. native_generation_sealed is

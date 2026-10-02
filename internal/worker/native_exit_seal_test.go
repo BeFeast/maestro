@@ -344,3 +344,102 @@ func TestReconcileNativeWorkerExitIgnoresForeignShapes(t *testing.T) {
 		})
 	}
 }
+
+// #1259 x #1243: a pipeline phase worker that exited leaves its session
+// running until advancePipeline launches the next phase. While that transition
+// waits (managed lane not ready, operator pause) the exited generation must be
+// sealed like any other clean exit, or it keeps counting toward fleet
+// occupancy. ReconcileNativePhaseExit runs the same prove -> seal -> record
+// sequence for the running pipeline projection; the cycle-start
+// ReconcileNativeWorkerExit still leaves running sessions alone.
+func TestReconcileNativePhaseExitSealsExitedRunningPipelineGeneration(t *testing.T) {
+	f, parent, pin := cleanExitWithoutMarker(t)
+	sess := f.st.Sessions[f.slot]
+	sess.Status, sess.Phase, sess.PRNumber, sess.FinishedAt = state.StatusRunning, state.PhaseImplement, 0, nil
+	sess.PID, sess.TmuxSession = parent.PID, TmuxSessionName(f.slot)
+	dir := sess.NativeReceiptDir
+	previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+	refuseNativeRegistration(t)
+	seals, verified := 0, 0
+	sealNativeWorker = func(_ admissioncontrol.Client, request admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		seals++
+		if request.NativeSessionID != parent.Request.NativeSessionID || verified == 0 {
+			t.Fatal("sealed a different registration or before the OS termination was observed")
+		}
+		return fixtureNativeOutcome(request, false), nil
+	}
+	verifyNativeWorkerTermination = func(got aiexecution.FileProof, nativeID, unit string) (*aiexecution.NativeProcessTermination, error) {
+		verified++
+		if got != pin || nativeID != parent.Request.NativeSessionID || unit != parent.ProcessLeaseUnit {
+			t.Fatal("wrong original process identity")
+		}
+		return nativeRuntimeProof(parent, pin, true), nil
+	}
+	expectNativeSlotPending(t, f, true)
+	if sealed, err := ReconcileNativeWorkerExit(f.cfg, f.st, f.slot); err != nil || sealed || seals != 0 || verified != 0 {
+		t.Fatalf("cycle-start exit reconciliation touched a running session: sealed=%v err=%v seals=%d verified=%d", sealed, err, seals, verified)
+	}
+	before := *sess
+
+	sealed, err := ReconcileNativePhaseExit(f.cfg, f.st, f.slot)
+	if err != nil || !sealed || seals != 1 || verified != 1 {
+		t.Fatalf("sealed=%v err=%v seals=%d verified=%d", sealed, err, seals, verified)
+	}
+	if !reflect.DeepEqual(before, *sess) {
+		t.Fatalf("phase exit seal modified the session projection:\n before=%+v\n after=%+v", before, *sess)
+	}
+	if terminal, err := NativeSessionProcessTerminal(f.cfg.StateDir, f.slot, sess); err != nil || !terminal {
+		t.Fatal("terminal marker not recorded", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dir, nativeReceiptName(2))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("phase exit seal registered a successor", err)
+	}
+	expectNativeSlotPending(t, f, false)
+
+	// Idempotent on later cycles while the transition still waits.
+	sealNativeWorker = func(admissioncontrol.Client, admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+		t.Fatal("re-sealed a settled generation")
+		return admissioncontrol.NativeOutcome{}, nil
+	}
+	if sealed, err := ReconcileNativePhaseExit(f.cfg, f.st, f.slot); err != nil || sealed {
+		t.Fatalf("second pass sealed=%v err=%v", sealed, err)
+	}
+}
+
+// ReconcileNativePhaseExit only accepts the running pipeline projection; an
+// unproven termination is a typed hold that leaves the generation counted.
+func TestReconcileNativePhaseExitShapes(t *testing.T) {
+	for _, mode := range []string{"not_pipeline", "exited_status", "pane_alive"} {
+		t.Run(mode, func(t *testing.T) {
+			f, _, _ := cleanExitWithoutMarker(t)
+			sess := f.st.Sessions[f.slot]
+			sess.Status, sess.Phase = state.StatusRunning, state.PhaseValidate
+			previousNativeGenerationOutcome = persistedNativeGenerationOutcome
+			refuseNativeRegistration(t)
+			sealNativeWorker = func(admissioncontrol.Client, admissioncontrol.SealRequest) (admissioncontrol.NativeOutcome, error) {
+				t.Fatal("sealed a generation whose exit is not proven or not a phase exit")
+				return admissioncontrol.NativeOutcome{}, nil
+			}
+			var wantErr bool
+			switch mode {
+			case "not_pipeline":
+				sess.Phase = state.PhaseNone
+			case "exited_status":
+				sess.Status = state.StatusDone
+			case "pane_alive":
+				oldAbsent := nativeWorkerPaneAbsent
+				t.Cleanup(func() { nativeWorkerPaneAbsent = oldAbsent })
+				nativeWorkerPaneAbsent = func(string) (bool, error) { return false, nil }
+				wantErr = true
+			}
+			sealed, err := ReconcileNativePhaseExit(f.cfg, f.st, f.slot)
+			if sealed || (err != nil) != wantErr {
+				t.Fatalf("sealed=%v err=%v", sealed, err)
+			}
+			if wantErr {
+				expectNativeHold(t, err, "native_process_identity_missing", true)
+			}
+			expectNativeSlotPending(t, f, true)
+		})
+	}
+}
