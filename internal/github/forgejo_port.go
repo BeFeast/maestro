@@ -455,7 +455,8 @@ func (c *Client) fjClosePR(prNumber int, comment string) error {
 // MergePRAtHead (shared with the gh path). A refusal the transport classified
 // as out-of-date/head-mismatch (forgejo.ErrMergeOutOfDate) is re-wrapped with
 // the package sentinel so the orchestrator's AutoRebase branch matches it via
-// errors.Is; every other failure surfaces raw and loud.
+// errors.Is; an actor refusal (forgejo.ErrMergeDenied) is re-wrapped with
+// ErrMergeDeniedForActor; every other failure surfaces raw and loud.
 func (c *Client) fjMergePRAtHead(prNumber int, expectedHeadSHA string) error {
 	fj, err := c.fjTransport()
 	if err != nil {
@@ -471,6 +472,9 @@ func (c *Client) fjMergePRAtHead(prNumber int, expectedHeadSHA string) error {
 	if err != nil {
 		if errors.Is(err, forgejo.ErrMergeOutOfDate) {
 			return fmt.Errorf("merge PR %d at head %s: %w: %w", prNumber, expectedHeadSHA, ErrMergeNotUpToDate, err)
+		}
+		if errors.Is(err, forgejo.ErrMergeDenied) {
+			return fmt.Errorf("merge PR %d at head %s: %w: %w", prNumber, expectedHeadSHA, ErrMergeDeniedForActor, err)
 		}
 		return fmt.Errorf("merge PR %d at head %s: %w", prNumber, expectedHeadSHA, err)
 	}

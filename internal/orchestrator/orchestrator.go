@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
@@ -219,6 +220,14 @@ type Orchestrator struct {
 	// `maestro status` and the Fleet API instead of silently ignoring the change.
 	restartRequired       bool
 	restartRequiredReason string
+
+	// nativeForgejoAuthorizationsFn stands in for the root-owned
+	// forgejo-authorization evidence read auto-merge consults before a merge
+	// call (#1247); nil takes aiexecution.NativeForgejoAuthorizations.
+	// mergeActorEvidenceNote de-duplicates the unavailable-evidence journal
+	// line so it is written once per distinct condition, not once per cycle.
+	nativeForgejoAuthorizationsFn func(aiexecution.Policy) (aiexecution.NativeForgejoAuthorizationReport, error)
+	mergeActorEvidenceNote        string
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn               func(prNumber int) (string, error)
@@ -5900,6 +5909,20 @@ func (o *Orchestrator) cleanupLeasedWorktree(s *state.State, lease worker.Worktr
 	)
 }
 
+// mergeCandidate is one green, review-cleared PR autoMergePRs may merge this
+// cycle, together with the head the final merge is bound to.
+type mergeCandidate struct {
+	slotName string
+	sess     *state.Session
+	pr       github.PR
+	headSHA  string
+	// missingReviewFor is non-zero when this candidate bypassed a silent
+	// review gate. The operator alert fires only after the merge actually
+	// succeeds — a candidate can still be deferred by the merge interval,
+	// dropped by conflict filtering, or fail to merge.
+	missingReviewFor time.Duration
+}
+
 // autoMergePRs checks open PRs and merges ones with green CI
 func (o *Orchestrator) autoMergePRs(s *state.State) {
 	prs, err := o.listOpenPRsForCycle()
@@ -5931,18 +5954,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	// retry_exhausted for the same PR (OK Player #388 / issues #345 and #406).
 	mergeOwners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
 
-	type mergeCandidate struct {
-		slotName string
-		sess     *state.Session
-		pr       github.PR
-		headSHA  string
-		// missingReviewFor is non-zero when this candidate bypassed a silent
-		// review gate. The operator alert fires only after the merge actually
-		// succeeds — a candidate can still be deferred by the merge interval,
-		// dropped by conflict filtering, or fail to merge.
-		missingReviewFor time.Duration
-	}
-
 	ready := make([]mergeCandidate, 0)
 
 	for slotName, sess := range s.Sessions {
@@ -5952,6 +5963,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 		pr, found := mergeFlowPRForSession(sess, branchToPR, numberToPR)
 		if !found {
+			// #1247: auto-merge only ever merges an open PR, so a merge-denied
+			// hold cannot outlive it as an attention item or an issue claim.
+			releaseMergeDeniedHold(sess)
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
 					// #577: worker exhausted retries without ever producing a PR
@@ -6245,6 +6259,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		kept = append(kept, candidate)
 	}
 	ready = kept
+
+	// #1247: a forge credential that may not merge never reaches the merge
+	// API, and a head the forge already refused for this credential is not
+	// asked again. Gating here, before the merge slot is chosen, keeps a held
+	// PR from occupying the sequential slot and starving ready siblings.
+	ready = o.gateMergeDeniedCandidates(ready)
 
 	if len(ready) == 0 {
 		return
@@ -7611,6 +7631,8 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 		sess.PRNumber = prNumber
 	}
 	sess.PRMerged = sess.PRNumber > 0
+	// #1247: the PR merged, so a merge-denied hold is moot.
+	releaseMergeDeniedHold(sess)
 	// #1013: a code_landed transition is terminal reconciliation — the PR
 	// merged, so any scheduled retry (including one deliberately held behind a
 	// current issue-guard label) is settled and must not survive. Clear it at
@@ -8609,6 +8631,23 @@ func (o *Orchestrator) mergeReadyPRAtExpectedHead(s *state.State, slotName strin
 	}
 	if err := mergeResult.Err; err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
+
+		// #1247: the forge answered that this credential may not merge the
+		// PR at all ("User not allowed to merge PR"). Asking again at the same
+		// head only repeats the same 405, so latch the head for this
+		// credential and surface the hold once instead of looping. mergegate
+		// always reports the head it merged at; without one there is nothing
+		// to latch and the refusal keeps the existing handling below.
+		if errors.Is(err, github.ErrMergeDeniedForActor) {
+			head := strings.TrimSpace(mergeResult.HeadSHA)
+			if head == "" {
+				head = strings.TrimSpace(expectedHead)
+			}
+			if head != "" {
+				o.latchMergeDeniedHead(sess, pr, head)
+				return false
+			}
+		}
 
 		// If the branch is behind main (not conflicting, just outdated),
 		// rebase the worktree when present; otherwise (worker already cleaned
