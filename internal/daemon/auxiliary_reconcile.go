@@ -31,8 +31,10 @@ type AuxiliaryRootReport struct {
 	ProjectDir string
 	Root       string
 	Role       string
-	// Result is "released" (an abandoned consultation was sealed), "clear" (no
-	// durable occupancy remains) or "held" (occupancy remains; see Hold).
+	// Result is "released" (an abandoned consultation was sealed and its
+	// capacity released), "sealed" (an abandoned pre-launch receipt was closed;
+	// it held no capacity), "clear" (no durable occupancy remains) or "held"
+	// (occupancy remains; see Hold).
 	Result string
 	Hold   string
 	// Occupants is the durable occupancy still recorded under Root.
@@ -106,6 +108,10 @@ func reconcileAuxiliaryRoot(ctx context.Context, cfg *config.Config, projectDir,
 		report.Result = "released"
 		err = nil
 	}
+	if errors.As(err, &hold) && hold.Code == "native_prelaunch_receipt_sealed" {
+		report.Result = "sealed"
+		err = nil
+	}
 	occupants, occErr := supervisor.PendingAuxiliaryOccupancy(projectDir)
 	if occErr != nil {
 		report.Result, report.Hold = "held", occErr.Error()
@@ -116,7 +122,7 @@ func reconcileAuxiliaryRoot(ctx context.Context, cfg *config.Config, projectDir,
 			report.Occupants = append(report.Occupants, o)
 		}
 	}
-	if report.Result == "released" {
+	if report.Result == "released" || report.Result == "sealed" {
 		return report
 	}
 	if len(report.Occupants) == 0 {
@@ -161,6 +167,8 @@ func logAuxiliaryRootReport(name string, report AuxiliaryRootReport, releaseHint
 	switch report.Result {
 	case "released":
 		log.Printf("[%s] auxiliary reconcile: sealed abandoned %s consultation under %s; capacity released", name, report.Role, report.Root)
+	case "sealed":
+		log.Printf("[%s] auxiliary reconcile: closed abandoned pre-launch %s receipt under %s; nothing had launched and no capacity was held", name, report.Role, report.Root)
 	case "clear":
 		log.Printf("[%s] auxiliary reconcile: %s root %s has no unresolved native consultation", name, report.Role, report.Root)
 	default:
