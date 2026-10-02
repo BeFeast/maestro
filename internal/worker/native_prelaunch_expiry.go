@@ -7,6 +7,7 @@ import (
 	"log"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/befeast/maestro/internal/admissioncontrol"
@@ -37,13 +38,37 @@ import (
 // registration expiry; tests pin it.
 var nativePrelaunchExpiryClock = time.Now
 
+// NativePrelaunchAutoReleaseHold reports whether a pre-launch hold code was
+// raised by the managed lane or by the admission authority, the only holds an
+// expired registration may release automatically. A first-generation start
+// that stopped after registration carries one of:
+//
+//   - binding_*: the managed-lane gateway binding observation
+//     (NativeLaneHoldCode; live 2026-10-02: binding_inventory_incomplete);
+//   - registration_*: the admission authority refused or retired the
+//     registration (registration_expired, registration_revoked,
+//     registration_invalid, registration_conflict) or the launch-time check
+//     found its acknowledged binding expired or mismatched
+//     (registration_binding_mismatch);
+//   - launch_not_authorized: launch intent was refused because the
+//     registration had already expired.
+//
+// Every other code (setup_failed from a before_run hook, worktree, runner or
+// harness faults, identity and persistence holds) is a deterministic local
+// failure: re-queueing it would fail the same way under a fresh registration,
+// so it stays held for the operator.
+func NativePrelaunchAutoReleaseHold(code string) bool {
+	return NativeLaneHoldCode(code) || strings.HasPrefix(code, "registration_") || code == "launch_not_authorized"
+}
+
 // NativePrelaunchExpiryCandidate reports whether sess has the projection of a
-// failed first-generation start held before launch: failed, held, and no native
-// generation was ever stamped on it. It is a cheap routing filter only;
-// ReconcileExpiredNativePrelaunch re-validates the whole projection and the
-// receipt under the receipt lock.
+// failed first-generation start held before launch by the managed lane or the
+// admission authority: failed, held with a NativePrelaunchAutoReleaseHold code,
+// and no native generation was ever stamped on it. It is a cheap routing filter
+// only; ReconcileExpiredNativePrelaunch re-validates the whole projection and
+// the receipt under the receipt lock.
 func NativePrelaunchExpiryCandidate(sess *state.Session) bool {
-	return sess != nil && sess.Status == state.StatusFailed && sess.NativeRegistrationHold != "" && !sess.ReleasedForRedispatch &&
+	return sess != nil && sess.Status == state.StatusFailed && NativePrelaunchAutoReleaseHold(sess.NativeRegistrationHold) && !sess.ReleasedForRedispatch &&
 		sess.WorkerGeneration == 0 && sess.NativeRoleRunID == "" && sess.NativeSessionID == ""
 }
 
@@ -53,7 +78,8 @@ func NativePrelaunchExpiryCandidate(sess *state.Session) bool {
 // has expired or been revoked at the authority. It reports whether the slot was
 // released.
 //
-// Untouched, with a nil error: sessions outside the candidate projection, slots
+// Untouched, with a nil error: sessions outside the candidate projection
+// (including holds that NativePrelaunchAutoReleaseHold leaves to the operator), slots
 // without a receipt (a hold raised before registration), receipts that are not
 // registered (registration_intent never received an acknowledgement to seal;
 // launch_intent and launched are uncertain launches that keep their existing

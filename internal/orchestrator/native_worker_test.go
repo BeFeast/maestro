@@ -265,6 +265,9 @@ func nativeHoldRoutingState() *state.State {
 	s.Sessions["fixture-4"] = &state.Session{IssueNumber: 24, Status: state.StatusRunning}
 	s.Sessions["fixture-5"] = &state.Session{IssueNumber: 25, Status: state.StatusFailed, NativeRegistrationHold: "setup_failed", ReleasedForRedispatch: true}
 	s.Sessions["fixture-6"] = &state.Session{IssueNumber: 26, Status: state.StatusPROpen, NativeRegistrationHold: "setup_failed", WorkerGeneration: 2, NativeRoleRunID: "00000000-0000-4000-8000-000000000006"}
+	// A failed first-generation start under a deterministic local hold is an
+	// operator decision, not an expiry candidate.
+	s.Sessions["fixture-7"] = &state.Session{IssueNumber: 27, Status: state.StatusFailed, NativeRegistrationHold: "setup_failed", Worktree: "/worktrees/fixture-7", Branch: "feat/fixture-7-27"}
 	return s
 }
 
@@ -370,5 +373,114 @@ func TestNativeHoldsAtCycleStartKeepHoldOnExpiredPrelaunchFailure(t *testing.T) 
 	o.reconcileNativeHoldsAtCycleStart(s)
 	if expiry["fixture-1"] != 2 || s.Sessions["fixture-1"].NativeRegistrationHold != "binding_inventory_incomplete" || !s.IssueHasNonFreshClaim(21) {
 		t.Fatalf("expiry=%v session=%+v", expiry, s.Sessions["fixture-1"])
+	}
+}
+
+// capturedNotifications returns a notifier whose messages are recorded, and a
+// reader for the messages containing substr.
+func capturedNotifications(t *testing.T) (*notify.Notifier, func(substr string) []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var messages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(b, &payload)
+		mu.Lock()
+		messages = append(messages, payload.Message)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	return notify.New(server.URL, "fixture-target"), func(substr string) []string {
+		mu.Lock()
+		defer mu.Unlock()
+		var matched []string
+		for _, m := range messages {
+			if strings.Contains(m, substr) {
+				matched = append(matched, m)
+			}
+		}
+		return matched
+	}
+}
+
+// heldFirstStart is the failed first-generation projection a binding hold
+// leaves when a fresh dispatch stops after registration.
+func heldFirstStart(issue int, slot string) *state.Session {
+	return &state.Session{IssueNumber: issue, Status: state.StatusFailed, NativeRegistrationHold: "binding_inventory_incomplete",
+		Worktree: "/worktrees/" + slot, Branch: "feat/" + slot}
+}
+
+// #1260 loop: every automatic release of an expired pre-launch hold notifies
+// the operator, and an issue whose fresh starts keep stopping before launch is
+// re-queued at most twice in a row. The third consecutive held start stays
+// held for the operator with exactly one notification, however many cycles
+// pass. A launched worker for the issue in between resets the count.
+func TestExpiredPrelaunchReleaseNotifiesAndStopsAfterTwoConsecutive(t *testing.T) {
+	notifier, messages := capturedNotifications(t)
+	expiry := map[string]int{}
+	cfg := &config.Config{StateDir: t.TempDir(), AIExecution: aiexecution.Policy{RequireVerifiedRoute: true}}
+	o := &Orchestrator{cfg: cfg, notifier: notifier,
+		nativeRuntimeReconcileFn: func(*config.Config, *state.State, string) error { return nil },
+		nativePrelaunchExpiryFn: func(_ *config.Config, s *state.State, slot string) (bool, error) {
+			expiry[slot]++
+			sess := s.Sessions[slot]
+			now := time.Now().UTC()
+			sess.NativeRegistrationHold, sess.ReleasedForRedispatch, sess.WorkerOutcome, sess.FinishedAt = "", true, state.WorkerOutcomeNativePrelaunchAbandoned, &now
+			return true, nil
+		}}
+	s := state.NewState()
+	// An earlier launched attempt does not count as "in between".
+	launchedAt := time.Now().UTC().Add(-time.Hour)
+	s.Sessions["fixture-1"] = &state.Session{IssueNumber: 31, Status: state.StatusDead, WorkerGeneration: 2, StartedAt: launchedAt, FinishedAt: &launchedAt}
+
+	// Two consecutive held fresh starts are released, one notification each.
+	for i, slot := range []string{"fixture-2", "fixture-3"} {
+		s.Sessions[slot] = heldFirstStart(31, slot)
+		o.reconcileNativeHoldsAtCycleStart(s)
+		if expiry[slot] != 1 || !s.Sessions[slot].ReleasedForRedispatch {
+			t.Fatalf("release %d of %s: expiry=%v session=%+v", i+1, slot, expiry, s.Sessions[slot])
+		}
+		want := "issue #31 re-queued after an expired pre-launch hold on " + slot
+		if got := messages(want); len(got) != 1 {
+			t.Fatalf("release notifications for %s = %q, want one containing %q", slot, got, want)
+		}
+	}
+
+	// The third consecutive held start is not released, on any cycle, and the
+	// operator is told once.
+	s.Sessions["fixture-4"] = heldFirstStart(31, "fixture-4")
+	for cycle := 0; cycle < 3; cycle++ {
+		o.reconcileNativeHoldsAtCycleStart(s)
+	}
+	if expiry["fixture-4"] != 0 || s.Sessions["fixture-4"].NativeRegistrationHold != "binding_inventory_incomplete" || s.Sessions["fixture-4"].ReleasedForRedispatch {
+		t.Fatalf("third consecutive held start was released: expiry=%v session=%+v", expiry, s.Sessions["fixture-4"])
+	}
+	if got := messages("automatic re-queue stopped"); len(got) != 1 || !strings.Contains(got[0], "issue #31") || !strings.Contains(got[0], "fixture-4") {
+		t.Fatalf("stop notifications = %q, want exactly one naming issue #31 and fixture-4", got)
+	}
+	if got := messages("re-queued after an expired pre-launch hold on fixture-4"); len(got) != 0 {
+		t.Fatalf("held slot reported as re-queued: %q", got)
+	}
+
+	// Another issue is unaffected by issue #31's count.
+	s.Sessions["fixture-5"] = heldFirstStart(32, "fixture-5")
+	o.reconcileNativeHoldsAtCycleStart(s)
+	if expiry["fixture-5"] != 1 {
+		t.Fatalf("issue #32 release blocked by another issue's count: expiry=%v", expiry)
+	}
+
+	// A launched worker for issue #31 after the releases resets the count.
+	relaunched := time.Now().UTC().Add(time.Second)
+	s.Sessions["fixture-4"].NativeRegistrationHold = ""
+	s.Sessions["fixture-4"].Status = state.StatusDone
+	s.Sessions["fixture-6"] = &state.Session{IssueNumber: 31, Status: state.StatusDone, WorkerGeneration: 1, StartedAt: relaunched, FinishedAt: &relaunched}
+	s.Sessions["fixture-7"] = heldFirstStart(31, "fixture-7")
+	o.reconcileNativeHoldsAtCycleStart(s)
+	if expiry["fixture-7"] != 1 {
+		t.Fatalf("held start after a launch was not released: expiry=%v", expiry)
 	}
 }

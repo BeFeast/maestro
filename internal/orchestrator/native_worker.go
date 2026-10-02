@@ -8,6 +8,7 @@ import (
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
 	"log"
+	"time"
 )
 
 func nativeWorkerConfig(cfg *config.Config, role, parent string) *config.Config {
@@ -110,11 +111,16 @@ func nativeRuntimeReconcileHold(code string) bool {
 //
 //   - the launch/state gap and pre-launch wedge holds go to the exact runtime
 //     reconciliation (worker.ReconcileNativeWorkerRuntime);
-//   - any other hold on a failed first-generation start goes to the expired
+//   - a managed-lane or admission-authority hold on a failed first-generation
+//     start (worker.NativePrelaunchExpiryCandidate) goes to the expired
 //     pre-launch reconciliation (worker.ReconcileExpiredNativePrelaunch), which
 //     retires a registration that expired or was revoked before launch and
 //     releases the issue for redispatch. Releasing re-enables dispatch, so it
-//     only runs while the project is not paused, drained or emergency-stopped.
+//     only runs while the project is not paused, drained or emergency-stopped,
+//     notifies the operator on every release and stops after
+//     maxConsecutiveNativePrelaunchReleases releases of one issue without a
+//     launch (releaseExpiredNativePrelaunch). Other first-generation holds stay
+//     operator decisions.
 //
 // Only the verified route records the evidence these reconcilers need.
 func (o *Orchestrator) reconcileNativeHoldsAtCycleStart(s *state.State) {
@@ -139,12 +145,87 @@ func (o *Orchestrator) reconcileNativeHoldsAtCycleStart(s *state.State) {
 				log.Printf("[orch] exact native runtime reconciliation held for %s: %v%s", slot, err, nativeWorkerExecHoldSuffix(sess))
 			}
 		case releaseAllowed && worker.NativePrelaunchExpiryCandidate(sess):
-			hold := sess.NativeRegistrationHold
-			if _, err := expiryFn(o.cfg, s, slot); err != nil {
-				log.Printf("[orch] expired native prelaunch reconciliation held for %s (hold %s): %v", slot, hold, err)
-			}
+			o.releaseExpiredNativePrelaunch(s, slot, sess, expiryFn)
 		}
 	}
+}
+
+// maxConsecutiveNativePrelaunchReleases bounds the automatic re-queueing of
+// one issue whose fresh starts keep stopping before launch. Each release
+// starts the issue again under a fresh registration; if the managed lane or
+// the authority keeps holding every new start past its registration TTL, the
+// release -> redispatch -> hold -> expiry cycle would otherwise repeat forever.
+const maxConsecutiveNativePrelaunchReleases = 2
+
+// releaseExpiredNativePrelaunch runs the expired pre-launch reconciliation for
+// one candidate slot and tells the operator about every release. An issue that
+// was already released maxConsecutiveNativePrelaunchReleases times in a row
+// without a launched worker in between is not released again: the slot stays
+// held for the operator and one notification says so.
+func (o *Orchestrator) releaseExpiredNativePrelaunch(s *state.State, slot string, sess *state.Session, expiryFn func(*config.Config, *state.State, string) (bool, error)) {
+	hold := sess.NativeRegistrationHold
+	streak := consecutiveNativePrelaunchReleases(s, sess.IssueNumber)
+	if streak >= maxConsecutiveNativePrelaunchReleases {
+		o.notifyNativePrelaunchReleaseStopped(slot, sess, streak)
+		return
+	}
+	released, err := expiryFn(o.cfg, s, slot)
+	if err != nil {
+		log.Printf("[orch] expired native prelaunch reconciliation held for %s (hold %s): %v", slot, hold, err)
+	}
+	if !released {
+		return
+	}
+	if o.notifier != nil {
+		o.notifier.Sendf("♻️ maestro: issue #%d re-queued after an expired pre-launch hold on %s (hold %s; consecutive re-queue %d of %d without a launch)",
+			sess.IssueNumber, slot, hold, streak+1, maxConsecutiveNativePrelaunchReleases)
+	}
+}
+
+// consecutiveNativePrelaunchReleases counts the automatic pre-launch releases
+// of issue since its most recent launched worker: released sessions with the
+// native_prelaunch_abandoned outcome that ended after the latest launch time of
+// any session for the issue. A launched attempt carries a worker generation and
+// a launch time; a pre-launch release never does, and its FinishedAt is the
+// release (or failure) time. Derived from the retained session records, so it
+// needs no separate counter and survives daemon restarts.
+func consecutiveNativePrelaunchReleases(s *state.State, issue int) int {
+	var lastLaunch time.Time
+	for _, sess := range s.Sessions {
+		if sess != nil && sess.IssueNumber == issue && sess.WorkerGeneration > 0 && sess.StartedAt.After(lastLaunch) {
+			lastLaunch = sess.StartedAt
+		}
+	}
+	releases := 0
+	for _, sess := range s.Sessions {
+		if sess == nil || sess.IssueNumber != issue || !sess.ReleasedForRedispatch || sess.WorkerOutcome != state.WorkerOutcomeNativePrelaunchAbandoned {
+			continue
+		}
+		if sess.FinishedAt == nil || sess.FinishedAt.After(lastLaunch) {
+			releases++
+		}
+	}
+	return releases
+}
+
+// notifyNativePrelaunchReleaseStopped journals and notifies, once per slot and
+// hold, that automatic re-queueing stopped for the slot's issue.
+func (o *Orchestrator) notifyNativePrelaunchReleaseStopped(slot string, sess *state.Session, streak int) {
+	identity := "prelaunch_release_stopped/" + sess.NativeRegistrationHold
+	if o.parkedNativeHoldNotified[slot] == identity {
+		return
+	}
+	if o.parkedNativeHoldNotified == nil {
+		o.parkedNativeHoldNotified = make(map[string]string)
+	}
+	o.parkedNativeHoldNotified[slot] = identity
+	log.Printf("[orch] expired native prelaunch hold on %s left for the operator: issue #%d was already re-queued %d times in a row without a launch (hold %s)",
+		slot, sess.IssueNumber, streak, sess.NativeRegistrationHold)
+	if o.notifier == nil {
+		return
+	}
+	o.notifier.Sendf("⚠️ maestro: issue #%d (%s): automatic re-queue stopped after %d consecutive expired pre-launch holds without a launch; slot %s stays held on %s for the operator (docs/worker-native-registration.md)",
+		sess.IssueNumber, sess.IssueTitle, streak, slot, sess.NativeRegistrationHold)
 }
 
 // nativeWorkerExecHoldSuffix appends the hold code the host runner wrote to the

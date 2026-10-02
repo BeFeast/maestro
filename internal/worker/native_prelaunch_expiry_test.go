@@ -49,10 +49,13 @@ func expiredPrelaunch(t *testing.T) *expiredPrelaunchFixture {
 	}
 	const hold = "binding_inventory_incomplete"
 	sess := f.st.Sessions[f.slot]
+	if sess.NativeRegistrationHold != "setup_failed" {
+		t.Fatalf("fixture: setup failure not held: %+v", sess)
+	}
+	sess.NativeRegistrationHold = hold
 	if !NativePrelaunchExpiryCandidate(sess) || sess.Worktree != filepath.Join(f.cfg.WorktreeBase, f.slot) || sess.LogFile != "" {
 		t.Fatalf("fixture is not the failed first-generation prelaunch projection: %+v", sess)
 	}
-	sess.NativeRegistrationHold = hold
 	if err := state.Save(f.cfg.StateDir, f.st); err != nil {
 		t.Fatal(err)
 	}
@@ -614,6 +617,17 @@ func TestNativePrelaunchExpiryCandidate(t *testing.T) {
 		"role_run_stamped":             {func(s *state.Session) { s.NativeRoleRunID = "00000000-0000-4000-8000-000000000001" }, false},
 		"native_session_stamped":       {func(s *state.Session) { s.NativeSessionID = "00000000-0000-4000-8000-000000000002" }, false},
 		"already_released":             {func(s *state.Session) { s.ReleasedForRedispatch = true }, false},
+		// Only managed-lane and admission-authority holds are released
+		// automatically; deterministic local failures stay operator holds.
+		"lane_route_unserved":            {func(s *state.Session) { s.NativeRegistrationHold = "binding_route_unserved" }, true},
+		"authority_registration_expired": {func(s *state.Session) { s.NativeRegistrationHold = "registration_expired" }, true},
+		"authority_registration_revoked": {func(s *state.Session) { s.NativeRegistrationHold = "registration_revoked" }, true},
+		"registration_binding_mismatch":  {func(s *state.Session) { s.NativeRegistrationHold = "registration_binding_mismatch" }, true},
+		"launch_not_authorized":          {func(s *state.Session) { s.NativeRegistrationHold = "launch_not_authorized" }, true},
+		"setup_failed":                   {func(s *state.Session) { s.NativeRegistrationHold = "setup_failed" }, false},
+		"harness_unsupported":            {func(s *state.Session) { s.NativeRegistrationHold = "harness_unsupported" }, false},
+		"receipt_persistence_failed":     {func(s *state.Session) { s.NativeRegistrationHold = "receipt_persistence_failed" }, false},
+		"authority_unavailable":          {func(s *state.Session) { s.NativeRegistrationHold = "authority_unavailable" }, false},
 	} {
 		sess := base
 		tc.edit(&sess)
@@ -624,4 +638,24 @@ func TestNativePrelaunchExpiryCandidate(t *testing.T) {
 	if NativePrelaunchExpiryCandidate(nil) {
 		t.Fatal("nil session is a candidate")
 	}
+}
+
+// An expired registration under a deterministic local hold (a before_run hook
+// that exits non-zero) is not retired: a fresh registration would fail the same
+// way, so the slot stays held for the operator exactly as before the expiry
+// reconciliation existed. Nothing is observed, sealed or archived.
+func TestExpiredNativePrelaunchLeavesLocalSetupHoldForOperator(t *testing.T) {
+	fx := expiredPrelaunch(t)
+	sess := fx.f.st.Sessions[fx.f.slot]
+	sess.NativeRegistrationHold = "setup_failed"
+	sessBefore := *sess
+	for cycle := 0; cycle < 2; cycle++ {
+		if released, err := fx.reconcile(); err != nil || released {
+			t.Fatalf("cycle %d: released=%v err=%v", cycle, released, err)
+		}
+	}
+	if fx.seals != 0 || fx.absence != 0 || *fx.register != 0 {
+		t.Fatalf("seals=%d absence=%d register=%d", fx.seals, fx.absence, *fx.register)
+	}
+	fx.assertUntouched(t, sessBefore)
 }
