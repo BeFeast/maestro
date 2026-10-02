@@ -241,7 +241,7 @@ func startReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	if cfg.AIExecution.RequireVerifiedRoute {
-		if err := materializeNativeClone(cfg.LocalPath, worktreePath, branchName); err != nil {
+		if err := materializeNativeCloneForProject(cfg, cfg.LocalPath, worktreePath, branchName); err != nil {
 			return "", err
 		}
 	} else if info, err := os.Stat(worktreePath); err == nil {
@@ -546,7 +546,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
 	create := addWorktreeFromBase
 	if cfg.AIExecution.RequireVerifiedRoute {
-		create = materializeNativeClone
+		create = func(parent, worktree, branch string) error {
+			return materializeNativeCloneForProject(cfg, parent, worktree, branch)
+		}
 	}
 	if err := create(cfg.LocalPath, worktreePath, branchName); err != nil {
 		return err

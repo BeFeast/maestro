@@ -25,7 +25,7 @@ func TestNativeForgejoCredentialRealGitProtocol(t *testing.T) {
 	cmd := exec.Command(git, "-c", "credential.helper=", "-c", "credential.helper="+helper, "-c", "credential.useHttpPath=true", "credential", "fill")
 	cmd.Dir = t.TempDir()
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0", "MAESTRO_CREDENTIAL_HELPER_TEST=1"}
-	cmd.Stdin = strings.NewReader("capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=git.oklabs.uk\npath=BeFeast/hedroom.git\nwwwauth[]=Basic realm=synthetic\nwwwauth[]=Bearer realm=synthetic\n\n")
+	cmd.Stdin = strings.NewReader("capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=forge.example.test\npath=acme/widget.git\nwwwauth[]=Basic realm=synthetic\nwwwauth[]=Bearer realm=synthetic\n\n")
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		t.Fatalf("real Git helper exchange: %v: %s", err, output)
@@ -47,7 +47,7 @@ func TestNativeForgejoCredentialHelperProcess(t *testing.T) {
 		fmt.Fprintln(os.Stderr, "real Git did not forward repeated protocol metadata")
 		os.Exit(2)
 	}
-	err = NativeForgejoCredential(os.Args[len(os.Args)-1], "BeFeast/hedroom", "synthetic-test-token", bytes.NewReader(wire), os.Stdout)
+	err = NativeForgejoCredential(os.Args[len(os.Args)-1], fixtureDestination, "synthetic-test-token", bytes.NewReader(wire), os.Stdout)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
@@ -56,16 +56,16 @@ func TestNativeForgejoCredentialHelperProcess(t *testing.T) {
 }
 
 func TestNativeForgejoCredentialEOFValidation(t *testing.T) {
-	valid := "protocol=https\nhost=git.oklabs.uk\npath=BeFeast/hedroom.git"
+	valid := "protocol=https\nhost=forge.example.test\npath=acme/widget.git"
 	for _, ending := range []string{"", "\n", "\n\n"} {
 		var out bytes.Buffer
-		if err := NativeForgejoCredential("get", "BeFeast/hedroom", "synthetic-test-token", strings.NewReader(valid+ending), &out); err != nil {
+		if err := NativeForgejoCredential("get", fixtureDestination, "synthetic-test-token", strings.NewReader(valid+ending), &out); err != nil {
 			t.Fatalf("valid ending %q rejected: %v", ending, err)
 		}
 	}
-	for _, request := range []string{"", "protocol=https\nhost=git.oklabs.uk", valid + "\nprotocol=https", strings.Replace(valid, "hedroom.git", "other.git", 1), valid + "\nextra=" + strings.Repeat("a", 8192)} {
+	for _, request := range []string{"", "protocol=https\nhost=forge.example.test", valid + "\nprotocol=https", strings.Replace(valid, "widget.git", "other.git", 1), valid + "\nextra=" + strings.Repeat("a", 8192)} {
 		var out bytes.Buffer
-		if err := NativeForgejoCredential("get", "BeFeast/hedroom", "synthetic-test-token", strings.NewReader(request), &out); err == nil || out.Len() != 0 {
+		if err := NativeForgejoCredential("get", fixtureDestination, "synthetic-test-token", strings.NewReader(request), &out); err == nil || out.Len() != 0 {
 			t.Fatal("invalid request disclosed fixture credentials")
 		}
 	}
@@ -73,16 +73,16 @@ func TestNativeForgejoCredentialEOFValidation(t *testing.T) {
 
 func TestNativeForgejoCredentialRepeatedMetadata(t *testing.T) {
 	// Field order and repetition match the sanitized real HTTP push projection.
-	request := "capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=git.oklabs.uk\npath=BeFeast/hedroom.git\nwwwauth[]=Basic realm=synthetic\nwwwauth[]=Bearer realm=synthetic"
+	request := "capability[]=authtype\ncapability[]=state\nprotocol=https\nhost=forge.example.test\npath=acme/widget.git\nwwwauth[]=Basic realm=synthetic\nwwwauth[]=Bearer realm=synthetic"
 	for _, ending := range []string{"", "\n", "\n\n"} {
 		var out bytes.Buffer
-		if err := NativeForgejoCredential("get", "BeFeast/hedroom", "synthetic-test-token", strings.NewReader(request+ending), &out); err != nil {
+		if err := NativeForgejoCredential("get", fixtureDestination, "synthetic-test-token", strings.NewReader(request+ending), &out); err != nil {
 			t.Fatal(err)
 		}
 	}
-	for _, suffix := range []string{"\nprotocol=https", "\nhost=git.oklabs.uk", "\npath=BeFeast/hedroom.git", "\nusername=oauth2\nusername=oauth2", "\nfuture[]=a\nfuture[]=b", "\ncapability[]=" + strings.Repeat("a", 4097), strings.Repeat("\nwwwauth[]=synthetic", 500)} {
+	for _, suffix := range []string{"\nprotocol=https", "\nhost=forge.example.test", "\npath=acme/widget.git", "\nusername=oauth2\nusername=oauth2", "\nfuture[]=a\nfuture[]=b", "\ncapability[]=" + strings.Repeat("a", 4097), strings.Repeat("\nwwwauth[]=synthetic", 500)} {
 		var out bytes.Buffer
-		if err := NativeForgejoCredential("get", "BeFeast/hedroom", "synthetic-test-token", strings.NewReader(request+suffix), &out); err == nil || out.Len() != 0 {
+		if err := NativeForgejoCredential("get", fixtureDestination, "synthetic-test-token", strings.NewReader(request+suffix), &out); err == nil || out.Len() != 0 {
 			t.Fatal("invalid repeated metadata disclosed fixture credential")
 		}
 	}

@@ -337,7 +337,7 @@ func nativeBubblewrapArguments(p NativeContainmentProfile, e nativeLaunchEnvelop
 			return nil, Held("containment_git_metadata_external")
 		}
 		args = append(args, "--bind", gitDir, "/work/.git", "--ro-bind", filepath.Join(gitDir, "config"), "/work/.git/config",
-			"--ro-bind", filepath.Join(gitDir, "maestro-native-clone.json"), "/work/.git/maestro-native-clone.json",
+			"--ro-bind", filepath.Join(gitDir, NativeCloneMarker), nativeSandboxCloneIdentityPath,
 			"--tmpfs", "/work/.git/hooks", "--remount-ro", "/work/.git/hooks")
 		if err := verifyNativeGitGuards(e.Worktree, p.UID); err != nil {
 			return nil, err

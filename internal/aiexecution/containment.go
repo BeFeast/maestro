@@ -103,7 +103,9 @@ func readContainmentProfile(pin FileProof) (NativeContainmentProfile, error) {
 }
 
 func validateContainmentProfile(p NativeContainmentProfile) error {
-	if !strings.HasPrefix(p.ForgejoRepository, "BeFeast/") || strings.Count(p.ForgejoRepository, "/") != 1 || strings.ContainsAny(p.ForgejoRepository, " \t\r\n?#%") || strings.Contains(p.ForgejoRepository, "..") {
+	// The root-owned, hash-pinned profile is the authority for the repository;
+	// only its shape is checked here, never a compiled-in organization.
+	if !validNativeForgejoRepository(p.ForgejoRepository) {
 		return Held("containment_forgejo_repository_invalid")
 	}
 	if p.Version != 1 || p.ProjectID == "" || p.UID == 0 || p.GID == 0 || p.NamespaceIno == 0 || !validDigest(p.RulesSHA256) || p.MemoryMaxMB <= 0 {

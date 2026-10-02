@@ -64,7 +64,9 @@ func TestStrictNativeWorkerActualRoutePreflightHoldsBeforeLease(t *testing.T) {
 	f := nativeTestFixture(t)
 	f.cfg.WorkerRuntime = config.WorkerRuntimeConfig{Mode: config.WorkerRuntimeModeIsolated, Scope: config.WorkerRuntimeScopeSystem}
 	runBranchGit(t, f.cfg.LocalPath, "worktree", "remove", "--force", filepath.Join(f.cfg.WorktreeBase, f.slot))
-	runBranchGit(t, f.cfg.LocalPath, "remote", "set-url", "origin", "https://git.oklabs.uk/BeFeast/maestro.git")
+	f.cfg.Repo = "acme/widget"
+	f.cfg.Forge = config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.test"}
+	runBranchGit(t, f.cfg.LocalPath, "remote", "set-url", "origin", fixtureNativeOrigin)
 	f.cfg.AIExecution.RequireVerifiedRoute = true
 	f.cfg.AIExecution = f.cfg.AIExecution.BindController(f.cfg.AIExecution, f.cfg.StateDir)
 	_, err := f.start()
