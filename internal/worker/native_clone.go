@@ -74,6 +74,52 @@ func materializeNativeCloneForProject(cfg *config.Config, parent, worktree, bran
 	return materializeNativeClone(parent, worktree, branch, origin)
 }
 
+// verifyNativeRelaunchCloneOrigin is the in-place relaunch counterpart of the
+// materialize check. RespawnInPlace and StartPhase reuse the retained clone
+// without materializing it, and the sandboxed forge helpers take the host from
+// that clone's daemon-written identity. A forge.base_url or repo change made
+// after the clone was created must hold the relaunch instead of silently
+// keeping the old destination.
+//
+// Only an identity that exists can carry a host into the sandbox. Without one
+// (no .git directory, or no identity file in it) the native monitor's
+// read-only identity bind and the in-sandbox helpers already fail closed, so
+// there is nothing stale to check here. An identity that exists but cannot be
+// read exactly holds. Git never runs in the retained clone here.
+func verifyNativeRelaunchCloneOrigin(cfg *config.Config, worktree string) error {
+	if cfg == nil || !cfg.AIExecution.RequireVerifiedRoute {
+		return nil
+	}
+	if !filepath.IsAbs(worktree) || filepath.Clean(worktree) != worktree {
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	gitDir := filepath.Join(worktree, ".git")
+	st, err := os.Lstat(gitDir)
+	switch {
+	case os.IsNotExist(err) || err == nil && st.Mode().IsRegular():
+		return nil
+	case err != nil || !st.IsDir():
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	marker := filepath.Join(gitDir, nativeCloneMarker)
+	if _, err := os.Lstat(marker); os.IsNotExist(err) {
+		return nil
+	}
+	b, err := readOwnedRegularNoFollow(marker, 16<<10)
+	var identity nativeCloneIdentity
+	if err != nil || aiexecution.DecodeStrict(b, &identity) != nil || identity.Version != 1 || identity.Worktree != worktree {
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	expected, err := nativeCloneOriginForProject(cfg)
+	if err != nil {
+		return err
+	}
+	if identity.Origin != expected {
+		return aiexecution.Held("containment_clone_origin_unsupported")
+	}
+	return nil
+}
+
 func materializeNativeClone(parent, worktree, branch, expectedOrigin string) error {
 	if _, err := os.Lstat(worktree); err == nil {
 		// Initial setup can stop after writing clone identity but before Git

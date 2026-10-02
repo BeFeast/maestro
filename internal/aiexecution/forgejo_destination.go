@@ -95,6 +95,14 @@ func validNativeForgejoName(s string) bool {
 // instance root: the base URL must be spelled exactly https://<host>[/], so
 // userinfo, a port, a path, a query, a fragment or any spelling a URL parser
 // would normalize is rejected.
+//
+// This is deliberately stricter than config.ForgeConfig.CanonicalBaseURL and
+// RepositoryIdentity.FetchURL, which normalize host case and default ports and
+// keep explicit ports and base paths for onboarding and delivery matching.
+// Native execution compares the origin, the Git credential request and the PR
+// URLs byte for byte, so it accepts only the one spelling every one of those
+// checks can agree on and fails closed on anything a normalizer would rewrite.
+// For a bare https root the two forms produce the same URL.
 func NativeForgejoOrigin(baseURL, repo string) (string, error) {
 	u, err := url.Parse(baseURL)
 	if err != nil || (baseURL != "https://"+u.Host && baseURL != "https://"+u.Host+"/") {
