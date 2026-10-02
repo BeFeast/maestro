@@ -18,6 +18,7 @@ import (
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/repopolicy"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/termguard"
 	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
@@ -120,6 +121,12 @@ func startReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	defer func() {
+		if h, ok := NativeHold(resultErr); ok && h.Deferred {
+			// Paused before registration: no session, receipt or hold is
+			// created, and an existing held projection keeps its own code.
+			h.Slot = slotName
+			return
+		}
 		if h, ok := NativeHold(resultErr); ok {
 			h.Slot = slotName
 			resultSlot = slotName
@@ -241,7 +248,7 @@ func startReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	if cfg.AIExecution.RequireVerifiedRoute {
-		if err := materializeNativeClone(cfg.LocalPath, worktreePath, branchName); err != nil {
+		if err := materializeNativeCloneForProject(cfg, cfg.LocalPath, worktreePath, branchName); err != nil {
 			return "", err
 		}
 	} else if info, err := os.Stat(worktreePath); err == nil {
@@ -546,7 +553,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
 	create := addWorktreeFromBase
 	if cfg.AIExecution.RequireVerifiedRoute {
-		create = materializeNativeClone
+		create = func(parent, worktree, branch string) error {
+			return materializeNativeCloneForProject(cfg, parent, worktree, branch)
+		}
 	}
 	if err := create(cfg.LocalPath, worktreePath, branchName); err != nil {
 		return err
@@ -777,7 +786,12 @@ func StopProcess(slotName string, sess *state.Session) error {
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
 	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
-	if sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
+	//
+	// The termination guard is consulted before the liveness probe so a test
+	// fixture carrying a literal PID is refused deterministically, whether or
+	// not an unrelated process currently owns that number (#1252). Production
+	// installs no guard, so Check is always nil here.
+	if sess != nil && sess.PID > 0 && termguard.Check(termguard.Attempt{Op: termguard.OpKillProcessTree, PID: sess.PID}) == nil && IsAlive(sess.PID) {
 		KillProcessTree(sess.PID)
 	}
 	return nil

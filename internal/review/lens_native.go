@@ -23,6 +23,9 @@ type NativeClaudeLens struct {
 	// operator rearm grant is exercised so a hold the runner would report
 	// before any launch is observed without opening a consultation (#1233).
 	limiter aiexecution.AuxiliaryLimiter
+	// readiness is the controller's managed-lane probe. It is consulted before
+	// an ordinary claim is posted and before a rearm grant is exercised.
+	readiness aiexecution.LaneReadiness
 }
 
 // NewNativeClaudeLens installs the supported runner. There is no exported
@@ -41,8 +44,24 @@ func NewNativeClaudeLens(stream, model string, cfg *config.Config) *NativeClaude
 	}
 	if cfg != nil {
 		l.limiter = cfg.RuntimeAuxiliaryLimiter
+		l.readiness = cfg.RuntimeNativeLaneReadiness
 	}
 	return l
+}
+
+// laneReady probes the managed lane without launching or claiming anything.
+func (l *NativeClaudeLens) laneReady() error {
+	return nativeLaneReadiness(l.readiness, l.policy)
+}
+
+func nativeLaneReadiness(readiness aiexecution.LaneReadiness, policy aiexecution.Policy) error {
+	if readiness == nil {
+		return nil
+	}
+	if err := readiness.ObserveLaneReadiness(policy); err != nil {
+		return aiexecution.Held(aiexecution.LaneHoldCode(err))
+	}
+	return nil
 }
 
 func (l *NativeClaudeLens) Name() string { return l.Stream }
@@ -80,10 +99,15 @@ func (l *NativeClaudeLens) runClaimed(ctx context.Context, prompt, claimID strin
 }
 
 // preflight observes, without launching, what would hold a claim before any
-// native launch: the lens's own availability, then auxiliary capacity.
+// native launch: the lens's own availability, managed-lane readiness, then
+// auxiliary capacity.
 func (l *NativeClaudeLens) preflight(stateDir string) rearmPreflight {
 	return func() string {
 		if err := l.Available(); err != nil {
+			code, _ := typedNativeHold(err)
+			return code
+		}
+		if err := l.laneReady(); err != nil {
 			code, _ := typedNativeHold(err)
 			return code
 		}

@@ -186,6 +186,19 @@ func (e *Engine) evaluateDependencyUnblock(st *state.State, issues []github.Issu
 			!supervisorMutationSucceeded(st, issue.Number, MutationRemoveBlockedLabel, blockedLabel)
 		addReady := !github.HasLabel(issue, []string{readyLabel}) &&
 			!supervisorMutationSucceeded(st, issue.Number, MutationAddReadyLabel, readyLabel)
+		// #1240: the blocked label this decision removes does not count, but
+		// any other excluded label or an epic/parent title keeps the member
+		// out of the unblock-and-promote plan entirely.
+		if addReady {
+			liftedLabel := ""
+			if removeBlocked {
+				liftedLabel = blockedLabel
+			}
+			if hold := e.promotionContentHold(issue, liftedLabel); hold != nil {
+				e.journalPromotionHold(issue, *hold)
+				continue
+			}
+		}
 		if !removeBlocked && !addReady {
 			continue
 		}

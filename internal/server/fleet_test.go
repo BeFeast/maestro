@@ -234,7 +234,8 @@ func TestFleetAPIAggregatesProjects(t *testing.T) {
 }
 
 func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *testing.T) {
-	stateDir := filepath.Join(t.TempDir(), "state")
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
 	st := state.NewState()
 	st.WorkerLeaseAttention = []state.WorkerLeaseAttention{{
 		Identity:   "ambiguous-a1b2c3d4e5f6",
@@ -247,7 +248,11 @@ func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *tes
 	if err := state.Save(stateDir, st); err != nil {
 		t.Fatal(err)
 	}
-	project := NewFleetProject("One", "", "", &config.Config{Repo: "owner/one", StateDir: stateDir, MaxParallel: 1})
+	// The scratch root is pinned under the test's own directory so the guard
+	// below is a path that exists only in this fixture.
+	cfg := &config.Config{Repo: "owner/one", StateDir: stateDir, MaxParallel: 1}
+	cfg.WorkerRuntime.ScratchRoot = filepath.Join(dir, "worker-scratch")
+	project := NewFleetProject("One", "", "", cfg)
 	srv := NewFleet([]FleetProject{project}, "127.0.0.1", 8786, true)
 
 	req := httptest.NewRequest(http.MethodGet, "/api/v1/fleet", nil)
@@ -267,8 +272,20 @@ func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *tes
 	if worker.Status != "worker_lease_attention" || !worker.NeedsAttention || !strings.Contains(worker.NextAction, "do not delete") {
 		t.Fatalf("worker lease attention = %+v", worker)
 	}
+	// The attention row carries the persisted reason and next action verbatim
+	// and nothing the handler could add from the lease itself.
+	if worker.StatusReason != st.WorkerLeaseAttention[0].Reason || worker.NextAction != st.WorkerLeaseAttention[0].NextAction {
+		t.Fatalf("worker lease attention = %+v", worker)
+	}
+	// The project row carries state_dir by design; what the lease attention
+	// projection must keep out is the worker scratch layer the lease lives in
+	// (the fleet reports scratch_configured, never the root or anything under
+	// it) and a systemctl remediation for the lease's unit. The guarded path is
+	// derived from the fixture rather than a literal prefix, because the test's
+	// own TempDir may itself live under the default scratch parent.
+	scratchRoot := cfg.WorkerRuntime.EffectiveScratchRoot()
 	encoded := w.Body.String()
-	if strings.Contains(encoded, "/var/tmp/") || strings.Contains(encoded, "systemctl") {
+	if strings.Contains(encoded, scratchRoot) || strings.Contains(encoded, "systemctl") {
 		t.Fatalf("worker lease attention leaked private runtime detail: %s", encoded)
 	}
 
@@ -284,6 +301,12 @@ func TestFleetAPISurfacesWorkerLeaseOwnershipAttentionWithoutPrivatePaths(t *tes
 	}
 	if detail.Log.Available || !strings.Contains(detail.Log.Reason, "no process log") {
 		t.Fatalf("detail log = %+v", detail.Log)
+	}
+	// The per-worker detail has no project row, so here no fixture path at all
+	// may appear: not the state dir, not the scratch root, and no unit hint.
+	encodedDetail := detailW.Body.String()
+	if strings.Contains(encodedDetail, stateDir) || strings.Contains(encodedDetail, scratchRoot) || strings.Contains(encodedDetail, "systemctl") {
+		t.Fatalf("worker lease detail leaked private runtime detail: %s", encodedDetail)
 	}
 }
 

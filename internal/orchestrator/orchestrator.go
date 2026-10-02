@@ -21,6 +21,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
@@ -85,6 +86,10 @@ type Orchestrator struct {
 	// missingReviewNotified remembers PRs already reported as merged past an
 	// absent review gate, so the alert fires once per PR.
 	missingReviewNotified map[int]bool
+	// parkedNativeHoldNotified remembers, per slot, the parked native hold
+	// (code, role run, generation) already reported, so the operator is told
+	// once instead of on every retention.
+	parkedNativeHoldNotified map[string]string
 	// reviewProduceInFlight guards one llm-review producer run per PR in this
 	// process (#1162 S5); cross-process dedup is the posted statuses.
 	reviewProduceMu       sync.Mutex
@@ -144,6 +149,14 @@ type Orchestrator struct {
 	workerStartClaimedFn      func(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, backend, slot string) (string, error)
 	nativePrelaunchRecoveries []NativePrelaunchRecovery
 	nativePrelaunchRecoverFn  func(*config.Config, *state.State, string, github.Issue, string, string, string) (string, error)
+	// nativeLaneHeldPrelaunchFn selects lane-held registered first spawns
+	// (worker.NativeLaneHeldPrelaunch); tests substitute it.
+	nativeLaneHeldPrelaunchFn func(*config.Config, string, *state.Session) (string, bool)
+	// nativeRuntimeReconcileFn / nativePrelaunchExpiryFn: cycle-start native
+	// hold reconcilers (worker.ReconcileNativeWorkerRuntime and
+	// worker.ReconcileExpiredNativePrelaunch); tests replace them.
+	nativeRuntimeReconcileFn func(*config.Config, *state.State, string) error
+	nativePrelaunchExpiryFn  func(*config.Config, *state.State, string) (bool, error)
 
 	// Cached project board metadata and sweep cadence.
 	projectField           *github.ProjectField
@@ -181,6 +194,18 @@ type Orchestrator struct {
 	fleetSpawnCeilingFn          func() bool
 	fleetSpawnReserveFn          func() (commit func(slot string), release func(), ok bool)
 	fleetNativeRecoveryReserveFn func(slot, nativeID string) (commit func(string), release func(), ok bool)
+	// fleetSpawnStallFn explains a closed fleet ceiling for the journal (#1243):
+	// detail names every counted slot and why it is counted, stalled reports
+	// that no worker runs anywhere in the fleet. nil = no diagnostic.
+	fleetSpawnStallFn func() (detail string, stalled bool)
+
+	// nativeExitReconcileFn seals cleanly exited native generations at cycle
+	// start (#1243). nil = worker.ReconcileNativeWorkerExit; tests override it.
+	nativeExitReconcileFn func(cfg *config.Config, s *state.State, slot string) (bool, error)
+	// nativePhaseExitSealFn seals the exited generation of a running pipeline
+	// session whose phase transition is about to run or wait
+	// (worker.ReconcileNativePhaseExit); tests replace it.
+	nativePhaseExitSealFn func(cfg *config.Config, s *state.State, slot string) (bool, error)
 
 	// spawnResourceHoldFn is the host-resource precondition (#1128): it reports
 	// whether the host is too short on tmpfs space to accept another worker, and
@@ -195,6 +220,14 @@ type Orchestrator struct {
 	// `maestro status` and the Fleet API instead of silently ignoring the change.
 	restartRequired       bool
 	restartRequiredReason string
+
+	// nativeForgejoAuthorizationsFn stands in for the root-owned
+	// forgejo-authorization evidence read auto-merge consults before a merge
+	// call (#1247); nil takes aiexecution.NativeForgejoAuthorizations.
+	// mergeActorEvidenceNote de-duplicates the unavailable-evidence journal
+	// line so it is written once per distinct condition, not once per cycle.
+	nativeForgejoAuthorizationsFn func(aiexecution.Policy) (aiexecution.NativeForgejoAuthorizationReport, error)
+	mergeActorEvidenceNote        string
 
 	// Testing hooks for autoMergePRs / mergeReadyPR
 	ghPRCIStatusFn               func(prNumber int) (string, error)
@@ -251,6 +284,17 @@ type Orchestrator struct {
 	cycleClosedPRsErr   error
 	cycleIssueClosed    map[int]cycleBoolResult
 	cyclePRMerged       map[int]cycleBoolResult
+
+	// pauseDeferredLaunches records the distinct native launch intents the
+	// operator pause (#683) held back during the current RunOnce, keyed by
+	// issue (or slot), so one intent seen by two launch paths in the same
+	// cycle is counted once. journalPauseDeferrals reports and resets it once
+	// per cycle so a paused project never logs one line per deferred launch.
+	pauseDeferredLaunches map[string]struct{}
+
+	// cycleFleetStallNoted limits the fleet ceiling stall diagnostic to one
+	// journal line per cycle (#1243).
+	cycleFleetStallNoted bool
 }
 
 // New creates a new Orchestrator
@@ -325,6 +369,72 @@ func (o *Orchestrator) SetSpawnResourceHold(fn func() (bool, string)) {
 // dispatch aborts before a worker starts.
 func (o *Orchestrator) SetFleetSpawnReserve(fn func() (commit func(slot string), release func(), ok bool)) {
 	o.fleetSpawnReserveFn = fn
+}
+
+// SetFleetSpawnStallDiagnostic wires the daemon's explanation of a closed
+// fleet ceiling (#1243). Passing nil disables the diagnostic.
+func (o *Orchestrator) SetFleetSpawnStallDiagnostic(fn func() (detail string, stalled bool)) {
+	o.fleetSpawnStallFn = fn
+}
+
+// noteFleetCeilingStall journals, at most once per cycle, which fleet slots
+// keep the live-worker ceiling closed while this project runs no worker
+// (#1243). A ceiling held only by native launch receipts without recorded
+// termination and in-flight reservations, with no worker running anywhere in
+// the fleet, cannot be reopened by any worker exit and is reported CRITICAL.
+func (o *Orchestrator) noteFleetCeilingStall(s *state.State) {
+	if o.fleetSpawnStallFn == nil || o.cycleFleetStallNoted || s == nil || s.RunningSessionCount() != 0 {
+		return
+	}
+	o.cycleFleetStallNoted = true
+	detail, stalled := o.fleetSpawnStallFn()
+	if detail == "" {
+		return
+	}
+	if stalled {
+		log.Printf("[orch] CRITICAL fleet live-worker ceiling stall: no worker is running anywhere in the fleet, so no exit can reopen capacity: %s", detail)
+		return
+	}
+	log.Printf("[orch] fleet live-worker ceiling held with no local worker running: %s", detail)
+}
+
+// reconcileNativeWorkerExits seals every cleanly exited native generation whose
+// OS termination is proven, before this cycle makes any capacity decision
+// (#1243). Without it the generation stays counted as a live worker by the
+// fleet ceiling until the next respawn of its slot, which that ceiling can
+// itself block. Each attempt uses the respawn fence's prove -> seal -> record
+// sequence; a typed hold leaves the generation counted and is journaled, and
+// the next cycle retries.
+func (o *Orchestrator) reconcileNativeWorkerExits(s *state.State) {
+	reconcile := o.nativeExitReconcileFn
+	if reconcile == nil {
+		reconcile = worker.ReconcileNativeWorkerExit
+	}
+	slots := make([]string, 0, len(s.Sessions))
+	for slot := range s.Sessions {
+		slots = append(slots, slot)
+	}
+	sort.Strings(slots)
+	for _, slot := range slots {
+		sealed, err := reconcile(o.cfg, s, slot)
+		journalNativeExitSeal(slot, sealed, err)
+	}
+}
+
+// journalNativeExitSeal journals one exit-seal attempt: a typed hold with its
+// cause (the generation stays counted and the next cycle retries), or a seal.
+func journalNativeExitSeal(slot string, sealed bool, err error) {
+	if err != nil {
+		cause := ""
+		if inner := errors.Unwrap(err); inner != nil {
+			cause = fmt.Sprintf(" (cause: %v)", inner)
+		}
+		log.Printf("[orch] native exit seal held for %s: %v%s", slot, err, cause)
+		return
+	}
+	if sealed {
+		log.Printf("[orch] native exit sealed for %s: generation recorded terminal and no longer occupies fleet capacity", slot)
+	}
 }
 
 type fleetSpawnPermit struct {
@@ -433,6 +543,7 @@ func (o *Orchestrator) beginCycle() {
 	o.cycleClosedPRsErr = nil
 	o.cycleIssueClosed = make(map[int]cycleBoolResult)
 	o.cyclePRMerged = make(map[int]cycleBoolResult)
+	o.cycleFleetStallNoted = false
 }
 
 // endCycle clears the per-cycle cache and deactivates memoization so any
@@ -1016,18 +1127,28 @@ func (o *Orchestrator) closeIssue(number int, comment string) error {
 	return err
 }
 
+// Process-termination fallbacks for an Orchestrator without an injected
+// workerStopFn / workerStopProcessFn. Production always uses the worker
+// implementations. The package's TestMain replaces them so a fixture that
+// carries a literal PID or tmux name and forgets its fake fails loudly instead
+// of tearing down a real process (#1252).
+var (
+	defaultWorkerStop        = worker.Stop
+	defaultWorkerStopProcess = worker.StopProcess
+)
+
 func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 	if o.workerStopFn != nil {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
-	return worker.Stop(o.cfg, slotName, sess)
+	return defaultWorkerStop(o.cfg, slotName, sess)
 }
 
 func (o *Orchestrator) stopWorkerProcess(slotName string, sess *state.Session) error {
 	if o.workerStopProcessFn != nil {
 		return o.workerStopProcessFn(slotName, sess)
 	}
-	return worker.StopProcess(slotName, sess)
+	return defaultWorkerStopProcess(slotName, sess)
 }
 
 func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
@@ -2946,6 +3067,9 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 	}
 
 	respawned := 0
+	// The lane is probed once, lazily, after the terminal settlement above and
+	// only when a due retry is about to respawn.
+	laneChecked := false
 	for _, slotName := range slotNames {
 		if respawned >= slots {
 			log.Printf("[orch] retry queue still has pending session(s), but retry slots are exhausted")
@@ -2967,6 +3091,13 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 				slotName, sess.RetryCount, sess.NextRetryAt.Format(time.RFC3339))
 			continue
 		}
+		// Operator pause (#683): a due retry is a new native launch. Leave the
+		// session dead and the retry due — no slot, budget, CI/review context
+		// or backend selection is consumed — so the first cycle after resume
+		// respawns it exactly once.
+		if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+			continue
+		}
 
 		// #800: the saved retry state can outlive the work it was scheduled
 		// for — the PR may have merged or the issue closed while the backoff
@@ -2981,6 +3112,13 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			continue
 		}
 		clearOperatorGateHold(sess)
+		if !laneChecked {
+			laneChecked = true
+			if hold, code := o.nativeLaneHold(); hold {
+				log.Printf("[orch] retry respawns paused: native lane not ready: %s — retrying next cycle", code)
+				return
+			}
+		}
 
 		beforeNative := nativeSessionSnapshot(o.cfg, sess)
 
@@ -3022,6 +3160,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 			sess.NextRetryAt = &retryAt
 			log.Printf("[orch] worker %s retry deferred until %s: fleet live-worker ceiling reached",
 				slotName, retryAt.Format(time.RFC3339))
+			o.noteFleetCeilingStall(s)
 			return
 		}
 
@@ -3140,7 +3279,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		respawnErr := o.respawnPreservingWorktreeWithConfig(respawnCfg, slotName, sess, issue, promptBase, respawnBackend)
 		if respawnErr != nil {
 			if hold, ok := worker.NativeHold(respawnErr); ok {
-				retainNativeWorkerHold(sess, respawnErr)
+				o.retainNativeWorkerHold(slotName, sess, respawnErr)
 				restoreNativeHeldSession(sess, beforeNative)
 				if hold.LaunchUncertain {
 					permit.Commit(slotName)
@@ -3279,6 +3418,7 @@ func (o *Orchestrator) RunOnce() error {
 	// across cycles.
 	o.beginCycle()
 	defer o.endCycle()
+	o.pauseDeferredLaunches = nil
 
 	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
@@ -3286,15 +3426,7 @@ func (o *Orchestrator) RunOnce() error {
 	}
 
 	log.Printf("[orch] === cycle start — %d sessions in state ===", len(s.Sessions))
-	if o.cfg.AIExecution.RequireVerifiedRoute {
-		for slot, sess := range s.Sessions {
-			if sess != nil && nativeRuntimeReconcileHold(sess.NativeRegistrationHold) {
-				if err := worker.ReconcileNativeWorkerRuntime(o.cfg, s, slot); err != nil {
-					log.Printf("[orch] exact native runtime reconciliation held for %s: %v%s", slot, err, nativeWorkerExecHoldSuffix(sess))
-				}
-			}
-		}
-	}
+	o.reconcileNativeHoldsAtCycleStart(s)
 
 	// Storage/process ownership is reconciled before any session-status or
 	// scheduling decision. An orphaned exact lease is stopped and cleaned here;
@@ -3306,6 +3438,13 @@ func (o *Orchestrator) RunOnce() error {
 	}
 	if leaseReconcile.Attention > 0 {
 		log.Printf("[orch] worker lease reconcile surfaced %d ownership attention item(s)", leaseReconcile.Attention)
+	}
+	// A cleanly exited native generation is sealed here, after its lease was
+	// released and before any step that consults the fleet ceiling, so the
+	// ceiling never needs to guess about a generation awaiting its seal: it
+	// stops counting the slot only once termination is proven and recorded.
+	if o.cfg.AIExecution.RequireVerifiedRoute {
+		o.reconcileNativeWorkerExits(s)
 	}
 
 	// Step 0: Surface a finished self-deploy (#698) as a supervisor finding.
@@ -3419,6 +3558,9 @@ func (o *Orchestrator) RunOnce() error {
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
 	}
+	// One journal line per paused cycle covering every launch the pause held
+	// back (retries, failovers, restart resumes, selected repairs).
+	o.journalPauseDeferrals(s)
 
 	// Step 5b: persist the machine-readable top-level dispatch hold and the
 	// two-cycle idle-stall debounce after fresh dispatch had its chance to
@@ -3761,6 +3903,7 @@ func (o *Orchestrator) reloadConfig(newCfg *config.Config, ticker **time.Ticker)
 		o.cfg.AIExecution = newCfg.AIExecution
 	}
 	o.cfg.RuntimeAuxiliaryLimiter = newCfg.RuntimeAuxiliaryLimiter
+	o.cfg.RuntimeNativeLaneReadiness = newCfg.RuntimeNativeLaneReadiness
 	if newCfg.MaxRuntimeMinutes != old.MaxRuntimeMinutes {
 		changed = append(changed, fmt.Sprintf("max_runtime_minutes: %d→%d", old.MaxRuntimeMinutes, newCfg.MaxRuntimeMinutes))
 		o.cfg.MaxRuntimeMinutes = newCfg.MaxRuntimeMinutes
@@ -4281,6 +4424,22 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 						slotName, sess.IssueNumber, pid, tmuxName)
 				}
 				continue
+			} else if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): resuming in place is a new native launch.
+				// Keep the marker and park the session in the dead+marker shape the
+				// drain path (#967) already uses, so checkSessions cannot turn the
+				// gone process into a budgeted retry while paused and the first
+				// cycle after resume resumes it here exactly once.
+				if sess.Status == state.StatusRunning {
+					now := time.Now().UTC()
+					sess.Status = state.StatusDead
+					sess.PID = 0
+					sess.TmuxSession = ""
+					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
+					reconciled = true
+				}
+				continue
 			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
 				// A transient GitHub read is not proof that the durable recovery is
 				// invalid. Preserve the marker and retry next cycle; consuming it here
@@ -4291,7 +4450,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 				o.updateTokensUsedFromWorkerLog(slotName, sess)
 				promptBase := o.selectPrompt(issue)
 				if respawnErr := o.respawnInPlaceWithConfig(o.cfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
-					if retainNativeWorkerHold(sess, respawnErr) {
+					if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 						restoreNativeHeldSession(sess, beforeNative)
 						continue
 					}
@@ -4363,6 +4522,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, resetStr)
 				continue
 			}
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): park the ended worker as a due retry
+				// instead of launching the fallback now.
+				parkEndedWorkerForPause(sess, now)
+				reconciled = true
+				continue
+			}
 
 			issue, fetchErr := o.getIssue(sess.IssueNumber)
 			if fetchErr != nil {
@@ -4385,7 +4551,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
-				if retainNativeWorkerHold(sess, respawnErr) {
+				if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 					restoreNativeHeldSession(sess, beforeNative)
 					continue
 				}
@@ -4447,6 +4613,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, cp.remedy)
 				continue
 			}
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): park the ended worker as a due retry
+				// instead of launching the fallback now.
+				parkEndedWorkerForPause(sess, now)
+				reconciled = true
+				continue
+			}
 
 			issue, fetchErr := o.getIssue(sess.IssueNumber)
 			if fetchErr != nil {
@@ -4469,7 +4642,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 			}
 			promptBase := o.selectPrompt(issue)
 			if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); respawnErr != nil {
-				if retainNativeWorkerHold(sess, respawnErr) {
+				if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 					restoreNativeHeldSession(sess, beforeNative)
 					continue
 				}
@@ -5152,10 +5325,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 			// Terminal states — cleanup old worktrees after 1h
 			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
-			// to preserve the grace period for recently-killed workers.
+			// to preserve the grace period for recently-killed workers. A dead
+			// session with a pending retry or restart resume keeps its worktree
+			// for the in-place relaunch, however long it waits (#1238).
 			nilAndOld := sess.FinishedAt == nil && !sess.StartedAt.IsZero() && time.Since(sess.StartedAt) > 1*time.Hour
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
-			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
+			if sess.Worktree != "" && (nilAndOld || finishedAndOld) && !deadSessionAwaitsRelaunch(sess) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
 					lease := worker.CaptureCleanupLease(slotName, sess)
 					if o.beforeWorktreeCleanupFn != nil {
@@ -5264,6 +5439,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							slotName, sess.IssueNumber, sess.IssueTitle)
 						continue
 					}
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+						// Operator pause (#683): park the ended worker as a due
+						// retry instead of launching the fallback now.
+						parkEndedWorkerForPause(sess, now)
+						continue
+					}
 					log.Printf("[orch] worker %s (backend=%s) hit rate limit, falling back to %s",
 						slotName, sess.Backend, nextBackend)
 
@@ -5285,7 +5466,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						if retainNativeWorkerHold(sess, err) {
+						if o.retainNativeWorkerHold(slotName, sess, err) {
 							restoreNativeHeldSession(sess, beforeNative)
 							continue
 						}
@@ -5328,6 +5509,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, failure.pattern, cp.remedy)
 						continue
 					}
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+						// Operator pause (#683): park the ended worker as a due
+						// retry instead of launching the fallback now.
+						parkEndedWorkerForPause(sess, now)
+						continue
+					}
 					log.Printf("[orch] worker %s (backend=%s) %s (%s), falling back to %s — retry budget preserved",
 						slotName, sess.Backend, cp.desc, failure.pattern, nextBackend)
 
@@ -5349,7 +5536,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					}
 					promptBase := o.selectPrompt(issue)
 					if err := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, nextBackend); err != nil {
-						if retainNativeWorkerHold(sess, err) {
+						if o.retainNativeWorkerHold(slotName, sess, err) {
 							restoreNativeHeldSession(sess, beforeNative)
 							continue
 						}
@@ -5478,6 +5665,13 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 							// Attempt fallback: respawn with the best currently available backend.
 							if fallback := selection.SelectedBackend; fallback != "" {
+								if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+									// Operator pause (#683): the worker was stopped above;
+									// park it as a due retry instead of launching the
+									// fallback now.
+									parkEndedWorkerForPause(sess, now)
+									continue
+								}
 								issue, fetchErr := o.getIssue(sess.IssueNumber)
 								if fetchErr != nil {
 									log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
@@ -5497,7 +5691,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 								}
 								promptBase := o.selectPrompt(issue)
 								if respawnErr := o.respawnPreservingWorktree(slotName, sess, issue, promptBase, fallback); respawnErr != nil {
-									if retainNativeWorkerHold(sess, respawnErr) {
+									if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 										restoreNativeHeldSession(sess, beforeNative)
 										continue
 									}
@@ -5534,7 +5728,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					budgetTokens, budgetMeasure := tokenBudgetObservation(sess)
 					if sess.Phase != state.PhaseAdvisor && o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
 						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
-						if budgetTokens >= softLimit {
+						// Operator pause (#683): a checkpoint respawn replaces the live
+						// worker with a new native launch. While paused the in-flight
+						// worker keeps running; the check is evaluated (and counted)
+						// only once the soft limit is actually reached.
+						if budgetTokens >= softLimit && !o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d, measure=%s), checkpointing",
 								slotName, budgetTokens, softLimit, budgetMeasure)
 
@@ -5557,7 +5755,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 									// for non-policy/shadow sessions — base o.cfg unchanged).
 									respawnCfg := o.tierOverrideConfigForSession(sess)
 									if respawnErr := o.respawnInPlaceWithConfig(respawnCfg, slotName, sess, issue, promptBase, sess.Backend); respawnErr != nil {
-										if retainNativeWorkerHold(sess, respawnErr) {
+										if o.retainNativeWorkerHold(slotName, sess, respawnErr) {
 											restoreNativeHeldSession(sess, beforeNative)
 											continue
 										}
@@ -5711,6 +5909,20 @@ func (o *Orchestrator) cleanupLeasedWorktree(s *state.State, lease worker.Worktr
 	)
 }
 
+// mergeCandidate is one green, review-cleared PR autoMergePRs may merge this
+// cycle, together with the head the final merge is bound to.
+type mergeCandidate struct {
+	slotName string
+	sess     *state.Session
+	pr       github.PR
+	headSHA  string
+	// missingReviewFor is non-zero when this candidate bypassed a silent
+	// review gate. The operator alert fires only after the merge actually
+	// succeeds — a candidate can still be deferred by the merge interval,
+	// dropped by conflict filtering, or fail to merge.
+	missingReviewFor time.Duration
+}
+
 // autoMergePRs checks open PRs and merges ones with green CI
 func (o *Orchestrator) autoMergePRs(s *state.State) {
 	prs, err := o.listOpenPRsForCycle()
@@ -5742,18 +5954,6 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 	// retry_exhausted for the same PR (OK Player #388 / issues #345 and #406).
 	mergeOwners := canonicalMergeFlowOwners(s, branchToPR, numberToPR)
 
-	type mergeCandidate struct {
-		slotName string
-		sess     *state.Session
-		pr       github.PR
-		headSHA  string
-		// missingReviewFor is non-zero when this candidate bypassed a silent
-		// review gate. The operator alert fires only after the merge actually
-		// succeeds — a candidate can still be deferred by the merge interval,
-		// dropped by conflict filtering, or fail to merge.
-		missingReviewFor time.Duration
-	}
-
 	ready := make([]mergeCandidate, 0)
 
 	for slotName, sess := range s.Sessions {
@@ -5763,6 +5963,9 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 
 		pr, found := mergeFlowPRForSession(sess, branchToPR, numberToPR)
 		if !found {
+			// #1247: auto-merge only ever merges an open PR, so a merge-denied
+			// hold cannot outlive it as an attention item or an issue claim.
+			releaseMergeDeniedHold(sess)
 			if sess.Status == state.StatusRetryExhausted {
 				if sess.PRNumber == 0 {
 					// #577: worker exhausted retries without ever producing a PR
@@ -6056,6 +6259,12 @@ func (o *Orchestrator) autoMergePRs(s *state.State) {
 		kept = append(kept, candidate)
 	}
 	ready = kept
+
+	// #1247: a forge credential that may not merge never reaches the merge
+	// API, and a head the forge already refused for this credential is not
+	// asked again. Gating here, before the merge slot is chosen, keeps a held
+	// PR from occupying the sequential slot and starving ready siblings.
+	ready = o.gateMergeDeniedCandidates(ready)
 
 	if len(ready) == 0 {
 		return
@@ -7422,6 +7631,8 @@ func (o *Orchestrator) markCodeLanded(sess *state.Session, prNumber int) {
 		sess.PRNumber = prNumber
 	}
 	sess.PRMerged = sess.PRNumber > 0
+	// #1247: the PR merged, so a merge-denied hold is moot.
+	releaseMergeDeniedHold(sess)
 	// #1013: a code_landed transition is terminal reconciliation — the PR
 	// merged, so any scheduled retry (including one deliberately held behind a
 	// current issue-guard label) is settled and must not survive. Clear it at
@@ -8420,6 +8631,23 @@ func (o *Orchestrator) mergeReadyPRAtExpectedHead(s *state.State, slotName strin
 	}
 	if err := mergeResult.Err; err != nil {
 		log.Printf("[orch] merge PR #%d: %v", pr.Number, err)
+
+		// #1247: the forge answered that this credential may not merge the
+		// PR at all ("User not allowed to merge PR"). Asking again at the same
+		// head only repeats the same 405, so latch the head for this
+		// credential and surface the hold once instead of looping. mergegate
+		// always reports the head it merged at; without one there is nothing
+		// to latch and the refusal keeps the existing handling below.
+		if errors.Is(err, github.ErrMergeDeniedForActor) {
+			head := strings.TrimSpace(mergeResult.HeadSHA)
+			if head == "" {
+				head = strings.TrimSpace(expectedHead)
+			}
+			if head != "" {
+				o.latchMergeDeniedHead(sess, pr, head)
+				return false
+			}
+		}
 
 		// If the branch is behind main (not conflicting, just outdated),
 		// rebase the worktree when present; otherwise (worker already cleaned
@@ -9896,7 +10124,7 @@ func (o *Orchestrator) dispatchSpawnRepairWorker(s *state.State, issue github.Is
 		err = o.respawnPreservingWorktreeWithConfig(repairCfg, slot, sess, issue, promptBase, backend)
 	}
 	if err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slot, sess, err) {
 			return false
 		}
 		log.Printf("[orch] repair dispatch for issue #%d on %s failed: %v", issue.Number, slot, err)
@@ -10577,6 +10805,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	}
 	if o.fleetSpawnCeilingFn != nil && o.fleetSpawnCeilingFn() {
 		log.Printf("[orch] fleet live-worker ceiling reached: not listing or spawning new work (local_running=%d)", s.RunningSessionCount())
+		o.noteFleetCeilingStall(s)
 		return
 	}
 	// Host-resource precondition (#1128): the host tmpfs is RAM-backed, so
@@ -10605,12 +10834,27 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	// selection entirely — no listing, no claiming, no spawns — while
 	// in-flight workers keep running to completion. Unlike drain, the flag
 	// is NOT cleared on startup; it persists until `maestro resume`, which
-	// the next cycle picks up from disk without a unit restart.
+	// the next cycle picks up from disk without a unit restart. Supervisor-
+	// selected repair and review-repair dispatches are held here too: their
+	// approvals stay approved/awaiting_dispatch and the recommendation stays
+	// unmaterialized, so the first cycle after resume dispatches them once.
+	// RunOnce journals the pause once per cycle (journalPauseDeferrals), and
+	// counts these held dispatches there, even on cycles with no free slot.
 	if s.PauseActive() {
-		log.Printf("[orch] project paused (since %s): skipping issue selection — not spawning new workers (running=%d)",
-			s.PausedAt.Format(time.RFC3339), s.RunningSessionCount())
 		return
 	}
+	// Managed-lane readiness: the same kind of pause, before listing, routing
+	// or any claim, so a lane that is not ready costs no router call either.
+	// It runs after the drain and pause returns: a cycle that dispatches
+	// nothing anyway makes no lane observation, and its journal names only
+	// the operator's reason.
+	if hold, code := o.nativeLaneHold(); hold {
+		log.Printf("[orch] spawn paused: native lane not ready: %s — retrying next cycle", code)
+		return
+	}
+	// The lane was just observed ready: first spawns that a binding hold
+	// stopped before launch intent resume before new work is selected.
+	o.resumeLaneHeldPrelaunchWorkers(s)
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)
 	if err != nil {
 		log.Printf("[orch] list issues: %v", err)
@@ -10805,6 +11049,7 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 		permit, permitOK := o.reserveFleetSpawn()
 		if !permitOK {
 			log.Printf("[orch] fleet live-worker ceiling reached before routing issue #%d", issue.Number)
+			o.noteFleetCeilingStall(s)
 			return
 		}
 
@@ -10966,6 +11211,21 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			slotName, err = o.startWorker(workerCfg, s, issue, promptBase, backendName)
 		}
 		if err != nil {
+			if hold, ok := worker.NativeHold(err); ok && hold.Deferred {
+				// Paused before registration: roll back every pre-start claim
+				// of this dispatch so the issue is dispatchable next cycle.
+				permit.Release()
+				log.Printf("[orch] issue #%d native lane not ready: %s — retrying next cycle", issue.Number, hold.Code)
+				if freshClaim != nil {
+					if supersedeErr := o.supersedeFreshDispatch(s, freshClaim, "native_lane_deferred", time.Now().UTC()); supersedeErr != nil {
+						log.Printf("[orch] supersede deferred fresh dispatch for issue #%d on %s: %v (lease remains authoritative)", issue.Number, freshClaim.Slot, supersedeErr)
+					}
+				}
+				if reviewRepair != nil && repairTarget != nil {
+					o.releaseReviewRepairSlot(s, repairTarget, reviewRepair)
+				}
+				continue
+			}
 			if hold, ok := worker.NativeHold(err); ok {
 				heldSlot := hold.Slot
 				if heldSlot == "" && freshClaim != nil {

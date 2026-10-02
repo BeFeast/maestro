@@ -103,6 +103,13 @@ const (
 	// Maestro's own bookkeeping, never evidence that the issue is hard — so it
 	// must not consume the per-issue retry budget.
 	WorkerOutcomeDuplicateDispatchReconciled = "duplicate_dispatch_reconciled"
+	// WorkerOutcomeNativePrelaunchAbandoned marks a failed first-generation
+	// native session whose registration expired (or was revoked) before any
+	// launch: the authority sealed it with zero physical attempts, its receipt
+	// was archived and the issue was released for a fresh dispatch. Nothing
+	// ran, so it is not evidence that the issue is hard and must not consume
+	// the per-issue retry budget.
+	WorkerOutcomeNativePrelaunchAbandoned = "native_prelaunch_abandoned"
 )
 
 const (
@@ -277,6 +284,10 @@ type Session struct {
 	NativeRoleRunID        string `json:"native_role_run_id,omitempty"`
 	NativeParentRoleRunID  string `json:"native_parent_role_run_id,omitempty"`
 	NativeRole             string `json:"native_role,omitempty"`
+	// NativeLaneDeferred is in-memory only: a launch in this call paused
+	// before registration because the managed lane was not ready. The caller
+	// restores its pre-call snapshot; nothing is persisted, no retry is spent.
+	NativeLaneDeferred string `json:"-"`
 	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
 	// Unit/scope intentionally duplicate the process receipt so reconciliation
 	// can reject corrupted cross-ownership without inventing another owner.
@@ -381,6 +392,11 @@ type Session struct {
 	RetryReason                     string            `json:"retry_reason,omitempty"`                       // current retry lifecycle reason, e.g. review_feedback
 	OperatorGateName                string            `json:"operator_gate_name,omitempty"`                 // explicit human/operator gate holding this PR; cleared when the gate opens
 	OperatorGateRequiredAction      string            `json:"operator_gate_required_action,omitempty"`      // concise operator action needed to clear OperatorGateName
+	MergeDeniedHeadSHA              string            `json:"merge_denied_head_sha,omitempty"`              // #1247: PR head latched as merge-denied for the configured credential (bound evidence merge_denied=true, or Forgejo 405 "User not allowed to merge PR"); auto-merge does not ask the forge again for that head until it moves or the credential changes
+	MergeDeniedActor                string            `json:"merge_denied_actor,omitempty"`                 // #1247: non-secret fingerprint of the merge credential the latch is bound to; a different credential releases the latch
+	MergeDeniedSource               string            `json:"merge_denied_source,omitempty"`                // #1247: what raised the latch: "evidence" (released also by bound evidence merge_denied=false for the same credential) or "forge" (the forge refused; only a head or credential change releases it)
+	MergeDeniedLogin                string            `json:"merge_denied_login,omitempty"`                 // #1247: worker login the bound evidence attested for an evidence-derived latch; names the merge-denied operator gate
+	MergeDeniedSurfaced             string            `json:"merge_denied_surfaced,omitempty"`              // #1247: (PR, credential fingerprint, head) of the merge-denied hold already journaled + notified, whichever source raised it, so a hold surfaces once until the head or credential changes; deliberately not LastNotifiedStatus, whose retry-exhausted markers gate #565 convergence
 	LastClosedPRNumber              int               `json:"last_closed_pr_number,omitempty"`              // PR the retry path closed before scheduling this retry (#800); if an operator reopens and merges it while the backoff runs, the pre-respawn staleness check sees the merge and cancels the retry
 	ReleasedForRedispatch           bool              `json:"released_for_redispatch,omitempty"`            // #818: a retry_exhausted session whose closed-unmerged PR was reconciled and the issue released for fresh dispatch. Marked failed so the attempt counts toward max_retries_per_issue, but the board must mirror it as runnable Todo (not Blocked) so the dynamic wave re-dispatches instead of re-stranding it
 	IssueClosedAt                   *time.Time        `json:"issue_closed_at,omitempty"`                    // authoritative GitHub issue closure observed by standing reconciliation; keeps external lifecycle truth separate from deployment/outcome history
@@ -3130,6 +3146,19 @@ func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration
 			continue
 		}
 		firstSeen := supervisorDecisionFirstSeen(*decision)
+		if pauseHeldLaunchRecommendation(*decision) {
+			// An operator pause (#683) holds every worker launch, so an
+			// unconsumed launch recommendation is waiting on the operator, not
+			// stale (#1238). Stop its TTL clock while paused and restart the
+			// window at resume (ClearPaused stamps PausedAt), so the first
+			// cycles after `maestro resume` can still dispatch it.
+			if s.PauseActive() {
+				continue
+			}
+			if s.PausedAt.After(firstSeen) {
+				firstSeen = s.PausedAt.UTC()
+			}
+		}
 		if firstSeen.IsZero() || now.Before(firstSeen.Add(ttl)) {
 			continue
 		}
@@ -3137,6 +3166,16 @@ func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration
 		expired[decision.ID] = true
 	}
 	return expired
+}
+
+// pauseHeldLaunchRecommendation reports whether the recommendation asks for a
+// worker launch, which the orchestrator defers while the project is paused.
+func pauseHeldLaunchRecommendation(decision SupervisorDecision) bool {
+	switch decision.RecommendedAction {
+	case approvalActionSpawnWorker, approvalActionSpawnRepairWorker, approvalActionSpawnReviewRepair:
+		return true
+	}
+	return false
 }
 
 func (s *State) disposeSupervisorDecision(decision *SupervisorDecision, status, reason string, now time.Time) {
@@ -5294,7 +5333,7 @@ func sessionProvesFailedAttempt(sess *Session) bool {
 		return false
 	}
 	switch sess.WorkerOutcome {
-	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled:
+	case string(DisplayTokenBudgetExceeded), WorkerOutcomeDuplicateDispatchReconciled, WorkerOutcomeNativePrelaunchAbandoned:
 		return false
 	}
 	return true

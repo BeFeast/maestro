@@ -283,19 +283,28 @@ func TestForgejoWriteMergePRAtHeadEmptySHAPreflight(t *testing.T) {
 // TestForgejoWriteMergeRefusalClassification pins the sentinel contract end to
 // end: a 405/409 refusal whose body indicates the out-of-date/head-mismatch
 // family maps onto github.ErrMergeNotUpToDate (and keeps the legacy
-// "not up to date" needle in its text for string-matching consumers); every
-// other refusal — bodyless 405 included — stays a raw loud error.
+// "not up to date" needle in its text for string-matching consumers); a 405
+// "User not allowed to merge PR" maps onto github.ErrMergeDeniedForActor
+// (#1247); every other refusal — bodyless 405, branch-protection reasons, WIP,
+// try-again-later — stays a raw loud error.
 func TestForgejoWriteMergeRefusalClassification(t *testing.T) {
 	cases := []struct {
 		name         string
 		status       int
 		body         string
 		wantSentinel bool
+		wantDenied   bool
 	}{
-		{"409 out-of-date body", 409, `{"message":"Please update your branch: it is not up to date with the base branch","url":""}`, true},
-		{"405 head_commit_id mismatch body", 405, `{"message":"head_commit_id is out of date","url":""}`, true},
-		{"bodyless 405 stays raw", 405, ``, false},
-		{"409 unrelated conflict body stays raw", 409, `{"message":"merge conflict detected in web/app.css","url":""}`, false},
+		{"409 out-of-date body", 409, `{"message":"Please update your branch: it is not up to date with the base branch","url":""}`, true, false},
+		{"405 head_commit_id mismatch body", 405, `{"message":"head_commit_id is out of date","url":""}`, true, false},
+		{"405 user not allowed is merge-denied", 405, `{"message":"User not allowed to merge PR","url":""}`, false, true},
+		{"bodyless 405 stays raw", 405, ``, false, false},
+		{"405 already merged (empty message) stays raw", 405, `{"message":"","url":""}`, false, false},
+		{"405 try again later stays raw", 405, `{"message":"Please try again later","url":""}`, false, false},
+		{"405 not enough approvals stays raw", 405, `{"message":"not allowed to merge [reason: Does not have enough approvals]","url":""}`, false, false},
+		{"405 behind base branch stays raw", 405, `{"message":"not allowed to merge [reason: The head branch is behind the base branch]","url":""}`, false, false},
+		{"405 WIP stays raw", 405, `{"message":"Work in progress PRs cannot be merged","url":""}`, false, false},
+		{"409 unrelated conflict body stays raw", 409, `{"message":"merge conflict detected in web/app.css","url":""}`, false, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -314,6 +323,12 @@ func TestForgejoWriteMergeRefusalClassification(t *testing.T) {
 			}
 			if tc.wantSentinel && !strings.Contains(err.Error(), "not up to date") {
 				t.Fatalf("classified error must keep the legacy needle for string-matching consumers, got: %v", err)
+			}
+			if got := errors.Is(err, ErrMergeDeniedForActor); got != tc.wantDenied {
+				t.Fatalf("errors.Is(err, ErrMergeDeniedForActor) = %v, want %v (err = %v)", got, tc.wantDenied, err)
+			}
+			if got := errors.Is(err, forgejo.ErrMergeDenied); got != tc.wantDenied {
+				t.Fatalf("errors.Is(err, forgejo.ErrMergeDenied) = %v, want %v (err = %v)", got, tc.wantDenied, err)
 			}
 			var se *forgejo.StatusError
 			if !errors.As(err, &se) || se.StatusCode != tc.status {

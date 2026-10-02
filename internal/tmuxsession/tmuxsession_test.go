@@ -10,6 +10,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/befeast/maestro/internal/termguard"
 )
 
 func TestScopeLaunchArgsUsesSiblingSystemdScopeAndPrivateSocket(t *testing.T) {
@@ -511,4 +513,28 @@ func waitPIDDead(t *testing.T, pid int) {
 
 func pidAlive(pid int) bool {
 	return syscall.Kill(pid, 0) == nil
+}
+
+// TestKillSessionConsultsTerminationGuard proves an exact tmux kill asks the
+// termination guard first and runs no tmux command when it refuses, so a test
+// fixture session name can never hang up a same-name session on the host
+// (#1252).
+func TestKillSessionConsultsTerminationGuard(t *testing.T) {
+	refuse := fmt.Errorf("refused by test")
+	var seen []termguard.Attempt
+	restore := termguard.SetHookForTesting(func(a termguard.Attempt) error {
+		seen = append(seen, a)
+		return refuse
+	})
+	defer restore()
+
+	name := fmt.Sprintf("maestro-termguard-%d", os.Getpid())
+	out, err := KillSession(name)
+	if err != refuse || out != nil {
+		t.Fatalf("KillSession = (%q, %v), want (nil, %v) without running tmux", out, err, refuse)
+	}
+	want := termguard.Attempt{Op: termguard.OpKillTmuxSession, Target: name}
+	if len(seen) != 1 || seen[0] != want {
+		t.Fatalf("guard saw %v, want [%v]", seen, want)
+	}
 }

@@ -11,6 +11,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -103,7 +104,9 @@ func readContainmentProfile(pin FileProof) (NativeContainmentProfile, error) {
 }
 
 func validateContainmentProfile(p NativeContainmentProfile) error {
-	if !strings.HasPrefix(p.ForgejoRepository, "BeFeast/") || strings.Count(p.ForgejoRepository, "/") != 1 || strings.ContainsAny(p.ForgejoRepository, " \t\r\n?#%") || strings.Contains(p.ForgejoRepository, "..") {
+	// The root-owned, hash-pinned profile is the authority for the repository;
+	// only its shape is checked here, never a compiled-in organization.
+	if !validNativeForgejoRepository(p.ForgejoRepository) {
 		return Held("containment_forgejo_repository_invalid")
 	}
 	if p.Version != 1 || p.ProjectID == "" || p.UID == 0 || p.GID == 0 || p.NamespaceIno == 0 || !validDigest(p.RulesSHA256) || p.MemoryMaxMB <= 0 {
@@ -273,32 +276,165 @@ func PrepareContainedNativeCommand(pin FileProof, projectID, role, nativeID stri
 	return contained, nil
 }
 
-// This root-owned, hash-pinned attestation is supplied by the reviewed R9
-// provisioner after server-side negative probes. The credential hash by itself
-// proves no repository scope, main-branch protection, or merge prohibition.
-func verifyNativeForgejoAuthorization(p NativeContainmentProfile) error {
-	var e struct {
-		Version                int       `json:"version"`
-		Repository             string    `json:"repository"`
-		CredentialSHA256       string    `json:"credential_sha256"`
-		WorkerLogin            string    `json:"worker_login"`
-		ObservedAt             time.Time `json:"observed_at"`
-		ExpiresAt              time.Time `json:"expires_at"`
-		Admin                  bool      `json:"admin"`
-		RepositoryOnly         bool      `json:"repository_only"`
-		MainPushDenied         bool      `json:"main_push_denied"`
-		MergeDenied            bool      `json:"merge_denied"`
-		PolicyFilesWriteDenied bool      `json:"policy_files_write_denied"`
-		ServerProbe            FileProof `json:"server_probe"`
-	}
+// nativeForgejoAuthorizationEvidence is the root-owned, hash-pinned
+// attestation the reviewed R9 provisioner writes after server-side negative
+// probes. The credential hash by itself proves no repository scope,
+// main-branch protection, or merge prohibition; these fields do.
+type nativeForgejoAuthorizationEvidence struct {
+	Version                int       `json:"version"`
+	Repository             string    `json:"repository"`
+	CredentialSHA256       string    `json:"credential_sha256"`
+	WorkerLogin            string    `json:"worker_login"`
+	ObservedAt             time.Time `json:"observed_at"`
+	ExpiresAt              time.Time `json:"expires_at"`
+	Admin                  bool      `json:"admin"`
+	RepositoryOnly         bool      `json:"repository_only"`
+	MainPushDenied         bool      `json:"main_push_denied"`
+	MergeDenied            bool      `json:"merge_denied"`
+	PolicyFilesWriteDenied bool      `json:"policy_files_write_denied"`
+	ServerProbe            FileProof `json:"server_probe"`
+}
+
+// readNativeForgejoAuthorization reads and strictly decodes the evidence the
+// profile pins. It verifies the file (root ownership, pinned digest, exact
+// schema), not the claims — verifyNativeForgejoAuthorization owns those.
+func readNativeForgejoAuthorization(p NativeContainmentProfile) (nativeForgejoAuthorizationEvidence, error) {
+	var e nativeForgejoAuthorizationEvidence
 	b, err := readRootContainmentEvidence(p.ForgejoAuthorization)
-	if err != nil || DecodeStrict(b, &e) != nil || e.Version != 1 || e.Repository != p.ForgejoRepository || e.CredentialSHA256 != p.ForgejoTokenSHA256 || e.WorkerLogin == "" || e.Admin || !e.RepositoryOnly || !e.MainPushDenied || !e.MergeDenied || !e.PolicyFilesWriteDenied || e.ObservedAt.IsZero() || e.ObservedAt.After(time.Now()) || !time.Now().Before(e.ExpiresAt) {
+	if err != nil || DecodeStrict(b, &e) != nil {
+		return nativeForgejoAuthorizationEvidence{}, Held("containment_forgejo_authorization_unverified")
+	}
+	return e, nil
+}
+
+func verifyNativeForgejoAuthorization(p NativeContainmentProfile) error {
+	e, err := readNativeForgejoAuthorization(p)
+	if err != nil || e.Version != 1 || e.Repository != p.ForgejoRepository || e.CredentialSHA256 != p.ForgejoTokenSHA256 || e.WorkerLogin == "" || e.Admin || !e.RepositoryOnly || !e.MainPushDenied || !e.MergeDenied || !e.PolicyFilesWriteDenied || e.ObservedAt.IsZero() || e.ObservedAt.After(time.Now()) || !time.Now().Before(e.ExpiresAt) {
 		return Held("containment_forgejo_authorization_unverified")
 	}
 	if _, err := readRootContainmentEvidence(e.ServerProbe); err != nil {
 		return Held("containment_forgejo_authorization_unverified")
 	}
 	return nil
+}
+
+// NativeForgejoAuthorization is the merge-relevant subset of the
+// forgejo-authorization evidence bound to one containment profile. It carries
+// no secret: CredentialSHA256 is the same domain-separated digest the profile
+// pins (NativeForgejoCredentialSHA256), so a caller can tell whether the
+// credential it acts with IS the attested worker actor without ever reading
+// the worker's token.
+type NativeForgejoAuthorization struct {
+	ProfileKey       string
+	Repository       string
+	WorkerLogin      string
+	CredentialSHA256 string
+	MergeDenied      bool
+}
+
+// NativeForgejoAuthorizationReport is the result of reading every bound
+// forgejo-authorization the policy manifest pins.
+type NativeForgejoAuthorizationReport struct {
+	// Authorizations lists the evidence provably bound to its profile's
+	// repository and credential.
+	Authorizations []NativeForgejoAuthorization
+	// Unverified lists the profile keys whose profile or pinned evidence could
+	// not be read, is not bound to that profile, or has expired. None of them
+	// is ever reported as a denial or an allowance.
+	Unverified []string
+}
+
+// loadNativeForgejoAuthorizationEvidence reads one pinned containment profile
+// and the forgejo-authorization evidence it pins, with the same root-ownership
+// and digest checks as the launch path. hasEvidence is false (and err nil)
+// for a profile that pins no forgejo-authorization at all. A package variable
+// so tests can stand in for the root-owned files; production never reassigns
+// it.
+var loadNativeForgejoAuthorizationEvidence = func(pin FileProof) (p NativeContainmentProfile, e nativeForgejoAuthorizationEvidence, hasEvidence bool, err error) {
+	p, err = readContainmentProfile(pin)
+	if err != nil {
+		return p, e, false, err
+	}
+	if strings.TrimSpace(p.ForgejoAuthorization.Path) == "" {
+		return p, e, false, nil
+	}
+	e, err = readNativeForgejoAuthorization(p)
+	return p, e, err == nil, err
+}
+
+// NativeForgejoAuthorizations reports the forgejo-authorization evidence bound
+// to every containment profile the policy manifest pins (#1247). The
+// orchestrator consults it before any merge call: when its own forge
+// credential hashes to an attested worker actor with merge_denied=true, the
+// forge will answer 405 for every head, so the merge must not be attempted.
+//
+// This is a read of what is provably bound, not an admission check: a profile
+// whose root-owned evidence cannot be verified, whose evidence is not bound to
+// that profile's repository and credential, or whose attestation has expired
+// is reported as Unverified rather than guessed. Launch verification
+// (verifyNativeForgejoAuthorization) stays the strict gate. A manifest that is
+// missing, oversized, or drifted from its pin is an error, because then
+// nothing at all is bound.
+func NativeForgejoAuthorizations(policy Policy) (NativeForgejoAuthorizationReport, error) {
+	return nativeForgejoAuthorizationsAt(policy, time.Now())
+}
+
+func nativeForgejoAuthorizationsAt(policy Policy, now time.Time) (NativeForgejoAuthorizationReport, error) {
+	m, err := readPinnedManifest(policy)
+	if err != nil {
+		return NativeForgejoAuthorizationReport{}, err
+	}
+	keys := make([]string, 0, len(m.Containment))
+	for key := range m.Containment {
+		keys = append(keys, key)
+	}
+	sort.Strings(keys)
+	var report NativeForgejoAuthorizationReport
+	for _, key := range keys {
+		p, e, hasEvidence, err := loadNativeForgejoAuthorizationEvidence(m.Containment[key])
+		if err != nil {
+			report.Unverified = append(report.Unverified, key)
+			continue
+		}
+		if !hasEvidence {
+			continue
+		}
+		if e.Version != 1 || e.Repository != p.ForgejoRepository || e.CredentialSHA256 == "" || e.CredentialSHA256 != p.ForgejoTokenSHA256 || !now.Before(e.ExpiresAt) {
+			report.Unverified = append(report.Unverified, key)
+			continue
+		}
+		report.Authorizations = append(report.Authorizations, NativeForgejoAuthorization{
+			ProfileKey:       key,
+			Repository:       e.Repository,
+			WorkerLogin:      e.WorkerLogin,
+			CredentialSHA256: e.CredentialSHA256,
+			MergeDenied:      e.MergeDenied,
+		})
+	}
+	return report, nil
+}
+
+// NativeForgejoCredentialSHA256 is the domain-separated digest a containment
+// profile pins for its Forgejo token (forgejo_token_sha256) and the
+// authorization evidence repeats as credential_sha256. The prefix keeps a
+// plain SHA-256 of the token (as a leaked log line or rainbow table would
+// compute it) from matching the pin.
+func NativeForgejoCredentialSHA256(token string) string {
+	return digest([]byte("maestro-native-forgejo:v1\x00" + token))
+}
+
+// readPinnedManifest reads the policy manifest exactly as the launch path does:
+// bounded size, digest-pinned, strict schema.
+func readPinnedManifest(policy Policy) (Manifest, error) {
+	b, err := os.ReadFile(policy.ManifestPath)
+	if err != nil || len(b) > 128<<10 || digest(b) != policy.ManifestSHA256 {
+		return Manifest{}, Held("manifest_drift")
+	}
+	var m Manifest
+	if DecodeStrict(b, &m) != nil {
+		return Manifest{}, Held("manifest_invalid")
+	}
+	return m, nil
 }
 
 func inspectContainmentProfile(pin FileProof, projectID string, gateway ProcessProof) (NativeContainmentProfile, error) {
@@ -457,7 +593,7 @@ func containedNativeEnvironment(p NativeContainmentProfile, original []string, r
 	}
 	if role != "supervisor" && role != "reviewer" {
 		token := values["FORGEJO_TOKEN"]
-		if !validDigest(p.ForgejoTokenSHA256) || digest([]byte("maestro-native-forgejo:v1\x00"+token)) != p.ForgejoTokenSHA256 || token == "" {
+		if !validDigest(p.ForgejoTokenSHA256) || NativeForgejoCredentialSHA256(token) != p.ForgejoTokenSHA256 || token == "" {
 			return nil, Held("containment_forgejo_credential_unverified")
 		}
 		out = append(out, "FORGEJO_TOKEN="+token, "FORGEJO_REPOSITORY="+p.ForgejoRepository,

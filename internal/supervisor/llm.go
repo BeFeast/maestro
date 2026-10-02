@@ -307,6 +307,13 @@ func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, p
 	// and the operator-rearm settlement require to prove nothing launched; a
 	// receipt left "prepared" is indistinguishable from an interrupted launch
 	// and silently spends the operator grant.
+	// Managed-lane readiness is probed before capacity and registration. A
+	// lane that is not ready is the same closed, zero-candidate pre-launch
+	// receipt as a refused reservation: no authority registration, no
+	// readiness_held candidate, and an operator grant stays provably unspent.
+	if err := c.nativeLaneReady(); err != nil {
+		return result, err
+	}
 	if c.cfg.RuntimeAuxiliaryLimiter != nil {
 		releaseAux, err = c.cfg.RuntimeAuxiliaryLimiter.ReserveAuxiliary(c.cfg.StateDir, identity.ID)
 		if err != nil {
@@ -1224,4 +1231,16 @@ func (c *backendLLMClient) executionRole() string {
 		return c.role
 	}
 	return "supervisor"
+}
+
+// nativeLaneReady runs the controller's managed-lane readiness probe for a
+// native consultation. Any failure is reported as a typed hold.
+func (c *backendLLMClient) nativeLaneReady() error {
+	if c.cfg.Supervisor.NativeSessionRegistration == nil || c.cfg.RuntimeNativeLaneReadiness == nil {
+		return nil
+	}
+	if err := c.cfg.RuntimeNativeLaneReadiness.ObserveLaneReadiness(c.cfg.AIExecution); err != nil {
+		return aiexecution.Held(aiexecution.LaneHoldCode(err))
+	}
+	return nil
 }

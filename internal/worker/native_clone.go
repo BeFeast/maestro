@@ -3,23 +3,24 @@ package worker
 import (
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 
 	"github.com/befeast/maestro/internal/aiexecution"
+	"github.com/befeast/maestro/internal/config"
 )
 
-const nativeCloneMarker = "maestro-native-clone.json"
+// The native forge helpers read this identity inside the sandbox, so its
+// schema lives with them.
+const nativeCloneMarker = aiexecution.NativeCloneMarker
 
-type nativeCloneIdentity struct {
-	Version    int    `json:"version"`
-	Parent     string `json:"parent"`
-	Worktree   string `json:"worktree"`
-	Origin     string `json:"origin"`
-	BaseCommit string `json:"base_commit"`
-}
+type nativeCloneIdentity = aiexecution.NativeCloneIdentity
+
+// registerNativeCloneGit installs the native Git sandbox for a clone. Tests
+// replace it to exercise the daemon-side origin checks on clone creation and
+// reuse without the native kernel fixture.
+var registerNativeCloneGit = aiexecution.RegisterNativeGit
 
 func nativeCloneGit(dir string, args ...string) ([]byte, error) {
 	cmd := aiexecution.NativeGitCommand(append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=", "-c", "protocol.ext.allow=never", "-c", "http.followRedirects=false", "--no-replace-objects"}, args...)...)
@@ -27,25 +28,114 @@ func nativeCloneGit(dir string, args ...string) ([]byte, error) {
 	return cmd.CombinedOutput()
 }
 
-func canonicalNativeOrigin(parent string) (string, error) {
-	b, err := nativeCloneGit(parent, "remote", "get-url", "origin")
-	if err != nil {
-		return "", aiexecution.Held("containment_clone_origin_unavailable")
+// nativeCloneOriginForProject derives the only origin a native clone may carry
+// from the project's forge base URL and repository, both covered by the
+// execution manifest's project config digest. The native helpers speak the
+// Forgejo API, so every other forge kind fails closed.
+func nativeCloneOriginForProject(cfg *config.Config) (string, error) {
+	if cfg == nil || !cfg.Forge.IsForgejo() {
+		return "", aiexecution.Held("containment_clone_origin_unsupported")
 	}
-	origin := strings.TrimSpace(string(b))
-	u, err := url.Parse(origin)
-	if err != nil || u.Scheme != "https" || u.Host != "git.oklabs.uk" || u.User != nil || u.RawQuery != "" || u.Fragment != "" || !strings.HasPrefix(u.Path, "/BeFeast/") || !strings.HasSuffix(u.Path, ".git") || strings.Count(u.Path, "/") != 2 {
+	origin, err := aiexecution.NativeForgejoOrigin(cfg.Forge.BaseURL, cfg.Repo)
+	if err != nil {
 		return "", aiexecution.Held("containment_clone_origin_unsupported")
 	}
 	return origin, nil
 }
 
-func materializeNativeClone(parent, worktree, branch string) error {
+// nativeCloneOrigin reads dir's origin and accepts only the canonical native
+// forge shape. The project's pinned host and repository are enforced by
+// canonicalNativeOrigin whenever a clone is materialized or reused.
+func nativeCloneOrigin(dir string) (string, error) {
+	b, err := nativeCloneGit(dir, "remote", "get-url", "origin")
+	if err != nil {
+		return "", aiexecution.Held("containment_clone_origin_unavailable")
+	}
+	origin := strings.TrimSpace(string(b))
+	if _, err := aiexecution.ParseNativeForgejoOrigin(origin); err != nil {
+		return "", aiexecution.Held("containment_clone_origin_unsupported")
+	}
+	return origin, nil
+}
+
+// canonicalNativeOrigin returns dir's origin only when it is byte-for-byte the
+// origin derived from the project's pinned forge configuration.
+func canonicalNativeOrigin(dir, expected string) (string, error) {
+	origin, err := nativeCloneOrigin(dir)
+	if err != nil {
+		return "", err
+	}
+	if origin != expected {
+		return "", aiexecution.Held("containment_clone_origin_unsupported")
+	}
+	return origin, nil
+}
+
+func materializeNativeCloneForProject(cfg *config.Config, parent, worktree, branch string) error {
+	origin, err := nativeCloneOriginForProject(cfg)
+	if err != nil {
+		return err
+	}
+	return materializeNativeClone(parent, worktree, branch, origin)
+}
+
+// verifyNativeRelaunchCloneOrigin is the in-place relaunch counterpart of the
+// materialize check. RespawnInPlace and StartPhase reuse the retained clone
+// without materializing it, and the sandboxed forge helpers take the host from
+// that clone's daemon-written identity. A forge.base_url or repo change made
+// after the clone was created must hold the relaunch instead of silently
+// keeping the old destination.
+//
+// Only an identity that exists can carry a host into the sandbox. Without one
+// (no .git directory, or no identity file in it) the native monitor's
+// read-only identity bind and the in-sandbox helpers already fail closed, so
+// there is nothing stale to check here. An identity that exists but cannot be
+// read exactly holds. Git never runs in the retained clone here.
+func verifyNativeRelaunchCloneOrigin(cfg *config.Config, worktree string) error {
+	if cfg == nil || !cfg.AIExecution.RequireVerifiedRoute {
+		return nil
+	}
+	if !filepath.IsAbs(worktree) || filepath.Clean(worktree) != worktree {
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	gitDir := filepath.Join(worktree, ".git")
+	st, err := os.Lstat(gitDir)
+	switch {
+	case os.IsNotExist(err) || err == nil && st.Mode().IsRegular():
+		return nil
+	case err != nil || !st.IsDir():
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	marker := filepath.Join(gitDir, nativeCloneMarker)
+	if _, err := os.Lstat(marker); os.IsNotExist(err) {
+		return nil
+	}
+	b, err := readOwnedRegularNoFollow(marker, 16<<10)
+	var identity nativeCloneIdentity
+	if err != nil || aiexecution.DecodeStrict(b, &identity) != nil || identity.Version != 1 || identity.Worktree != worktree {
+		return aiexecution.Held("containment_clone_identity_unavailable")
+	}
+	expected, err := nativeCloneOriginForProject(cfg)
+	if err != nil {
+		return err
+	}
+	if identity.Origin != expected {
+		return aiexecution.Held("containment_clone_origin_unsupported")
+	}
+	return nil
+}
+
+func materializeNativeClone(parent, worktree, branch, expectedOrigin string) error {
 	if _, err := os.Lstat(worktree); err == nil {
 		// Initial setup can stop after writing clone identity but before Git
 		// registration (for example, a writable ancestor). Recovery must install
 		// the sandbox before inspecting even that partially prepared checkout.
-		if err := aiexecution.RegisterNativeGit(worktree); err != nil {
+		if err := registerNativeCloneGit(worktree); err != nil {
+			return err
+		}
+		// The retained identity must still name the currently pinned origin;
+		// isNativeCloneForRepo ties it to the parent's origin.
+		if _, err := canonicalNativeOrigin(parent, expectedOrigin); err != nil {
 			return err
 		}
 		if !isNativeCloneForRepo(parent, worktree) {
@@ -55,7 +145,7 @@ func materializeNativeClone(parent, worktree, branch string) error {
 	} else if !os.IsNotExist(err) {
 		return err
 	}
-	origin, err := canonicalNativeOrigin(parent)
+	origin, err := canonicalNativeOrigin(parent, expectedOrigin)
 	if err != nil {
 		return err
 	}
@@ -88,7 +178,7 @@ func materializeNativeClone(parent, worktree, branch string) error {
 	if err := os.Chmod(worktree, 0700); err != nil {
 		return err
 	}
-	identity := nativeCloneIdentity{1, filepath.Clean(parent), filepath.Clean(worktree), origin, strings.TrimSpace(string(base))}
+	identity := nativeCloneIdentity{Version: 1, Parent: filepath.Clean(parent), Worktree: filepath.Clean(worktree), Origin: origin, BaseCommit: strings.TrimSpace(string(base))}
 	b, err := json.Marshal(identity)
 	if err != nil {
 		return err
@@ -96,7 +186,7 @@ func materializeNativeClone(parent, worktree, branch string) error {
 	if err := writeFileAtomicMode(filepath.Join(worktree, ".git"), filepath.Join(worktree, ".git", nativeCloneMarker), string(b), 0600); err != nil {
 		return err
 	}
-	return aiexecution.RegisterNativeGit(worktree)
+	return registerNativeCloneGit(worktree)
 }
 
 func isNativeCloneForRepo(parent, worktree string) bool {
@@ -109,11 +199,11 @@ func isNativeCloneForRepo(parent, worktree string) bool {
 	if err != nil || aiexecution.DecodeStrict(b, &identity) != nil || identity.Version != 1 || identity.Parent != filepath.Clean(parent) || identity.Worktree != filepath.Clean(worktree) || len(identity.BaseCommit) != 40 {
 		return false
 	}
-	origin, err := canonicalNativeOrigin(parent)
+	origin, err := nativeCloneOrigin(parent)
 	if err != nil || origin != identity.Origin {
 		return false
 	}
-	childOrigin, err := canonicalNativeOrigin(worktree)
+	childOrigin, err := nativeCloneOrigin(worktree)
 	if err != nil || childOrigin != origin {
 		return false
 	}

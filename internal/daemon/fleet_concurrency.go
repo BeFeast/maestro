@@ -110,18 +110,36 @@ func fleetWorkerKey(stateDir, slot string) string {
 	return stateDir + "\x00" + slot
 }
 
-func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
+func (l *fleetSpawnLimiter) runningLocked() (map[string]string, error) {
 	return l.workerOccupancyLocked(false)
 }
 
-func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[string]struct{}, error) {
+const fleetOccupancyRunning = "running"
+
+// nativePendingOccupancyReason names why a native slot is counted: its latest
+// launched receipt has no recorded OS termination. The owning session's
+// projection tells an operator whether that is a live worker or an exited one
+// still awaiting its exit seal (#1243).
+func nativePendingOccupancyReason(sess *state.Session) string {
+	if sess == nil {
+		return "native launch not recorded terminal (no session)"
+	}
+	if sess.NativeRegistrationHold != "" {
+		return fmt.Sprintf("native launch not recorded terminal (session %s, hold %s)", sess.Status, sess.NativeRegistrationHold)
+	}
+	return fmt.Sprintf("native launch not recorded terminal (session %s)", sess.Status)
+}
+
+// workerOccupancyLocked maps every counted worker key to the reason it is
+// counted.
+func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[string]string, error) {
 	dirs := make([]string, 0, len(l.stateDirs))
 	for dir := range l.stateDirs {
 		dirs = append(dirs, dir)
 	}
 	sort.Strings(dirs)
 
-	running := make(map[string]struct{})
+	running := make(map[string]string)
 	for _, dir := range dirs {
 		st, err := l.loadState(dir)
 		if err != nil {
@@ -133,7 +151,7 @@ func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[st
 				return nil, fmt.Errorf("load native worker occupancy: %w", err)
 			}
 			for _, slot := range slots {
-				running[fleetWorkerKey(dir, slot)] = struct{}{}
+				running[fleetWorkerKey(dir, slot)] = nativePendingOccupancyReason(st.Sessions[slot])
 			}
 		}
 		for slot, sess := range st.Sessions {
@@ -149,14 +167,14 @@ func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[st
 				}
 			}
 			if sess != nil && sess.Status == state.StatusRunning && (sess.NativeRegistrationHold == "" || (includeUncertain && sess.NativeRoleRunID == "")) {
-				running[fleetWorkerKey(dir, slot)] = struct{}{}
+				running[fleetWorkerKey(dir, slot)] = fleetOccupancyRunning
 			}
 		}
 	}
 	return running, nil
 }
 
-func (l *fleetSpawnLimiter) reconcileReservationsLocked(running map[string]struct{}) {
+func (l *fleetSpawnLimiter) reconcileReservationsLocked(running map[string]string) {
 	// Once a committed reservation appears as a running state session, the
 	// durable state count replaces it. Pending or not-yet-persisted commits stay
 	// reserved, so no other flow can consume the same global slot.
@@ -203,6 +221,63 @@ func (l *fleetSpawnLimiter) CeilingReached() bool {
 		return true
 	}
 	return false
+}
+
+// CeilingStallDiagnostic explains a closed live-worker ceiling for the journal
+// (#1243). detail is empty while capacity remains, when the ceiling is
+// disabled, or when the count is unavailable (the ceiling already fails closed
+// and logs that). Otherwise it lists every counted slot with the reason it is
+// counted, plus in-flight reservations. stalled reports that no durable
+// running worker exists anywhere in the fleet: every counted unit is a native
+// launch receipt without recorded termination or a reservation, so no worker
+// exit can reopen the ceiling; only the owning project's exit reconciliation
+// or an operator can.
+func (l *fleetSpawnLimiter) CeilingStallDiagnostic() (detail string, stalled bool) {
+	if l == nil {
+		return "", false
+	}
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	settings, err := l.settingsLocked()
+	if err != nil || settings.MaxLiveWorkers == 0 {
+		return "", false
+	}
+	occupied, err := l.workerOccupancyLocked(true)
+	if err != nil {
+		return "", false
+	}
+	l.reconcileReservationsLocked(occupied)
+	live := len(occupied) + len(l.reservations)
+	if live < settings.MaxLiveWorkers {
+		return "", false
+	}
+	running, err := l.runningLocked()
+	if err != nil {
+		return "", false
+	}
+	occupants := make([]string, 0, live)
+	for key, reason := range occupied {
+		dir, slot, _ := strings.Cut(key, "\x00")
+		occupants = append(occupants, fmt.Sprintf("%s/%s: %s", l.projectLabelLocked(dir), slot, reason))
+	}
+	for _, reservation := range l.reservations {
+		slot := reservation.slot
+		if slot == "" {
+			slot = "(uncommitted)"
+		}
+		occupants = append(occupants, fmt.Sprintf("%s/%s: spawn reservation", l.projectLabelLocked(reservation.stateDir), slot))
+	}
+	sort.Strings(occupants)
+	detail = fmt.Sprintf("live=%d min=%d max=%d fleet_running=%d occupants=[%s]",
+		live, settings.MinLiveWorkers, settings.MaxLiveWorkers, len(running), strings.Join(occupants, "; "))
+	return detail, len(running) == 0
+}
+
+func (l *fleetSpawnLimiter) projectLabelLocked(stateDir string) string {
+	if project, ok := l.projects[stateDir]; ok && project.repo != "" {
+		return project.repo
+	}
+	return stateDir
 }
 
 // FloorStatus reports the durable StatusRunning count against
@@ -430,6 +505,13 @@ func hasUnclaimedRunnableCandidate(st *state.State, decision *state.SupervisorDe
 
 func (d *Daemon) fleetSpawnCeilingReached() bool {
 	return d.spawnLimiter != nil && d.spawnLimiter.CeilingReached()
+}
+
+func (d *Daemon) fleetSpawnStallDiagnostic() (string, bool) {
+	if d.spawnLimiter == nil {
+		return "", false
+	}
+	return d.spawnLimiter.CeilingStallDiagnostic()
 }
 
 func (d *Daemon) reserveFleetSpawn(stateDir string) (func(string), func(), bool) {

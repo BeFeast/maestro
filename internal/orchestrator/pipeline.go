@@ -23,6 +23,33 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	if sess.Phase == state.PhaseNone {
 		return false // not a pipeline session
 	}
+	// The phase worker has exited, but the session stays running until the
+	// next phase launches, so the cycle-start exit reconciliation never sees
+	// it. Seal the exited generation first, with the same proofs as that
+	// reconciliation and the successor's termination fence, so a transition
+	// that waits below does not keep an exited generation counted toward
+	// fleet occupancy. A hold is journaled and leaves the generation counted;
+	// the next cycle retries, and the next phase's fence still applies.
+	o.sealExitedPhaseGeneration(st, slotName)
+	// A transition that starts a next-phase worker is a new native launch,
+	// and its preparation is not idempotent (Advisor artifacts are consumed,
+	// plan versions and validation counters advance). While the project is
+	// paused (#683, #1238) or the managed lane is not ready, the session stays
+	// untouched and the transition is retried next cycle; the pause is
+	// counted in the cycle's single deferral journal line and is checked
+	// before the lane, so a paused cycle makes no lane observation.
+	// Transitions that start no worker (validation passed, no validator, no
+	// plan artifacts, validation retries exhausted) still reach the normal
+	// dead-worker flow, so a paused worker finishes and lands its PR.
+	if o.pipelineTransitionLaunches(sess) {
+		if o.pauseDefersNativeLaunch(st, slotName, sess.IssueNumber) {
+			return true
+		}
+		if hold, code := o.nativeLaneHold(); hold {
+			log.Printf("[pipeline] %s phase transition paused: native lane not ready: %s — retrying next cycle", slotName, code)
+			return true
+		}
+	}
 
 	switch sess.Phase {
 	case state.PhasePlan:
@@ -36,6 +63,50 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	default:
 		return false
 	}
+}
+
+// maxValidationFails is the number of failed validations after which the
+// pipeline gives up instead of starting the implementer again.
+const maxValidationFails = 3
+
+// pipelineTransitionLaunches reports whether the phase transition
+// advancePipeline is about to run for sess can start a next-phase worker. It
+// mirrors the handlers' launch decisions read-only: no artifact is consumed,
+// no hook runs and the session is not modified.
+//
+//   - plan: with plan artifacts the Advisor or the implementer starts (without
+//     them the session is marked dead);
+//   - advisor: every verdict starts the implementer or the planner, or fails
+//     closed; treated as a launch;
+//   - implement: the validator starts when one is configured (otherwise the
+//     session returns to the normal flow);
+//   - validate: a failed or unreadable result restarts the implementer until
+//     maxValidationFails (a pass returns to the normal flow).
+func (o *Orchestrator) pipelineTransitionLaunches(sess *state.Session) bool {
+	switch sess.Phase {
+	case state.PhasePlan:
+		return pipeline.PlanArtifactsExist(sess.Worktree)
+	case state.PhaseAdvisor:
+		return true
+	case state.PhaseImplement:
+		return pipeline.NextPhase(o.pipelineConfigForSession(sess), state.PhaseImplement) != state.PhaseNone
+	case state.PhaseValidate:
+		passed, _, err := pipeline.ValidationPassed(sess.Worktree)
+		return (err != nil || !passed) && sess.ValidationFails+1 < maxValidationFails
+	default:
+		return false
+	}
+}
+
+// sealExitedPhaseGeneration seals the exited native generation of the running
+// pipeline session in slotName (worker.ReconcileNativePhaseExit).
+func (o *Orchestrator) sealExitedPhaseGeneration(st *state.State, slotName string) {
+	seal := o.nativePhaseExitSealFn
+	if seal == nil {
+		seal = worker.ReconcileNativePhaseExit
+	}
+	sealed, err := seal(o.cfg, st, slotName)
+	journalNativeExitSeal(slotName, sealed, err)
 }
 
 // handlePlanComplete checks if the planner produced artifacts and advances to
@@ -125,7 +196,7 @@ func (o *Orchestrator) startAdvisorPhase(st *state.State, cfg *config.Config, sl
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "prompt_build_failed", err.Error())
 	}
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_start_failed", err.Error())
@@ -205,7 +276,7 @@ func (o *Orchestrator) handleAdvisorComplete(slotName string, sess *state.Sessio
 		promptContent := pipeline.PlannerRevisionPrompt(cfg, issue, sess.Worktree, sess.Branch, sess)
 		backendName := pipeline.BackendForPhase(cfg, state.PhasePlan)
 		if startErr := o.startPhase(cfg, slotName, sess, promptContent, backendName); startErr != nil {
-			if retainNativeWorkerHold(sess, startErr) {
+			if o.retainNativeWorkerHold(slotName, sess, startErr) {
 				return true
 			}
 			return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "planner_revision_start_failed", startErr.Error())
@@ -241,7 +312,7 @@ func (o *Orchestrator) startImplementPhase(cfg *config.Config, slotName string, 
 	promptContent := o.buildImplementerPrompt(sess, issue)
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start implement phase for %s: %v — marking dead", slotName, err)
@@ -414,7 +485,7 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseValidate)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start validate phase for %s: %v — marking dead", slotName, err)
@@ -456,8 +527,8 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	sess.ValidationFeedback = feedback
 	log.Printf("[pipeline] validator %s FAILED (attempt %d): %s", slotName, sess.ValidationFails, truncateFeedback(feedback))
 
-	// After 3 validation failures, give up
-	if sess.ValidationFails >= 3 {
+	// After maxValidationFails validation failures, give up
+	if sess.ValidationFails >= maxValidationFails {
 		log.Printf("[pipeline] validator %s exhausted validation retries — marking as failed", slotName)
 		sess.Status = state.StatusFailed
 		now := time.Now().UTC()
@@ -484,7 +555,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start implement retry for %s: %v — marking dead", slotName, err)

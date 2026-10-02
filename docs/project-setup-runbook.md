@@ -159,6 +159,9 @@ supervisor:
   mode: cautious
   ready_label: maestro-ready
   blocked_label: blocked
+  # Default queue policy only (no ordered_queue/dynamic_wave): let the
+  # supervisor add ready_label to unlabeled open issues. Default false.
+  # auto_promote_ready: false
   excluded_labels:
     - epic
     - meta
@@ -294,7 +297,7 @@ telegram:
 | `hooks.post_edit` | Optional command run inside worker sessions after matching file edit tools |
 | `hooks.pre_tool` | Optional command run inside worker sessions before matching tool calls |
 
-Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker. Identical recommendations are journaled at most once per `supervisor.unchanged_decision_window_seconds` (default 3600), and an unconsumed recommendation receives a dropped disposition after `supervisor.recommendation_ttl_seconds` (default 86400).
+Supervisor policy can also live in `.maestro/supervisor.yaml` next to the project config or repository checkout. If an ordered queue is configured, only the first unfinished issue in that queue is eligible for supervisor dispatch until the queue is exhausted. `dynamic_wave` is explicit opt-in and lets the supervisor select the next runnable open issue without listing issue numbers, using priority labels and conservative skip rules. Without either policy the supervisor never adds the ready label on its own unless `supervisor.auto_promote_ready: true` is set (default `false`; it cannot be combined with an active `ordered_queue` or `dynamic_wave`). An issue with an excluded label or an epic/parent title is never promoted on any path. Set `supervisor.dispatch_sla_seconds` to control when Fleet escalates a selected issue that has not started a worker. Identical recommendations are journaled at most once per `supervisor.unchanged_decision_window_seconds` (default 3600), and an unconsumed recommendation receives a dropped disposition after `supervisor.recommendation_ttl_seconds` (default 86400).
 
 For Maestro dogfooding, add the `outcome` block to the `BeFeast/maestro` project config first. Point `runtime_target` and `healthcheck_url` at the local Mission Control dashboard, and keep deploy/runtime actions read-only until approval-backed controls exist.
 

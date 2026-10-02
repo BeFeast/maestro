@@ -138,14 +138,15 @@ func TestNativeEnvironmentDoesNotInheritProviderOrHostCredentials(t *testing.T) 
 }
 
 func TestNativeForgejoCredentialOnlyAnswersExactRepository(t *testing.T) {
-	valid := "protocol=https\nhost=git.oklabs.uk\npath=BeFeast/maestro.git\n\n"
+	destination := NativeForgejoDestination{Host: "forge.example.test", Repository: "acme/widget"}
+	valid := "protocol=https\nhost=forge.example.test\npath=acme/widget.git\n\n"
 	var out bytes.Buffer
-	if err := NativeForgejoCredential("get", "BeFeast/maestro", "secret", strings.NewReader(valid), &out); err != nil || !strings.Contains(out.String(), "password=secret") {
+	if err := NativeForgejoCredential("get", destination, "secret", strings.NewReader(valid), &out); err != nil || !strings.Contains(out.String(), "password=secret") {
 		t.Fatal(out.String(), err)
 	}
-	for _, request := range []string{strings.ReplaceAll(valid, "https", "http"), strings.ReplaceAll(valid, "git.oklabs.uk", "git.oklabs.uk:443"), strings.ReplaceAll(valid, "maestro.git", "other.git"), strings.ReplaceAll(valid, "maestro.git", "../maestro.git"), "protocol=https\nprotocol=http\nhost=git.oklabs.uk\npath=BeFeast/maestro.git\n"} {
+	for _, request := range []string{strings.ReplaceAll(valid, "https", "http"), strings.ReplaceAll(valid, "forge.example.test", "forge.example.test:443"), strings.ReplaceAll(valid, "widget.git", "other.git"), strings.ReplaceAll(valid, "widget.git", "../widget.git"), "protocol=https\nprotocol=http\nhost=forge.example.test\npath=acme/widget.git\n"} {
 		out.Reset()
-		if err := NativeForgejoCredential("get", "BeFeast/maestro", "secret", strings.NewReader(request), &out); err == nil || out.Len() != 0 {
+		if err := NativeForgejoCredential("get", destination, "secret", strings.NewReader(request), &out); err == nil || out.Len() != 0 {
 			t.Fatal("leaked credential", request, out.String(), err)
 		}
 	}

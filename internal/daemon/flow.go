@@ -49,6 +49,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 		cfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+		cfg.RuntimeNativeLaneReadiness = managedLaneProbe
 		cfg.AIExecution = cfg.AIExecution.BindController(cfg.AIExecution, cfg.StateDir)
 		if err := cfg.AIExecution.CheckCurrent(); err != nil {
 			log.Printf("[%s] AI execution held: controller revision initialization failed: %v", storeName, err)
@@ -368,6 +369,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			}
 			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 			newCfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+			newCfg.RuntimeNativeLaneReadiness = managedLaneProbe
 			newCfg.AIExecution = flow.cfg.AIExecution.BindController(newCfg.AIExecution, newCfg.StateDir)
 			if err := newCfg.AIExecution.CheckCurrent(); err != nil {
 				log.Printf("[%s] config reload held: controller revision not durably applied: %v", flow.name, err)
@@ -497,6 +499,7 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// leaves the closure reading a permanently-normal cache, i.e. inert.
 	orch.SetEmergencyHalt(d.emergencySpawnHalt)
 	orch.SetFleetSpawnCeiling(d.fleetSpawnCeilingReached)
+	orch.SetFleetSpawnStallDiagnostic(d.fleetSpawnStallDiagnostic)
 	// Host-resource precondition (#1128): /tmp is a RAM-backed tmpfs, so
 	// dispatching into a nearly-full one turns a space problem into a host
 	// memory outage. Daemon.tmpfsSpawnHold is a self-clearing throughput pause
