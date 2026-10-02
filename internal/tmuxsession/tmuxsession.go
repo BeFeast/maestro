@@ -22,6 +22,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/befeast/maestro/internal/termguard"
 )
 
 const (
@@ -200,8 +202,13 @@ func PanePID(name string) ([]byte, error) {
 	return CommandForSession(name, "list-panes", "-t", exactTarget(name), "-F", "#{pane_pid}").Output()
 }
 
-// KillSession terminates exactly name without fuzzy tmux target matching.
+// KillSession terminates exactly name without fuzzy tmux target matching. It
+// consults termguard first; production installs no hook, so only a test binary
+// can refuse the kill (#1252).
 func KillSession(name string) ([]byte, error) {
+	if err := termguard.Check(termguard.Attempt{Op: termguard.OpKillTmuxSession, Target: name}); err != nil {
+		return nil, err
+	}
 	return CommandForSession(name, "kill-session", "-t", exactTarget(name)).CombinedOutput()
 }
 

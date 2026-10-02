@@ -9,6 +9,8 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"github.com/befeast/maestro/internal/termguard"
 )
 
 // VisualQATempPrefix is the well-known prefix for visual-QA Chrome temp
@@ -29,6 +31,9 @@ const VisualQATempPrefix = "/tmp/scribe-visual-qa-"
 // back to a best-effort kill of pid alone. A non-positive pid is a no-op.
 func KillProcessTree(pid int) {
 	if pid <= 0 {
+		return
+	}
+	if termguard.Check(termguard.Attempt{Op: termguard.OpKillProcessTree, PID: pid}) != nil {
 		return
 	}
 
@@ -67,6 +72,9 @@ func KillProcessTree(pid int) {
 // window.
 func ForceKillProcessTree(pid int) {
 	if pid <= 0 {
+		return
+	}
+	if termguard.Check(termguard.Attempt{Op: termguard.OpKillProcessTree, PID: pid}) != nil {
 		return
 	}
 
