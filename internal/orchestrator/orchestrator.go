@@ -252,11 +252,12 @@ type Orchestrator struct {
 	cycleIssueClosed    map[int]cycleBoolResult
 	cyclePRMerged       map[int]cycleBoolResult
 
-	// pauseDeferredLaunches counts native worker launches the operator pause
-	// (#683) held back during the current RunOnce. journalPauseDeferrals
-	// reports and resets it once per cycle so a paused project never logs one
-	// line per deferred launch.
-	pauseDeferredLaunches int
+	// pauseDeferredLaunches records the distinct native launch intents the
+	// operator pause (#683) held back during the current RunOnce, keyed by
+	// issue (or slot), so one intent seen by two launch paths in the same
+	// cycle is counted once. journalPauseDeferrals reports and resets it once
+	// per cycle so a paused project never logs one line per deferred launch.
+	pauseDeferredLaunches map[string]struct{}
 }
 
 // New creates a new Orchestrator
@@ -2977,7 +2978,7 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 		// session dead and the retry due — no slot, budget, CI/review context
 		// or backend selection is consumed — so the first cycle after resume
 		// respawns it exactly once.
-		if o.pauseDefersNativeLaunch(s) {
+		if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 			continue
 		}
 
@@ -3292,7 +3293,7 @@ func (o *Orchestrator) RunOnce() error {
 	// across cycles.
 	o.beginCycle()
 	defer o.endCycle()
-	o.pauseDeferredLaunches = 0
+	o.pauseDeferredLaunches = nil
 
 	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
@@ -4298,7 +4299,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 						slotName, sess.IssueNumber, pid, tmuxName)
 				}
 				continue
-			} else if o.pauseDefersNativeLaunch(s) {
+			} else if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 				// Operator pause (#683): resuming in place is a new native launch.
 				// Keep the marker and park the session in the dead+marker shape the
 				// drain path (#967) already uses, so checkSessions cannot turn the
@@ -4396,7 +4397,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, resetStr)
 				continue
 			}
-			if o.pauseDefersNativeLaunch(s) {
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 				// Operator pause (#683): park the ended worker as a due retry
 				// instead of launching the fallback now.
 				parkEndedWorkerForPause(sess, now)
@@ -4487,7 +4488,7 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, cp.remedy)
 				continue
 			}
-			if o.pauseDefersNativeLaunch(s) {
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 				// Operator pause (#683): park the ended worker as a due retry
 				// instead of launching the fallback now.
 				parkEndedWorkerForPause(sess, now)
@@ -5199,10 +5200,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 			// Terminal states — cleanup old worktrees after 1h
 			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
-			// to preserve the grace period for recently-killed workers.
+			// to preserve the grace period for recently-killed workers. A dead
+			// session with a pending retry or restart resume keeps its worktree
+			// for the in-place relaunch, however long it waits (#1238).
 			nilAndOld := sess.FinishedAt == nil && !sess.StartedAt.IsZero() && time.Since(sess.StartedAt) > 1*time.Hour
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
-			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
+			if sess.Worktree != "" && (nilAndOld || finishedAndOld) && !deadSessionAwaitsRelaunch(sess) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
 					lease := worker.CaptureCleanupLease(slotName, sess)
 					if o.beforeWorktreeCleanupFn != nil {
@@ -5311,7 +5314,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							slotName, sess.IssueNumber, sess.IssueTitle)
 						continue
 					}
-					if o.pauseDefersNativeLaunch(s) {
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 						// Operator pause (#683): park the ended worker as a due
 						// retry instead of launching the fallback now.
 						parkEndedWorkerForPause(sess, now)
@@ -5381,7 +5384,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, failure.pattern, cp.remedy)
 						continue
 					}
-					if o.pauseDefersNativeLaunch(s) {
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 						// Operator pause (#683): park the ended worker as a due
 						// retry instead of launching the fallback now.
 						parkEndedWorkerForPause(sess, now)
@@ -5537,7 +5540,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 							// Attempt fallback: respawn with the best currently available backend.
 							if fallback := selection.SelectedBackend; fallback != "" {
-								if o.pauseDefersNativeLaunch(s) {
+								if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 									// Operator pause (#683): the worker was stopped above;
 									// park it as a due retry instead of launching the
 									// fallback now.
@@ -5604,7 +5607,7 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						// worker with a new native launch. While paused the in-flight
 						// worker keeps running; the check is evaluated (and counted)
 						// only once the soft limit is actually reached.
-						if budgetTokens >= softLimit && !o.pauseDefersNativeLaunch(s) {
+						if budgetTokens >= softLimit && !o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d, measure=%s), checkpointing",
 								slotName, budgetTokens, softLimit, budgetMeasure)
 
@@ -10679,9 +10682,9 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	// selected repair and review-repair dispatches are held here too: their
 	// approvals stay approved/awaiting_dispatch and the recommendation stays
 	// unmaterialized, so the first cycle after resume dispatches them once.
-	// RunOnce journals the pause once per cycle (journalPauseDeferrals).
+	// RunOnce journals the pause once per cycle (journalPauseDeferrals), and
+	// counts these held dispatches there, even on cycles with no free slot.
 	if s.PauseActive() {
-		o.pauseDeferredLaunches += o.pausedRepairDispatches(s)
 		return
 	}
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)

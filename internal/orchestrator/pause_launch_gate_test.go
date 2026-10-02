@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"log"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -67,8 +68,8 @@ func TestRespawnDueRetries_PausedDefersElapsedRetryUntilResume(t *testing.T) {
 	if sess.RetryCount != 1 || sess.CIFailureOutput != "ci failure excerpt" {
 		t.Fatalf("paused retry consumed state: retry_count=%d ci_output=%q", sess.RetryCount, sess.CIFailureOutput)
 	}
-	if o.pauseDeferredLaunches != 1 {
-		t.Fatalf("deferred launches = %d, want 1", o.pauseDeferredLaunches)
+	if got := len(o.pauseDeferredLaunches); got != 1 {
+		t.Fatalf("deferred launches = %d, want 1", got)
 	}
 
 	s.ClearPaused(time.Now().UTC())
@@ -145,9 +146,11 @@ func TestStartNewWorkers_PausedHoldsDeterministicRepairRecommendationUntilResume
 	if d := s.LatestSupervisorDecision(); d == nil || d.Disposition != nil {
 		t.Fatalf("paused recommendation disposition = %+v, want unmaterialized", d)
 	}
-	if o.pauseDeferredLaunches != 1 {
-		t.Fatalf("deferred launches = %d, want 1 (the selected repair)", o.pauseDeferredLaunches)
+	o.notePausedLaunchIntents(s, time.Now().UTC())
+	if got := len(o.pauseDeferredLaunches); got != 1 {
+		t.Fatalf("deferred launches = %d, want 1 (the selected repair)", got)
 	}
+	o.pauseDeferredLaunches = nil
 
 	s.ClearPaused(time.Now().UTC())
 	o.startNewWorkers(s, 1)
@@ -182,9 +185,11 @@ func TestStartNewWorkers_PausedKeepsRepairApprovalAwaitingDispatchUntilResume(t 
 	if got := len(s.Approvals[0].Audit); got != before {
 		t.Fatalf("paused approval audit grew %d -> %d, want untouched", before, got)
 	}
-	if o.pauseDeferredLaunches != 1 {
-		t.Fatalf("deferred launches = %d, want 1 (the approved repair)", o.pauseDeferredLaunches)
+	o.notePausedLaunchIntents(s, time.Now().UTC())
+	if got := len(o.pauseDeferredLaunches); got != 1 {
+		t.Fatalf("deferred launches = %d, want 1 (the approved repair)", got)
 	}
+	o.pauseDeferredLaunches = nil
 
 	s.ClearPaused(time.Now().UTC())
 	o.startNewWorkers(s, 1)
@@ -220,8 +225,8 @@ func TestStartNewWorkers_EmergencyStopStillPrecedesPause(t *testing.T) {
 
 	o.startNewWorkers(s, 1)
 
-	if *respawns != 0 || o.pauseDeferredLaunches != 0 {
-		t.Fatalf("respawns=%d deferred=%d, want emergency stop to return first", *respawns, o.pauseDeferredLaunches)
+	if *respawns != 0 || len(o.pauseDeferredLaunches) != 0 {
+		t.Fatalf("respawns=%d deferred=%d, want emergency stop to return first", *respawns, len(o.pauseDeferredLaunches))
 	}
 	if !strings.Contains(logs.String(), "EMERGENCY STOP active") {
 		t.Fatalf("logs = %q, want the emergency stop line", logs.String())
@@ -323,8 +328,8 @@ func TestPausedFailoverRespawnParksAsDueRetryUntilResume(t *testing.T) {
 			if sess.RetryCount != 0 || sess.UnexpectedExitRetries != 0 {
 				t.Fatalf("paused failover burned budget: retry_count=%d unexpected=%d", sess.RetryCount, sess.UnexpectedExitRetries)
 			}
-			if o.pauseDeferredLaunches != 1 {
-				t.Fatalf("deferred launches = %d, want 1", o.pauseDeferredLaunches)
+			if got := len(o.pauseDeferredLaunches); got != 1 {
+				t.Fatalf("deferred launches = %d, want 1", got)
 			}
 			if _, gated := s.BackendHealth["claude"]; !gated {
 				t.Fatal("the failed backend must still be gated while paused")
@@ -435,8 +440,8 @@ func TestCheckSessions_PausedLeavesSoftTokenWorkerRunning(t *testing.T) {
 	if sess.Status != state.StatusRunning || sess.CheckpointFile != "" {
 		t.Fatalf("in-flight worker = status %q checkpoint %q, want running and untouched", sess.Status, sess.CheckpointFile)
 	}
-	if o.pauseDeferredLaunches != 1 {
-		t.Fatalf("deferred launches = %d, want 1", o.pauseDeferredLaunches)
+	if got := len(o.pauseDeferredLaunches); got != 1 {
+		t.Fatalf("deferred launches = %d, want 1", got)
 	}
 
 	s.ClearPaused(time.Now().UTC())
@@ -561,5 +566,178 @@ func TestRunOnce_PausedJournalsOneDeferralLinePerCycle(t *testing.T) {
 	}
 	if strings.Contains(logs.String(), "project paused") {
 		t.Fatalf("resumed cycles still journal a pause: %q", logs.String())
+	}
+}
+
+// A pause routinely outlasts the 1h terminal worktree GC grace. A dead session
+// whose retry or restart resume the pause is holding still owns its clean
+// worktree: removing it would make the relaunch after resume fall back to
+// worker.Respawn (branch deleted, fresh branch from the default branch)
+// instead of the in-place relaunch on the existing branch.
+func TestCheckSessions_PausedHeldRelaunchKeepsWorktreeBeyondCleanupGrace(t *testing.T) {
+	cases := []struct {
+		name          string
+		restartMarker bool
+	}{
+		{name: "due retry"},
+		{name: "restart resume marker", restartMarker: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			root := t.TempDir()
+			repo := filepath.Join(root, "repo")
+			worktreeBase := filepath.Join(root, "worktrees")
+			slot := "mae-7"
+			branch := "feat/mae-7-707-repair"
+			worktree := filepath.Join(worktreeBase, slot)
+			runGitTest(t, root, "init", repo)
+			runGitTest(t, repo, "config", "user.email", "maestro@example.invalid")
+			runGitTest(t, repo, "config", "user.name", "Maestro Test")
+			if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("base\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			runGitTest(t, repo, "add", "README.md")
+			runGitTest(t, repo, "commit", "-m", "base")
+			runGitTest(t, repo, "branch", branch)
+			if err := os.MkdirAll(worktreeBase, 0o755); err != nil {
+				t.Fatal(err)
+			}
+			runGitTest(t, repo, "worktree", "add", worktree, branch)
+
+			cfg := &config.Config{
+				Repo:              "owner/repo",
+				LocalPath:         repo,
+				WorktreeBase:      worktreeBase,
+				MaxRuntimeMinutes: 999,
+			}
+			o, _ := newCheckSessionsOrchestrator(cfg, "")
+			o.repo = cfg.Repo
+			o.promptBase = "test prompt"
+			inPlaceLaunched := false
+			// Only the relaunched worker is alive.
+			o.pidAliveFn = func(pid int) bool { return pid == 5555 }
+			o.tmuxSessionExistsFn = func(name string) bool { return inPlaceLaunched && name == "maestro-"+slot }
+			o.isPRMergedFn = func(int) (bool, error) { return false, nil }
+			o.getIssueFn = func(number int) (github.Issue, error) { return makeIssue(number, "held relaunch"), nil }
+			removed := 0
+			o.removeWorktreeFn = func(string, string) error {
+				removed++
+				return nil
+			}
+			inPlace := 0
+			o.respawnInPlaceFn = func(_ *config.Config, gotSlot string, sess *state.Session, _ string, _ github.Issue, _ string, _ string) error {
+				inPlace++
+				if gotSlot != slot || sess.Worktree != worktree || sess.Branch != branch {
+					t.Fatalf("in-place relaunch slot=%q worktree=%q branch=%q, want the retained %q/%q/%q", gotSlot, sess.Worktree, sess.Branch, slot, worktree, branch)
+				}
+				inPlaceLaunched = true
+				sess.Status = state.StatusRunning
+				sess.PID = 5555
+				sess.TmuxSession = "maestro-" + slot
+				sess.RestartCheckpointAt = nil
+				sess.FinishedAt = nil
+				return nil
+			}
+			fresh := 0
+			o.respawnWorkerFn = func(*config.Config, string, *state.Session, string, github.Issue, string, string) error {
+				fresh++
+				return nil
+			}
+
+			finished := time.Now().UTC().Add(-2 * time.Hour)
+			sess := &state.Session{
+				IssueNumber: 707,
+				IssueTitle:  "held relaunch",
+				Status:      state.StatusDead,
+				PRNumber:    708,
+				Branch:      branch,
+				Worktree:    worktree,
+				Backend:     "claude",
+				StartedAt:   finished.Add(-time.Hour),
+				FinishedAt:  &finished,
+				RetryCount:  1,
+			}
+			if tc.restartMarker {
+				stamp := finished.Add(-time.Minute)
+				sess.RestartCheckpointAt = &stamp
+			} else {
+				due := finished.Add(time.Minute)
+				sess.NextRetryAt = &due
+			}
+			s := state.NewState()
+			s.Sessions[slot] = sess
+			s.SetPaused(finished.Add(-time.Hour))
+
+			o.reconcileRunningSessions(s)
+			o.checkSessions(s)
+			o.respawnDueRetries(s, 1)
+
+			if removed != 0 || sess.Worktree != worktree {
+				t.Fatalf("paused GC removed=%d worktree=%q, want the held relaunch to keep %q", removed, sess.Worktree, worktree)
+			}
+			if _, err := os.Stat(worktree); err != nil {
+				t.Fatalf("held relaunch worktree gone: %v", err)
+			}
+			if inPlace != 0 || fresh != 0 {
+				t.Fatalf("paused cycle launched: in_place=%d fresh=%d", inPlace, fresh)
+			}
+
+			s.ClearPaused(time.Now().UTC())
+			for i := 0; i < 2; i++ {
+				o.reconcileRunningSessions(s)
+				o.respawnDueRetries(s, 1)
+			}
+
+			if inPlace != 1 || fresh != 0 {
+				t.Fatalf("after resume: in_place=%d fresh=%d, want exactly one in-place relaunch and no fresh respawn", inPlace, fresh)
+			}
+		})
+	}
+}
+
+// The journal count is one per held launch intent. A failover parked as a due
+// retry during reconcile is the same launch the retry queue defers later in
+// the cycle, and a held repair approval is counted even when no slot is free
+// (RunOnce skips startNewWorkers then).
+func TestJournalPauseDeferrals_CountsEachHeldLaunchOnce(t *testing.T) {
+	o, s, respawns := pausedRepairFixture(t)
+	now := time.Now().UTC().Add(-time.Minute)
+	s.Approvals = []state.Approval{repairApproval("repair-517", 517, 520, state.ApprovalStatusAwaitingDispatch, now)}
+	s.Approvals[0].Target.Session = "rep-1"
+	s.Sessions["fo-1"] = &state.Session{
+		IssueNumber: 301,
+		IssueTitle:  "failover target",
+		Status:      state.StatusDead,
+		Branch:      "feat/fo-1-301-failover",
+		Backend:     "codex",
+	}
+	s.SetPaused(time.Now().UTC())
+
+	// The reconcile failover gate parks fo-1; the retry queue then defers the
+	// same now-due retry in the same cycle.
+	o.pauseDefersNativeLaunch(s, "fo-1", 301)
+	parkEndedWorkerForPause(s.Sessions["fo-1"], time.Now().UTC())
+	o.respawnDueRetries(s, 1)
+
+	var logs strings.Builder
+	previous := log.Writer()
+	log.SetOutput(&logs)
+	defer log.SetOutput(previous)
+
+	// No startNewWorkers call: a cycle with no free slot still counts the
+	// held repair approval.
+	o.journalPauseDeferrals(s)
+
+	if *respawns != 0 {
+		t.Fatalf("RespawnInPlace called %d time(s) while paused, want 0", *respawns)
+	}
+	if !strings.Contains(logs.String(), "project paused: deferring 2 native launches") {
+		t.Fatalf("journal = %q, want 'project paused: deferring 2 native launches' (one failover retry, one repair)", logs.String())
+	}
+	if got := approvalStatus(t, s, "repair-517"); got != state.ApprovalStatusAwaitingDispatch {
+		t.Fatalf("paused approval = %q, want awaiting_dispatch", got)
+	}
+	if o.pauseDeferredLaunches != nil {
+		t.Fatalf("journal did not reset the per-cycle record: %v", o.pauseDeferredLaunches)
 	}
 }

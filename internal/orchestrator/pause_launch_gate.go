@@ -1,6 +1,7 @@
 package orchestrator
 
 import (
+	"fmt"
 	"log"
 	"time"
 
@@ -20,17 +21,32 @@ import (
 // EMERGENCY STOP (#840) is a separate, fleet-wide gate and is unchanged here.
 
 // pauseDefersNativeLaunch reports whether the operator pause holds back the
-// native launch the caller is about to start. It must be called only at the
-// point where a launch would otherwise happen, before any session mutation,
-// so a deferral leaves the launch intent exactly as it was. Each deferral is
-// counted for the single per-cycle journal line; callers must not log their
-// own per-launch pause line.
-func (o *Orchestrator) pauseDefersNativeLaunch(s *state.State) bool {
+// native launch the caller is about to start for slotName/issueNumber. It must
+// be called only at the point where a launch would otherwise happen, before
+// any session mutation, so a deferral leaves the launch intent exactly as it
+// was. Each deferral is recorded for the single per-cycle journal line;
+// callers must not log their own per-launch pause line.
+func (o *Orchestrator) pauseDefersNativeLaunch(s *state.State, slotName string, issueNumber int) bool {
 	if !s.PauseActive() {
 		return false
 	}
-	o.pauseDeferredLaunches++
+	o.notePauseDeferredLaunch(slotName, issueNumber)
 	return true
+}
+
+// notePauseDeferredLaunch records one held launch intent for this cycle. The
+// key is the issue when known: a project runs at most one worker per issue,
+// so a failover parked as a due retry and the retry queue deferring that same
+// retry later in the cycle are one launch, not two.
+func (o *Orchestrator) notePauseDeferredLaunch(slotName string, issueNumber int) {
+	key := "slot:" + slotName
+	if issueNumber > 0 {
+		key = fmt.Sprintf("issue:%d", issueNumber)
+	}
+	if o.pauseDeferredLaunches == nil {
+		o.pauseDeferredLaunches = make(map[string]struct{})
+	}
+	o.pauseDeferredLaunches[key] = struct{}{}
 }
 
 // parkEndedWorkerForPause records a worker whose process has already ended as
@@ -50,13 +66,32 @@ func parkEndedWorkerForPause(sess *state.Session, now time.Time) {
 	sess.NextRetryAt = &retryAt
 }
 
-// pausedRepairDispatches counts the supervisor-selected repair and
-// review-repair dispatches that startNewWorkers would have tried this cycle.
-// It reuses supervisorSelectedRepairSpawn so the count matches dispatch
+// deadSessionAwaitsRelaunch reports whether a dead session still carries an
+// unconsumed relaunch intent: a scheduled retry (NextRetryAt) or a restart
+// resume marker (RestartCheckpointAt). Both relaunch the same slot, branch and
+// worktree in place, so the session still owns its worktree and the 1h
+// terminal worktree GC must leave it alone. Without the worktree, the retry
+// path falls back to worker.Respawn, which deletes the branch and starts over
+// from the default branch, and a restart resume drops its marker. An operator
+// pause holds these intents for as long as the pause lasts, which is routinely
+// longer than the GC grace.
+func deadSessionAwaitsRelaunch(sess *state.Session) bool {
+	if sess == nil || sess.Status != state.StatusDead {
+		return false
+	}
+	return sess.NextRetryAt != nil || sess.RestartCheckpointAt != nil
+}
+
+// notePausedLaunchIntents records the launch intents that a paused cycle
+// holds without reaching their launch point: supervisor-selected repair and
+// review-repair dispatches (startNewWorkers returns before them while paused,
+// and RunOnce skips it entirely when no slot is free) and due retries that
+// respawnDueRetries never reached for lack of a slot. It reuses
+// supervisorSelectedRepairSpawn so repair counting matches dispatch
 // eligibility exactly, and it reads state only (no forge calls while paused).
-func (o *Orchestrator) pausedRepairDispatches(s *state.State) int {
+func (o *Orchestrator) notePausedLaunchIntents(s *state.State, now time.Time) {
 	if s == nil {
-		return 0
+		return
 	}
 	candidates := make(map[int]struct{})
 	for i := range s.Approvals {
@@ -75,24 +110,33 @@ func (o *Orchestrator) pausedRepairDispatches(s *state.State) int {
 	if decision := s.LatestSupervisorDecision(); decision != nil && decision.Target != nil && decision.Target.Issue > 0 {
 		candidates[decision.Target.Issue] = struct{}{}
 	}
-	count := 0
 	for issue := range candidates {
 		if o.supervisorSelectedRepairSpawn(s, issue) {
-			count++
+			o.notePauseDeferredLaunch("", issue)
 		}
 	}
-	return count
+	for slotName, sess := range s.Sessions {
+		if sess == nil || sess.NativeRegistrationHold != "" || sess.Status != state.StatusDead || sess.NextRetryAt == nil {
+			continue
+		}
+		if now.Before(*sess.NextRetryAt) {
+			continue
+		}
+		o.notePauseDeferredLaunch(slotName, sess.IssueNumber)
+	}
 }
 
 // journalPauseDeferrals writes the one journal line a paused cycle produces
-// and resets the per-cycle counter. Fresh issue selection is skipped before
-// any listing while paused, so its candidates are not part of the count.
+// and resets the per-cycle record. Fresh issue selection is skipped before any
+// listing while paused, so its candidates are not part of the count.
 func (o *Orchestrator) journalPauseDeferrals(s *state.State) {
-	deferred := o.pauseDeferredLaunches
-	o.pauseDeferredLaunches = 0
 	if !s.PauseActive() {
+		o.pauseDeferredLaunches = nil
 		return
 	}
+	o.notePausedLaunchIntents(s, time.Now().UTC())
+	deferred := len(o.pauseDeferredLaunches)
+	o.pauseDeferredLaunches = nil
 	log.Printf("[orch] project paused: deferring %d native launches (since %s; issue selection skipped; running=%d)",
 		deferred, s.PausedAt.Format(time.RFC3339), s.RunningSessionCount())
 }
