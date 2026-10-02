@@ -17,6 +17,11 @@ const nativeCloneMarker = aiexecution.NativeCloneMarker
 
 type nativeCloneIdentity = aiexecution.NativeCloneIdentity
 
+// registerNativeCloneGit installs the native Git sandbox for a clone. Tests
+// replace it to exercise the daemon-side origin checks on clone creation and
+// reuse without the native kernel fixture.
+var registerNativeCloneGit = aiexecution.RegisterNativeGit
+
 func nativeCloneGit(dir string, args ...string) ([]byte, error) {
 	cmd := aiexecution.NativeGitCommand(append([]string{"-C", dir, "-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false", "-c", "credential.helper=", "-c", "protocol.ext.allow=never", "-c", "http.followRedirects=false", "--no-replace-objects"}, args...)...)
 	cmd.Env = []string{"PATH=/usr/bin:/bin", "HOME=/nonexistent", "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0"}
@@ -125,7 +130,7 @@ func materializeNativeClone(parent, worktree, branch, expectedOrigin string) err
 		// Initial setup can stop after writing clone identity but before Git
 		// registration (for example, a writable ancestor). Recovery must install
 		// the sandbox before inspecting even that partially prepared checkout.
-		if err := aiexecution.RegisterNativeGit(worktree); err != nil {
+		if err := registerNativeCloneGit(worktree); err != nil {
 			return err
 		}
 		// The retained identity must still name the currently pinned origin;
@@ -181,7 +186,7 @@ func materializeNativeClone(parent, worktree, branch, expectedOrigin string) err
 	if err := writeFileAtomicMode(filepath.Join(worktree, ".git"), filepath.Join(worktree, ".git", nativeCloneMarker), string(b), 0600); err != nil {
 		return err
 	}
-	return aiexecution.RegisterNativeGit(worktree)
+	return registerNativeCloneGit(worktree)
 }
 
 func isNativeCloneForRepo(parent, worktree string) bool {

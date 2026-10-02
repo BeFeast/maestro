@@ -21,10 +21,14 @@ func fixtureForgejoConfig(base, repo string) *config.Config {
 	return &config.Config{Repo: repo, Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: base}}
 }
 
+func isAIExecutionHold(err error, code string) bool {
+	var hold *aiexecution.Hold
+	return errors.As(err, &hold) && hold.Code == code
+}
+
 func expectAIExecutionHold(t *testing.T, err error, code string) {
 	t.Helper()
-	var hold *aiexecution.Hold
-	if !errors.As(err, &hold) || hold.Code != code {
+	if !isAIExecutionHold(err, code) {
 		t.Fatalf("err=%v, want hold %s", err, code)
 	}
 }
@@ -41,6 +45,90 @@ func mismatchedPinnedForgeConfigs() map[string]*config.Config {
 		"org case":       fixtureForgejoConfig("https://forge.example.test", "Acme/widget"),
 		"repo case":      fixtureForgejoConfig("https://forge.example.test", "acme/Widget"),
 	}
+}
+
+// unsupportedForgeConfigs are project configs from which no native origin can
+// be derived: another forge kind, or a base URL or repository spelling the
+// native form refuses rather than normalizes.
+func unsupportedForgeConfigs() map[string]*config.Config {
+	forgejo := fixtureForgejoConfig
+	return map[string]*config.Config{
+		"no config":   nil,
+		"github kind": {Repo: "acme/widget"},
+		// A well-formed base URL must not stand in for the Forgejo kind: the
+		// native helpers speak only the Forgejo API.
+		"github kind with base url":  {Repo: "acme/widget", Forge: config.ForgeConfig{Kind: config.ForgeKindGitHub, BaseURL: "https://forge.example.test"}},
+		"default kind with base url": {Repo: "acme/widget", Forge: config.ForgeConfig{BaseURL: "https://forge.example.test"}},
+		"no base url":                forgejo("", "acme/widget"),
+		"http":                       forgejo("http://forge.example.test", "acme/widget"),
+		"scheme case":                forgejo("HTTPS://forge.example.test", "acme/widget"),
+		"ssh":                        forgejo("ssh://forge.example.test", "acme/widget"),
+		"default port":               forgejo("https://forge.example.test:443", "acme/widget"),
+		"port":                       forgejo("https://forge.example.test:8443", "acme/widget"),
+		"userinfo":                   forgejo("https://user@forge.example.test", "acme/widget"),
+		"path prefix":                forgejo("https://forge.example.test/forgejo", "acme/widget"),
+		"host case":                  forgejo("https://FORGE.example.test", "acme/widget"),
+		"trailing dot":               forgejo("https://forge.example.test.", "acme/widget"),
+		"query":                      forgejo("https://forge.example.test?x=1", "acme/widget"),
+		"repo shape":                 forgejo("https://forge.example.test", "acme"),
+		"repo path":                  forgejo("https://forge.example.test", "acme/widget/extra"),
+		"repo dot segment":           forgejo("https://forge.example.test", "acme/.."),
+	}
+}
+
+// nativeOriginLookalikes resemble fixtureNativeOrigin but name another
+// destination, or spell it in a form the native origin never takes. Wherever
+// fixtureNativeOrigin is pinned, each must be refused, never normalized.
+func nativeOriginLookalikes() []string {
+	return []string{
+		// Other hosts.
+		"https://forge2.example.test/acme/widget.git",
+		"https://evil.forge.example.test/acme/widget.git",
+		"https://forge.example.test.evil.test/acme/widget.git",
+		// Host spelling.
+		"https://FORGE.example.test/acme/widget.git",
+		"https://forge.example.test./acme/widget.git",
+		// Ports, including the scheme default.
+		"https://forge.example.test:443/acme/widget.git",
+		"https://forge.example.test:8443/acme/widget.git",
+		// Schemes.
+		"http://forge.example.test/acme/widget.git",
+		"HTTPS://forge.example.test/acme/widget.git",
+		"ssh://git@forge.example.test/acme/widget.git",
+		"git@forge.example.test:acme/widget.git",
+		"git://forge.example.test/acme/widget.git",
+		// Userinfo.
+		"https://user@forge.example.test/acme/widget.git",
+		"https://user:pw@forge.example.test/acme/widget.git",
+		// Organizations and repositories, including case.
+		"https://forge.example.test/other/widget.git",
+		"https://forge.example.test/acme/other.git",
+		"https://forge.example.test/Acme/widget.git",
+		"https://forge.example.test/acme/Widget.git",
+		// Path spelling.
+		"https://forge.example.test/acme/widget",
+		"https://forge.example.test/acme/widget.git/",
+		"https://forge.example.test//acme/widget.git",
+		"https://forge.example.test/forgejo/acme/widget.git",
+		"https://forge.example.test/acme/wid%67et.git",
+		"https://forge.example.test/acme/widget.git?x",
+		"https://forge.example.test/acme/widget.git#x",
+	}
+}
+
+// stubNativeCloneRegistration stands in for the native Git sandbox so the
+// daemon-side origin checks on clone creation and reuse run without the
+// kernel fixture. It returns the worktrees registered, in call order.
+func stubNativeCloneRegistration(t *testing.T) *[]string {
+	t.Helper()
+	var registered []string
+	previous := registerNativeCloneGit
+	registerNativeCloneGit = func(worktree string) error {
+		registered = append(registered, worktree)
+		return nil
+	}
+	t.Cleanup(func() { registerNativeCloneGit = previous })
+	return &registered
 }
 
 func TestNativeCloneMaterializesAssignedPathWithoutSharedGitMetadata(t *testing.T) {
@@ -120,28 +208,18 @@ func TestNativeCloneRecoveryRegistersSandboxBeforeInspectingRetainedClone(t *tes
 }
 
 func TestNativeCloneOriginComesFromPinnedProjectForge(t *testing.T) {
-	forgejo := fixtureForgejoConfig
-	origin, err := nativeCloneOriginForProject(forgejo("https://forge.example.test", "acme/widget"))
-	if err != nil || origin != fixtureNativeOrigin {
-		t.Fatalf("configured forge origin: %q %v", origin, err)
+	for _, base := range []string{"https://forge.example.test", "https://forge.example.test/"} {
+		origin, err := nativeCloneOriginForProject(fixtureForgejoConfig(base, "acme/widget"))
+		if err != nil || origin != fixtureNativeOrigin {
+			t.Fatalf("configured forge origin %s: %q %v", base, origin, err)
+		}
 	}
-	for name, cfg := range map[string]*config.Config{
-		"no config":   nil,
-		"github kind": {Repo: "acme/widget"},
-		// A well-formed base URL must not stand in for the Forgejo kind: the
-		// native helpers speak only the Forgejo API.
-		"github kind with base url":  {Repo: "acme/widget", Forge: config.ForgeConfig{Kind: config.ForgeKindGitHub, BaseURL: "https://forge.example.test"}},
-		"default kind with base url": {Repo: "acme/widget", Forge: config.ForgeConfig{BaseURL: "https://forge.example.test"}},
-		"http":                       forgejo("http://forge.example.test", "acme/widget"),
-		"port":                       forgejo("https://forge.example.test:8443", "acme/widget"),
-		"userinfo":                   forgejo("https://user@forge.example.test", "acme/widget"),
-		"path prefix":                forgejo("https://forge.example.test/forgejo", "acme/widget"),
-		"host case":                  forgejo("https://FORGE.example.test", "acme/widget"),
-		"trailing dot":               forgejo("https://forge.example.test.", "acme/widget"),
-		"repo shape":                 forgejo("https://forge.example.test", "acme"),
-	} {
-		if got, err := nativeCloneOriginForProject(cfg); err == nil {
-			t.Fatalf("%s: accepted origin %q", name, got)
+	origin := fixtureNativeOrigin
+	for name, cfg := range unsupportedForgeConfigs() {
+		got, err := nativeCloneOriginForProject(cfg)
+		expectAIExecutionHold(t, err, "containment_clone_origin_unsupported")
+		if got != "" {
+			t.Fatalf("%s: returned origin %q with the hold", name, got)
 		}
 	}
 	parent := newBranchTestRepo(t)
@@ -149,19 +227,7 @@ func TestNativeCloneOriginComesFromPinnedProjectForge(t *testing.T) {
 	if got, err := canonicalNativeOrigin(parent, origin); err != nil || got != origin {
 		t.Fatalf("configured parent origin: %q %v", got, err)
 	}
-	for _, lookalike := range []string{
-		"https://evil.forge.example.test/acme/widget.git",
-		"https://forge.example.test.evil.test/acme/widget.git",
-		"https://forge.example.test:443/acme/widget.git",
-		"https://forge.example.test:8443/acme/widget.git",
-		"http://forge.example.test/acme/widget.git",
-		"https://forge.example.test/other/widget.git",
-		"https://forge.example.test/acme/other.git",
-		"https://FORGE.example.test/acme/widget.git",
-		"https://forge.example.test/Acme/widget.git",
-		"https://forge.example.test./acme/widget.git",
-		"https://user@forge.example.test/acme/widget.git",
-	} {
+	for _, lookalike := range nativeOriginLookalikes() {
 		runBranchGit(t, parent, "remote", "set-url", "origin", lookalike)
 		if got, err := canonicalNativeOrigin(parent, origin); err == nil {
 			t.Fatalf("parent origin %q accepted as %q", lookalike, got)
@@ -192,6 +258,7 @@ func TestNativeCloneOriginAgreesWithRepositoryIdentityForCanonicalInputs(t *test
 // origin is byte for byte the origin derived from the pinned project config.
 // The refusal happens before any clone or kernel step, so it runs everywhere.
 func TestNativeCloneMaterializeHoldsWhenParentOriginIsNotPinned(t *testing.T) {
+	registered := stubNativeCloneRegistration(t)
 	parent := newBranchTestRepo(t)
 	runBranchGit(t, parent, "remote", "add", "origin", fixtureNativeOrigin)
 	runBranchGit(t, parent, "update-ref", "refs/remotes/origin/main", "HEAD")
@@ -206,29 +273,138 @@ func TestNativeCloneMaterializeHoldsWhenParentOriginIsNotPinned(t *testing.T) {
 		if _, err := os.Lstat(path); !os.IsNotExist(err) {
 			t.Fatalf("%s: clone path created before the origin was accepted: %v", name, err)
 		}
+		if len(*registered) != 0 {
+			t.Fatalf("%s: refused clone registered: %q", name, *registered)
+		}
 	}
 	// Config pins another destination than the parent's (canonical) origin.
 	for name, cfg := range mismatchedPinnedForgeConfigs() {
 		refuse("config "+name, cfg)
 	}
+	// Config derives no native origin at all.
+	for name, cfg := range unsupportedForgeConfigs() {
+		refuse("config "+name, cfg)
+	}
 	// Config is correct; the parent's origin is a lookalike of the pinned one.
 	pinned := fixtureForgejoConfig("https://forge.example.test", "acme/widget")
-	for _, lookalike := range []string{
-		"https://forge2.example.test/acme/widget.git",
-		"https://evil.forge.example.test/acme/widget.git",
-		"https://forge.example.test.evil.test/acme/widget.git",
-		"https://forge.example.test/other/widget.git",
-		"https://forge.example.test/acme/other.git",
-		"https://forge.example.test/Acme/widget.git",
-		"https://FORGE.example.test/acme/widget.git",
-		"https://forge.example.test./acme/widget.git",
-		"https://forge.example.test:443/acme/widget.git",
-		"https://forge.example.test:8443/acme/widget.git",
-		"http://forge.example.test/acme/widget.git",
-		"https://user@forge.example.test/acme/widget.git",
-	} {
+	for _, lookalike := range nativeOriginLookalikes() {
 		runBranchGit(t, parent, "remote", "set-url", "origin", lookalike)
 		refuse("parent "+lookalike, pinned)
+	}
+}
+
+// The daemon-side pinned-origin check on both sides of a retained clone's
+// life: creation writes exactly the derived origin, and reuse adopts the clone
+// only while the pinned config, the parent's origin, the clone's own origin and
+// its identity all still name that same origin byte for byte. Sandbox
+// registration is stubbed, so this runs without the native kernel fixture.
+func TestNativeCloneCreateAndReuseRequirePinnedOrigin(t *testing.T) {
+	registered := stubNativeCloneRegistration(t)
+	parent := newBranchTestRepo(t)
+	runBranchGit(t, parent, "remote", "add", "origin", fixtureNativeOrigin)
+	runBranchGit(t, parent, "update-ref", "refs/remotes/origin/main", "HEAD")
+	base := strings.TrimSpace(runBranchGit(t, parent, "rev-parse", "HEAD"))
+	pinned := fixtureForgejoConfig("https://forge.example.test", "acme/widget")
+	path := filepath.Join(t.TempDir(), "assigned")
+	const branch = "codex/fixture-1"
+
+	// Creation: the clone carries the derived origin and is registered.
+	if err := materializeNativeCloneForProject(pinned, parent, path, branch); err != nil {
+		t.Fatal(err)
+	}
+	if len(*registered) != 1 || (*registered)[0] != path {
+		t.Fatalf("created clone registrations: %q", *registered)
+	}
+	if got := strings.TrimSpace(runBranchGit(t, path, "remote", "get-url", "origin")); got != fixtureNativeOrigin {
+		t.Fatalf("created clone origin %q", got)
+	}
+	// The identity keeps the layout earlier releases wrote, so clones retained
+	// across the upgrade are adopted without being regenerated.
+	identityPath := filepath.Join(path, ".git", nativeCloneMarker)
+	identity, err := os.ReadFile(identityPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"version":1,"parent":"` + parent + `","worktree":"` + path + `","origin":"` + fixtureNativeOrigin + `","base_commit":"` + base + `"}`; string(identity) != want {
+		t.Fatalf("clone identity layout:\n got %s\nwant %s", identity, want)
+	}
+	relaunch := fixtureForgejoConfig("https://forge.example.test", "acme/widget")
+	relaunch.AIExecution.RequireVerifiedRoute = true
+	if err := verifyNativeRelaunchCloneOrigin(relaunch, path); err != nil {
+		t.Fatalf("relaunch of the created clone: %v", err)
+	}
+
+	// Reuse registers the retained clone's sandbox before anything inspects it.
+	reuse := func(cfg *config.Config) error {
+		t.Helper()
+		before := len(*registered)
+		err := materializeNativeCloneForProject(cfg, parent, path, branch)
+		if len(*registered) != before+1 || (*registered)[before] != path {
+			t.Fatalf("reuse did not register the retained clone first: %q (err=%v)", *registered, err)
+		}
+		return err
+	}
+	if err := reuse(pinned); err != nil {
+		t.Fatalf("reuse under the pinned config: %v", err)
+	}
+
+	// The project config was re-pinned after the clone was created.
+	for name, cfg := range mismatchedPinnedForgeConfigs() {
+		if err := materializeNativeCloneForProject(cfg, parent, path, branch); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
+			t.Fatalf("reuse under config %s: err=%v", name, err)
+		}
+	}
+	for name, cfg := range unsupportedForgeConfigs() {
+		if err := materializeNativeCloneForProject(cfg, parent, path, branch); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
+			t.Fatalf("reuse under config %s: err=%v", name, err)
+		}
+	}
+
+	// The parent's origin became a lookalike of the pinned origin.
+	for _, lookalike := range nativeOriginLookalikes() {
+		runBranchGit(t, parent, "remote", "set-url", "origin", lookalike)
+		if err := reuse(pinned); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
+			t.Fatalf("reuse with parent origin %q: err=%v", lookalike, err)
+		}
+	}
+	runBranchGit(t, parent, "remote", "set-url", "origin", fixtureNativeOrigin)
+
+	// The retained clone's own origin drifted from the pinned origin.
+	for _, lookalike := range nativeOriginLookalikes() {
+		runBranchGit(t, path, "remote", "set-url", "origin", lookalike)
+		if err := reuse(pinned); !isAIExecutionHold(err, "containment_existing_checkout_unsupported") {
+			t.Fatalf("reuse with clone origin %q: err=%v", lookalike, err)
+		}
+	}
+	runBranchGit(t, path, "remote", "set-url", "origin", fixtureNativeOrigin)
+
+	// The retained identity names a lookalike, so the sandboxed helpers would
+	// address another destination than the clone's origin.
+	for _, lookalike := range nativeOriginLookalikes() {
+		stale := strings.Replace(string(identity), fixtureNativeOrigin, lookalike, 1)
+		if err := os.WriteFile(identityPath, []byte(stale), 0600); err != nil {
+			t.Fatal(err)
+		}
+		if err := reuse(pinned); !isAIExecutionHold(err, "containment_existing_checkout_unsupported") {
+			t.Fatalf("reuse with identity origin %q: err=%v", lookalike, err)
+		}
+	}
+	if err := os.WriteFile(identityPath, identity, 0600); err != nil {
+		t.Fatal(err)
+	}
+
+	// A legitimate re-pin that also moved the parent's origin must not adopt a
+	// clone whose identity still names the previous destination.
+	repinned := fixtureForgejoConfig("https://forge2.example.test", "acme/widget")
+	runBranchGit(t, parent, "remote", "set-url", "origin", "https://forge2.example.test/acme/widget.git")
+	if err := reuse(repinned); !isAIExecutionHold(err, "containment_existing_checkout_unsupported") {
+		t.Fatalf("reuse of a clone created under the previous pin: err=%v", err)
+	}
+	runBranchGit(t, parent, "remote", "set-url", "origin", fixtureNativeOrigin)
+
+	// Restored to the pinned origin everywhere, the clone is adopted again.
+	if err := reuse(pinned); err != nil {
+		t.Fatalf("reuse after restoring the pinned origin: %v", err)
 	}
 }
 
@@ -294,17 +470,7 @@ func TestNativeRelaunchHoldsWhenRetainedCloneOriginIsNotPinned(t *testing.T) {
 	unpinned.AIExecution.RequireVerifiedRoute = true
 	expectAIExecutionHold(t, verifyNativeRelaunchCloneOrigin(unpinned, worktree), "containment_clone_origin_unsupported")
 	// The retained identity names a lookalike of the pinned origin.
-	for _, lookalike := range []string{
-		"https://forge2.example.test/acme/widget.git",
-		"https://evil.forge.example.test/acme/widget.git",
-		"https://forge.example.test/other/widget.git",
-		"https://forge.example.test/Acme/widget.git",
-		"https://FORGE.example.test/acme/widget.git",
-		"https://forge.example.test./acme/widget.git",
-		"https://forge.example.test:443/acme/widget.git",
-		"http://forge.example.test/acme/widget.git",
-		"https://user@forge.example.test/acme/widget.git",
-	} {
+	for _, lookalike := range nativeOriginLookalikes() {
 		stale := identity
 		stale.Origin = lookalike
 		writeNativeCloneIdentityFixture(t, worktree, stale)
@@ -392,9 +558,10 @@ func TestNativeInPlaceRelaunchHoldsWhenRetainedCloneOriginIsStale(t *testing.T) 
 	}
 }
 
-// Kernel fixture: reusing a retained clone after the pinned config changed is
-// refused on both the materialize (Respawn/start) and the relaunch path, and
-// the original config still reuses it.
+// Kernel fixture: reusing a retained clone after the pinned config changed, or
+// while the parent's origin is a lookalike, is refused on both the materialize
+// (Respawn/start) and the relaunch path, and the original config still reuses
+// it.
 func TestNativeCloneReuseHoldsWhenPinnedOriginChanges(t *testing.T) {
 	if os.Getenv("MAESTRO_NATIVE_KERNEL_TESTS") != "1" {
 		t.Skip("set MAESTRO_NATIVE_KERNEL_TESTS=1 for native clone kernel fixture")
@@ -413,15 +580,20 @@ func TestNativeCloneReuseHoldsWhenPinnedOriginChanges(t *testing.T) {
 	}
 	for name, cfg := range mismatchedPinnedForgeConfigs() {
 		cfg.AIExecution.RequireVerifiedRoute = true
-		err := materializeNativeCloneForProject(cfg, parent, path, "codex/fixture-1")
-		var hold *aiexecution.Hold
-		if !errors.As(err, &hold) || hold.Code != "containment_clone_origin_unsupported" {
+		if err := materializeNativeCloneForProject(cfg, parent, path, "codex/fixture-1"); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
 			t.Fatalf("reuse under %s: err=%v", name, err)
 		}
-		if err := verifyNativeRelaunchCloneOrigin(cfg, path); !errors.As(err, &hold) || hold.Code != "containment_clone_origin_unsupported" {
+		if err := verifyNativeRelaunchCloneOrigin(cfg, path); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
 			t.Fatalf("relaunch under %s: err=%v", name, err)
 		}
 	}
+	for _, lookalike := range nativeOriginLookalikes() {
+		runBranchGit(t, parent, "remote", "set-url", "origin", lookalike)
+		if err := materializeNativeCloneForProject(pinned, parent, path, "codex/fixture-1"); !isAIExecutionHold(err, "containment_clone_origin_unsupported") {
+			t.Fatalf("reuse with parent origin %q: err=%v", lookalike, err)
+		}
+	}
+	runBranchGit(t, parent, "remote", "set-url", "origin", fixtureNativeOrigin)
 	if err := materializeNativeCloneForProject(pinned, parent, path, "codex/fixture-1"); err != nil {
 		t.Fatalf("reuse under pinned config: %v", err)
 	}

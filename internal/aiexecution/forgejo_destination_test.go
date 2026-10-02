@@ -39,7 +39,9 @@ func requireHold(t *testing.T, err error, code string) {
 }
 
 func TestContainmentProfileRepositoryIsPinnedByProfileNotOrganization(t *testing.T) {
-	for _, repo := range []string{"acme/widget", "Acme-Org/widget_2.svc"} {
+	// "BeFeast/maestro" is the shape every profile provisioned under the former
+	// organization-prefix rule carries; those stay valid without regeneration.
+	for _, repo := range []string{"acme/widget", "Acme-Org/widget_2.svc", "BeFeast/maestro"} {
 		if err := validateContainmentProfile(fixtureContainmentProfile(repo)); err != nil {
 			t.Fatalf("profile repository %q rejected: %v", repo, err)
 		}
