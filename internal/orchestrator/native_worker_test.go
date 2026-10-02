@@ -7,6 +7,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -171,9 +172,21 @@ func parkedHoldMessages(t *testing.T) (*notify.Notifier, func() []string) {
 // later cycle skips the held session. Before these holds the same receipt
 // faults failed the respawn with a notification, so the first retention must
 // tell the operator, once, and neither the next cycle nor a repeated retention
-// of the same hold may repeat it.
+// of the same hold may repeat it. This holds for every code the termination
+// fence can report for an untrusted projected receipt, including the
+// outcome, operator recovery and process evidence checks of the receipt read,
+// so the codes come from the worker's list rather than a copy here.
 func TestNativeWorkerParkedHoldNotifiesOperatorOnce(t *testing.T) {
-	for _, code := range []string{"projected_receipt_missing", "projected_receipt_undecodable", "receipt_invalid", "native_identity_conflict"} {
+	codes := worker.NativeProjectedReceiptHoldCodes()
+	for _, want := range []string{"projected_receipt_missing", "projected_receipt_undecodable", "receipt_invalid", "outcome_receipt_invalid", "operator_recovery_receipt_invalid", "native_process_evidence_invalid", "native_identity_conflict"} {
+		if !slices.Contains(codes, want) {
+			t.Fatalf("termination fence hold %s missing from the parked codes %q", want, codes)
+		}
+	}
+	for _, code := range codes {
+		if nativeRuntimeReconcileHold(code) {
+			t.Fatalf("parked code %s is routed to cycle-start reconciliation", code)
+		}
 		t.Run(code, func(t *testing.T) {
 			notifier, parked := parkedHoldMessages(t)
 			cfg := &config.Config{Repo: "fixture/repo", StateDir: t.TempDir(), MaxRetryBackoffMs: 300000, MaxRuntimeMinutes: 999, WorkerNativeSessionRegistration: &config.NativeSessionRegistrationConfig{}}
@@ -195,6 +208,11 @@ func TestNativeWorkerParkedHoldNotifiesOperatorOnce(t *testing.T) {
 			got := parked()
 			if len(got) != 1 || !strings.Contains(got[0], "fixture-1") || !strings.Contains(got[0], "#1249") || !strings.Contains(got[0], code) || !strings.Contains(got[0], "generation 3") {
 				t.Fatalf("parked hold notifications = %q, want one naming slot, issue, code and generation", got)
+			}
+			// Inspecting or repairing the receipt does not release the slot;
+			// the message must not suggest it does.
+			if !strings.Contains(got[0], "no release command exists yet") || strings.Contains(got[0], "until an operator") {
+				t.Fatalf("parked hold notification %q implies a release path", got[0])
 			}
 			o.respawnDueRetries(s, 10)
 			if !o.retainNativeWorkerHold("fixture-1", sess, hold) {

@@ -34,16 +34,12 @@ func (o *Orchestrator) retainNativeWorkerHold(slot string, sess *state.Session, 
 // slot until an operator acts. No cycle-start reconciliation routes these codes
 // (nativeRuntimeReconcileHold) and no reconciliation clears them, while every
 // respawn, retry, phase and repair path skips a held session, so the slot keeps
-// its capacity and issue claim with no further automatic attempt. The
-// termination fence reports these when the projected generation's receipt is
-// absent, unreadable or undecodable, its terminal marker fails the receipt
-// integrity check, or the marker names another identity.
+// its capacity and issue claim with no further automatic attempt. The set is
+// the worker's own list of codes the termination fence reports when the
+// projected generation's receipt or terminal marker cannot be trusted
+// (worker.NativeProjectedReceiptHoldCodes), not a copy of it.
 func nativeParkedHold(code string) bool {
-	switch code {
-	case "projected_receipt_missing", "projected_receipt_undecodable", "receipt_invalid", "native_identity_conflict":
-		return true
-	}
-	return false
+	return worker.NativeProjectedReceiptHold(code)
 }
 
 // notifyParkedNativeHold tells the operator once that a slot is parked on a
@@ -68,7 +64,7 @@ func (o *Orchestrator) notifyParkedNativeHold(slot string, sess *state.Session, 
 	if o.notifier == nil {
 		return
 	}
-	o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) is parked on native hold %s for generation %d; no respawn, retry, phase transition or repair runs until an operator inspects the slot's native receipt directory (docs/worker-native-registration.md)",
+	o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) is parked on native hold %s for generation %d: no respawn, retry, phase transition or repair runs and no release command exists yet; inspect the slot's native receipt directory (docs/worker-native-registration.md)",
 		slot, sess.IssueNumber, sess.IssueTitle, code, sess.WorkerGeneration)
 }
 

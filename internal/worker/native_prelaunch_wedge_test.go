@@ -841,9 +841,14 @@ func TestTerminationFenceLeavesSessionProjectionUntouched(t *testing.T) {
 // code: a marker that decodes but names another identity is the existing
 // native_identity_conflict, a marker failing the receipt integrity check is the
 // existing receipt_invalid, and only an unreadable or undecodable file is
-// projected_receipt_undecodable. Nothing is observed, sealed or minted meanwhile.
+// projected_receipt_undecodable. A receipt whose outcome, operator recovery or
+// process evidence section fails validation keeps the receipt read's own hold.
+// Nothing is observed, sealed or minted meanwhile. Together the modes produce
+// every code in NativeProjectedReceiptHoldCodes, the set the orchestrator parks
+// and reports.
 func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testing.T) {
-	for _, mode := range []string{"receipt_missing", "receipt_undecodable", "terminal_marker_undecodable", "terminal_marker_identity_conflict", "terminal_marker_invalid_mode"} {
+	produced := map[string]bool{}
+	for _, mode := range []string{"receipt_missing", "receipt_undecodable", "terminal_marker_undecodable", "terminal_marker_identity_conflict", "terminal_marker_invalid_mode", "outcome_invalid", "operator_recovery_invalid", "process_evidence_invalid"} {
 		t.Run(mode, func(t *testing.T) {
 			f, parent, _ := cleanExitWithoutMarker(t)
 			sess := f.st.Sessions[f.slot]
@@ -898,7 +903,33 @@ func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testin
 					t.Fatal(err)
 				}
 				want = "receipt_invalid"
+			case "outcome_invalid":
+				// A settled outcome without the intent it answers.
+				corrupt := *parent
+				corrupt.Outcome = &admissioncontrol.NativeOutcome{}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "outcome_receipt_invalid"
+			case "operator_recovery_invalid":
+				// An operator recovery record without the retired outcome it
+				// consumes.
+				corrupt := *parent
+				corrupt.OperatorRecovery = &NativeOperatorRecoveryRecord{NextGeneration: 2, ScheduledAt: time.Now().UTC()}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "operator_recovery_receipt_invalid"
+			case "process_evidence_invalid":
+				// Process evidence that proves neither a launch nor a termination.
+				corrupt := *parent
+				corrupt.NativeProcessEvidence = &aiexecution.NativeProcessTermination{Version: 1, NativeSessionID: parent.Request.NativeSessionID, Unit: parent.ProcessLeaseUnit, LocalStatus: "terminated"}
+				if err := writeNativeWorkerReceipt(dir, &corrupt); err != nil {
+					t.Fatal(err)
+				}
+				want = "native_process_evidence_invalid"
 			}
+			produced[want] = true
 			before := *sess
 			err := ensureNativeGenerationTerminalBeforeSuccessor(f.cfg, f.slot, sess)
 			expectNativeHold(t, err, want, true)
@@ -920,6 +951,11 @@ func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testin
 				t.Fatalf("registered=%d spawned=%d stopped=%d gen=%d status=%s", len(f.registered), f.spawned, f.stopped, sess.WorkerGeneration, sess.Status)
 			}
 		})
+	}
+	for _, code := range NativeProjectedReceiptHoldCodes() {
+		if !produced[code] {
+			t.Errorf("no fence fault produces parked code %s", code)
+		}
 	}
 }
 
