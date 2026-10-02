@@ -442,6 +442,11 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	if err := ensureNativeGenerationTerminalBeforeSuccessor(cfg, slotName, sess); err != nil {
 		return err
 	}
+	// The retained native clone is relaunched without being materialized again,
+	// so its forge identity is checked against the current pinned config here.
+	if err := verifyNativeRelaunchCloneOrigin(cfg, sess.Worktree); err != nil {
+		return err
+	}
 	nextGeneration := sess.WorkerGeneration + 1
 	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, sess.IssueNumber, sess.Worktree, sess.Branch)
 	if err != nil {

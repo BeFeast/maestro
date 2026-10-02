@@ -7,14 +7,15 @@ import (
 	"strings"
 )
 
-// NativeForgejoCredential is a read-only Git credential helper. The server's
-// repository-scoped token and branch policy must be proved at provisioning;
-// a client-side path restriction is not that ACL.
-func NativeForgejoCredential(operation, repo, token string, input io.Reader, output io.Writer) error {
+// NativeForgejoCredential is a read-only Git credential helper. It answers only
+// for the exact pinned destination. The server's repository-scoped token and
+// branch policy must be proved at provisioning; a client-side path restriction
+// is not that ACL.
+func NativeForgejoCredential(operation string, destination NativeForgejoDestination, token string, input io.Reader, output io.Writer) error {
 	if operation != "get" {
 		return nil
 	}
-	if repo == "" || token == "" || strings.ContainsAny(token, "\r\n\x00") {
+	if !destination.valid() || token == "" || strings.ContainsAny(token, "\r\n\x00") {
 		return Held("containment_forgejo_credential_unavailable")
 	}
 	fields := map[string]string{}
@@ -49,7 +50,7 @@ func NativeForgejoCredential(operation, repo, token string, input io.Reader, out
 	if scanner.Err() != nil {
 		return Held("containment_git_credential_request_invalid")
 	}
-	if fields["protocol"] != "https" || fields["host"] != "git.oklabs.uk" || fields["path"] != repo+".git" || fields["username"] != "" && fields["username"] != "oauth2" {
+	if fields["protocol"] != "https" || fields["host"] != destination.Host || fields["path"] != destination.Repository+".git" || fields["username"] != "" && fields["username"] != "oauth2" {
 		return Held("containment_git_credential_destination_denied")
 	}
 	_, err := fmt.Fprintf(output, "username=oauth2\npassword=%s\n\n", token)

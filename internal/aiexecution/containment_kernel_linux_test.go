@@ -3,6 +3,7 @@ package aiexecution
 import (
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -30,6 +31,13 @@ func TestNativeSharedBubblewrapActualFilesystemAndCompiler(t *testing.T) {
 	}
 	profile := filepath.Join(dir, "profile.json")
 	os.WriteFile(profile, []byte("{}"), 0600)
+	// Probe the invoking user's real home, resolved at runtime, for host
+	// credentials that must not be visible inside the sandbox.
+	account, err := user.Current()
+	if err != nil || !filepath.IsAbs(account.HomeDir) || filepath.Clean(account.HomeDir) == "/" {
+		t.Fatalf("invoking user's home unavailable: %v", err)
+	}
+	home := filepath.Clean(account.HomeDir)
 	secret := filepath.Join(dir, "host-secret")
 	os.WriteFile(secret, []byte("must-not-be-visible"), 0600)
 	proof := func(path string) FileProof {
@@ -50,8 +58,8 @@ func TestNativeSharedBubblewrapActualFilesystemAndCompiler(t *testing.T) {
 	script := `set -eu
  test ! -e "$1"
  test ! -e /run/docker.sock
- test ! -e /home/god/.ssh
- test ! -e /proc/1/root/home/god/.ssh
+ test ! -e "$2/.ssh"
+ test ! -e "/proc/1/root$2/.ssh"
  if unshare -Ur true 2>/dev/null; then exit 81; fi
  if (echo poison > /work/.git/config) 2>/dev/null; then exit 82; fi
  if (echo poison > /work/.git/commondir) 2>/dev/null; then exit 83; fi
@@ -61,7 +69,7 @@ func TestNativeSharedBubblewrapActualFilesystemAndCompiler(t *testing.T) {
  echo native-contained
  `
 	args = append([]string{"--unshare-net"}, args[:len(args)-2]...)
-	args = append(args, "/bin/bash", "-c", script, "probe", secret)
+	args = append(args, "/bin/bash", "-c", script, "probe", secret, home)
 	filter, err := nativeSeccompFile()
 	if err != nil {
 		t.Fatal(err)
