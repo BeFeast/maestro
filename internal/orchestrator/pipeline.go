@@ -31,12 +31,24 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	// fleet occupancy. A hold is journaled and leaves the generation counted;
 	// the next cycle retries, and the next phase's fence still applies.
 	o.sealExitedPhaseGeneration(st, slotName)
-	// A phase transition launches a native worker and its preparation is not
-	// idempotent (Advisor artifacts are consumed). While the lane is not ready
-	// the session stays untouched and the transition is retried next cycle.
-	if hold, code := o.nativeLaneHold(); hold {
-		log.Printf("[pipeline] %s phase transition paused: native lane not ready: %s — retrying next cycle", slotName, code)
-		return true
+	// A transition that starts a next-phase worker is a new native launch,
+	// and its preparation is not idempotent (Advisor artifacts are consumed,
+	// plan versions and validation counters advance). While the project is
+	// paused (#683, #1238) or the managed lane is not ready, the session stays
+	// untouched and the transition is retried next cycle; the pause is
+	// counted in the cycle's single deferral journal line and is checked
+	// before the lane, so a paused cycle makes no lane observation.
+	// Transitions that start no worker (validation passed, no validator, no
+	// plan artifacts, validation retries exhausted) still reach the normal
+	// dead-worker flow, so a paused worker finishes and lands its PR.
+	if o.pipelineTransitionLaunches(sess) {
+		if o.pauseDefersNativeLaunch(st, slotName, sess.IssueNumber) {
+			return true
+		}
+		if hold, code := o.nativeLaneHold(); hold {
+			log.Printf("[pipeline] %s phase transition paused: native lane not ready: %s — retrying next cycle", slotName, code)
+			return true
+		}
 	}
 
 	switch sess.Phase {
@@ -48,6 +60,39 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 		return o.handleImplementComplete(slotName, sess)
 	case state.PhaseValidate:
 		return o.handleValidateComplete(slotName, sess)
+	default:
+		return false
+	}
+}
+
+// maxValidationFails is the number of failed validations after which the
+// pipeline gives up instead of starting the implementer again.
+const maxValidationFails = 3
+
+// pipelineTransitionLaunches reports whether the phase transition
+// advancePipeline is about to run for sess can start a next-phase worker. It
+// mirrors the handlers' launch decisions read-only: no artifact is consumed,
+// no hook runs and the session is not modified.
+//
+//   - plan: with plan artifacts the Advisor or the implementer starts (without
+//     them the session is marked dead);
+//   - advisor: every verdict starts the implementer or the planner, or fails
+//     closed; treated as a launch;
+//   - implement: the validator starts when one is configured (otherwise the
+//     session returns to the normal flow);
+//   - validate: a failed or unreadable result restarts the implementer until
+//     maxValidationFails (a pass returns to the normal flow).
+func (o *Orchestrator) pipelineTransitionLaunches(sess *state.Session) bool {
+	switch sess.Phase {
+	case state.PhasePlan:
+		return pipeline.PlanArtifactsExist(sess.Worktree)
+	case state.PhaseAdvisor:
+		return true
+	case state.PhaseImplement:
+		return pipeline.NextPhase(o.pipelineConfigForSession(sess), state.PhaseImplement) != state.PhaseNone
+	case state.PhaseValidate:
+		passed, _, err := pipeline.ValidationPassed(sess.Worktree)
+		return (err != nil || !passed) && sess.ValidationFails+1 < maxValidationFails
 	default:
 		return false
 	}
@@ -482,8 +527,8 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	sess.ValidationFeedback = feedback
 	log.Printf("[pipeline] validator %s FAILED (attempt %d): %s", slotName, sess.ValidationFails, truncateFeedback(feedback))
 
-	// After 3 validation failures, give up
-	if sess.ValidationFails >= 3 {
+	// After maxValidationFails validation failures, give up
+	if sess.ValidationFails >= maxValidationFails {
 		log.Printf("[pipeline] validator %s exhausted validation retries — marking as failed", slotName)
 		sess.Status = state.StatusFailed
 		now := time.Now().UTC()

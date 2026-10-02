@@ -11,6 +11,7 @@ import (
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/notify"
+	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/router"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/supervisor"
@@ -739,5 +740,105 @@ func TestJournalPauseDeferrals_CountsEachHeldLaunchOnce(t *testing.T) {
 	}
 	if o.pauseDeferredLaunches != nil {
 		t.Fatalf("journal did not reset the per-cycle record: %v", o.pauseDeferredLaunches)
+	}
+}
+
+// #1238 pipeline: a phase transition that would start a next-phase worker is a
+// new native launch. While paused it is held with the session untouched (no
+// Advisor artifact consumed, no counter bumped), counted once in the cycle's
+// deferral journal and probed against no managed lane; the first cycle after
+// resume runs it exactly once.
+func TestAdvancePipeline_PausedDefersLaunchingTransitionUntilResume(t *testing.T) {
+	cfg := pipelineConfig()
+	cfg.StateDir = t.TempDir()
+	cfg.WorkerNativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+	lane := &fakeLaneReadiness{}
+	cfg.RuntimeNativeLaneReadiness = lane
+	o := pipelineOrchestrator(cfg)
+	o.getIssueFn = func(n int) (github.Issue, error) { return makeIssue(n, "fixture issue"), nil }
+	starts := 0
+	o.workerStartPhaseFn = func(_ *config.Config, sess *state.Session, _ string, _ string, _ string) error {
+		starts++
+		sess.WorkerGeneration++
+		return nil
+	}
+	dir := t.TempDir()
+	for _, name := range []string{pipeline.PlanFile, pipeline.ValidationFile} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("fixture"), 0600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	s := state.NewState()
+	s.SetPaused(time.Now().UTC())
+	sess := &state.Session{IssueNumber: 1258, Status: state.StatusRunning, Phase: state.PhasePlan, PlanVersion: 1, WorkerGeneration: 3, Worktree: dir}
+	s.Sessions["fixture-1"] = sess
+	before := sessionSnapshotJSON(t, sess)
+
+	for cycle := 0; cycle < 2; cycle++ {
+		o.pauseDeferredLaunches = nil
+		if !o.advancePipeline(s, "fixture-1", sess) {
+			t.Fatal("paused transition fell through to the dead-worker flow")
+		}
+		if starts != 0 || lane.calls != 0 || sessionSnapshotJSON(t, sess) != before {
+			t.Fatalf("paused transition cycle %d: starts=%d lane probes=%d session=%+v", cycle, starts, lane.calls, sess)
+		}
+		if _, ok := o.pauseDeferredLaunches["issue:1258"]; !ok || len(o.pauseDeferredLaunches) != 1 {
+			t.Fatalf("paused transition not counted once in the deferral journal: %v", o.pauseDeferredLaunches)
+		}
+	}
+
+	s.ClearPaused(time.Now().UTC())
+	o.pauseDeferredLaunches = nil
+	if !o.advancePipeline(s, "fixture-1", sess) {
+		t.Fatal("resumed transition not handled")
+	}
+	if starts != 1 || sess.Phase != state.PhaseImplement || sess.PlanVersion != 2 || sess.WorkerGeneration != 4 || len(o.pauseDeferredLaunches) != 0 {
+		t.Fatalf("resumed transition: starts=%d session=%+v deferred=%v", starts, sess, o.pauseDeferredLaunches)
+	}
+}
+
+// Transitions that start no next phase are not launches: while paused (or
+// while the managed lane is not ready) a passed validation and an implementer
+// without a validator still reach the normal dead-worker flow, so the worker
+// finishes and lands its PR as the pause contract promises.
+func TestAdvancePipeline_PausedLetsNonLaunchingTransitionsFinish(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		phase state.Phase
+		setup func(cfg *config.Config, dir string)
+	}{
+		{"validation_passed", state.PhaseValidate, func(_ *config.Config, dir string) {
+			if err := os.WriteFile(filepath.Join(dir, pipeline.ValidationResultFile), []byte("PASS\n"), 0600); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{"implement_without_validator", state.PhaseImplement, func(cfg *config.Config, _ string) {
+			cfg.Pipeline.Validator.Enabled = false
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := pipelineConfig()
+			cfg.StateDir = t.TempDir()
+			cfg.WorkerNativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+			lane := &fakeLaneReadiness{}
+			cfg.RuntimeNativeLaneReadiness = lane
+			dir := t.TempDir()
+			tc.setup(cfg, dir)
+			o := pipelineOrchestrator(cfg)
+			o.workerStartPhaseFn = func(*config.Config, *state.Session, string, string, string) error {
+				t.Fatal("a non-launching transition started a phase")
+				return nil
+			}
+			s := state.NewState()
+			s.SetPaused(time.Now().UTC())
+			sess := &state.Session{IssueNumber: 1259, Status: state.StatusRunning, Phase: tc.phase, WorkerGeneration: 2, Worktree: dir}
+			s.Sessions["fixture-1"] = sess
+			if o.advancePipeline(s, "fixture-1", sess) {
+				t.Fatal("non-launching transition was held instead of returning to the dead-worker flow")
+			}
+			if sess.Phase != state.PhaseNone || lane.calls != 0 || len(o.pauseDeferredLaunches) != 0 {
+				t.Fatalf("phase=%s lane probes=%d deferred=%v", sess.Phase, lane.calls, o.pauseDeferredLaunches)
+			}
+		})
 	}
 }
