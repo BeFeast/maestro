@@ -2770,6 +2770,12 @@ func allQueueMutationsAllowed(cfg *config.Config, mutations []state.SupervisorMu
 // supervisor.auto_promote_ready is set; an ordered queue drives promotion of
 // its own head. On every path an issue with an excluded label or an
 // epic/parent title is never promoted.
+//
+// A held issue becomes a candidate only for a blocked-label removal that is
+// itself a whitelisted safe action and only when the hold is not a content
+// hold. Anything else would leave a mutation-less label_issue_ready decision,
+// which RunOnce turns into a pending approval whose execution adds the ready
+// label to the very issue the guard held.
 func (e *Engine) firstQueueActionCandidate(st *state.State, issues, openIssues []github.Issue, policyRule string) (*queueActionCandidate, []string, error) {
 	readyLabel := e.readyLabel()
 	blockedLabel := e.blockedLabel()
@@ -2794,12 +2800,28 @@ func (e *Engine) firstQueueActionCandidate(st *state.State, issues, openIssues [
 		if !addReady && !removeBlocked {
 			continue
 		}
-		// With promotion disabled an add-only issue can never become a
-		// candidate. Explaining the withheld promotion for the first such
-		// issue is enough; skip the per-issue dispatch guards (which may read
-		// blocker issues) for the rest.
-		if addReady && !removeBlocked && !promotionAllowed && withheldWhileDisabled {
-			continue
+
+		// The promotion guard is pure in-memory work, so it runs before the
+		// per-issue dispatch guards (which may read blocker issues): a held
+		// issue with nothing left to do never costs a forge read.
+		if addReady {
+			liftedLabel := ""
+			if removeBlocked && removeBlockedAllowed {
+				liftedLabel = blockedLabel
+			}
+			if hold := e.queuePromotionHold(issue, openIssues, readyLabel, liftedLabel, policyRule); hold != nil {
+				addReady = false
+				// With promotion disabled nothing on this path is promoted,
+				// so explaining the first withheld promotion is enough.
+				if promotionAllowed || !withheldWhileDisabled {
+					e.journalPromotionHold(issue, *hold)
+					holds = append(holds, promotionHoldNote(issue.Number, *hold))
+					withheldWhileDisabled = !promotionAllowed
+				}
+				if !heldIssueKeepsBlockedRemoval(*hold, removeBlocked, removeBlockedAllowed) {
+					continue
+				}
+			}
 		}
 
 		reason, err := e.issueQueueSkipReason(st, issue, blockedLabel)
@@ -2809,33 +2831,15 @@ func (e *Engine) firstQueueActionCandidate(st *state.State, issues, openIssues [
 		if reason != "" {
 			continue
 		}
-
-		if addReady {
-			liftedLabel := ""
-			if removeBlocked && removeBlockedAllowed {
-				liftedLabel = blockedLabel
-			}
-			if hold := e.queuePromotionHold(issue, openIssues, readyLabel, liftedLabel, policyRule); hold != nil {
-				e.journalPromotionHold(issue, *hold)
-				holds = append(holds, promotionHoldNote(issue.Number, *hold))
-				addReady = false
-				if !promotionAllowed {
-					withheldWhileDisabled = true
-				}
-			}
-		}
-		if !addReady && !removeBlocked {
-			continue
-		}
 		return &queueActionCandidate{
 			issue:         issue,
 			readyLabel:    readyLabel,
 			blockedLabel:  blockedLabel,
 			addReady:      addReady,
 			removeBlocked: removeBlocked,
-		}, holds, nil
+		}, summarizePromotionHoldNotes(holds), nil
 	}
-	return nil, holds, nil
+	return nil, summarizePromotionHoldNotes(holds), nil
 }
 
 func (e *Engine) dynamicQueueActionCandidate(st *state.State, selected github.Issue, openIssues []github.Issue) *queueActionCandidate {

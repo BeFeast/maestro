@@ -3,6 +3,7 @@ package supervisor
 import (
 	"bytes"
 	"context"
+	"fmt"
 	"log"
 	"strings"
 	"testing"
@@ -192,7 +193,159 @@ func TestDecide_ExcludedLabelNeverPromoted(t *testing.T) {
 		t.Fatalf("Decide: %v", err)
 	}
 	requireNoAddReadyMutation(t, decision)
+	// A mutation-less label_issue_ready decision would mint an approval whose
+	// execution adds the ready label to #9 (review round 1).
+	if decision.RecommendedAction == ActionLabelIssueReady {
+		t.Fatalf("action = %q target = %#v mutations = %#v, want no label_issue_ready decision for held #9", decision.RecommendedAction, decision.Target, decision.Mutations)
+	}
 	requireReasonContains(t, decision, `Ready-label promotion withheld for issue #9: issue carries excluded label "blocked"`)
+}
+
+// requireNoReadyApproval loads the state RunOnce saved and fails if any
+// label_issue_ready approval was recorded: approving one adds the ready label
+// to the target regardless of the decision's planned mutations.
+func requireNoReadyApproval(t *testing.T, cfg *config.Config) {
+	t.Helper()
+	loaded, err := state.Load(cfg.StateDir)
+	if err != nil {
+		t.Fatalf("state.Load: %v", err)
+	}
+	for _, approval := range loaded.Approvals {
+		if approval.Action == ActionLabelIssueReady {
+			t.Fatalf("approval %s action=%s target=%#v status=%s summary=%q, want no label_issue_ready approval for a held issue", approval.ID, approval.Action, approval.Target, approval.Status, approval.Summary)
+		}
+	}
+}
+
+// A held promotion must not reach the ready label through the approval
+// route. With remove_blocked_label not whitelisted, the remaining
+// blocked-label removal used to become a mutation-less label_issue_ready
+// decision, and RunOnce minted a pending approval whose execution adds the
+// ready label to the held issue.
+func TestRunOnce_HeldPromotionNeverMintsReadyApproval(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		issue github.Issue
+	}{
+		{name: "epic title", issue: testIssue(9, "Epic: big parent", "blocked")},
+		{name: "excluded label", issue: testIssue(9, "Waiting on vendor", "blocked")},
+	} {
+		for _, autoPromote := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/auto_promote_ready=%v", tc.name, autoPromote), func(t *testing.T) {
+				cfg := pilotPromotionConfig(t)
+				cfg.ExcludeLabels = []string{"epic", "blocked"}
+				cfg.Supervisor.BlockedLabel = "blocked"
+				cfg.Supervisor.SafeActions = []string{config.SupervisorActionAddReadyLabel}
+				cfg.Supervisor.AutoPromoteReady = autoPromote
+				reader := &fakeReader{issues: []github.Issue{tc.issue}}
+
+				decision, err := RunOnce(context.Background(), cfg, reader)
+				if err != nil {
+					t.Fatalf("RunOnce: %v", err)
+				}
+				if len(reader.addedLabels) != 0 || len(reader.removedLabels) != 0 {
+					t.Fatalf("added=%q removed=%q, want no label change on held #9", reader.addedLabels, reader.removedLabels)
+				}
+				if decision.RecommendedAction == ActionLabelIssueReady {
+					t.Fatalf("action = %q target = %#v summary = %q, want no label_issue_ready decision for held #9", decision.RecommendedAction, decision.Target, decision.Summary)
+				}
+				if decision.ApprovalID != "" {
+					t.Fatalf("decision.ApprovalID = %q, want no approval", decision.ApprovalID)
+				}
+				requireNoReadyApproval(t, cfg)
+				requireReasonContains(t, decision, "Ready-label promotion withheld for issue #9")
+			})
+		}
+	}
+}
+
+// An epic keeps its blocked label even when remove_blocked_label is a safe
+// action: lifting it alone can make the epic dispatchable when the project
+// does not require a ready label.
+func TestRunOnce_EpicKeepsBlockedLabelWhenRemovalIsSafe(t *testing.T) {
+	for _, autoPromote := range []bool{false, true} {
+		t.Run(fmt.Sprintf("auto_promote_ready=%v", autoPromote), func(t *testing.T) {
+			cfg := pilotPromotionConfig(t)
+			cfg.Supervisor.BlockedLabel = "blocked"
+			cfg.Supervisor.SafeActions = []string{
+				config.SupervisorActionAddReadyLabel,
+				config.SupervisorActionRemoveBlockedLabel,
+			}
+			cfg.Supervisor.AutoPromoteReady = autoPromote
+			reader := &fakeReader{issues: []github.Issue{testIssue(9, "Epic: big parent", "blocked")}}
+
+			decision, err := RunOnce(context.Background(), cfg, reader)
+			if err != nil {
+				t.Fatalf("RunOnce: %v", err)
+			}
+			if len(reader.addedLabels) != 0 || len(reader.removedLabels) != 0 {
+				t.Fatalf("added=%q removed=%q, want no label change on epic #9", reader.addedLabels, reader.removedLabels)
+			}
+			if decision.RecommendedAction == ActionLabelIssueReady {
+				t.Fatalf("action = %q mutations = %#v, want no queue mutation for epic #9", decision.RecommendedAction, decision.Mutations)
+			}
+			requireNoReadyApproval(t, cfg)
+		})
+	}
+}
+
+// A policy hold (auto_promote_ready off) withholds only the ready label: a
+// whitelisted blocked-label removal still applies as before #1240.
+func TestRunOnce_PolicyHoldStillRemovesSafeBlockedLabel(t *testing.T) {
+	cfg := pilotPromotionConfig(t)
+	cfg.Supervisor.BlockedLabel = "blocked"
+	cfg.Supervisor.SafeActions = []string{
+		config.SupervisorActionAddReadyLabel,
+		config.SupervisorActionRemoveBlockedLabel,
+	}
+	reader := &fakeReader{issues: []github.Issue{testIssue(9, "Waiting on vendor", "blocked")}}
+
+	decision, err := RunOnce(context.Background(), cfg, reader)
+	if err != nil {
+		t.Fatalf("RunOnce: %v", err)
+	}
+	if len(reader.addedLabels) != 0 {
+		t.Fatalf("added labels = %q, want none with auto_promote_ready off", reader.addedLabels)
+	}
+	if got, want := strings.Join(reader.removedLabels, ","), "#9:blocked"; got != want {
+		t.Fatalf("removed labels = %q, want %q", got, want)
+	}
+	requireNoAddReadyMutation(t, decision)
+	requireNoReadyApproval(t, cfg)
+}
+
+// With auto_promote_ready on, a held backlog must not cost a forge read per
+// held issue every cycle, and the decision lists only the first few holds.
+func TestFirstQueueActionCandidate_HeldBacklogSkipsForgeReadsAndCapsNotes(t *testing.T) {
+	cfg := pilotPromotionConfig(t)
+	cfg.Supervisor.AutoPromoteReady = true
+	cfg.BlockerPatterns = []string{`blocked by #(\d+)`}
+	reader := &fakeReader{}
+	eng := testEngine(cfg, reader)
+	running := testIssue(3, "Pilot repair", "pilot-ready", "p0")
+
+	var lower []github.Issue
+	for number := 10; number < 15; number++ {
+		issue := testIssue(number, fmt.Sprintf("Polish page %d", number), "p2")
+		issue.Body = "blocked by #500"
+		lower = append(lower, issue)
+	}
+	cand, holds, err := eng.firstQueueActionCandidate(state.NewState(), lower, append([]github.Issue{running}, lower...), PolicyRuleIssueLabels)
+	if err != nil {
+		t.Fatalf("firstQueueActionCandidate: %v", err)
+	}
+	if cand != nil {
+		t.Fatalf("candidate = %+v, want none: every p2 issue is held while p0 ready work is open", cand)
+	}
+	if got := reader.closedIssueCalls[500]; got != 0 {
+		t.Fatalf("blocker reads = %d, want 0 for issues the promotion guard already held", got)
+	}
+	if len(holds) != maxPromotionHoldNotes+1 {
+		t.Fatalf("holds = %q, want %d notes plus a count", holds, maxPromotionHoldNotes)
+	}
+	if got, want := holds[len(holds)-1], "Ready-label promotion withheld for 2 more issue(s)"; got != want {
+		t.Fatalf("last hold note = %q, want %q", got, want)
+	}
 }
 
 // The dependency-unblock controller (dynamic wave) may lift the blocked label

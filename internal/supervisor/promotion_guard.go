@@ -147,6 +147,41 @@ func higherPriorityReadyIssue(issue github.Issue, openIssues []github.Issue, rea
 	return best, found
 }
 
+// contentHold reports whether the hold comes from the issue itself (an
+// excluded label or an epic/parent title) rather than from queue policy.
+func (h promotionHold) contentHold() bool {
+	return h.Code == promotionHoldExcludedLabel || h.Code == promotionHoldEpicTitle
+}
+
+// heldIssueKeepsBlockedRemoval reports whether an issue whose ready-label
+// promotion was withheld may still be a queue candidate for removing the
+// blocked label alone. That needs remove_blocked_label to be a whitelisted
+// safe action, so the decision carries the mutation and applies directly: a
+// mutation-less label_issue_ready decision would mint a pending approval
+// whose execution adds the ready label to the held issue. A content hold
+// (excluded label, epic/parent title) keeps the issue out of every queue
+// mutation, as on the dynamic wave and dependency-unblock paths: lifting the
+// blocked label alone can make an epic dispatchable when no ready label is
+// required.
+func heldIssueKeepsBlockedRemoval(hold promotionHold, removeBlocked, removeBlockedAllowed bool) bool {
+	return removeBlocked && removeBlockedAllowed && !hold.contentHold()
+}
+
+// maxPromotionHoldNotes caps the per-decision hold notes so a large held
+// backlog does not grow the decision reasons without bound; the journal keeps
+// the full per-issue record.
+const maxPromotionHoldNotes = 3
+
+// summarizePromotionHoldNotes keeps the first maxPromotionHoldNotes notes and
+// replaces the rest with a count.
+func summarizePromotionHoldNotes(notes []string) []string {
+	if len(notes) <= maxPromotionHoldNotes {
+		return notes
+	}
+	summary := append([]string(nil), notes[:maxPromotionHoldNotes]...)
+	return append(summary, fmt.Sprintf("Ready-label promotion withheld for %d more issue(s)", len(notes)-maxPromotionHoldNotes))
+}
+
 // promotionHoldNote is the decision reason recorded for a withheld promotion.
 func promotionHoldNote(issueNumber int, hold promotionHold) string {
 	return fmt.Sprintf("Ready-label promotion withheld for issue #%d: %s", issueNumber, hold.Reason)
