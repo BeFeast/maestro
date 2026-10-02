@@ -9,6 +9,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"strings"
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
@@ -119,7 +120,7 @@ func loadAuxiliaryReconcileProjects(ctx context.Context, store *configstore.Stor
 		cfg, err := store.Load(ctx, name)
 		if err != nil {
 			skipped++
-			fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: skipping project %s: %v\n", name, err)
+			fmt.Fprintf(stderr, "[maestro] auxiliary reconcile: skipping project %s: %s\n", name, singleLineError(err))
 			continue
 		}
 		configured = append(configured, cfg)
@@ -128,4 +129,17 @@ func loadAuxiliaryReconcileProjects(ctx context.Context, store *configstore.Stor
 		return nil, fmt.Errorf("load projects: all %d project rows were skipped; no root can be reconciled", skipped)
 	}
 	return configured, nil
+}
+
+// singleLineError renders err on one line. A parse error can span several
+// lines (yaml lists each type mismatch on its own indented line), which would
+// split one skip warning across stderr.
+func singleLineError(err error) string {
+	var parts []string
+	for _, line := range strings.Split(err.Error(), "\n") {
+		if line = strings.TrimSpace(line); line != "" {
+			parts = append(parts, line)
+		}
+	}
+	return strings.Join(parts, " ")
 }

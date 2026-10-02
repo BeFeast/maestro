@@ -108,6 +108,9 @@ func TestAuxiliaryReconcileSkipsInvalidProjectRow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// --db is explicit, but the flag default still inspects the stores under
+	// HOME; pin it so the test never reads a real operator store.
+	t.Setenv("HOME", dir)
 	dbPath := filepath.Join(dir, "config.db")
 	stateDir := filepath.Join(dir, "svc-state")
 	writeSettledAuxiliaryReceipt(t, stateDir)
@@ -137,6 +140,9 @@ func TestAuxiliaryReconcileFailsWhenNoProjectRowLoads(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// --db is explicit, but the flag default still inspects the stores under
+	// HOME; pin it so the test never reads a real operator store.
+	t.Setenv("HOME", dir)
 	dbPath := filepath.Join(dir, "config.db")
 	stateDir := filepath.Join(dir, "orphan-state")
 	writeSettledAuxiliaryReceipt(t, stateDir)
@@ -162,5 +168,13 @@ func TestAuxiliaryReconcileFailsWhenNoProjectRowLoads(t *testing.T) {
 	}
 	if !strings.Contains(stderr.String(), "skipping project broken") {
 		t.Fatalf("stderr=%q", stderr.String())
+	}
+}
+
+func TestAuxiliaryReconcileSkipWarningIsOneLine(t *testing.T) {
+	err := fmt.Errorf("config: %s", "yaml: unmarshal errors:\n  line 3: cannot unmarshal !!str `x` into int\n  line 5: cannot unmarshal !!seq into string\n")
+	want := "config: yaml: unmarshal errors: line 3: cannot unmarshal !!str `x` into int line 5: cannot unmarshal !!seq into string"
+	if got := singleLineError(err); got != want {
+		t.Fatalf("singleLineError = %q, want %q", got, want)
 	}
 }
