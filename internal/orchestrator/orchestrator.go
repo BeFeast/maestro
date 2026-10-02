@@ -255,6 +255,13 @@ type Orchestrator struct {
 	cycleClosedPRsErr   error
 	cycleIssueClosed    map[int]cycleBoolResult
 	cyclePRMerged       map[int]cycleBoolResult
+
+	// pauseDeferredLaunches records the distinct native launch intents the
+	// operator pause (#683) held back during the current RunOnce, keyed by
+	// issue (or slot), so one intent seen by two launch paths in the same
+	// cycle is counted once. journalPauseDeferrals reports and resets it once
+	// per cycle so a paused project never logs one line per deferred launch.
+	pauseDeferredLaunches map[string]struct{}
 }
 
 // New creates a new Orchestrator
@@ -2981,6 +2988,13 @@ func (o *Orchestrator) respawnDueRetries(s *state.State, slots int) {
 				slotName, sess.RetryCount, sess.NextRetryAt.Format(time.RFC3339))
 			continue
 		}
+		// Operator pause (#683): a due retry is a new native launch. Leave the
+		// session dead and the retry due — no slot, budget, CI/review context
+		// or backend selection is consumed — so the first cycle after resume
+		// respawns it exactly once.
+		if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+			continue
+		}
 
 		// #800: the saved retry state can outlive the work it was scheduled
 		// for — the PR may have merged or the issue closed while the backoff
@@ -3293,6 +3307,7 @@ func (o *Orchestrator) RunOnce() error {
 	// across cycles.
 	o.beginCycle()
 	defer o.endCycle()
+	o.pauseDeferredLaunches = nil
 
 	s, err := state.Load(o.cfg.StateDir)
 	if err != nil {
@@ -3433,6 +3448,9 @@ func (o *Orchestrator) RunOnce() error {
 	if slots > 0 {
 		o.startNewWorkers(s, slots)
 	}
+	// One journal line per paused cycle covering every launch the pause held
+	// back (retries, failovers, restart resumes, selected repairs).
+	o.journalPauseDeferrals(s)
 
 	// Step 5b: persist the machine-readable top-level dispatch hold and the
 	// two-cycle idle-stall debounce after fresh dispatch had its chance to
@@ -4295,6 +4313,22 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 						slotName, sess.IssueNumber, pid, tmuxName)
 				}
 				continue
+			} else if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): resuming in place is a new native launch.
+				// Keep the marker and park the session in the dead+marker shape the
+				// drain path (#967) already uses, so checkSessions cannot turn the
+				// gone process into a budgeted retry while paused and the first
+				// cycle after resume resumes it here exactly once.
+				if sess.Status == state.StatusRunning {
+					now := time.Now().UTC()
+					sess.Status = state.StatusDead
+					sess.PID = 0
+					sess.TmuxSession = ""
+					sess.FinishedAt = &now
+					state.MarkWorkerEnded(sess, now)
+					reconciled = true
+				}
+				continue
 			} else if issue, fetchErr := o.getIssue(sess.IssueNumber); fetchErr != nil {
 				// A transient GitHub read is not proof that the durable recovery is
 				// invalid. Preserve the marker and retry next cycle; consuming it here
@@ -4375,6 +4409,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, previousBackend, resetStr, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) hit provider limit on %s; reset=%s; no fallback available",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, resetStr)
+				continue
+			}
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): park the ended worker as a due retry
+				// instead of launching the fallback now.
+				parkEndedWorkerForPause(sess, now)
+				reconciled = true
 				continue
 			}
 
@@ -4459,6 +4500,13 @@ func (o *Orchestrator) reconcileRunningSessions(s *state.State) bool {
 					slotName, cp.noun, previousBackend, failure.pattern, strings.Join(reasons, ", "), oldPID, oldTmux)
 				o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
 					slotName, sess.IssueNumber, sess.IssueTitle, previousBackend, cp.desc, failure.pattern, cp.remedy)
+				continue
+			}
+			if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+				// Operator pause (#683): park the ended worker as a due retry
+				// instead of launching the fallback now.
+				parkEndedWorkerForPause(sess, now)
+				reconciled = true
 				continue
 			}
 
@@ -5166,10 +5214,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 			}
 			// Terminal states — cleanup old worktrees after 1h
 			// Use StartedAt as fallback when FinishedAt is nil (orphaned sessions)
-			// to preserve the grace period for recently-killed workers.
+			// to preserve the grace period for recently-killed workers. A dead
+			// session with a pending retry or restart resume keeps its worktree
+			// for the in-place relaunch, however long it waits (#1238).
 			nilAndOld := sess.FinishedAt == nil && !sess.StartedAt.IsZero() && time.Since(sess.StartedAt) > 1*time.Hour
 			finishedAndOld := sess.FinishedAt != nil && time.Since(*sess.FinishedAt) > 1*time.Hour
-			if sess.Worktree != "" && (nilAndOld || finishedAndOld) {
+			if sess.Worktree != "" && (nilAndOld || finishedAndOld) && !deadSessionAwaitsRelaunch(sess) {
 				if _, err := os.Stat(sess.Worktree); err == nil {
 					lease := worker.CaptureCleanupLease(slotName, sess)
 					if o.beforeWorktreeCleanupFn != nil {
@@ -5278,6 +5328,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 							slotName, sess.IssueNumber, sess.IssueTitle)
 						continue
 					}
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+						// Operator pause (#683): park the ended worker as a due
+						// retry instead of launching the fallback now.
+						parkEndedWorkerForPause(sess, now)
+						continue
+					}
 					log.Printf("[orch] worker %s (backend=%s) hit rate limit, falling back to %s",
 						slotName, sess.Backend, nextBackend)
 
@@ -5340,6 +5396,12 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 						state.MarkWorkerEnded(sess, now)
 						o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) backend %s %s (%s); no fallback backend available — %s",
 							slotName, sess.IssueNumber, sess.IssueTitle, sess.Backend, cp.desc, failure.pattern, cp.remedy)
+						continue
+					}
+					if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+						// Operator pause (#683): park the ended worker as a due
+						// retry instead of launching the fallback now.
+						parkEndedWorkerForPause(sess, now)
 						continue
 					}
 					log.Printf("[orch] worker %s (backend=%s) %s (%s), falling back to %s — retry budget preserved",
@@ -5492,6 +5554,13 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 
 							// Attempt fallback: respawn with the best currently available backend.
 							if fallback := selection.SelectedBackend; fallback != "" {
+								if o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
+									// Operator pause (#683): the worker was stopped above;
+									// park it as a due retry instead of launching the
+									// fallback now.
+									parkEndedWorkerForPause(sess, now)
+									continue
+								}
 								issue, fetchErr := o.getIssue(sess.IssueNumber)
 								if fetchErr != nil {
 									log.Printf("[orch] fetch issue #%d for rate-limit fallback: %v — marking dead", sess.IssueNumber, fetchErr)
@@ -5548,7 +5617,11 @@ func (o *Orchestrator) checkSessions(s *state.State) {
 					budgetTokens, budgetMeasure := tokenBudgetObservation(sess)
 					if sess.Phase != state.PhaseAdvisor && o.cfg.WorkerMaxTokens > 0 && o.cfg.SoftTokenThreshold() > 0 && sess.CheckpointFile == "" {
 						softLimit := int(float64(o.cfg.WorkerMaxTokens) * o.cfg.SoftTokenThreshold())
-						if budgetTokens >= softLimit {
+						// Operator pause (#683): a checkpoint respawn replaces the live
+						// worker with a new native launch. While paused the in-flight
+						// worker keeps running; the check is evaluated (and counted)
+						// only once the soft limit is actually reached.
+						if budgetTokens >= softLimit && !o.pauseDefersNativeLaunch(s, slotName, sess.IssueNumber) {
 							log.Printf("[orch] worker %s hit soft token threshold (%d >= %d, measure=%s), checkpointing",
 								slotName, budgetTokens, softLimit, budgetMeasure)
 
@@ -10619,10 +10692,13 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	// selection entirely — no listing, no claiming, no spawns — while
 	// in-flight workers keep running to completion. Unlike drain, the flag
 	// is NOT cleared on startup; it persists until `maestro resume`, which
-	// the next cycle picks up from disk without a unit restart.
+	// the next cycle picks up from disk without a unit restart. Supervisor-
+	// selected repair and review-repair dispatches are held here too: their
+	// approvals stay approved/awaiting_dispatch and the recommendation stays
+	// unmaterialized, so the first cycle after resume dispatches them once.
+	// RunOnce journals the pause once per cycle (journalPauseDeferrals), and
+	// counts these held dispatches there, even on cycles with no free slot.
 	if s.PauseActive() {
-		log.Printf("[orch] project paused (since %s): skipping issue selection — not spawning new workers (running=%d)",
-			s.PausedAt.Format(time.RFC3339), s.RunningSessionCount())
 		return
 	}
 	issues, err := o.listOpenIssues(o.cfg.IssueLabels)

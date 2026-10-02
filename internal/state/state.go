@@ -3130,6 +3130,19 @@ func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration
 			continue
 		}
 		firstSeen := supervisorDecisionFirstSeen(*decision)
+		if pauseHeldLaunchRecommendation(*decision) {
+			// An operator pause (#683) holds every worker launch, so an
+			// unconsumed launch recommendation is waiting on the operator, not
+			// stale (#1238). Stop its TTL clock while paused and restart the
+			// window at resume (ClearPaused stamps PausedAt), so the first
+			// cycles after `maestro resume` can still dispatch it.
+			if s.PauseActive() {
+				continue
+			}
+			if s.PausedAt.After(firstSeen) {
+				firstSeen = s.PausedAt.UTC()
+			}
+		}
 		if firstSeen.IsZero() || now.Before(firstSeen.Add(ttl)) {
 			continue
 		}
@@ -3137,6 +3150,16 @@ func (s *State) expireSupervisorRecommendations(now time.Time, ttl time.Duration
 		expired[decision.ID] = true
 	}
 	return expired
+}
+
+// pauseHeldLaunchRecommendation reports whether the recommendation asks for a
+// worker launch, which the orchestrator defers while the project is paused.
+func pauseHeldLaunchRecommendation(decision SupervisorDecision) bool {
+	switch decision.RecommendedAction {
+	case approvalActionSpawnWorker, approvalActionSpawnRepairWorker, approvalActionSpawnReviewRepair:
+		return true
+	}
+	return false
 }
 
 func (s *State) disposeSupervisorDecision(decision *SupervisorDecision, status, reason string, now time.Time) {
