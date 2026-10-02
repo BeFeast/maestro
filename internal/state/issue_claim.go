@@ -201,9 +201,10 @@ func (s *State) IssueHasNonFreshClaim(issueNumber int) bool {
 
 // ClaimFreshDispatch atomically reserves or renews one exact fresh-worker
 // identity. An unexpired lease records contention and refuses a second owner.
-// An expired lease, or a lease superseded after a failed start, is renewed in
-// place on the same slot/branch/worktree; it never allocates a replacement
-// identity merely to retry startup.
+// An expired lease, or a lease superseded after a failed start or a managed
+// lane pause before registration, is renewed in place on the same
+// slot/branch/worktree; it never allocates a replacement identity merely to
+// retry startup.
 //
 // The caller may fill Branch and Worktree on a newly returned claim before the
 // enclosing State.Update callback returns.
@@ -236,7 +237,7 @@ func (s *State) ClaimFreshDispatch(issueNumber int, slotPrefix, leaseID string, 
 	}
 	if existing := s.FreshDispatchClaims[issueNumber]; existing != nil &&
 		existing.Status == FreshDispatchClaimStatusSuperseded &&
-		existing.TerminalReason == "start_failed" {
+		(existing.TerminalReason == "start_failed" || existing.TerminalReason == "native_lane_deferred") {
 		existing.Status = FreshDispatchClaimStatusClaimed
 		existing.LeaseID = leaseID
 		existing.LeaseGeneration++

@@ -49,6 +49,7 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 		cfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+		cfg.RuntimeNativeLaneReadiness = managedLaneProbe
 		cfg.AIExecution = cfg.AIExecution.BindController(cfg.AIExecution, cfg.StateDir)
 		if err := cfg.AIExecution.CheckCurrent(); err != nil {
 			log.Printf("[%s] AI execution held: controller revision initialization failed: %v", storeName, err)
@@ -368,6 +369,7 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			}
 			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
 			newCfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+			newCfg.RuntimeNativeLaneReadiness = managedLaneProbe
 			newCfg.AIExecution = flow.cfg.AIExecution.BindController(newCfg.AIExecution, newCfg.StateDir)
 			if err := newCfg.AIExecution.CheckCurrent(); err != nil {
 				log.Printf("[%s] config reload held: controller revision not durably applied: %v", flow.name, err)

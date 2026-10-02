@@ -36,6 +36,71 @@ holds execution. Source tests do not establish operational readiness: the
 reviewed R9 installation and complete systemd-to-native-entry acceptance remain
 required before activation.
 
+## Managed Claude credential bindings
+
+The `managed-claude-bindings-v1` observation pins the whole managed credential
+set. Every configured credential must be a pinned one with its reviewed alias,
+kind, binding mode and approved model definitions. A credential that is not
+selectable (quota block, expired token, cooldown) may stay as a standby while
+every pinned (route, model) key is served by a selectable credential whose
+identity proof matches its pin. The same predicate runs at every launch and in
+the pre-registration lane probe, which pauses dispatch without persisting a
+hold or spending a retry.
+
+| Hold | Meaning |
+| --- | --- |
+| `binding_credential_unverified` | A selectable credential has no identity proof for its current token. The observer asks the gateway's verifier at most once a minute and observes again. |
+| `binding_credential_absent` | A pinned credential has no loaded auth at the gateway: no kind, token, generation or registered model. |
+| `binding_credential_mismatch` | A credential contradicts its pin: alias, kind, mode, key digest, identity, generations, or a pin match its fields disagree with. |
+| `binding_route_unserved` | A pinned (route, model) key has no selectable, verified credential. |
+| `binding_model_mismatch`, `binding_model_set_mismatch` | A credential's model definitions differ from the approved ones. |
+
+Wherever the gateway can compare a credential with the pin it enforces, the
+comparison must be reported (`pin_matches`) and agree with the manifest. That
+covers every exact key and every OAuth credential that carries an identity
+proof, standby or not. The gateway stores a proof only for its configured
+identity, so a reported identity is the enforced one. An OAuth standby whose
+current token has no proof cannot be compared: the projection exposes the
+enforced identity only through a proof. For that standby the launch relies on
+provisioning:
+
+- `ValidateClaudeBindingReceipt`, the provisioning contract, accepts a manifest
+  only against a receipt in which every pinned credential proves its pin.
+- The enforced pins belong to the gateway's immutable startup admission
+  snapshot of the manifest's process instance. Its digest is
+  `managed_admission_sha256`, which every launch requires unchanged, fully
+  applied and without drift.
+
+A pin proved once at provisioning therefore holds for the manifest's lifetime;
+a gateway restart or a pin change holds every launch until a new manifest is
+provisioned. Provision while every pinned credential is verified: a quota
+block keeps the proof, an expired token does not.
+
+Every observer request carries the management key, so the observer proves that
+the pinned gateway PID owns the loopback listener immediately before each
+request, and once more after the last response.
+
+### Holds persisted by earlier builds
+
+Installing standby support does not re-evaluate holds that earlier builds
+already persisted, such as sessions and review attempts held while one pinned
+credential was blocked. Earlier builds held at launch, after `launch_intent`,
+so the bounded automatic lane resume does not apply: it only resumes a first
+generation still at `registered` that a `binding_` hold stopped. These holds
+need the existing operator paths:
+
+- Worker first generations with a failed host `launch_intent` or a `registered`
+  receipt whose acknowledgement is still valid: the one-shot daemon flag
+  `--recover-native-prelaunch project-UUID:slot:native-session-UUID`; see
+  [worker native registration](worker-native-registration.md).
+- Sealed worker generations with unknown usage: the authority's `retire_native`
+  followed by `ScheduleNativeOperatorRecovery`; see
+  [native request budgets](native-request-accounting.md).
+- Review attempts: an operator rearm grant (`AttemptStore.AuthorizeNativeRearm`)
+  with proof kind `pre_launch_hold` and the `NativeReviewPreLaunchHoldProof`
+  digest for an attempt held before any native launch, or the verified outcome
+  digest (`NativeReviewRearmProof`) for a failed attempt.
+
 ## Leaf behavior
 
 Supervisor calls and explicit `review_producer.native_opus: true` share the

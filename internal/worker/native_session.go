@@ -32,6 +32,10 @@ type NativeRegistrationHold struct {
 	Code            string
 	LaunchUncertain bool
 	Slot            string
+	// Deferred marks a pause raised before any receipt, registration, lease or
+	// session change of this call: the managed lane was not ready. Callers
+	// restore their pre-call state, persist no hold and retry next cycle.
+	Deferred bool
 }
 
 func (h *NativeRegistrationHold) Error() string { return "worker native registration held: " + h.Code }
@@ -361,6 +365,9 @@ func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, sl
 			return nil, &NativeRegistrationHold{Code: "identity_conflict", LaunchUncertain: previous.Status == "launch_intent" || previous.Status == "launched"}
 		}
 		if recoveryNativeSessionID != "" {
+			if err := nativeLaneDeferral(cfg, slot); err != nil {
+				return nil, err
+			}
 			if err := authorizeRegisteredWorkerRecovery(cfg, client, dir, previous, lease, recoveryNativeSessionID); err != nil {
 				return nil, err
 			}
@@ -400,6 +407,11 @@ func prepareNativeWorkerWithRecovery(cfg *config.Config, sess *state.Session, sl
 				return nil, &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 			}
 		}
+	}
+	// Last check before the first durable step of a new generation: a lane
+	// that is not ready pauses here with nothing written or registered.
+	if err := nativeLaneDeferral(cfg, slot); err != nil {
+		return nil, err
 	}
 	r := cfg.WorkerNativeSessionRegistration
 	receipt := &NativeWorkerReceipt{SchemaVersion: 1, ProjectID: cfg.ProjectID, Slot: slot, Generation: generation, IssueNumber: issue,
@@ -964,9 +976,29 @@ func stampNativeHold(slot string, sess *state.Session, err error) bool {
 	}
 	hold.Slot = slot
 	if sess != nil {
-		sess.NativeRegistrationHold = hold.Code
+		if hold.Deferred {
+			sess.NativeLaneDeferred = hold.Code
+		} else {
+			sess.NativeRegistrationHold = hold.Code
+		}
 	}
 	return true
+}
+
+// nativeLaneDeferral runs the controller's managed-lane readiness probe, if
+// one is installed, immediately before a native registration. Any failure,
+// typed or not, is a deferred pause: no receipt, registration or session hold
+// exists yet, so nothing has to be reconciled and no retry budget is spent.
+// Inspect still runs at launch and remains the enforcement point.
+func nativeLaneDeferral(cfg *config.Config, slot string) error {
+	if cfg == nil || cfg.RuntimeNativeLaneReadiness == nil || cfg.WorkerNativeSessionRegistration == nil {
+		return nil
+	}
+	err := cfg.RuntimeNativeLaneReadiness.ObserveLaneReadiness(cfg.AIExecution)
+	if err == nil {
+		return nil
+	}
+	return &NativeRegistrationHold{Code: aiexecution.LaneHoldCode(err), Slot: slot, Deferred: true, cause: err}
 }
 
 func nativeOwned(info os.FileInfo) bool {
@@ -1132,4 +1164,37 @@ func nativeWorkerDestructiveOutcome(cfg *config.Config, slot string, sess *state
 		return &NativeRegistrationHold{Code: "previous_outcome_unknown"}
 	}
 	return nil
+}
+
+// NativeLaneHoldCode reports whether a persisted native hold was raised by the
+// managed-lane binding observation. Such a hold describes the gateway's
+// credential inventory at one instant, not this generation's identity.
+func NativeLaneHoldCode(code string) bool {
+	return strings.HasPrefix(code, "binding_")
+}
+
+// maxNativeLaneResumes bounds automatic resumption of one registration; every
+// resumption is also archived by the registered-recovery path itself.
+const maxNativeLaneResumes = 3
+
+// NativeLaneHeldPrelaunch returns the native session of a first-generation
+// registration that a managed-lane binding hold stopped at the registered
+// stage: acknowledged, never launch intent, no log, process or outcome, and an
+// acknowledgement that is still valid for a while. Only such a registration
+// may be resumed automatically, through the same RecoverRegisteredWorkerStart
+// path an operator would use (exact receipt, absence proofs, idempotent
+// re-registration under the slot lock). Anything else stays an operator
+// decision.
+func NativeLaneHeldPrelaunch(cfg *config.Config, slot string, sess *state.Session) (string, bool) {
+	if cfg == nil || cfg.WorkerNativeSessionRegistration == nil || sess == nil || sess.Status != state.StatusFailed || !NativeLaneHoldCode(sess.NativeRegistrationHold) ||
+		sess.WorkerGeneration != 0 || sess.NativeSessionID != "" || sess.NativeRoleRunID != "" || sess.PID != 0 || sess.ProcessLeaseUnit != "" {
+		return "", false
+	}
+	r, err := readNativeWorkerReceipt(nativeReceiptDir(cfg.StateDir, slot), 1)
+	if err != nil || r.Status != "registered" || r.Generation != 1 || r.Slot != slot || r.ProjectID != cfg.ProjectID || r.IssueNumber != sess.IssueNumber ||
+		r.PID != 0 || r.LogFile != "" || r.ParentRoleRunID != "" || r.OutcomeIntent != nil || r.Outcome != nil || r.NativeProcessEvidence != nil || r.OperatorRecovery != nil ||
+		r.Acknowledgement == nil || r.Request.ExpiresAt <= time.Now().Add(time.Minute).Unix() || len(r.PrelaunchRecoveries) >= maxNativeLaneResumes {
+		return "", false
+	}
+	return r.Request.NativeSessionID, true
 }

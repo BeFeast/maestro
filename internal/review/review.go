@@ -218,6 +218,17 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 				errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
 				continue
 			}
+			// A managed lane that is not ready is a pause, not an attempt: no
+			// status is posted and nothing is claimed, so the stream stays
+			// unobserved and is retried on a later cycle.
+			if native, ok := lens.(*NativeClaudeLens); ok {
+				if err := native.laneReady(); err != nil {
+					code, _ := typedNativeHold(err)
+					p.logf("%s: native lane not ready: %s — retrying next cycle", lens.Name(), code)
+					errs = append(errs, fmt.Errorf("%s: native lane not ready: %w", lens.Name(), err))
+					continue
+				}
+			}
 		}
 		switch p.prepare(ctx, lens, pr.HeadSHA, statuses) {
 		case prepareRun:

@@ -23,6 +23,13 @@ func (o *Orchestrator) advancePipeline(st *state.State, slotName string, sess *s
 	if sess.Phase == state.PhaseNone {
 		return false // not a pipeline session
 	}
+	// A phase transition launches a native worker and its preparation is not
+	// idempotent (Advisor artifacts are consumed). While the lane is not ready
+	// the session stays untouched and the transition is retried next cycle.
+	if hold, code := o.nativeLaneHold(); hold {
+		log.Printf("[pipeline] %s phase transition paused: native lane not ready: %s — retrying next cycle", slotName, code)
+		return true
+	}
 
 	switch sess.Phase {
 	case state.PhasePlan:
