@@ -59,6 +59,7 @@ Commands:
   pause         Pause issue selection for a project (in-flight workers finish normally)
   resume        Resume issue selection for a paused project
   emergency     Fleet-wide EMERGENCY STOP: halt all LLM calls in one action (stop-llm/stop-all/resume/status)
+  auxiliary     Reconcile abandoned auxiliary (supervisor/review) consultations over every indexed receipt root (reconcile [--db] [--root])
   stop          Stop a worker session
   kill          Kill a worker session by slot name
   import        Seed state from existing worktrees
@@ -70,6 +71,7 @@ Commands:
   tmpfs-hygiene Protect-aware allowlisted /tmp tmpfs sweep (dry-run/apply JSONL)
   version-bump  Bump project version based on merged PR labels
   selfcheck     Run the bundled behavioral smoke gate (self-deploy pre-finalize check)
+  candidate-preflight Compare supplied stable/candidate resource snapshots without runtime access
   version       Print version
 
 Global flags:
@@ -344,6 +346,15 @@ func main() {
 	cmd := os.Args[1]
 	args := os.Args[2:]
 
+	owner, err := claimControllerForCommand(cmd, args, acquireControllerOwner)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+	if owner != nil {
+		defer owner.Close()
+	}
+
 	switch cmd {
 	case "init":
 		initCmd(args)
@@ -373,6 +384,8 @@ func main() {
 		resumeCmd(args)
 	case "emergency":
 		emergencyCmd(args)
+	case "auxiliary":
+		auxiliaryCmd(args)
 	case "stop":
 		stopCmd(args)
 	case "kill":
@@ -397,10 +410,20 @@ func main() {
 		versionBumpCmd(args)
 	case "selfcheck":
 		selfcheckCmd(args)
+	case "candidate-preflight":
+		candidatePreflightCmd(args)
 	case "stream-split":
 		streamSplitCmd(args)
 	case "_worker-exec":
 		workerExecCmd(args)
+	case "_native-monitor":
+		nativeContainmentCmd(false)
+	case "_native-entry":
+		nativeContainmentCmd(true)
+	case "_native-forgejo-credential":
+		nativeForgejoCredentialCmd(args)
+	case "_native-forgejo-pr":
+		nativeForgejoPullRequestCmd()
 	case "_worker-lease-cleanup":
 		workerLeaseCleanupCmd(args)
 	case "_watch-updater":
@@ -963,13 +986,9 @@ func superviseCmd(args []string) {
 	}
 
 	fs := flag.NewFlagSet("supervise", flag.ExitOnError)
-	configPath := fs.String("config", "", "Path to config file")
-	storePath, storeProject := configStoreFlags(fs)
-	once := fs.Bool("once", false, "Run once and exit")
-	interval := fs.Duration("interval", 5*time.Minute, "Loop interval")
-	jsonOutput := fs.Bool("json", false, "Output decision as JSON")
-	dryRun := fs.Bool("dry-run", false, "Compute decision without recording state")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "SQLite approvals db path used for durable delivery claims")
+	flags := addSuperviseFlags(fs, approvalstore.DefaultDBPath())
+	configPath, storePath, storeProject := flags.configPath, flags.storePath, flags.storeProject
+	once, interval, jsonOutput, dryRun, approvalsDB := flags.once, flags.interval, flags.jsonOutput, flags.dryRun, flags.approvalsDB
 	fs.Parse(args)
 	if fs.NArg() > 0 {
 		subcmd := fs.Arg(0)
@@ -1389,18 +1408,7 @@ var deliveryFreshnessCheckerFactory = func(cfg *config.Config) approver.Delivery
 	if cfg == nil {
 		return nil
 	}
-	if cfg.Forge.IsForgejo() {
-		// Delivery freshness is GitHub-anchored end to end: RevisionContains
-		// proves merge ancestry against https://github.com/<repo>.git, which on
-		// a forgejo row is the MIRROR, not the original — a stale mirror could
-		// flip the verdict with no error (#1172 M2). Fail loud instead: the
-		// executor treats any checker error as unverified and runs no side
-		// effect. Forge-aware delivery lands with the M3/M4 slices.
-		return approver.DeliveryFreshnessFunc(func(context.Context, *state.DeliveryPayload) error {
-			return fmt.Errorf("delivery freshness is GitHub-anchored: %w", github.ErrForgejoNotSupported)
-		})
-	}
-	return approver.NewGitHubDeliveryFreshnessChecker(github.New(cfg.Repo, cfg.Forge), cfg.Repo, cfg.LocalPath)
+	return approver.NewDeliveryFreshnessChecker(github.New(cfg.Repo, cfg.Forge), cfg.Repo, cfg.LocalPath, cfg.Forge)
 }
 
 var deliveryCheckoutPreparerFactory = func(*config.Config) approver.CheckoutPreparer { return nil }
@@ -2607,6 +2615,13 @@ func spawnCmd(args []string) {
 	r := router.New(cfg)
 	backendDecision := r.ResolveBackendDecision(*targetIssue)
 	backendName := backendDecision.Backend
+	// The explicit spawn command launches an implementation worker; pipeline
+	// dispatch supplies its own initial role through the orchestrator.
+	if cfg.WorkerNativeSessionRegistration != nil {
+		launchCfg := *cfg
+		launchCfg.WorkerLaunchContext = &config.WorkerLaunchContext{Role: "implementer"}
+		cfg = &launchCfg
+	}
 	slotName, err := worker.Start(cfg, s, cfg.Repo, *targetIssue, promptBase, backendName)
 	if err != nil {
 		log.Fatalf("start worker: %v", err)

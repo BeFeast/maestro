@@ -4,9 +4,9 @@ import (
 	"bytes"
 	"context"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -413,7 +413,7 @@ func boundedFileFingerprintProbe(path string, maxBytes int64) (string, bool) {
 	if err != nil || !info.Mode().IsRegular() || info.Size() < 0 || info.Size() > maxBytes {
 		return "", false
 	}
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil || int64(len(data)) != info.Size() {
 		return "", false
 	}
@@ -908,7 +908,7 @@ func (w *boundedOutput) Write(p []byte) (int, error) {
 func boundedGitOutput(ctx context.Context, worktree string, args ...string) ([]byte, bool) {
 	gitArgs := []string{"--literal-pathspecs", "-C", worktree, "-c", "core.fsmonitor=false", "-c", "diff.external="}
 	gitArgs = append(gitArgs, args...)
-	cmd := exec.CommandContext(ctx, "git", gitArgs...)
+	cmd := aiexecution.NativeGitCommandContext(ctx, gitArgs...)
 	cmd.Env = materialProgressGitEnv()
 	stdout := &boundedOutput{limit: worktreeProgressMaxOutputBytes}
 	stderr := &boundedOutput{limit: 32 << 10}

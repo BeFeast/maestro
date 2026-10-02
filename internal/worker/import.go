@@ -2,8 +2,8 @@ package worker
 
 import (
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
-	"os/exec"
 	"path/filepath"
 	"regexp"
 	"strconv"
@@ -36,7 +36,7 @@ func Import(cfg *config.Config, s *state.State) ([]ImportResult, error) {
 		return nil, fmt.Errorf("local_path not set in config")
 	}
 
-	out, err := exec.Command("git", "-C", cfg.LocalPath, "worktree", "list").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", cfg.LocalPath, "worktree", "list").CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git worktree list: %w\n%s", err, out)
 	}

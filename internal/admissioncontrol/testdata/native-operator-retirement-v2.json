@@ -1,0 +1,146 @@
+{
+  "seal_args": {
+    "gateway_scope": "gateway-a",
+    "native_session_id": "11111111-1111-4111-8111-111111111111",
+    "fleet_id": "fleet",
+    "project_id": "p",
+    "run_id": "r",
+    "role": "supervisor",
+    "expires_at": 1785944800,
+    "admission_basis": "requests",
+    "registration_version": 1
+  },
+  "retire_args": {
+    "gateway_scope": "gateway-a",
+    "native_session_id": "11111111-1111-4111-8111-111111111111",
+    "fleet_id": "fleet",
+    "project_id": "p",
+    "run_id": "r",
+    "role": "supervisor",
+    "expires_at": 1785944800,
+    "admission_basis": "requests",
+    "registration_version": 1,
+    "expected_evidence_id": "native-outcome-v2:1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c",
+    "expected_snapshot_digest": "1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c",
+    "expected_attempts_digest": "231020993e6504193087e96b6b95a575c2e0f00da3ac94054b40821d645e5674",
+    "reason": "operator_reviewed_unknown_usage",
+    "attempt_observations": [
+      {
+        "physical_attempt_id": "33333333-3333-4333-8333-333333333333",
+        "observation_digest": "3c75cac2a5b1aafe3d905cd62e02435908af1833dfc2d92fb4ed9e363a7b6f3b"
+      }
+    ],
+    "local_termination_attestation": {
+      "schema_version": 1,
+      "native_session_id": "11111111-1111-4111-8111-111111111111",
+      "unit": "maestro-fixture.service",
+      "cgroup": "/maestro.slice/maestro-fixture.service",
+      "boot_id": "00000000-0000-0000-0000-000000000007",
+      "invocation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "proof_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    }
+  },
+  "held": {
+    "binding": {
+      "admission_basis": "requests",
+      "expires_at": 1785944800,
+      "fleet_id": "fleet",
+      "gateway_scope": "gateway-a",
+      "native_session_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "p",
+      "role": "supervisor",
+      "run_id": "r"
+    },
+    "registration_version": 1,
+    "sealed": true,
+    "outcome": "held",
+    "next_generation_allowed": false,
+    "physical_attempts": 1,
+    "terminal_attempts": 0,
+    "unresolved_attempts": 1,
+    "cap_violations": 0,
+    "hold_code": "outcome_unknown",
+    "attempts_digest": "231020993e6504193087e96b6b95a575c2e0f00da3ac94054b40821d645e5674",
+    "schema_version": 2,
+    "admission_basis": "requests",
+    "money_status": "unknown",
+    "snapshot_digest": "1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c",
+    "evidence_id": "native-outcome-v2:1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c"
+  },
+  "retired": {
+    "binding": {
+      "admission_basis": "requests",
+      "expires_at": 1785944800,
+      "fleet_id": "fleet",
+      "gateway_scope": "gateway-a",
+      "native_session_id": "11111111-1111-4111-8111-111111111111",
+      "project_id": "p",
+      "role": "supervisor",
+      "run_id": "r"
+    },
+    "registration_version": 1,
+    "sealed": true,
+    "outcome": "operator_retired_unknown",
+    "next_generation_allowed": true,
+    "physical_attempts": 1,
+    "terminal_attempts": 0,
+    "unresolved_attempts": 1,
+    "cap_violations": 0,
+    "hold_code": null,
+    "attempts_digest": "231020993e6504193087e96b6b95a575c2e0f00da3ac94054b40821d645e5674",
+    "schema_version": 2,
+    "admission_basis": "requests",
+    "money_status": "unknown",
+    "snapshot_digest": "c577395b55aefa0f4cad45de55630781e5cbdc8dd841998fdc921584db0aa4a9",
+    "evidence_id": "native-outcome-v2:c577395b55aefa0f4cad45de55630781e5cbdc8dd841998fdc921584db0aa4a9",
+    "operator_retirement": {
+      "schema_version": 1,
+      "operator_uid": 1000,
+      "reason": "operator_reviewed_unknown_usage",
+      "prior_outcome": {
+        "binding": {
+          "admission_basis": "requests",
+          "expires_at": 1785944800,
+          "fleet_id": "fleet",
+          "gateway_scope": "gateway-a",
+          "native_session_id": "11111111-1111-4111-8111-111111111111",
+          "project_id": "p",
+          "role": "supervisor",
+          "run_id": "r"
+        },
+        "registration_version": 1,
+        "sealed": true,
+        "outcome": "held",
+        "next_generation_allowed": false,
+        "physical_attempts": 1,
+        "terminal_attempts": 0,
+        "unresolved_attempts": 1,
+        "cap_violations": 0,
+        "hold_code": "outcome_unknown",
+        "attempts_digest": "231020993e6504193087e96b6b95a575c2e0f00da3ac94054b40821d645e5674",
+        "schema_version": 2,
+        "admission_basis": "requests",
+        "money_status": "unknown",
+        "snapshot_digest": "1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c",
+        "evidence_id": "native-outcome-v2:1baf1c9beef7ef52c8a6dad9d19e6adb74a072d225547dd78fcd402efb5f297c"
+      },
+      "attempt_observations": [
+        {
+          "physical_attempt_id": "33333333-3333-4333-8333-333333333333",
+          "observation_digest": "3c75cac2a5b1aafe3d905cd62e02435908af1833dfc2d92fb4ed9e363a7b6f3b"
+        }
+      ],
+      "local_termination_attestation": {
+        "schema_version": 1,
+        "native_session_id": "11111111-1111-4111-8111-111111111111",
+        "unit": "maestro-fixture.service",
+        "cgroup": "/maestro.slice/maestro-fixture.service",
+        "boot_id": "00000000-0000-0000-0000-000000000007",
+        "invocation_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "proof_digest": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "request_digest": "3f2f0b6769104fce429364842248fac94870a9ac1bbc8634a02a49288bec8200",
+      "retirement_digest": "ea7cee84b6af403754cdf71bfd64db35d17629da8f507d3b45bd3b485639fe91"
+    }
+  }
+}

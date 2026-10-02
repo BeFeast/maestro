@@ -9,6 +9,7 @@ package pipeline
 import (
 	"context"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"os"
 	"os/exec"
 	"path"
@@ -98,6 +99,9 @@ func MatchUIAffectingFiles(patterns, changedFiles []string) []string {
 // timeout returns an error together with whatever screenshots already exist —
 // callers treat both as advisory (warning + finding), never as a merge block.
 func RunVisualCapture(v config.VerifyVisualConfig, worktreePath string) ([]string, error) {
+	if aiexecution.NativeGitRegistered(worktreePath) {
+		return nil, aiexecution.Held("native_visual_capture_requires_native_tool")
+	}
 	command := strings.TrimSpace(v.Command)
 	if command == "" {
 		return nil, fmt.Errorf("verify.visual: no capture command configured")

@@ -4,8 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 )
@@ -32,7 +32,7 @@ type AdvisorResult struct {
 // marker, unknown markers, and PLAN_REVISE without findings are all invalid.
 func ReadAdvisorResult(worktreePath string) (AdvisorResult, error) {
 	path := filepath.Join(worktreePath, AdvisorReviewFile)
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return AdvisorResult{}, fmt.Errorf("read advisor review: %w", err)
 	}
@@ -146,7 +146,7 @@ func AppendAdvisorFindings(ledger string, planVersion, reviewRound int, findings
 }
 
 func fileDigest(path string) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return "", err
 	}
@@ -156,7 +156,7 @@ func fileDigest(path string) (string, error) {
 
 func gitOutput(worktreePath string, args ...string) (string, error) {
 	cmdArgs := append([]string{"-C", worktreePath}, args...)
-	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand(cmdArgs...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w: %s", strings.Join(args, " "), err, strings.TrimSpace(string(out)))
 	}

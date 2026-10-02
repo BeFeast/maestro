@@ -21,6 +21,7 @@ import (
 	"unicode"
 	"unicode/utf8"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/outcome"
 	"github.com/befeast/maestro/internal/progress"
 	"gopkg.in/yaml.v3"
@@ -662,15 +663,16 @@ func (c GitHubMirrorConfig) ReconcileInterval() time.Duration {
 // survive that restart; restarting via `systemctl --user restart` keeps the
 // unit's ExecStop drain semantics intact.
 type SelfDeployConfig struct {
-	Enabled        bool     `yaml:"enabled"`          // default false (opt-in)
-	Script         string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
-	BinPath        string   `yaml:"bin_path"`         // install target (default: path of the running binary)
-	InstallViaSudo bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
-	Scope          string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
-	Units          []string `yaml:"units"`            // systemd units to restart (default: ["maestro.service"])
-	HealthURL      string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
-	HealthTokenEnv string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
-	TimeoutMinutes int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
+	PromotionPolicy string   `yaml:"promotion_policy"` // automatic (default) or explicit (blocks automatic triggers; does not provide manual promotion)
+	Enabled         bool     `yaml:"enabled"`          // default false (opt-in)
+	Script          string   `yaml:"script"`           // deploy script path override; empty = stage origin/main:scripts/self-deploy.sh into state_dir (#1077), with checkout fallback
+	BinPath         string   `yaml:"bin_path"`         // install target (default: path of the running binary)
+	InstallViaSudo  bool     `yaml:"install_via_sudo"` // #711: stage/rename/rollback bin_path via `sudo -n` so a root-owned target (e.g. /usr/local/bin/maestro) can be updated by the unprivileged deploy user; requires passwordless sudo (default false)
+	Scope           string   `yaml:"scope"`            // #716: systemd unit scope — "user" (systemctl --user, default for back-compat) or "system" (sudo -n systemctl restart, for system units like the Loki fleet)
+	Units           []string `yaml:"units"`            // systemd units to restart (default: ["maestro.service"])
+	HealthURL       string   `yaml:"health_url"`       // running-process version probe (default: http://127.0.0.1:<server.port>/api/v1/state when server.port > 0)
+	HealthTokenEnv  string   `yaml:"health_token_env"` // env var holding the bearer token for health_url (default: server.auth.token_env)
+	TimeoutMinutes  int      `yaml:"timeout_minutes"`  // build+install+restart+verify budget; must cover unit drain (default: 30)
 	// RestartTimeoutSeconds bounds only the blocking systemctl restart step. It is
 	// deliberately much smaller than TimeoutMinutes so Fleet unavailability is
 	// reported shortly after the daemon's bounded drain, not hidden under the
@@ -685,6 +687,30 @@ type SelfDeployConfig struct {
 	// converges. The orchestrator debounces re-triggers within this window.
 	// Default: timeout_minutes (at most one deploy per budget).
 	MinIntervalMinutes int `yaml:"min_interval_minutes"`
+}
+
+const (
+	SelfDeployPromotionAutomatic = "automatic"
+	SelfDeployPromotionExplicit  = "explicit"
+)
+
+// EffectivePromotionPolicy preserves automatic promotion for existing configs.
+// Unknown values are retained so programmatic configs cannot fail open.
+func (c SelfDeployConfig) EffectivePromotionPolicy() string {
+	policy := strings.ToLower(strings.TrimSpace(c.PromotionPolicy))
+	if policy == "" {
+		return SelfDeployPromotionAutomatic
+	}
+	return policy
+}
+
+func (c SelfDeployConfig) ValidatePromotionPolicy() error {
+	switch c.EffectivePromotionPolicy() {
+	case SelfDeployPromotionAutomatic, SelfDeployPromotionExplicit:
+		return nil
+	default:
+		return fmt.Errorf("config: self_deploy.promotion_policy %q is invalid (want automatic or explicit)", c.PromotionPolicy)
+	}
 }
 
 // SelfDeployScope* are the valid values for SelfDeployConfig.Scope.
@@ -910,6 +936,8 @@ type DeliveryConfig struct {
 	// but it participates in ApprovalDigest: moving the checkout changes what
 	// source and scripts would execute and therefore requires a fresh approval.
 	LocalPath string `yaml:"-" json:"-"`
+	// Forge is runtime-only canonical source identity, never an approval fetch URL.
+	Forge ForgeConfig `yaml:"-" json:"-"`
 }
 
 // deliveryTimeoutDefaultMinutes is the fallback delivery timeout.
@@ -935,6 +963,7 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 		return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: deliveryTimeoutDefaultMinutes}
 	}
 	d := c.Delivery
+	d.Forge = c.Forge
 	if d.configured() {
 		if strings.TrimSpace(string(d.Mode)) == "" {
 			if strings.TrimSpace(d.Command) != "" {
@@ -953,9 +982,10 @@ func (c *Config) EffectiveDelivery() DeliveryConfig {
 			Command:        c.DeployCmd,
 			TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes),
 			LocalPath:      c.LocalPath,
+			Forge:          c.Forge,
 		}
 	}
-	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes), LocalPath: c.LocalPath}
+	return DeliveryConfig{Mode: DeliveryModeDisabled, TimeoutMinutes: normalizeDeliveryTimeout(c.DeployTimeoutMinutes), LocalPath: c.LocalPath, Forge: c.Forge}
 }
 
 // configured reports whether the operator set any field of the delivery block.
@@ -989,9 +1019,14 @@ func (d DeliveryConfig) EffectiveApprovalTimeout() time.Duration {
 
 // ApprovalDigest binds the exact execution-relevant delivery configuration to
 // the approval without persisting the raw command as an executable payload.
-// Any command, verifier, timeout, mode, target, or rollback drift requires a
-// fresh approval before execution.
+// Any command, verifier, timeout, mode, target, rollback, or canonical forge
+// drift requires a fresh approval before execution. Credentials and the token
+// environment-variable name are not execution identity and never enter it.
 func (d DeliveryConfig) ApprovalDigest() string {
+	base, err := d.Forge.CanonicalBaseURL()
+	if err != nil {
+		base = "invalid:" + d.Forge.BaseURL
+	}
 	parts := []string{
 		string(d.Mode),
 		d.Command,
@@ -1004,6 +1039,13 @@ func (d DeliveryConfig) ApprovalDigest() string {
 		d.VerificationLabel,
 		d.RollbackLabel,
 		d.LocalPath,
+	}
+	// The historical materializer was fixed to canonical GitHub, so its digest
+	// already implied that identity. Preserve those approvals without rewriting
+	// rows. A non-default forge must bind its identity explicitly; old Forgejo
+	// approvals therefore become stale, while executing leases remain intact.
+	if d.Forge.EffectiveKind() != ForgeKindGitHub || err != nil {
+		parts = append([]string{"delivery-source/v2", d.Forge.EffectiveKind(), base}, parts...)
 	}
 	var canonical strings.Builder
 	for _, part := range parts {
@@ -1034,8 +1076,35 @@ func normalizeDeliveryTimeout(min int) int {
 	return min
 }
 
+// NativeSessionRegistrationConfig selects an existing trusted control authority.
+// No socket, UID, fleet, policy, or lifetime budget scope is inferred.
+type NativeSessionRegistrationConfig struct {
+	// Omitted preserves monetary v1; requests selects explicit request-cap v2.
+	AdmissionBasis        string  `yaml:"admission_basis,omitempty" json:"admission_basis,omitempty"`
+	ControlSocket         string  `yaml:"control_socket" json:"control_socket"`
+	AuthorityUID          *uint32 `yaml:"authority_uid" json:"authority_uid"`
+	ExpectedPolicyVersion int64   `yaml:"expected_policy_version" json:"expected_policy_version"`
+	FleetID               string  `yaml:"fleet_id" json:"fleet_id"`
+	GatewayScope          string  `yaml:"gateway_scope" json:"gateway_scope"`
+	BudgetRunID           string  `yaml:"budget_run_id" json:"budget_run_id"`
+	TTLSeconds            int64   `yaml:"ttl_seconds" json:"ttl_seconds"`
+}
+
+// WorkerLaunchContext is supplied by the trusted scheduler on a per-call config
+// copy. It is never read from YAML, prompt text, model output, or request headers.
+type WorkerLaunchContext struct {
+	Role            string
+	ParentRoleRunID string
+}
+
 // SupervisorConfig defines local policy for supervisor decisions.
 type SupervisorConfig struct {
+	// NativeSessionRegistration is opt-in attribution only, not spending admission.
+	NativeSessionRegistration *NativeSessionRegistrationConfig `yaml:"native_session_registration,omitempty" json:"native_session_registration,omitempty"`
+	// RequireAccountingReady holds model consultations until a transport proves
+	// attribution and shared admission for every physical request. The current
+	// CLI adapter cannot provide that capability; this is not a local budget.
+	RequireAccountingReady  bool                            `yaml:"require_accounting_ready" json:"require_accounting_ready,omitempty"`
 	Enabled                 bool                            `yaml:"enabled" json:"enabled"`
 	Backend                 string                          `yaml:"backend" json:"backend,omitempty"`
 	Model                   string                          `yaml:"model" json:"model,omitempty"`
@@ -1407,6 +1476,14 @@ type SupervisorOrderedQueueConfig struct {
 	Enabled    bool  `yaml:"enabled" json:"enabled"`
 	Issues     []int `yaml:"issues" json:"issues,omitempty"`
 	DoneIssues []int `yaml:"done_issues" json:"done_issues,omitempty"`
+
+	// enabledSet records an explicit `enabled:` key in YAML so Active can tell
+	// `enabled: false` (operator deactivated the queue but kept the issue list
+	// for a later re-enable, #1234) apart from the legacy shorthand of listing
+	// issues without a flag. Programmatic literals keep the shorthand. It is
+	// set by SupervisorConfig.UnmarshalYAML rather than a nested unmarshaler so
+	// ParseStrict's methodless KnownFields probe still covers this subtree.
+	enabledSet bool
 }
 
 // SupervisorDynamicWaveConfig enables policy-driven issue selection without a
@@ -1471,7 +1548,13 @@ func (d SupervisorDependencyUnblockConfig) AnnounceWithCommentEnabled() bool {
 	return *d.AnnounceWithComment
 }
 
+// Active reports whether the ordered queue governs issue selection. An explicit
+// `enabled:` key in YAML is authoritative; without one, a non-empty issue list
+// implies enabled (legacy shorthand, also used by programmatic literals).
 func (q SupervisorOrderedQueueConfig) Active() bool {
+	if q.enabledSet {
+		return q.Enabled
+	}
 	return q.Enabled || len(q.Issues) > 0
 }
 
@@ -1495,6 +1578,14 @@ func (s *SupervisorConfig) UnmarshalYAML(value *yaml.Node) error {
 		for i := 0; i+1 < len(value.Content); i += 2 {
 			if value.Content[i].Value == "excluded_labels" {
 				s.excludedLabelsSet = true
+				break
+			}
+		}
+	}
+	if queue := yamlMappingValue(value, "ordered_queue"); queue != nil && queue.Kind == yaml.MappingNode {
+		for i := 0; i+1 < len(queue.Content); i += 2 {
+			if queue.Content[i].Value == "enabled" {
+				s.OrderedQueue.enabledSet = true
 				break
 			}
 		}
@@ -1984,7 +2075,14 @@ func (c ReviewRetriggerConfig) MissingReviewGraceOrZero() time.Duration {
 // (*_env indirection, never values); the chat lenses talk to CLIProxy — never
 // a direct provider login (the #1148 bash design defect this replaces).
 type ReviewProducerConfig struct {
-	Enabled bool `yaml:"enabled"` // opt-in per project row
+	// NativeOpus explicitly selects the registered native Claude runner, keeping OpusModel.
+	NativeOpus             bool               `yaml:"native_opus,omitempty"`
+	RuntimeExecutionPolicy aiexecution.Policy `yaml:"-" json:"-"`
+	RuntimeNativeConfig    *Config            `yaml:"-" json:"-"`
+	// MaxAttempts caps HTTP review attempts per exact head/lens; 0 defaults to 1.
+	// Values 2..5 opt into bounded retries supported by gateway evidence.
+	MaxAttempts int  `yaml:"max_attempts,omitempty"`
+	Enabled     bool `yaml:"enabled"` // opt-in per project row
 	// ChatBaseURL is the CLIProxy root for the opus/terra chat lenses, e.g.
 	// "http://127.0.0.1:23020". Required for those streams to run.
 	ChatBaseURL string `yaml:"chat_base_url,omitempty"`
@@ -2004,6 +2102,13 @@ type ReviewProducerConfig struct {
 	// MaxDiffBytes caps the diff fed to the models (default 400000, the bash
 	// LLM_REVIEW_MAX_DIFF_BYTES). Truncation is surfaced in the status.
 	MaxDiffBytes int `yaml:"max_diff_bytes,omitempty"`
+}
+
+func (c ReviewProducerConfig) EffectiveMaxAttempts() int {
+	if c.MaxAttempts == 0 {
+		return 1
+	}
+	return c.MaxAttempts
 }
 
 func (c ReviewProducerConfig) EffectiveChatAPIKeyEnv() string {
@@ -2584,9 +2689,13 @@ func containsControlOrSpace(value string) bool {
 }
 
 type Config struct {
-	Server     ServerConfig     `yaml:"server"`
-	Supervisor SupervisorConfig `yaml:"supervisor"`
-	Repo       string           `yaml:"repo"`
+	AIExecution                     aiexecution.Policy               `yaml:"ai_execution" json:"ai_execution"`
+	RuntimeAuxiliaryLimiter         aiexecution.AuxiliaryLimiter     `yaml:"-" json:"-"`
+	WorkerNativeSessionRegistration *NativeSessionRegistrationConfig `yaml:"worker_native_session_registration,omitempty" json:"worker_native_session_registration,omitempty"`
+	WorkerLaunchContext             *WorkerLaunchContext             `yaml:"-" json:"-"`
+	Server                          ServerConfig                     `yaml:"server"`
+	Supervisor                      SupervisorConfig                 `yaml:"supervisor"`
+	Repo                            string                           `yaml:"repo"`
 	// ProjectID is the optional stable UUID identifying this project durably,
 	// independent of the mutable repo/state/store names (#869). Empty for legacy
 	// rows; validated as a canonical UUID when present and kept immutable across
@@ -2855,6 +2964,9 @@ func parse(data []byte) (*Config, error) {
 	if cfg.Repo == "" {
 		return nil, fmt.Errorf("config: repo is required")
 	}
+	if err := cfg.AIExecution.Validate(); err != nil {
+		return nil, fmt.Errorf("config: %w", err)
+	}
 	if cfg.Pipeline.AdvisorReviewRounds < 0 || cfg.Pipeline.AdvisorReviewRounds > MaxAdvisorReviewRounds {
 		return nil, fmt.Errorf("config: pipeline.advisor_review_rounds must be between 1 and %d when set (0 uses the default of %d)", MaxAdvisorReviewRounds, DefaultAdvisorReviewRounds)
 	}
@@ -2881,6 +2993,9 @@ func parse(data []byte) (*Config, error) {
 		return nil, err
 	}
 	if err := validateRemoteRunner(cfg); err != nil {
+		return nil, err
+	}
+	if err := cfg.SelfDeploy.ValidatePromotionPolicy(); err != nil {
 		return nil, err
 	}
 	if !cfg.Delivery.ValidMode() {

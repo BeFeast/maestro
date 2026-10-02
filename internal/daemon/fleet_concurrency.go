@@ -11,6 +11,7 @@ import (
 
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/worker"
 )
 
 type fleetConcurrencySettingsLoader interface {
@@ -32,23 +33,32 @@ type fleetProjectRegistration struct {
 // authoritative state file, closing both the concurrent-flow race and the
 // single-flow batch overshoot window.
 type fleetSpawnLimiter struct {
-	mu           sync.Mutex
-	settings     fleetConcurrencySettingsLoader
-	stateDirs    map[string]struct{}
-	projects     map[string]fleetProjectRegistration
-	reservations map[uint64]fleetSpawnReservation
-	nextID       uint64
-	loadState    func(string) (*state.State, error)
+	mu                    sync.Mutex
+	settings              fleetConcurrencySettingsLoader
+	stateDirs             map[string]struct{}
+	projects              map[string]fleetProjectRegistration
+	reservations          map[uint64]fleetSpawnReservation
+	recoveryReservations  map[string]struct{}
+	auxiliaryReservations map[string]struct{}
+	auxiliaryStateDirs    map[string]struct{}
+	auxiliaryStore        AuxiliaryReceiptIndex
+	nextID                uint64
+	loadState             func(string) (*state.State, error)
 }
 
 func newFleetSpawnLimiter(store ConfigLoader) *fleetSpawnLimiter {
 	loader, _ := store.(fleetConcurrencySettingsLoader)
+	index, _ := store.(AuxiliaryReceiptIndex)
 	return &fleetSpawnLimiter{
-		settings:     loader,
-		stateDirs:    make(map[string]struct{}),
-		projects:     make(map[string]fleetProjectRegistration),
-		reservations: make(map[uint64]fleetSpawnReservation),
-		loadState:    state.Load,
+		settings:              loader,
+		auxiliaryStore:        index,
+		stateDirs:             make(map[string]struct{}),
+		projects:              make(map[string]fleetProjectRegistration),
+		reservations:          make(map[uint64]fleetSpawnReservation),
+		recoveryReservations:  make(map[string]struct{}),
+		auxiliaryReservations: make(map[string]struct{}),
+		auxiliaryStateDirs:    make(map[string]struct{}),
+		loadState:             state.Load,
 	}
 }
 
@@ -66,6 +76,7 @@ func (l *fleetSpawnLimiter) RegisterProject(stateDir, repo string, superviseInte
 	}
 	l.mu.Lock()
 	l.stateDirs[stateDir] = struct{}{}
+	l.auxiliaryStateDirs[stateDir] = struct{}{}
 	l.projects[stateDir] = fleetProjectRegistration{
 		repo:              strings.TrimSpace(repo),
 		queueSignalMaxAge: 2*superviseInterval + time.Minute,
@@ -100,6 +111,10 @@ func fleetWorkerKey(stateDir, slot string) string {
 }
 
 func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
+	return l.workerOccupancyLocked(false)
+}
+
+func (l *fleetSpawnLimiter) workerOccupancyLocked(includeUncertain bool) (map[string]struct{}, error) {
 	dirs := make([]string, 0, len(l.stateDirs))
 	for dir := range l.stateDirs {
 		dirs = append(dirs, dir)
@@ -112,8 +127,28 @@ func (l *fleetSpawnLimiter) runningLocked() (map[string]struct{}, error) {
 		if err != nil {
 			return nil, fmt.Errorf("load fleet state %s: %w", dir, err)
 		}
+		if includeUncertain {
+			slots, err := worker.NativePendingSlots(dir, st.Sessions)
+			if err != nil {
+				return nil, fmt.Errorf("load native worker occupancy: %w", err)
+			}
+			for _, slot := range slots {
+				running[fleetWorkerKey(dir, slot)] = struct{}{}
+			}
+		}
 		for slot, sess := range st.Sessions {
-			if sess != nil && sess.Status == state.StatusRunning {
+			if sess != nil && sess.NativeRoleRunID != "" {
+				terminal, err := worker.NativeSessionProcessTerminal(dir, slot, sess)
+				if err != nil {
+					return nil, err
+				}
+				// Native occupancy comes only from its durable OS receipts. A stale
+				// Running projection cannot override proven local termination.
+				if includeUncertain || terminal {
+					continue
+				}
+			}
+			if sess != nil && sess.Status == state.StatusRunning && (sess.NativeRegistrationHold == "" || (includeUncertain && sess.NativeRoleRunID == "")) {
 				running[fleetWorkerKey(dir, slot)] = struct{}{}
 			}
 		}
@@ -136,7 +171,7 @@ func (l *fleetSpawnLimiter) reconcileReservationsLocked(running map[string]struc
 }
 
 func (l *fleetSpawnLimiter) liveLocked() (int, error) {
-	running, err := l.runningLocked()
+	running, err := l.workerOccupancyLocked(true)
 	if err != nil {
 		return 0, err
 	}
@@ -257,6 +292,46 @@ func (l *fleetSpawnLimiter) Reserve(stateDir string) (commit func(string), relea
 		l.mu.Unlock()
 	}
 	return commit, release, true
+}
+
+// ReserveNativeRecovery reuses an already counted launch_intent, never an
+// additional slot. The durable receipt stays occupied throughout the recovery.
+func (l *fleetSpawnLimiter) ReserveNativeRecovery(stateDir, slot, nativeID string) (func(string), func(), bool) {
+	if l == nil {
+		return func(string) {}, func() {}, true
+	}
+	l.mu.Lock()
+	if !worker.NativeRecoveryOccupiesSlot(stateDir, slot, nativeID) {
+		l.mu.Unlock()
+		return l.Reserve(stateDir)
+	}
+	key := fleetWorkerKey(stateDir, slot)
+	settings, err := l.settingsLocked()
+	if err != nil {
+		l.mu.Unlock()
+		return nil, nil, false
+	}
+	occupied, err := l.workerOccupancyLocked(true)
+	if err == nil {
+		l.reconcileReservationsLocked(occupied)
+	}
+	_, counted := occupied[key]
+	_, reserved := l.recoveryReservations[key]
+	if err != nil || !counted || reserved || settings.MaxLiveWorkers > 0 && len(occupied)+len(l.reservations) > settings.MaxLiveWorkers {
+		l.mu.Unlock()
+		return nil, nil, false
+	}
+	if l.recoveryReservations == nil {
+		l.recoveryReservations = make(map[string]struct{})
+	}
+	l.recoveryReservations[key] = struct{}{}
+	l.mu.Unlock()
+	release := func() {
+		l.mu.Lock()
+		delete(l.recoveryReservations, key)
+		l.mu.Unlock()
+	}
+	return func(string) { release() }, release, true
 }
 
 const factoryDogfoodRepo = "BeFeast/maestro"

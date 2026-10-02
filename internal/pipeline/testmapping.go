@@ -2,6 +2,7 @@ package pipeline
 
 import (
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
 	"path/filepath"
@@ -32,12 +33,12 @@ func mapTests(issueNumber int, issueTitle, issueBody, worktreePath, plan string)
 
 	// Generate verify.sh
 	verifyPath := filepath.Join(worktreePath, ".maestro", "verify.sh")
-	if err := os.MkdirAll(filepath.Dir(verifyPath), 0755); err != nil {
+	if err := aiexecution.MkdirWorkspaceAll(filepath.Dir(verifyPath), 0755); err != nil {
 		return "", "", fmt.Errorf("create verify dir: %w", err)
 	}
 
 	script := generateVerifyScript(mappings, testCmds)
-	if err := os.WriteFile(verifyPath, []byte(script), 0755); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(verifyPath, []byte(script), 0755); err != nil {
 		return "", "", fmt.Errorf("write verify script: %w", err)
 	}
 	log.Printf("[pipeline] test-mapping: wrote verify.sh (%d bytes, %d mappings)", len(script), len(mappings))
@@ -64,7 +65,7 @@ func detectTestInfrastructure(worktreePath string) []string {
 
 	// Node.js — check package.json for test script
 	pkgJSON := filepath.Join(worktreePath, "package.json")
-	if data, err := os.ReadFile(pkgJSON); err == nil {
+	if data, err := aiexecution.ReadWorkspaceFile(pkgJSON); err == nil {
 		content := string(data)
 		if strings.Contains(content, `"test"`) {
 			cmds = append(cmds, "npm test")

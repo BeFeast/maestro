@@ -2,18 +2,20 @@ package main
 
 import (
 	"context"
-	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/approver"
 	"github.com/befeast/maestro/internal/config"
-	"github.com/befeast/maestro/internal/github"
 	"github.com/befeast/maestro/internal/state"
 )
 
@@ -133,23 +135,40 @@ func TestExecuteApprovedDeliveryCLIUsesConfiguredDBAndMirrorsResult(t *testing.T
 	}
 }
 
-// Delivery freshness is GitHub-anchored end to end (RevisionContains proves
-// ancestry against https://github.com/<repo>.git — the MIRROR of a forgejo
-// row). The factory must fail loud on forgejo rows so no delivery ever
-// validates Forgejo merge SHAs against a possibly-stale GitHub mirror
-// (#1172 M2; forge-aware delivery lands in M3/M4).
-func TestDeliveryFreshnessCheckerFactoryFailsLoudOnForgejo(t *testing.T) {
+// The CLI factory must query the configured forge, even when the owner/repo
+// has a GitHub mirror. A single-generation read needs no Git fetch.
+func TestDeliveryFreshnessCheckerFactoryUsesForgejo(t *testing.T) {
+	sha := strings.Repeat("a", 40)
+	mergedAt := time.Date(2026, 9, 30, 10, 0, 0, 0, time.UTC)
+	var calls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/instance/api/v1/repos/o/r":
+			fmt.Fprint(w, `{"default_branch":"main"}`)
+		case "/instance/api/v1/repos/o/r/pulls":
+			fmt.Fprintf(w, `[{"number":1,"state":"closed","merged":true,"merged_at":%q,"merge_commit_sha":%q,"base":{"ref":"main"}}]`, mergedAt.Format(time.RFC3339), sha)
+		default:
+			t.Errorf("unexpected forge read %s", r.URL.Path)
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+	t.Setenv("MAESTRO_TEST_FORGEJO_TOKEN", "synthetic-fixture-token")
 	cfg := &config.Config{
 		Repo:  "o/r",
-		Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: "https://forge.example.com"},
+		Forge: config.ForgeConfig{Kind: config.ForgeKindForgejo, BaseURL: server.URL + "/instance", TokenEnv: "MAESTRO_TEST_FORGEJO_TOKEN"},
 	}
 	checker := deliveryFreshnessCheckerFactory(cfg)
 	if checker == nil {
-		t.Fatal("factory must return a fail-loud checker on forgejo rows, not nil")
+		t.Fatal("missing Forgejo freshness checker")
 	}
-	err := checker.CheckDeliveryFreshness(context.Background(), &state.DeliveryPayload{})
-	if !errors.Is(err, github.ErrForgejoNotSupported) {
-		t.Fatalf("forgejo delivery freshness = %v; want errors.Is ErrForgejoNotSupported", err)
+	if err := checker.CheckDeliveryFreshness(context.Background(), &state.DeliveryPayload{MergedSHA: sha, MergedAt: mergedAt}); err != nil {
+		t.Fatalf("configured Forgejo freshness: %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("forge reads = %d, want repository and merged generations", calls.Load())
 	}
 }
 

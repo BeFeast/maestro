@@ -113,6 +113,7 @@ func TestRunStartsFlowPerProjectAndAggregatesFleet(t *testing.T) {
 	}
 
 	// Each flow ran both loops.
+	waitFor(t, func() bool { return atomic.LoadInt64(&runTracker.started) == 3 && atomic.LoadInt64(&supTracker.started) == 3 })
 	if got := atomic.LoadInt64(&runTracker.started); got != 3 {
 		t.Fatalf("run loops started = %d, want 3", got)
 	}
@@ -282,7 +283,7 @@ func TestRunSameBasenameDistinctReposBothStart(t *testing.T) {
 	go func() { done <- d.Run(ctx) }()
 
 	waitForFleet(t, d)
-	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 2 })
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 2 && atomic.LoadInt64(&sup.started) == 2 })
 
 	d.mu.Lock()
 	flows := len(d.flows)

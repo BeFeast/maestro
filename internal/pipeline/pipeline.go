@@ -19,6 +19,7 @@ package pipeline
 
 import (
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
 	"path/filepath"
@@ -93,7 +94,7 @@ func PlanArtifactsExist(worktreePath string) bool {
 // Returns (passed, feedback, error).
 func ValidationPassed(worktreePath string) (bool, string, error) {
 	resultPath := filepath.Join(worktreePath, ValidationResultFile)
-	data, err := os.ReadFile(resultPath)
+	data, err := aiexecution.ReadWorkspaceFile(resultPath)
 	if err != nil {
 		return false, "", fmt.Errorf("read validation result: %w", err)
 	}

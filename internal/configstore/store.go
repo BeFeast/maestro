@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS settings_audit (
 	actor TEXT NOT NULL DEFAULT '',
 	changed_at TEXT NOT NULL
 );
+
+-- Durable receipt roots outlive a project's removal from the config store.
+-- This is an occupancy index, not another scheduler or an outcome authority.
+CREATE TABLE IF NOT EXISTS auxiliary_receipt_roots (
+	state_dir TEXT PRIMARY KEY
+);
 `
 
 type Store struct {

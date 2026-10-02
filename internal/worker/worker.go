@@ -3,6 +3,7 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
 	"os/exec"
@@ -84,9 +85,58 @@ func BranchName(slotName string, issue github.Issue) string {
 // Session, the exact tmux/worktree/branch identity is adopted. If setup created
 // the canonical worktree but no process, it is reused in place. Mismatched or
 // invalid identities fail closed and are never deleted.
-func StartReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName string) (string, error) {
+func StartReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName string) (resultSlot string, resultErr error) {
+	return startReserved(cfg, s, repo, issue, promptBase, backendName, slotName, "")
+}
+
+// RecoverRegisteredWorkerStart explicitly resumes a failed first-generation
+// setup, including an acknowledged host launch that provably never reached
+// the native monitor. It never allocates a slot, changes native identity, or authorizes a
+// registration whose acknowledgement was lost. The native receipt and exact
+// process absence are checked together under the existing per-slot lock.
+func RecoverRegisteredWorkerStart(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase, slotName, expectedNativeSessionID string) (string, error) {
+	if cfg == nil || cfg.WorkerNativeSessionRegistration == nil || s == nil || expectedNativeSessionID == "" {
+		return "", &NativeRegistrationHold{Code: "native_recovery_identity_invalid", Slot: slotName}
+	}
+	sess := s.Sessions[slotName]
+	if sess == nil || sess.Status != state.StatusFailed || sess.NativeRegistrationHold == "" ||
+		sess.IssueNumber != issue.Number || sess.WorkerGeneration != 0 || sess.NativeRoleRunID != "" ||
+		sess.NativeSessionID != "" || sess.PID != 0 || sess.ProcessLeaseUnit != "" ||
+		sess.TmuxSession != "" || !sess.StartedAt.IsZero() ||
+		sess.Worktree != filepath.Join(cfg.WorktreeBase, slotName) || sess.Branch != BranchName(slotName, issue) {
+		return "", &NativeRegistrationHold{Code: "native_recovery_projection_conflict", Slot: slotName}
+	}
+	for otherSlot, other := range s.Sessions {
+		if otherSlot != slotName && other != nil && other.IssueNumber == issue.Number {
+			return "", &NativeRegistrationHold{Code: "native_recovery_sibling_conflict", Slot: slotName}
+		}
+	}
+	return startReserved(cfg, s, repo, issue, promptBase, sess.Backend, slotName, expectedNativeSessionID)
+}
+
+func startReserved(cfg *config.Config, s *state.State, repo string, issue github.Issue, promptBase string, backendName string, slotName, recoveryNativeSessionID string) (resultSlot string, resultErr error) {
 	if cfg == nil || s == nil || strings.TrimSpace(slotName) == "" {
 		return "", fmt.Errorf("reserved worker start requires config, state, and slot")
+	}
+
+	defer func() {
+		if h, ok := NativeHold(resultErr); ok {
+			h.Slot = slotName
+			resultSlot = slotName
+			if s.Sessions == nil {
+				s.Sessions = make(map[string]*state.Session)
+			}
+			sess := s.Sessions[slotName]
+			if sess == nil {
+				sess = &state.Session{IssueNumber: issue.Number, IssueTitle: issue.Title, Worktree: filepath.Join(cfg.WorktreeBase, slotName), Branch: BranchName(slotName, issue), Backend: backendName, Status: state.StatusFailed}
+				s.Sessions[slotName] = sess
+			}
+			sess.NativeRegistrationHold = h.Code
+			_ = state.Save(cfg.StateDir, s) // The fsynced native receipt remains authoritative if this projection fails.
+		}
+	}()
+	if cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return "", &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
 	}
 	if cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
 		return "", fmt.Errorf("remote runner v1 does not support phase-pipeline dispatches")
@@ -104,6 +154,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 	backendDef, ok := cfg.Model.Backends[backendName]
 	if !ok {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return "", &NativeRegistrationHold{Code: "backend_unknown", Slot: slotName}
+		}
 		log.Printf("[worker] warn: backend %q not found in config, falling back to default %q", backendName, cfg.Model.Default)
 		backendName = cfg.Model.Default
 		backendDef, ok = cfg.Model.Backends[backendName]
@@ -114,7 +167,30 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return "", &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return "", err
+	}
+
+	native, err := prepareNativeWorkerWithRecovery(cfg, nil, slotName, backendName, backendCfg, 1, issue.Number, worktreePath, branchName, recoveryNativeSessionID)
+	if err != nil {
+		return "", err
+	}
+	defer native.close()
+	defer native.finishError(&resultErr)
+	if native != nil && native.adopt {
+		pid, lease, err := native.adoptExisting(cfg, slotName)
+		if err != nil {
+			return "", err
+		}
+		sess := freshRunningSession(issue, worktreePath, branchName, pid, TmuxSessionName(slotName), filepath.Join(state.LogDir(cfg.StateDir), slotName+".log"), backendName, lease, time.Now().UTC())
+		native.stamp(sess)
+		s.Sessions[slotName] = sess
+		if err := state.Save(cfg.StateDir, s); err != nil {
+			return "", &NativeRegistrationHold{Code: "state_persistence_failed", LaunchUncertain: true, Slot: slotName}
+		}
+		return slotName, nil
 	}
 
 	// The process may already exist when a previous owner died between tmux
@@ -158,12 +234,17 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		startedAt := time.Now().UTC()
 		logFile := filepath.Join(state.LogDir(cfg.StateDir), slotName+".log")
 		s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
+		native.stamp(s.Sessions[slotName])
 		recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn_adopted", "", startedAt)
 		log.Printf("[worker] adopted reserved worker %s in tmux session %s (pane_pid=%d)", slotName, tmuxName, pid)
 		return slotName, nil
 	}
 
-	if info, err := os.Stat(worktreePath); err == nil {
+	if cfg.AIExecution.RequireVerifiedRoute {
+		if err := materializeNativeClone(cfg.LocalPath, worktreePath, branchName); err != nil {
+			return "", err
+		}
+	} else if info, err := os.Stat(worktreePath); err == nil {
 		if !info.IsDir() {
 			return "", fmt.Errorf("reserved worktree path %s exists but is not a directory", worktreePath)
 		}
@@ -231,6 +312,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	if cfg.AIExecution.RequireVerifiedRoute {
+		prompt += "\n\nNative delivery: push the assigned feat/ branch over the canonical HTTPS origin. To create the PR, pipe a JSON object with title, body, head (the assigned branch), and base=main to /runtime/maestro _native-forgejo-pr. The scoped credential is already configured; never print it. Agent/Task delegation, merge, server administration, and direct provider access are unavailable.\n"
+	}
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
 	if err := assertCanonicalPrompt(slotName, issue.Number, prompt); err != nil {
 		return "", err
@@ -255,8 +339,15 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 		return "", fmt.Errorf("build worker cmd: %w", err)
 	}
 
+	if err := native.command(workerCmd); err != nil {
+		return "", err
+	}
+
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return "", err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, 1)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return "", err
@@ -268,7 +359,19 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	}
 
 	// Start tmux session inside its unique OS process lease.
+	if err := native.beginLaunch(logFile); err != nil {
+		return "", err
+	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, 1, 0, "initial_spawn")
+	if native != nil && err != nil {
+		return "", err
+	}
+	if err == nil {
+		err = native.complete(pid, processLease)
+	}
+	if native != nil && err != nil {
+		return "", err
+	}
 	if err != nil {
 		if processLease.Unit != "" {
 			startedAt := time.Now().UTC()
@@ -300,6 +403,7 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	// Save session to state
 	startedAt := time.Now().UTC()
 	s.Sessions[slotName] = freshRunningSession(issue, worktreePath, branchName, pid, tmuxName, logFile, backendName, processLease, startedAt)
+	native.stamp(s.Sessions[slotName])
 	// #513: stamp the first attribution segment for this session.
 	recordBackendAttribution(cfg, s.Sessions[slotName], backendName, "initial_spawn", "", startedAt)
 	s.ReconcileSpawnWorkerApprovalsForStartedSession(slotName, s.Sessions[slotName], startedAt)
@@ -308,6 +412,9 @@ func StartReserved(cfg *config.Config, s *state.State, repo string, issue github
 	// receipt needed to adopt or clean this worker; caller-specific metadata
 	// (such as backend-selection audit detail) can be saved immediately after.
 	if err := state.Save(cfg.StateDir, s); err != nil {
+		if native != nil {
+			return "", &NativeRegistrationHold{Code: "state_persistence_failed", LaunchUncertain: true, Slot: slotName}
+		}
 		stopErr := StopProcess(slotName, s.Sessions[slotName])
 		if stopErr != nil {
 			return "", fmt.Errorf("persist worker process lease: %w (rollback teardown: %v)", err, stopErr)
@@ -322,14 +429,14 @@ func localBranchExists(localPath, branch string) bool {
 	if strings.TrimSpace(localPath) == "" || strings.TrimSpace(branch) == "" {
 		return false
 	}
-	return exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
+	return aiexecution.NativeGitCommand("-C", localPath, "show-ref", "--verify", "--quiet", "refs/heads/"+branch).Run() == nil
 }
 
 func validateExactWorktreeIdentity(localPath, worktree, branch string) error {
 	if !isGitWorktreeForRepo(localPath, worktree) {
 		return fmt.Errorf("reserved path %s is not a worktree for the configured repository", worktree)
 	}
-	out, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("inspect reserved worktree branch: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -359,7 +466,11 @@ func freshRunningSession(issue github.Issue, worktree, branch string, pid int, t
 
 // Respawn cleans up a dead worker and restarts it in the same slot with a fresh worktree.
 // The session is updated in place with new PID, worktree, branch, and timestamps.
-func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) (resultErr error) {
+	defer func() { stampNativeHold(slotName, sess, resultErr) }()
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
+	}
 	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
 		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
 	}
@@ -376,6 +487,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 	backendDef, ok := cfg.Model.Backends[backendName]
 	if !ok {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_unknown", Slot: slotName}
+		}
 		backendName = cfg.Model.Default
 		backendDef, ok = cfg.Model.Backends[backendName]
 		if !ok {
@@ -385,7 +499,31 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	backendCfg := workerBackendConfig(backendDef)
 	backendCfg.TokenBudget = cfg.WorkerMaxTokens
 	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
 		return err
+	}
+
+	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
+	branchName := BranchName(slotName, issue)
+	// Prove and record the projected generation's exact termination before any
+	// successor identity is registered (pre-launch wedge fence).
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(cfg, slotName, sess); err != nil {
+		return err
+	}
+	nextGeneration := sess.WorkerGeneration + 1
+	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, issue.Number, worktreePath, branchName)
+	if err != nil {
+		return err
+	}
+	defer native.close()
+	defer native.finishError(&resultErr)
+	if adopted, err := native.adoptSession(cfg, slotName, sess); adopted {
+		return err
+	}
+	if native != nil {
+		sess.NativeRegistrationHold = ""
 	}
 
 	// Clean up old worker (tmux session, process, worktree)
@@ -394,11 +532,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	// Delete old local branch (ignore errors — branch may not exist locally)
-	exec.Command("git", "-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
+	aiexecution.NativeGitCommand("-C", cfg.LocalPath, "branch", "-D", sess.Branch).CombinedOutput()
 
 	// Create fresh worktree with new branch
-	worktreePath := filepath.Join(cfg.WorktreeBase, slotName)
-	branchName := fmt.Sprintf("feat/%s-%d-%s", slotName, issue.Number, slugify(issue.Title))
 	executionWorktree := workerExecutionWorktree(cfg, slotName, worktreePath)
 
 	// #734: sync the local base branch to origin and root the worktree directly
@@ -408,7 +544,11 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	}
 
 	log.Printf("[worker] respawn: creating worktree %s on branch %s", worktreePath, branchName)
-	if err := addWorktreeFromBase(cfg.LocalPath, worktreePath, branchName); err != nil {
+	create := addWorktreeFromBase
+	if cfg.AIExecution.RequireVerifiedRoute {
+		create = materializeNativeClone
+	}
+	if err := create(cfg.LocalPath, worktreePath, branchName); err != nil {
 		return err
 	}
 
@@ -453,6 +593,9 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	prompt := assemblePromptWithSource(promptBase, issue, executionWorktree, worktreePath, branchName, cfg)
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	if cfg.AIExecution.RequireVerifiedRoute {
+		prompt += "\n\nNative delivery: push the assigned feat/ branch over the canonical HTTPS origin. To create the PR, pipe a JSON object with title, body, head (the assigned branch), and base=main to /runtime/maestro _native-forgejo-pr. The scoped credential is already configured; never print it. Agent/Task delegation, merge, server administration, and direct provider access are unavailable.\n"
+	}
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
 	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
 		return err
@@ -477,9 +620,15 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
 
+	if err := native.command(workerCmd); err != nil {
+		return err
+	}
+
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	nextGeneration := sess.WorkerGeneration + 1
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, branchName, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, worktreePath, split); err != nil {
 		return err
@@ -492,7 +641,19 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 
 	// Start tmux session inside a new generation-specific process lease.
 	tmuxName := TmuxSessionName(slotName)
+	if err := native.beginLaunch(logFile); err != nil {
+		return err
+	}
 	pid, processLease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, worktreePath, runnerPath, nextGeneration, sess.PID, "fallover")
+	if native != nil && err != nil {
+		return err
+	}
+	if err == nil {
+		err = native.complete(pid, processLease)
+	}
+	if native != nil && err != nil {
+		return err
+	}
 	if err != nil {
 		if processLease.Unit != "" {
 			sess.WorkerGeneration = nextGeneration
@@ -514,6 +675,7 @@ func Respawn(cfg *config.Config, slotName string, sess *state.Session, repo stri
 	// #513/#931: stamp the fallover segment and clear the previous attempt's
 	// terminal/model projection without losing cumulative history.
 	beginSessionAttempt(cfg, sess, backendName, "fallover", "fallover", now)
+	native.stamp(sess)
 	setSessionProcessLease(sess, processLease)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
@@ -541,6 +703,25 @@ func StopProcess(slotName string, sess *state.Session) error {
 	if leaseErr != nil {
 		return leaseErr
 	}
+	if sess != nil && sess.NativeRoleRunID != "" && !hasLease {
+		r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+		if err != nil || r.Slot != slotName || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID {
+			return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slotName}
+		}
+		terminal, err := nativeWorkerTerminated(sess.NativeReceiptDir, r)
+		if err != nil || !terminal {
+			return &NativeRegistrationHold{Code: "native_process_identity_missing", LaunchUncertain: true, Slot: slotName}
+		}
+		sess.PID = 0
+		sess.TmuxSession = ""
+		return nil
+	}
+	if sess != nil && sess.NativeRoleRunID != "" && hasLease {
+		r, err := readNativeWorkerReceipt(sess.NativeReceiptDir, sess.WorkerGeneration)
+		if err != nil || r.Slot != slotName || r.RoleRunID != sess.NativeRoleRunID || r.Request.NativeSessionID != sess.NativeSessionID || r.ProcessLeaseUnit != lease.Unit || r.ProcessLeaseManager != lease.Manager {
+			return &NativeRegistrationHold{Code: "native_process_identity_conflict", LaunchUncertain: true, Slot: slotName}
+		}
+	}
 	if hasLease {
 		// The cgroup is the ownership boundary. Signal it directly so
 		// double-forked/reparented descendants receive the graceful window and
@@ -560,6 +741,9 @@ func StopProcess(slotName string, sess *state.Session) error {
 		// killing a same-name pane whose lease ownership is not proven.
 		if !waitWorkerTmuxSessionGone(tmuxName, processLeaseTmuxExitWait) {
 			return fmt.Errorf("worker process lease %s is empty but tmux session %q still exists; refusing unowned tmux kill", lease.Unit, tmuxName)
+		}
+		if err := markNativeWorkerTerminated(sess); err != nil {
+			return err
 		}
 		clearSessionProcessLease(sess)
 		if sess != nil {
@@ -601,6 +785,12 @@ func StopProcess(slotName string, sess *state.Session) error {
 
 // Stop kills a worker and removes its worktree.
 func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
+	if sess != nil && sess.NativeRegistrationHold != "" {
+		return &NativeRegistrationHold{Code: "unresolved_native_generation", LaunchUncertain: true, Slot: slotName}
+	}
+	if err := nativeWorkerDestructiveOutcome(cfg, slotName, sess); err != nil {
+		return err
+	}
 	if err := StopProcess(slotName, sess); err != nil {
 		return err
 	}
@@ -622,7 +812,10 @@ func Stop(cfg *config.Config, slotName string, sess *state.Session) error {
 
 	// Remove worktree
 	if sess.Worktree != "" {
-		out, err := exec.Command("git", "-C", cfg.LocalPath,
+		if aiexecution.NativeGitRegistered(sess.Worktree) {
+			return RemoveWorktree(cfg.LocalPath, sess.Worktree)
+		}
+		out, err := aiexecution.NativeGitCommand("-C", cfg.LocalPath,
 			"worktree", "remove", "--force", sess.Worktree).CombinedOutput()
 		if err != nil {
 			log.Printf("[worker] remove worktree %s: %v\n%s", sess.Worktree, err, out)
@@ -646,6 +839,12 @@ type CleanupResult struct {
 func CleanupWorktrees(cfg *config.Config, s *state.State) []CleanupResult {
 	var results []CleanupResult
 	for slotName, sess := range s.Sessions {
+		if sess.NativeRegistrationHold != "" {
+			continue
+		}
+		if err := nativeWorkerDestructiveOutcome(cfg, slotName, sess); err != nil {
+			continue
+		}
 		if !state.IsTerminal(sess.Status) {
 			continue
 		}
@@ -692,7 +891,10 @@ func RemoveWorktree(localPath, worktreePath string) error {
 	if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
 		return nil
 	}
-	out, err := exec.Command("git", "-C", localPath,
+	if isNativeCloneForRepo(localPath, worktreePath) {
+		return os.RemoveAll(worktreePath)
+	}
+	out, err := aiexecution.NativeGitCommand("-C", localPath,
 		"worktree", "remove", "--force", worktreePath).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree remove %s: %w\n%s", worktreePath, err, out)
@@ -848,7 +1050,7 @@ func normalizedGitPaths(paths []string) []string {
 
 func runGit(worktreePath string, args ...string) (string, error) {
 	cmdArgs := append([]string{"-C", worktreePath}, args...)
-	out, err := exec.Command("git", cmdArgs...).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand(cmdArgs...).CombinedOutput()
 	if err != nil {
 		return "", fmt.Errorf("git %s: %w\n%s", strings.Join(args, " "), err, out)
 	}
@@ -933,7 +1135,7 @@ func toSlash(path string) string {
 }
 
 func resolveConflictFileKeepBothSides(path string) error {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return fmt.Errorf("read file: %w", err)
 	}
@@ -951,7 +1153,7 @@ func resolveConflictFileKeepBothSides(path string) error {
 	if statErr == nil {
 		mode = fi.Mode()
 	}
-	if err := os.WriteFile(path, []byte(resolved), mode); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(path, []byte(resolved), mode); err != nil {
 		return fmt.Errorf("write resolved file: %w", err)
 	}
 	return nil
@@ -1052,7 +1254,7 @@ func slugify(title string) string {
 // readValidationContract reads VALIDATION.md from the worktree root.
 // Returns the file content or empty string if the file doesn't exist.
 func readValidationContract(worktreePath string) string {
-	data, err := os.ReadFile(filepath.Join(worktreePath, "VALIDATION.md"))
+	data, err := aiexecution.ReadWorkspaceFile(filepath.Join(worktreePath, "VALIDATION.md"))
 	if err != nil {
 		return ""
 	}
@@ -1068,7 +1270,7 @@ var repoRulesPromptFiles = []string{"AGENTS.md", "CLAUDE.md", "CONTRIBUTING.md"}
 func repoRulesPromptSection(worktreePath string) string {
 	for _, name := range repoRulesPromptFiles {
 		path := filepath.Join(worktreePath, name)
-		data, err := os.ReadFile(path)
+		data, err := aiexecution.ReadWorkspaceFile(path)
 		if err != nil {
 			continue
 		}
@@ -1317,7 +1519,7 @@ func appendSectionsAndValidation(prompt string, sectionPaths []string, validatio
 
 	// Append prompt sections
 	for _, path := range sectionPaths {
-		data, err := os.ReadFile(path)
+		data, err := aiexecution.ReadWorkspaceFile(path)
 		if err != nil {
 			log.Printf("[worker] warn: could not read prompt section %s: %v", path, err)
 			continue

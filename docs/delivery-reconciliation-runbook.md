@@ -55,6 +55,26 @@ argument-free `verify_command`. It never runs `delivery.command`. Verifier
 output is discarded. Only a zero verifier exit atomically records the closed
 `operator_reconcile/verified` result.
 
+Delivery, merge-ancestry checks, and reconciliation fetch from the configured
+canonical forge (`forge.kind` and `forge.base_url`), never a GitHub mirror.
+The local origin must match that forge and owner/repository. HTTP(S) identity
+also binds scheme, effective port and instance path; an SSH origin uses its
+own port and repository path, while fetching still uses the configured web
+endpoint. Redirects and embedded credentials are refused.
+
+Changing canonical forge identity makes pending/approved deliveries stale
+before freshness reads or checkout. Existing default-GitHub digests remain
+compatible, including an explicit `forge.kind: github`. Old Forgejo approvals
+that predate forge identity binding require a fresh approval. Changing the
+token environment-variable name or rotating its value does not change source
+identity. Executing and terminal rows are never rewritten or replayed; a
+verified reconciliation still requires the original approved configuration.
+
+Forgejo materialization currently supports public repositories. Private
+Forgejo Git authentication fails closed: it does not inherit project/global
+credential helpers, put API tokens in Git URLs, or fall back to a mirror.
+The explicit local bare-origin override is for offline tests/self-checks only.
+
 A wrong SHA, config drift, unsafe/missing verifier, checkout failure, timeout,
 or non-zero verifier leaves the row `executing`. Investigate again; do not
 convert uncertainty into `not-applied` unless the target has independently been

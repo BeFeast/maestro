@@ -4350,7 +4350,7 @@ func TestFleetAPISuppressesPredecessorAttentionBehindCurrentLifecycle(t *testing
 func TestMakeSessionInfoPreservesSubsecondLifecycleOrdering(t *testing.T) {
 	started := time.Date(2026, 7, 21, 18, 0, 0, 987654321, time.UTC)
 	finished := started.Add(123456789 * time.Nanosecond)
-	info := makeSessionInfo("BeFeast/maestro", "current", &state.Session{
+	info := makeSessionInfo(&config.Config{Repo: "BeFeast/maestro"}, "current", &state.Session{
 		IssueNumber: 976,
 		Status:      state.StatusDone,
 		StartedAt:   started,

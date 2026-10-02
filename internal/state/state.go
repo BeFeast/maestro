@@ -267,9 +267,16 @@ type Session struct {
 	StartedAt           time.Time `json:"started_at"`
 	// WorkerGeneration is the durable lease generation for the process that
 	// owns this canonical session. Every successful spawn, respawn, phase
-	// transition, or live-runtime adoption advances it. Destructive cleanup
+	// transition advances it. Legacy runtime adoption also advances it; native
+	// adoption preserves the receipt generation. Destructive cleanup
 	// captures and revalidates this exact value before touching the worktree.
-	WorkerGeneration uint64 `json:"worker_generation,omitempty"`
+	WorkerGeneration       uint64 `json:"worker_generation,omitempty"`
+	NativeRegistrationHold string `json:"native_registration_hold,omitempty"`
+	NativeReceiptDir       string `json:"native_receipt_dir,omitempty"`
+	NativeSessionID        string `json:"native_session_id,omitempty"`
+	NativeRoleRunID        string `json:"native_role_run_id,omitempty"`
+	NativeParentRoleRunID  string `json:"native_parent_role_run_id,omitempty"`
+	NativeRole             string `json:"native_role,omitempty"`
 	// WorkerLease* is the durable scratch receipt bound to ProcessLeaseUnit.
 	// Unit/scope intentionally duplicate the process receipt so reconciliation
 	// can reject corrupted cross-ownership without inventing another owner.
@@ -1263,6 +1270,8 @@ type SupervisorStuckState struct {
 
 // SupervisorDecision is a stable, machine-readable supervisor orchestration record.
 type SupervisorDecision struct {
+	// ConsultationID joins optional local execution receipts, never gateway usage.
+	ConsultationID   string                     `json:"consultation_id,omitempty"`
 	ID               string                     `json:"id"`
 	CreatedAt        time.Time                  `json:"created_at"`
 	RecommendationID string                     `json:"recommendation_id,omitempty"`
@@ -1652,6 +1661,8 @@ type State struct {
 	// short SHA observed when the decision was recorded.
 	ReviewRepairTracks map[string]ReviewRepairTrack `json:"review_repair_tracks,omitempty"`
 
+	ReviewAttempts map[string]ReviewAttemptTrack `json:"review_attempts,omitempty"`
+
 	// PRGateSnapshots is the authoritative, durable PR/CI/review/merge progress
 	// observed by the orchestrator (#887). Each value is keyed by the exact
 	// project+issue+PR+head+generation identity; notification-dedup and review
@@ -2000,6 +2011,42 @@ func Save(stateDir string, s *State) error {
 // immediately before changing durable ownership, such as watchdog recovery
 // lease claims. fn must not perform external side effects or re-enter Load/Save.
 func Update(stateDir string, fn func(*State) error) error {
+	return updateState(stateDir, fn, nil)
+}
+
+// UpdateDurable additionally syncs the new file and its directory before releasing
+// the flock. Use it when a successful return grants permission for an external call.
+// A sync failure returns an error even if rename succeeded; callers must not act.
+func UpdateDurable(stateDir string, fn func(*State) error) error {
+	return updateState(stateDir, fn, syncStateSnapshot)
+}
+
+func syncStateSnapshot(stateDir string) error {
+	f, err := os.Open(StatePath(stateDir))
+	if err != nil {
+		return err
+	}
+	err = f.Sync()
+	closeErr := f.Close()
+	if err != nil {
+		return err
+	}
+	if closeErr != nil {
+		return closeErr
+	}
+	d, err := os.Open(stateDir)
+	if err != nil {
+		return err
+	}
+	err = d.Sync()
+	closeErr = d.Close()
+	if err != nil {
+		return err
+	}
+	return closeErr
+}
+
+func updateState(stateDir string, fn func(*State) error, syncSnapshot func(string) error) error {
 	if fn == nil {
 		return fmt.Errorf("update state: nil callback")
 	}
@@ -2025,6 +2072,11 @@ func Update(stateDir string, fn func(*State) error) error {
 	}
 	if err := saveLocked(stateDir, current); err != nil {
 		return err
+	}
+	if syncSnapshot != nil {
+		if err := syncSnapshot(stateDir); err != nil {
+			return fmt.Errorf("sync state snapshot: %w", err)
+		}
 	}
 	if hook := currentSaveHook(); hook != nil {
 		hook(stateDir, current)
@@ -2242,6 +2294,7 @@ func mergeStateSnapshots(base, current, ours *State) (*State, error) {
 	merged.DispatchHold, merged.IdleStall = mergeDispatchVisibility(current, ours)
 	merged.ProjectStatusSync = mergeProjectStatusSync(current.ProjectStatusSync, ours.ProjectStatusSync)
 	merged.SpecLintTracks = mergeSpecLintTracks(current.SpecLintTracks, ours.SpecLintTracks)
+	merged.ReviewAttempts = mergeReviewAttempts(current.ReviewAttempts, ours.ReviewAttempts)
 	merged.PRGateSnapshots = mergePRGateSnapshots(current.PRGateSnapshots, ours.PRGateSnapshots)
 	merged.BackendHealth = mergeBackendHealth(current.BackendHealth, ours.BackendHealth)
 	merged.ProviderModelHealth = mergeProviderModelHealth(current.ProviderModelHealth, ours.ProviderModelHealth)
@@ -5237,7 +5290,7 @@ func SessionProvesFailedAttempt(sess *Session) bool {
 }
 
 func sessionProvesFailedAttempt(sess *Session) bool {
-	if sess == nil || sess.RateLimitHit {
+	if sess == nil || sess.RateLimitHit || sess.NativeRegistrationHold != "" {
 		return false
 	}
 	switch sess.WorkerOutcome {

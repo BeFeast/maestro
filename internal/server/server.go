@@ -466,7 +466,12 @@ type backendDriftInfo struct {
 	RecommendedAction string                 `json:"recommended_action,omitempty"`
 }
 
-func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
+func makeSessionInfo(cfg *config.Config, slot string, sess *state.Session) sessionInfo {
+	var repo string
+	var forge config.ForgeConfig
+	if cfg != nil {
+		repo, forge = cfg.Repo, cfg.Forge
+	}
 	tokenBudgetMeasure := sess.TokenBudgetMeasure
 	marker, markerOK := worker.ReadTokenBudgetMarkerForAttempt(sess.LogFile, sess.WorkerGeneration, sess.StartedAt)
 	if markerOK {
@@ -499,7 +504,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		Slot:                      slot,
 		IssueNumber:               sess.IssueNumber,
 		IssueTitle:                sess.IssueTitle,
-		IssueURL:                  githubIssueURL(repo, sess.IssueNumber),
+		IssueURL:                  forgeIssueURL(forge, repo, sess.IssueNumber),
 		Status:                    string(sess.Status),
 		Backend:                   sess.Backend,
 		ProviderLimitBackend:      sess.ProviderLimitBackend,
@@ -514,7 +519,7 @@ func makeSessionInfo(repo, slot string, sess *state.Session) sessionInfo {
 		Model:                     currentSessionModel(sess),
 		PRNumber:                  sess.PRNumber,
 		PRMerged:                  sess.PRMerged,
-		PRURL:                     githubPRURL(repo, sess.PRNumber),
+		PRURL:                     forgePRURL(forge, repo, sess.PRNumber),
 		Phase:                     string(sess.Phase),
 		PlanVersion:               sess.PlanVersion,
 		AdvisorReviewRound:        sess.AdvisorReviewRound,
@@ -654,18 +659,18 @@ func currentSessionModel(sess *state.Session) string {
 	return sess.Model
 }
 
-func githubIssueURL(repo string, issueNumber int) string {
+func forgeIssueURL(forge config.ForgeConfig, repo string, issueNumber int) string {
 	if issueNumber <= 0 || !validGitHubRepo(repo) {
 		return ""
 	}
-	return fmt.Sprintf("https://github.com/%s/issues/%d", strings.TrimSpace(repo), issueNumber)
+	return forge.IssueWebURL(strings.TrimSpace(repo), issueNumber)
 }
 
-func githubPRURL(repo string, prNumber int) string {
+func forgePRURL(forge config.ForgeConfig, repo string, prNumber int) string {
 	if prNumber <= 0 || !validGitHubRepo(repo) {
 		return ""
 	}
-	return fmt.Sprintf("https://github.com/%s/pull/%d", strings.TrimSpace(repo), prNumber)
+	return forge.PRWebURL(strings.TrimSpace(repo), prNumber)
 }
 
 func buildSupervisorInfo(cfg *config.Config, st *state.State) supervisorInfo {
@@ -714,7 +719,7 @@ func makeSupervisorDecisionInfo(cfg *config.Config, st *state.State, decision st
 		RecommendedAction: decision.RecommendedAction,
 		OperatorSentence:  supervisorOperatorSentence(decision.RecommendedAction, decision.Summary, decision.Target),
 		Target:            decision.Target,
-		TargetLinks:       supervisorTargetLinks(cfg.Repo, decision.Target),
+		TargetLinks:       supervisorTargetLinks(cfg.Forge, cfg.Repo, decision.Target),
 		Risk:              decision.Risk,
 		Confidence:        decision.Confidence,
 		ErrorClass:        decision.ErrorClass,
@@ -738,7 +743,7 @@ func makeSupervisorActionInfo(cfg *config.Config, decision state.SupervisorDecis
 		Risk:             decision.Risk,
 		CreatedAt:        decision.CreatedAt,
 		Target:           decision.Target,
-		TargetLinks:      supervisorTargetLinks(cfg.Repo, decision.Target),
+		TargetLinks:      supervisorTargetLinks(cfg.Forge, cfg.Repo, decision.Target),
 		Disabled:         disabled,
 		DisabledReason:   disabledReason,
 	}
@@ -829,7 +834,7 @@ func latestSafeSupervisorDecision(st *state.State) *state.SupervisorDecision {
 	return latest
 }
 
-func supervisorTargetLinks(repo string, target *state.SupervisorTarget) []targetLinkInfo {
+func supervisorTargetLinks(forge config.ForgeConfig, repo string, target *state.SupervisorTarget) []targetLinkInfo {
 	if target == nil {
 		return nil
 	}
@@ -838,14 +843,14 @@ func supervisorTargetLinks(repo string, target *state.SupervisorTarget) []target
 		links = append(links, targetLinkInfo{
 			Kind:  "issue",
 			Label: fmt.Sprintf("Issue #%d", target.Issue),
-			URL:   githubIssueURL(repo, target.Issue),
+			URL:   forgeIssueURL(forge, repo, target.Issue),
 		})
 	}
 	if target.PR > 0 {
 		links = append(links, targetLinkInfo{
 			Kind:  "pr",
 			Label: fmt.Sprintf("PR #%d", target.PR),
-			URL:   githubPRURL(repo, target.PR),
+			URL:   forgePRURL(forge, repo, target.PR),
 		})
 	}
 	if strings.TrimSpace(target.Session) != "" {
@@ -918,13 +923,9 @@ func watchSessionName(slot string, sess *state.Session) string {
 }
 
 func allSessionInfos(cfg *config.Config, st *state.State) []sessionInfo {
-	repo := ""
-	if cfg != nil {
-		repo = cfg.Repo
-	}
 	infos := make([]sessionInfo, 0, len(st.Sessions))
 	for slot, sess := range st.Sessions {
-		info := makeSessionInfo(repo, slot, sess)
+		info := makeSessionInfo(cfg, slot, sess)
 		applyBackendDrift(cfg, &info)
 		infos = append(infos, info)
 	}

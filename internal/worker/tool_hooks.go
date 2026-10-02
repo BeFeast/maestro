@@ -5,8 +5,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 
@@ -29,6 +29,9 @@ type workerToolHookSetup struct {
 func setupWorkerToolHooks(stateDir, worktree, backendKind string, hooks config.HooksConfig) (workerToolHookSetup, error) {
 	if !toolHookConfigured(hooks.PreTool) && !toolHookConfigured(hooks.PostEdit) {
 		return workerToolHookSetup{}, nil
+	}
+	if aiexecution.NativeGitRegistered(worktree) {
+		return workerToolHookSetup{}, aiexecution.Held("native_tool_hook_unsupported")
 	}
 	if strings.TrimSpace(stateDir) == "" {
 		return workerToolHookSetup{}, fmt.Errorf("empty state dir")
@@ -167,7 +170,7 @@ func appendClaudeHook(existing any, matcher, runnerPath, event string) []any {
 }
 
 func excludeClaudeLocalSettings(worktree string) error {
-	out, err := exec.Command("git", "-C", worktree, "rev-parse", "--git-path", "info/exclude").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", worktree, "rev-parse", "--git-path", "info/exclude").CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("resolve git exclude path: %w\n%s", err, out)
 	}

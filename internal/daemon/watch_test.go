@@ -133,9 +133,7 @@ func TestWatchStoreLoopHotAddsAndRemoves(t *testing.T) {
 
 	// Initial project is present.
 	waitForNames(t, d, "alpha")
-	if got := atomic.LoadInt64(&run.started); got != 1 {
-		t.Fatalf("run loops started = %d, want 1", got)
-	}
+	waitFor(t, func() bool { return atomic.LoadInt64(&run.started) == 1 })
 
 	// Hot-add beta.
 	store.Set("beta", testConfig(t, "owner/beta"))

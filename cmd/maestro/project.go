@@ -7,13 +7,13 @@ import (
 	"fmt"
 	"io"
 	"log"
-	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 
+	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
 )
@@ -270,7 +270,7 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 	if err != nil {
 		return fmt.Errorf("local_path %s has no readable origin remote", p.LocalPath)
 	}
-	if !remoteMatchesRepo(strings.TrimSpace(string(remote)), p.Repo) {
+	if !remoteMatchesRepo(strings.TrimSpace(string(remote)), p.Repo, p.Forge) {
 		return fmt.Errorf("local_path origin %q does not match configured repo %q", strings.TrimSpace(string(remote)), p.Repo)
 	}
 
@@ -300,25 +300,13 @@ func validateGenesisRuntime(p *configstore.PreparedProject) error {
 	return nil
 }
 
-func remoteMatchesRepo(remote, repo string) bool {
-	r := strings.TrimSpace(remote)
-	want := strings.ToLower(strings.TrimSuffix(strings.Trim(strings.TrimSpace(repo), "/"), ".git"))
-	lowerRemote := strings.ToLower(r)
-	if strings.HasPrefix(lowerRemote, "git@github.com:") {
-		got := strings.TrimSuffix(strings.TrimPrefix(lowerRemote, "git@github.com:"), ".git")
-		return got == want
-	}
-	u, err := url.Parse(r)
-	if err != nil || !strings.EqualFold(u.Hostname(), "github.com") {
-		return false
-	}
-	switch strings.ToLower(u.Scheme) {
-	case "https", "http", "ssh", "git":
-	default:
-		return false
-	}
-	got := strings.TrimSuffix(strings.ToLower(strings.Trim(u.Path, "/")), ".git")
-	return got == want
+// remoteMatchesRepo binds genesis to the configured forge, not its downstream
+// mirror. SSH uses the same hostname and owner/repo but its own transport port;
+// HTTP(S) additionally binds the web port and optional instance path prefix.
+// DNS/IP aliases are deliberately not inferred or resolved.
+func remoteMatchesRepo(remote, repo string, forge config.ForgeConfig) bool {
+	identity, err := forge.RepositoryIdentity(repo)
+	return err == nil && identity.MatchesOrigin(remote, false)
 }
 
 // planReport previews prepared against the store at dbPath without any write. A

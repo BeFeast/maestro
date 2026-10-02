@@ -5,6 +5,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/tmuxsession"
@@ -31,6 +32,14 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 	if cfg == nil {
 		return 0, tmuxsession.ProcessLease{}, fmt.Errorf("launch worker process lease: nil config")
 	}
+	if err := cfg.AIExecution.CheckCurrent(); err != nil {
+		return 0, tmuxsession.ProcessLease{}, err
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		if err := preflightWorkerExecutionDescriptor(cfg, runnerPath); err != nil {
+			return 0, tmuxsession.ProcessLease{}, err
+		}
+	}
 	lease, err := workerProcessLease(cfg, slotName, generation)
 	if err != nil {
 		return 0, tmuxsession.ProcessLease{}, err
@@ -40,8 +49,14 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 		return 0, tmuxsession.ProcessLease{}, err
 	}
 	lease.Runtime = runtime
+	lease.HostRunner = cfg.AIExecution.RequireVerifiedRoute
 	pid, err := startOrReconcileTmuxSession(tmuxName, worktree, runnerPath, lease, previousPID)
-	if err == nil {
+	if err == nil && cfg.AIExecution.RequireVerifiedRoute {
+		err = waitNativeWorkerLaunch(cfg, slotName, generation, 30*time.Second)
+		if err == nil {
+			return pid, lease, nil
+		}
+	} else if err == nil {
 		ready, readyErr := confirmWorkerProcessLease(lease, pid, processLeaseStartWait)
 		switch {
 		case readyErr != nil:
@@ -51,6 +66,13 @@ func launchWorkerProcessLease(cfg *config.Config, slotName, tmuxName, worktree, 
 		default:
 			return pid, lease, nil
 		}
+	}
+
+	if cfg.WorkerNativeSessionRegistration != nil {
+		// The runner may already have dispatched. Preserve the exact OS lease and
+		// scratch receipt; only exact adoption or proven termination may release it.
+		attachWorkerScratchReceipt(&lease, scratchLease)
+		return 0, lease, &NativeRegistrationHold{Code: "unresolved_launch", LaunchUncertain: true, Slot: slotName}
 	}
 
 	// A failed or ambiguous start must not strand a partially-created cgroup.
@@ -96,6 +118,9 @@ func waitWorkerProcessLeaseReady(lease tmuxsession.ProcessLease, pid int, timeou
 func workerProcessLease(cfg *config.Config, slotName string, generation uint64) (tmuxsession.ProcessLease, error) {
 	if cfg == nil {
 		return tmuxsession.ProcessLease{}, fmt.Errorf("worker process lease: nil config")
+	}
+	if cfg.AIExecution.RequireVerifiedRoute && (!cfg.WorkerRuntime.IsolatedEnabled() || cfg.WorkerRuntime.EffectiveScope() != tmuxsession.ProcessLeaseManagerSystem) {
+		return tmuxsession.ProcessLease{}, aiexecution.Held("containment_system_service_required")
 	}
 	if cfg.WorkerRuntime.IsolatedEnabled() {
 		return tmuxsession.WorkerProcessServiceLease(processLeaseProjectIdentity(cfg), slotName, generation, cfg.WorkerRuntime.EffectiveScope())

@@ -2,6 +2,7 @@ package supervisor
 
 import (
 	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -9,13 +10,17 @@ import (
 	"log"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/tmuxsession"
 	"github.com/befeast/maestro/internal/worker"
+	"github.com/google/uuid"
 )
 
 const defaultSupervisorPrompt = `You are the Maestro Supervisor LLM.
@@ -53,7 +58,10 @@ type LLMClient interface {
 }
 
 type backendLLMClient struct {
-	cfg *config.Config
+	cfg                 *config.Config
+	role                string
+	executionContext    context.Context
+	projectConfigSHA256 string
 	// backendHealth is an optional per-cycle snapshot of the project's
 	// BackendHealth gates. When present, candidates in an active cooldown are
 	// skipped instead of re-tried every supervise tick — without it the walk
@@ -67,6 +75,14 @@ type backendLLMClient struct {
 	// RCA 2026-07-24: without this, a 100%-failing chain was re-walked on every
 	// consult for 4.5h.
 	memory *supervisorBackendMemory
+	// receiptSave is an injected persistence fault seam for offline tests.
+	receiptSave func(*ConsultationReceipt) error
+	// acceptPendingOutcome lets a complete successful native output be
+	// returned while the authority still reports the exited session's attempt
+	// as claimed but unaccounted (#1239). Only the one-shot reviewer lane sets
+	// it: the receipt stays unsealed and held exactly as a lost seal would be,
+	// so the regular reconcile finishes accounting without a second attempt.
+	acceptPendingOutcome bool
 }
 
 const (
@@ -165,75 +181,420 @@ func NewBackendLLMClient(cfg *config.Config) LLMClient {
 // never observes a mutated map. The failure memory pointer is shared — it must
 // survive across cycles.
 func (c *backendLLMClient) withBackendHealth(health map[string]state.BackendHealth) *backendLLMClient {
-	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory}
+	return &backendLLMClient{cfg: c.cfg, backendHealth: health, memory: c.memory, receiptSave: c.receiptSave, role: c.role, executionContext: c.executionContext, projectConfigSHA256: c.projectConfigSHA256}
 }
 
 func (c *backendLLMClient) Complete(prompt string) (string, error) {
-	candidates, err := supervisorBackendCandidates(c.cfg, c.backendHealth, time.Now().UTC())
-	if err != nil {
-		return "", err
-	}
+	result, err := c.CompleteConsultation(newConsultationIdentity(c.cfg, ""), prompt)
+	return result.Output, err
+}
 
-	if err := os.MkdirAll(c.cfg.StateDir, 0755); err != nil {
-		return "", fmt.Errorf("create state dir: %w", err)
+func (c *backendLLMClient) CompleteConsultation(identity ConsultationIdentity, prompt string) (result ConsultationResult, retErr error) {
+	if err := c.cfg.AIExecution.CheckCurrent(); err != nil {
+		return result, err
+	}
+	if c.cfg.Supervisor.RequireAccountingReady && !c.cfg.AIExecution.RequireVerifiedRoute {
+		return result, &ConsultationHold{Code: "accounting_route_unsupported"}
+	}
+	if identity.ID == "" {
+		identity = newConsultationIdentity(c.cfg, identity.CycleID)
+	}
+	if uuid.Validate(identity.ID) != nil || identity.Role != c.executionRole() || identity.ProjectID != c.cfg.ProjectID || routeIdentifier(identity.CycleID) == "" || (identity.ParentRoleRunID != "" && uuid.Validate(identity.ParentRoleRunID) != nil) {
+		return result, &ConsultationHold{Code: "consultation_identity_invalid"}
+	}
+	if strings.TrimSpace(c.cfg.StateDir) == "" {
+		return result, &ConsultationHold{Code: "receipt_store_unavailable"}
+	}
+	if c.cfg.Supervisor.NativeSessionRegistration != nil {
+		if previous, found, err := replayNativeConsultation(c.cfg, identity, prompt); found || err != nil {
+			// An abandoned pre-launch receipt sealed on the way in never
+			// launched and holds no capacity; the live consultation proceeds
+			// (the store archives the closed receipt when it opens).
+			var hold *aiexecution.Hold
+			if !errors.As(err, &hold) || hold.Code != nativePreLaunchReceiptSealed {
+				return previous, err
+			}
+		}
+	}
+	store, unlock, err := openConsultationStore(c.cfg.StateDir)
+	if err != nil {
+		var hold *ConsultationHold
+		if errors.As(err, &hold) {
+			return result, hold
+		}
+		return result, &ConsultationHold{Code: "receipt_store_unavailable"}
+	}
+	defer unlock()
+	if _, err := os.Stat(filepath.Join(store.dir, identity.ID+".json")); err == nil {
+		return result, &ConsultationHold{Code: "consultation_identity_reused"}
+	} else if !errors.Is(err, os.ErrNotExist) {
+		return result, &ConsultationHold{Code: "receipt_store_unavailable"}
+	}
+	receipt := newConsultationReceipt(c.cfg, identity)
+	if c.cfg.Supervisor.NativeSessionRegistration != nil {
+		receipt.InputDigest = nativeInputDigest(c.cfg, identity, prompt)
+	}
+	result.Receipt = receipt
+	save := store.save
+	if c.receiptSave != nil {
+		save = c.receiptSave
+	}
+	persist := func() error {
+		if err := save(receipt); err != nil {
+			return &ConsultationHold{Code: "receipt_persistence_failed"}
+		}
+		return nil
+	}
+	if err := persist(); err != nil {
+		return result, err
+	}
+	launchIntentWritten := false
+	var releaseAux func()
+	defer func() {
+		if releaseAux != nil && !launchIntentWritten {
+			releaseAux()
+		}
+	}()
+	defer func() {
+		// A persistence failure after launch must not erase its durable intent.
+		var hold *ConsultationHold
+		if errors.As(retErr, &hold) && hold.Code == "receipt_persistence_failed" {
+			return
+		}
+		var nativeHold *aiexecution.Hold
+		if errors.As(retErr, &nativeHold) && nativeHold.Code == "native_outcome_unverified" {
+			return
+		}
+		if result.AccountingPending {
+			// The verdict is surfaced, but the receipt is not complete: marker,
+			// permit and current.json stay held until the seal settles.
+			return
+		}
+		if hasNativeInvocations(receipt) && !nativeInvocationsAllowed(receipt) {
+			result.Output = ""
+			retErr = aiexecution.Held("native_outcome_unverified")
+			return
+		}
+		end := time.Now().UTC()
+		receipt.EndedAt = &end
+		if retErr != nil {
+			receipt.Status = "failed"
+		} else {
+			receipt.Status = "succeeded"
+		}
+		receipt.NativeOutcomeComplete = hasNativeInvocations(receipt)
+		if err := persist(); err != nil {
+			result.Output = ""
+			retErr = err
+			return
+		}
+		if launchIntentWritten {
+			// Final outcome is durable. Cleanup failure must not convert a known
+			// success into an apparent model failure that invites another call.
+			// A retained marker conservatively holds the next consultation.
+			if err := store.finishLaunch(); err != nil {
+				log.Printf("[supervisor] consultation outcome persisted; launch marker cleanup incomplete")
+			} else {
+				launchIntentWritten = false
+			}
+		}
+	}()
+	// Capacity is reserved only after the finaliser above is registered
+	// (#1233 review). A refused reservation (auxiliary_capacity_exhausted,
+	// auxiliary_controller_unavailable) is a typed hold before any launch and
+	// must leave a closed receipt: status failed, ended_at set, zero candidates
+	// and invocations. That is the shape review.NativeReviewPreLaunchHoldProof
+	// and the operator-rearm settlement require to prove nothing launched; a
+	// receipt left "prepared" is indistinguishable from an interrupted launch
+	// and silently spends the operator grant.
+	if c.cfg.RuntimeAuxiliaryLimiter != nil {
+		releaseAux, err = c.cfg.RuntimeAuxiliaryLimiter.ReserveAuxiliary(c.cfg.StateDir, identity.ID)
+		if err != nil {
+			return result, err
+		}
+	} else if c.cfg.AIExecution.RequireVerifiedRoute || c.executionRole() == "reviewer" {
+		return result, aiexecution.Held("auxiliary_controller_unavailable")
+	}
+	candidates, err := supervisorBackendCandidates(c.cfg, c.backendHealth, time.Now().UTC())
+	eligible := map[string]bool{}
+	for _, candidate := range candidates {
+		eligible[candidate.name] = true
+	}
+	primary, _, _ := supervisorBackend(c.cfg)
+	seen := map[string]bool{}
+	for _, name := range append([]string{primary}, c.cfg.Model.FallbackBackends...) {
+		name = strings.TrimSpace(name)
+		if name == "" || seen[name] || eligible[name] {
+			continue
+		}
+		seen[name] = true
+		reason := "disabled_or_missing"
+		if gate, ok := c.backendHealth[name]; ok && gate.State == state.BackendHealthCooldown {
+			reason = "cooldown"
+		}
+		receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(name), Status: reason})
+	}
+	if err != nil {
+		return result, err
 	}
 	promptFile, err := os.CreateTemp(c.cfg.StateDir, "supervisor-prompt-*.md")
 	if err != nil {
-		return "", fmt.Errorf("create supervisor prompt file: %w", err)
+		return result, fmt.Errorf("create supervisor prompt file: %w", err)
 	}
 	promptPath := promptFile.Name()
 	defer os.Remove(promptPath)
 	if _, err := promptFile.WriteString(prompt); err != nil {
-		promptFile.Close()
-		return "", fmt.Errorf("write supervisor prompt file: %w", err)
+		_ = promptFile.Close()
+		return result, err
 	}
 	if err := promptFile.Close(); err != nil {
-		return "", fmt.Errorf("close supervisor prompt file: %w", err)
+		return result, err
 	}
-
 	worktree := c.cfg.LocalPath
 	if strings.TrimSpace(worktree) == "" {
 		worktree = "."
 	}
 	deadline := time.Now().Add(supervisorTotalTimeoutFor(c.cfg))
-	var failed []string
-	var skipped []string
+	var failed, skipped []string
 	for _, candidate := range candidates {
-		now := time.Now()
-		if until, skip := c.memory.shouldSkip(candidate.name, now); skip {
+		if candidate.def.IsMetered() && !c.cfg.Supervisor.AllowMeteredBackend {
+			receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: "metered_policy_denied"})
+			continue
+		}
+		if _, skip := c.memory.shouldSkip(candidate.name, time.Now()); skip {
 			skipped = append(skipped, candidate.name)
-			log.Printf("[supervisor] skipping backend %s: %d consecutive failures, retry allowed after %s",
-				candidate.name, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
+			receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: "failure_memory"})
 			continue
 		}
 		remaining := time.Until(deadline)
 		if remaining <= 0 {
-			break
+			receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: "deadline"})
+			continue
 		}
-		attemptTimeout := supervisorAttemptTimeoutFor(c.cfg, candidate.def)
-		if remaining < attemptTimeout {
-			attemptTimeout = remaining
+		timeout := supervisorAttemptTimeoutFor(c.cfg, candidate.def)
+		if remaining < timeout {
+			timeout = remaining
 		}
-		out, runErr := completeSupervisorBackend(candidate.name, candidate.def, c.cfg, promptPath, worktree, attemptTimeout)
+		cmd, stdin, buildErr := buildSupervisorBackend(candidate.name, candidate.def, c.cfg, promptPath, worktree)
+		if buildErr != nil {
+			receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: "build_failed"})
+			failed = append(failed, candidate.name)
+			continue
+		}
+		fallback := ""
+		if len(failed) > 0 {
+			fallback = "previous_candidate_failed"
+		} else if candidate.name != primary {
+			fallback = "primary_skipped"
+		}
+		intent := uuid.NewString()
+		invocation := invocationForCommand(candidate, cmd, intent, len(receipt.Invocations)+1, fallback)
+		var contained *aiexecution.ContainedNativeCommand
+		if c.executionRole() == "reviewer" && (invocation.EffectiveCLIModel == nil || *invocation.EffectiveCLIModel != c.cfg.Supervisor.Model) {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, aiexecution.Held("reviewer_model_unproven")
+		}
+		candidateStatus := "launch_intent"
+		if c.cfg.Supervisor.NativeSessionRegistration != nil {
+			if err := prepareNativeSession(c.cfg, identity, &invocation, cmd); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
+			candidateStatus = "registration_intent"
+		}
+		receipt.PlannedInvocation = &invocation
+		receipt.Candidates = append(receipt.Candidates, CandidateReceipt{Backend: routeIdentifier(candidate.name), Status: candidateStatus, IntentID: intent})
+		index := len(receipt.Candidates) - 1
+		if err := persist(); err != nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, err
+		}
+		if invocation.NativeSession != nil {
+			if err := store.beginRegistration(identity, invocation.NativeSession); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			if err := registerNativeSession(c.cfg, invocation.NativeSession, time.Until(deadline)); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
+			configDigest, digestErr := config.AIExecutionConfigDigest(c.cfg)
+			if c.projectConfigSHA256 != "" {
+				configDigest = c.projectConfigSHA256
+				digestErr = nil
+			}
+			if digestErr != nil {
+				return result, aiexecution.Held("project_config_unobservable")
+			}
+			if err := aiexecution.Inspect(c.cfg.AIExecution, aiexecution.LaunchSpec{
+				ProjectID: identity.ProjectID, Role: identity.Role, RoleRunID: identity.ID, Model: c.cfg.Supervisor.Model,
+				GatewayScope:          c.cfg.Supervisor.NativeSessionRegistration.GatewayScope,
+				ExpectedPolicyVersion: c.cfg.Supervisor.NativeSessionRegistration.ExpectedPolicyVersion,
+				Registration:          invocation.NativeSession.Acknowledgement,
+				ProjectConfigSHA256:   configDigest,
+			}, cmd); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				receipt.Candidates[index].Status = "readiness_held"
+				if err := persist(); err != nil {
+					return result, err
+				}
+				if err := store.finishRegistration(); err != nil {
+					return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+				}
+				return result, err
+			}
+			if c.cfg.AIExecution.RequireVerifiedRoute {
+				pin, err := aiexecution.ContainmentProfilePin(c.cfg.AIExecution, identity.Role, identity.Role)
+				if err != nil {
+					return result, err
+				}
+				gateway, err := aiexecution.GatewayProcessFromPolicy(c.cfg.AIExecution)
+				if err != nil {
+					return result, err
+				}
+				unit, err := aiexecution.NativeAuxiliaryUnit(invocation.ID)
+				if err != nil {
+					return result, err
+				}
+				lease := tmuxsession.ProcessLease{Unit: unit, Manager: tmuxsession.ProcessLeaseManagerSystem}
+				contained, err = aiexecution.PrepareContainedNativeCommand(pin, identity.ProjectID, identity.Role, invocation.ID, gateway, cmd, lease)
+				if err != nil {
+					return result, err
+				}
+				invocation.ProcessLease = &NativeInvocationProcessLease{Unit: unit, Manager: lease.Manager, Profile: pin}
+				cmd = contained.Cmd
+			}
+			receipt.Candidates[index].Status = "launch_intent"
+			if err := persist(); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, err
+			}
+		}
+		if c.cfg.AIExecution.RequireVerifiedRoute && invocation.NativeSession == nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, aiexecution.Held("native_registration_required")
+		}
+		if err := store.beginLaunch(identity, intent); err != nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+		}
+		launchIntentWritten = true
+		if invocation.NativeSession != nil {
+			if err := store.finishRegistration(); err != nil {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			remaining = time.Until(deadline)
+			if remaining <= 0 || invocation.NativeSession.Request.ExpiresAt <= time.Now().Unix() {
+				if stdin != nil {
+					_ = stdin.Close()
+				}
+				return result, &ConsultationHold{Code: "registration_launch_deadline"}
+			}
+			if remaining < timeout {
+				timeout = remaining
+			}
+		}
+		invocation.StartedAt = time.Now().UTC()
+		if err := c.cfg.AIExecution.CheckCurrent(); err != nil {
+			if stdin != nil {
+				_ = stdin.Close()
+			}
+			return result, err
+		}
+		var stop func() error
+		if contained != nil {
+			stop = contained.StopAndVerify
+		}
+		out, launched, status, runErr := outputWithTimeoutReceiptContext(c.executionContext, cmd, timeout, stop)
+		if contained != nil && launched && status != "containment_unresolved" {
+			proof, err := aiexecution.VerifyNativeProcessTermination(invocation.ProcessLease.Profile, invocation.ID, invocation.ProcessLease.Unit)
+			if err != nil {
+				status = "containment_unresolved"
+				runErr = err
+			} else {
+				invocation.ProcessTerminationVerified = true
+				invocation.ProcessTerminationDigest = proof.Digest
+				invocation.ProcessTermination = proof
+			}
+		}
+		if stdin != nil {
+			_ = stdin.Close()
+		}
+		invocation.EndedAt = time.Now().UTC()
+		invocation.Status = status
+		if invocation.NativeSession != nil && launched {
+			checkpoint, err := store.saveNativeOutput(identity, invocation, out)
+			if err != nil {
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
+			}
+			invocation.OutputCheckpoint = checkpoint
+		}
+		receipt.PlannedInvocation = nil
+		receipt.Candidates[index].Status = status
+		if launched {
+			receipt.Invocations = append(receipt.Invocations, invocation)
+		}
+		// Persist the completed call BEFORE deciding whether another candidate may run.
+		if err := persist(); err != nil {
+			return result, err
+		}
+		if invocation.NativeSession != nil && launched {
+			if err := sealNativeInvocations(c.executionContext, c.cfg, receipt, persist, nativeSettleWindow); err != nil {
+				var hold *aiexecution.Hold
+				if c.acceptPendingOutcome && runErr == nil && invocation.Status == "succeeded" && errors.As(err, &hold) && hold.Code == "native_outcome_unverified" && nativeOutcomeAccountingPending(receipt) {
+					// Every binding is sealed; only settlement of the exited
+					// session's attempt is outstanding. Surface the complete
+					// verdict and leave the receipt for the regular reconcile.
+					log.Printf("[supervisor] native %s output complete; authority accounting pending, receipt retained for reconcile", identity.Role)
+					c.memory.recordSuccess(candidate.name)
+					result.Output = strings.TrimSpace(string(out))
+					result.AccountingPending = true
+					return result, nil
+				}
+				return result, err
+			}
+		}
 		if runErr == nil {
 			c.memory.recordSuccess(candidate.name)
-			if len(failed) > 0 {
-				log.Printf("[supervisor] backend fallback selected %s after %s failed", candidate.name, strings.Join(failed, ", "))
+			result.Output = strings.TrimSpace(string(out))
+			return result, nil
+		}
+		if invocation.NativeSession != nil {
+			// The failed process outcome is synced above. Clear only this known
+			// completed launch before recording the next candidate's registration.
+			if err := store.finishLaunch(); err != nil {
+				return result, &ConsultationHold{Code: "receipt_persistence_failed"}
 			}
-			return strings.TrimSpace(string(out)), nil
+			launchIntentWritten = false
 		}
 		failed = append(failed, candidate.name)
-		if until, opened := c.memory.recordFailure(candidate.name, time.Now()); opened {
-			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); %d consecutive failures — skipping it until %s",
-				candidate.name, runErr, supervisorBackendFailureThreshold, until.UTC().Format(time.RFC3339))
-		} else {
-			log.Printf("[supervisor] backend %s unavailable for this cycle (%v); trying configured fallback", candidate.name, runErr)
-		}
+		c.memory.recordFailure(candidate.name, time.Now())
 	}
 	if len(failed) == 0 && len(skipped) > 0 {
-		return "", fmt.Errorf("run supervisor backends: all candidates inside failure-memory skip windows (%s); deterministic guardrail proceeds", strings.Join(skipped, ", "))
+		return result, fmt.Errorf("run supervisor backends: all candidates inside failure-memory skip windows (%s); deterministic guardrail proceeds", strings.Join(skipped, ", "))
 	}
-	return "", fmt.Errorf("run supervisor backends: all bounded candidates failed (%s)", strings.Join(failed, ", "))
+	return result, fmt.Errorf("run supervisor backends: all bounded candidates failed (%s)", strings.Join(failed, ", "))
 }
 
 type supervisorBackendCandidate struct {
@@ -290,33 +651,73 @@ func supervisorBackendCandidates(cfg *config.Config, health map[string]state.Bac
 	return out, nil
 }
 
-func completeSupervisorBackend(name string, def config.BackendDef, cfg *config.Config, promptPath, worktree string, timeout time.Duration) ([]byte, error) {
+func buildSupervisorBackend(name string, def config.BackendDef, cfg *config.Config, promptPath, worktree string) (*exec.Cmd, *os.File, error) {
 	backendCfg := worker.BackendConfig{
 		Cmd: def.Cmd, ExtraArgs: def.ExtraArgs, PromptMode: def.PromptMode, Provider: def.Provider,
-		Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort,
-		// #1127: keep this probe's temp files off the RAM-backed host /tmp.
-		TempDir: cfg.Supervisor.EffectiveTempDir(),
+		Model: cfg.Supervisor.Model, Effort: cfg.Supervisor.Effort, TempDir: cfg.Supervisor.EffectiveTempDir(),
 	}
 	cmd, stdinFile, err := worker.BuildSupervisorCmd(name, backendCfg, promptPath, worktree)
 	if err != nil {
-		return nil, fmt.Errorf("build supervisor backend cmd: %w", err)
+		return nil, nil, err
 	}
+	var stdin *os.File
 	if stdinFile != "" {
-		in, err := os.Open(stdinFile)
+		stdin, err = os.Open(stdinFile)
 		if err != nil {
-			return nil, fmt.Errorf("open supervisor prompt stdin: %w", err)
+			return nil, nil, err
 		}
-		defer in.Close()
-		cmd.Stdin = in
+		cmd.Stdin = stdin
 	}
-	return outputWithTimeout(cmd, timeout)
+	return cmd, stdin, nil
 }
 
 func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
-	var out bytes.Buffer
+	out, _, _, err := outputWithTimeoutReceipt(cmd, timeout)
+	return out, err
+}
+
+func outputWithTimeoutReceipt(cmd *exec.Cmd, timeout time.Duration) ([]byte, bool, string, error) {
+	return outputWithTimeoutReceiptContext(context.Background(), cmd, timeout)
+}
+
+type boundedNativeOutput struct {
+	buffer   bytes.Buffer
+	overflow bool
+}
+
+func (b *boundedNativeOutput) Bytes() []byte { return b.buffer.Bytes() }
+func (b *boundedNativeOutput) Len() int      { return b.buffer.Len() }
+
+func (b *boundedNativeOutput) Write(p []byte) (int, error) {
+	const maxOutput = 4 << 20
+	n := len(p)
+	remaining := maxOutput - b.Len()
+	if len(p) > remaining {
+		p = p[:remaining]
+		b.overflow = true
+	}
+	_, _ = b.buffer.Write(p)
+	return n, nil
+}
+
+func outputWithTimeoutReceiptContext(ctx context.Context, cmd *exec.Cmd, timeout time.Duration, stops ...func() error) ([]byte, bool, string, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, false, "cancelled", err
+	}
+	var out boundedNativeOutput
+	stop := func() error {
+		if len(stops) == 1 && stops[0] != nil {
+			return stops[0]()
+		}
+		return nil
+	}
 	cmd.Stdout = &out
+	cmd.WaitDelay = 2 * time.Second
 	if err := cmd.Start(); err != nil {
-		return nil, err
+		return nil, false, "start_failed", err
 	}
 	done := make(chan error, 1)
 	go func() { done <- cmd.Wait() }()
@@ -324,14 +725,36 @@ func outputWithTimeout(cmd *exec.Cmd, timeout time.Duration) ([]byte, error) {
 	defer timer.Stop()
 	select {
 	case err := <-done:
-		return out.Bytes(), err
+		if stopErr := stop(); stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
+		if out.overflow {
+			return out.Bytes(), true, "output_limit", fmt.Errorf("native output exceeded bounded receipt limit")
+		}
+		status := "succeeded"
+		if err != nil {
+			status = "failed"
+		}
+		return out.Bytes(), true, status, err
+	case <-ctx.Done():
+		stopErr := stop()
+		worker.ForceKillProcessTree(cmd.Process.Pid)
+		<-done
+		if stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
+		return out.Bytes(), true, "cancelled", ctx.Err()
 	case <-timer.C:
 		// This is already a hard attempt deadline. Do not spend the worker
 		// reaper's two-second SIGTERM grace period here or the bounded fallback
 		// chain can overrun its advertised total deadline.
+		stopErr := stop()
 		worker.ForceKillProcessTree(cmd.Process.Pid)
 		<-done
-		return nil, fmt.Errorf("timed out after %s", timeout.Round(time.Second))
+		if stopErr != nil {
+			return out.Bytes(), true, "containment_unresolved", stopErr
+		}
+		return out.Bytes(), true, "timed_out", fmt.Errorf("timed out after %s", timeout.Round(time.Second))
 	}
 }
 
@@ -388,13 +811,38 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 	if backendClient, ok := client.(*backendLLMClient); ok {
 		client = backendClient.withBackendHealth(st.BackendHealth)
 	}
-	output, err := client.Complete(prompt)
+	var output string
+	if currentErr := e.cfg.AIExecution.CheckCurrent(); currentErr != nil {
+		err = currentErr
+	} else if e.cfg.Supervisor.RequireAccountingReady && !e.cfg.AIExecution.RequireVerifiedRoute {
+		err = &ConsultationHold{Code: "accounting_route_unsupported"}
+	} else if _, native := client.(*backendLLMClient); e.cfg.AIExecution.RequireVerifiedRoute && !native {
+		err = aiexecution.Held("custom_completer_unsupported")
+	} else if rich, ok := client.(ConsultationClient); ok {
+		identity := newConsultationIdentity(e.cfg, deterministic.ID)
+		var result ConsultationResult
+		result, err = rich.CompleteConsultation(identity, prompt)
+		output = result.Output
+		deterministic.ConsultationID = identity.ID
+	} else if e.cfg.AIExecution.RequireVerifiedRoute {
+		err = aiexecution.Held("custom_completer_unsupported")
+	} else {
+		output, err = client.Complete(prompt)
+	}
 	if err != nil {
 		// The deterministic guardrail already selected the only action the LLM
 		// is allowed to agree with. Provider failure must not freeze the project
 		// control loop: preserve that decision and make the degraded route visible.
 		log.Printf("[supervisor] all model backends unavailable; continuing with deterministic guardrail: %v", err)
 		deterministic.ErrorClass = ErrorClassSupervisorBackend
+		var hold *ConsultationHold
+		if errors.As(err, &hold) {
+			deterministic.ErrorClass = hold.Code
+		}
+		var executionHold *aiexecution.Hold
+		if errors.As(err, &executionHold) {
+			deterministic.ErrorClass = executionHold.Code
+		}
 		deterministic.Reasons = append(deterministic.Reasons, "Supervisor model backends were unavailable; deterministic guardrail executed without model synthesis.")
 		return deterministic, nil
 	}
@@ -403,6 +851,7 @@ func (e *Engine) decideWithLLM(st *state.State) (state.SupervisorDecision, error
 		return state.SupervisorDecision{}, err
 	}
 	decision, err := validateLLMDecision(llmDecision, deterministic, policy)
+	decision.ConsultationID = deterministic.ConsultationID
 	var conflict *guardrailConflictError
 	if errors.As(err, &conflict) {
 		return resolveGuardrailConflict(llmDecision, deterministic, conflict), nil
@@ -768,4 +1217,11 @@ func copyTarget(target *state.SupervisorTarget) *state.SupervisorTarget {
 	copy := *target
 	copy.Session = strings.TrimSpace(copy.Session)
 	return &copy
+}
+
+func (c *backendLLMClient) executionRole() string {
+	if c.role != "" {
+		return c.role
+	}
+	return "supervisor"
 }

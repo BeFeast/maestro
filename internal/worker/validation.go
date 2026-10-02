@@ -2,10 +2,10 @@ package worker
 
 import (
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/github"
 )
 
@@ -64,7 +64,7 @@ func GenerateValidationContract(issue github.Issue, worktreePath string) (string
 
 	// Write to worktree
 	outPath := filepath.Join(worktreePath, "VALIDATION.md")
-	if err := os.WriteFile(outPath, []byte(contract), 0644); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(outPath, []byte(contract), 0644); err != nil {
 		return "", fmt.Errorf("write VALIDATION.md: %w", err)
 	}
 

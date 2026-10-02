@@ -12,46 +12,56 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/befeast/maestro/internal/approvalstore"
 	"github.com/befeast/maestro/internal/configstore"
 	"github.com/befeast/maestro/internal/daemon"
-	"github.com/befeast/maestro/internal/emergencystore"
-	"github.com/befeast/maestro/internal/statestore"
+	"github.com/befeast/maestro/internal/daemonresources"
+	"github.com/befeast/maestro/internal/orchestrator"
 	"github.com/befeast/maestro/internal/tmpfshygiene"
 	"github.com/befeast/maestro/internal/webhook"
-	"github.com/befeast/maestro/internal/webhookstore"
 )
 
-// daemonCmd runs every project in the config store as one long-lived process:
+// daemonCmd runs the selected projects (all by default) as one long-lived process:
 // an orchestrator + supervisor loop per project flow, plus a single
 // FleetServer aggregating them all (#756, epic #754). Legacy per-project units
 // and a separate `maestro serve` process are migration sources, not peers to a
 // running daemon.
 func daemonCmd(args []string) {
 	fs := flag.NewFlagSet("daemon", flag.ExitOnError)
-	storePath := fs.String("store", defaultConfigStorePath(), "Path to SQLite config store")
+	defaults := daemonresources.Defaults(defaultConfigStorePath())
+	storePath := fs.String("store", defaults.Store, "Path to SQLite config store")
+	var projects multiFlag
+	fs.Var(&projects, "project", "Exact config-store row to run (repeatable; omitted runs all projects)")
+	var recoverNative multiFlag
+	fs.Var(&recoverNative, "recover-native-prelaunch", "One explicit recovery attempt: project-ID:slot:native-session-UUID (repeatable)")
 	runInterval := fs.Duration("run-interval", daemon.DefaultRunInterval, "Orchestrator loop interval")
 	superviseInterval := fs.Duration("supervise-interval", daemon.DefaultSuperviseInterval, "Supervisor loop interval")
 	tmpfsHygieneInterval := fs.Duration("tmpfs-hygiene-interval", daemon.DefaultTmpfsHygieneInterval, "Protect-aware /tmp apply interval")
 	tmpfsPressureInterval := fs.Duration("tmpfs-pressure-interval", daemon.DefaultTmpfsPressureInterval, "Sweep-independent /tmp free-space sampling interval (#1128)")
 	tmpfsPressureFloor := fs.Int64("tmpfs-pressure-floor-bytes", tmpfshygiene.DefaultPressureFreeBytes, "Free bytes on /tmp below which the operator is paged CRITICAL; negative disables (#1128)")
 	tmpfsSpawnFloor := fs.Int64("tmpfs-spawn-floor-bytes", tmpfshygiene.DefaultSpawnFreeBytes, "Free bytes on /tmp below which new worker dispatch pauses; negative disables (#1128)")
-	host := fs.String("host", "127.0.0.1", "Host/interface to bind the fleet web server")
-	port := fs.Int("port", 8786, "Port to bind the fleet web server")
+	host := fs.String("host", defaults.Host, "Host/interface to bind the fleet web server")
+	port := fs.Int("port", defaults.Port, "Port to bind the fleet web server")
 	promptPath := fs.String("prompt", "", "Path to worker prompt base file")
 	readOnly := fs.Bool("read-only", false, "Disable mutating fleet HTTP endpoints")
 	watchStore := fs.Bool("watch-store", false, "Hot add/remove/reload projects from the config store without a restart (#757)")
 	watchStoreInterval := fs.Duration("watch-store-interval", daemon.DefaultWatchStoreInterval, "Config-store diff/reload poll interval (with --watch-store)")
-	approvalsStore := fs.String("approvals-store", "json", "Approvals store backend for the fleet approve/reject endpoint: json|sqlite (#759)")
-	approvalsDB := fs.String("approvals-db", approvalstore.DefaultDBPath(), "Shared SQLite approvals DB (always used for delivery; generic gate uses it with --approvals-store=sqlite)")
-	stateStore := fs.String("state-store", "json", "State store backend for sessions/decisions/health/missions: json|sqlite (write-through mirror, #760)")
-	stateDB := fs.String("state-db", statestore.DefaultDBPath(), "Shared SQLite state db path (used with --state-store=sqlite)")
+	approvalsStore := fs.String("approvals-store", defaults.ApprovalsStore, "Approvals store backend for the fleet approve/reject endpoint: json|sqlite (#759)")
+	approvalsDB := fs.String("approvals-db", defaults.ApprovalsDB, "Shared SQLite approvals DB (always used for delivery; generic gate uses it with --approvals-store=sqlite)")
+	stateStore := fs.String("state-store", defaults.StateStore, "State store backend for sessions/decisions/health/missions: json|sqlite (write-through mirror, #760)")
+	stateDB := fs.String("state-db", defaults.StateDB, "Shared SQLite state db path (used with --state-store=sqlite)")
 	webhookSecretFile := fs.String("webhook-secret-file", "", "Path to a file holding the GitHub webhook secret; enables inbound webhook ingestion on the fleet port (#824)")
 	webhookPath := fs.String("webhook-path", webhook.DefaultPath, "HTTP path the webhook ingestion endpoint is served on (#824)")
-	webhookDB := fs.String("webhook-db", webhookstore.DefaultDBPath(), "Shared SQLite db path webhook deliveries land in (#824)")
-	emergencyDB := fs.String("emergency-db", emergencystore.DefaultDBPath(), "Shared SQLite db path the fleet-wide EMERGENCY STOP switch lives in (#840)")
+	webhookDB := fs.String("webhook-db", defaults.WebhookDB, "Shared SQLite db path webhook deliveries land in (#824)")
+	emergencyDB := fs.String("emergency-db", defaults.EmergencyDB, "Shared SQLite db path the fleet-wide EMERGENCY STOP switch lives in (#840)")
 	drainTimeout := fs.Duration("drain-timeout", daemon.DefaultDrainTimeout, "Whole SIGTERM drain + shutdown deadline; includes flow joins and restart checkpointing (#761, #966)")
 	fs.Parse(args)
+	if err := daemon.ValidateProjectSelection(projects); err != nil {
+		log.Fatalf("daemon: %v", err)
+	}
+	recoveries, err := orchestrator.ParseNativePrelaunchRecoveries(recoverNative)
+	if err != nil {
+		log.Fatalf("daemon: %v", err)
+	}
 	if err := refuseUnmigratedCanonicalStore(*storePath); err != nil {
 		log.Fatalf("daemon: %v", err)
 	}
@@ -66,17 +76,19 @@ func daemonCmd(args []string) {
 	defer store.Close()
 
 	d := daemon.New(store, daemon.Options{
-		Host:                    *host,
-		Port:                    *port,
-		RunInterval:             *runInterval,
-		SuperviseInterval:       *superviseInterval,
-		TmpfsHygieneInterval:    *tmpfsHygieneInterval,
-		TmpfsPressureInterval:   *tmpfsPressureInterval,
-		TmpfsPressureFloorBytes: *tmpfsPressureFloor,
-		TmpfsSpawnFloorBytes:    *tmpfsSpawnFloor,
-		PromptPath:              *promptPath,
-		Version:                 resolveVersion(),
-		ReadOnly:                *readOnly,
+		ProjectNames:              projects,
+		NativePrelaunchRecoveries: recoveries,
+		Host:                      *host,
+		Port:                      *port,
+		RunInterval:               *runInterval,
+		SuperviseInterval:         *superviseInterval,
+		TmpfsHygieneInterval:      *tmpfsHygieneInterval,
+		TmpfsPressureInterval:     *tmpfsPressureInterval,
+		TmpfsPressureFloorBytes:   *tmpfsPressureFloor,
+		TmpfsSpawnFloorBytes:      *tmpfsSpawnFloor,
+		PromptPath:                *promptPath,
+		Version:                   resolveVersion(),
+		ReadOnly:                  *readOnly,
 		// Centralized self-deploy debounce marker (#758): one shared location next
 		// to the config store so every flow's RequestSelfDeploy debounces on the
 		// same marker, and it survives the daemon being restarted by its own

@@ -3,6 +3,7 @@ package worker
 import (
 	"context"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os/exec"
 	"strings"
@@ -25,6 +26,12 @@ func RunHook(cfg *config.Config, hookName, script string, env HookEnv) error {
 		return nil
 	}
 
+	if err := cfg.AIExecution.CheckCurrent(); err != nil {
+		return err
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		return aiexecution.Held("opaque_hook_unsupported")
+	}
 	timeout := time.Duration(cfg.Hooks.TimeoutMs) * time.Millisecond
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()

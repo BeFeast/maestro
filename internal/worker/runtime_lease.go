@@ -383,6 +383,13 @@ func reconcileWorkerLeasesWithOps(cfg *config.Config, s *state.State, now time.T
 		lease := leasesByID[id]
 		seen[id] = true
 		refs := sessionsByID[id]
+		// Native receipts own launch uncertainty even when the ordinary session
+		// projection was never committed. Never signal or clean such an exact
+		// lease based on a failed/missing session row.
+		if hold, err := nativeLeaseCleanupHold(cfg, lease); hold || err != nil {
+			addAttention(id, lease.Slot, "native process outcome is unresolved; exact receipt must reconcile before cleanup", s.Sessions[lease.Slot])
+			continue
+		}
 		if ambiguousUnits[lease.Unit] {
 			if len(refs) == 0 {
 				addAttention(id, lease.Slot, "multiple scratch manifests claim the same process lease", nil)

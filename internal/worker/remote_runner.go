@@ -31,7 +31,21 @@ func writeConfiguredWorkerRunnerScript(cfg *config.Config, slotName, branch, pro
 		return fmt.Errorf("write worker runner: nil config")
 	}
 	if !cfg.RemoteRunner.Enabled {
+		if cfg.AIExecution.RequireVerifiedRoute {
+			proof := runnerPath + ".execution.json"
+			sha, err := workerExecutionProofPin(proof)
+			if err != nil {
+				return err
+			}
+			if err := preflightWorkerExecution(cfg, runnerPath, args); err != nil {
+				return err
+			}
+			return writeWorkerRunnerScript(cfg.StateDir, runnerPath, args, stdinFile, logFile, localWorktree, split, proof, sha)
+		}
 		return writeWorkerRunnerScript(cfg.StateDir, runnerPath, args, stdinFile, logFile, localWorktree, split)
+	}
+	if cfg.AIExecution.RequireVerifiedRoute {
+		return fmt.Errorf("AI execution held: remote_runner_unsupported")
 	}
 	return writeRemoteWorkerRunnerScript(cfg, slotName, branch, promptFile, runnerPath, args, stdinFile, logFile, localWorktree, split)
 }

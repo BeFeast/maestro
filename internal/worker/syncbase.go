@@ -2,7 +2,7 @@ package worker
 
 import (
 	"fmt"
-	"os/exec"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"strings"
 )
 
@@ -156,7 +156,7 @@ func isIgnorableBaseUntracked(path string) bool {
 // out, so the worktree's merge-base with origin/main is origin/main (#734).
 func addWorktreeFromBase(localPath, worktreePath, branchName string) error {
 	base := "origin/" + defaultBaseBranch
-	out, err := exec.Command("git", "-C", localPath,
+	out, err := aiexecution.NativeGitCommand("-C", localPath,
 		"worktree", "add", "--no-track", "-b", branchName, worktreePath, base).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git worktree add %s on %s from %s: %w\n%s", worktreePath, branchName, base, err, out)

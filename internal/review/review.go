@@ -32,7 +32,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/forge"
+	"github.com/befeast/maestro/internal/supervisor"
 )
 
 // Lens runs one review model. Implementations: ChatLens (any OpenAI-compatible
@@ -49,8 +51,15 @@ type Lens interface {
 
 // Producer publishes reviews for one repository through one forge client.
 type Producer struct {
-	Forge forge.Client
-	Repo  string
+	ExecutionPolicy aiexecution.Policy
+	// Attempts is mandatory for HTTP lenses; nil fails closed before HTTP.
+	Attempts    *AttemptStore
+	MaxAttempts int
+	Forge       forge.Client
+	Repo        string
+	// ExpectedHead pins daemon dispatch to the observed/authorized head. An
+	// advanced branch must be reconsidered in the next orchestration cycle.
+	ExpectedHead string
 	// Lenses are the streams to produce. The caller (daemon trigger, S5) maps
 	// the project's effective review-gate streams here — the two sets MUST
 	// match or the gate degrades on an unproduced stream.
@@ -72,6 +81,9 @@ type Producer struct {
 const (
 	defaultPendingStaleAfter = 30 * time.Minute
 	defaultMaxDiffBytes      = 400000
+	// accountingPendingNote is appended to a native lens's final status when
+	// its verdict was posted before the authority settled the attempt.
+	accountingPendingNote = "; accounting pending: native attempt settlement awaited"
 )
 
 // promptTemplate is the shared review prompt, byte-identical to the bash
@@ -136,6 +148,9 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
 	}
+	if p.ExpectedHead != "" && pr.HeadSHA != p.ExpectedHead {
+		return fmt.Errorf("review %s#%d: head changed before dispatch", p.Repo, prNumber)
+	}
 	diff, err := p.Forge.GetPRDiff(ctx, p.Repo, prNumber)
 	if err != nil {
 		return fmt.Errorf("review %s#%d: %w", p.Repo, prNumber, err)
@@ -178,9 +193,48 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	// any model runs or any comment is posted.
 	var errs []error
 	var runnable []Lens
+	claims := map[string]string{}
+	grants := map[string]string{}
 	for _, lens := range p.Lenses {
+		if managedLens(lens) {
+			if settled, _ := p.statusSettled(lens.Name(), statuses); settled {
+				continue
+			}
+			observed := false
+			for _, st := range statuses {
+				if st.Context == lens.Name() {
+					observed = true
+					break
+				}
+			}
+			max := p.MaxAttempts
+			if max == 0 {
+				max = 1
+			}
+			if err := p.checkAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, lens, max, observed); err != nil {
+				if !observed {
+					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
+				}
+				errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
+				continue
+			}
+		}
 		switch p.prepare(ctx, lens, pr.HeadSHA, statuses) {
 		case prepareRun:
+			if managedLens(lens) {
+				max := p.MaxAttempts
+				if max == 0 {
+					max = 1
+				}
+				id, grantID, err := p.claimAttempt(AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}, lens, max)
+				if err != nil {
+					p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt or retry policy")
+					errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
+					continue
+				}
+				claims[lens.Name()] = id
+				grants[lens.Name()] = grantID
+			}
 			runnable = append(runnable, lens)
 		case prepareSkip:
 		case prepareCredsMissing:
@@ -197,7 +251,7 @@ func (p *Producer) ProducePR(ctx context.Context, prNumber int) error {
 	// Phase 2: run the reviews and flip each pending to its final state.
 	prompt := fmt.Sprintf(promptTemplate, pr.Title)
 	for _, lens := range runnable {
-		if err := p.runLens(ctx, lens, pr, prompt+string(diff), truncNote); err != nil {
+		if err := p.runLensClaimed(ctx, lens, pr, prompt+string(diff), truncNote, claims[lens.Name()], grants[lens.Name()]); err != nil {
 			errs = append(errs, fmt.Errorf("%s: %w", lens.Name(), err))
 		}
 	}
@@ -347,13 +401,107 @@ func parseOutput(output string) (findings []Finding, ok bool) {
 }
 
 // runLens is phase 2 for one lens: run the model, parse fail-closed, post the
-// findings and flip the pending status to its final state.
-func (p *Producer) runLens(ctx context.Context, lens Lens, pr forge.PR, prompt, truncNote string) error {
-	output, err := lens.Run(ctx, prompt)
+// findings and flip the pending status to its final state. grantID is set when
+// claimID exercises an operator rearm grant; the grant is consumed only after
+// the native run settles (see settleRearmAttempt), and a refusal before the
+// native runner is entered retracts the attempt without spending it.
+func (p *Producer) runLensClaimed(ctx context.Context, lens Lens, pr forge.PR, prompt, truncNote, claimID, grantID string) error {
+	scope := AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}
+	// refuse settles a grant claim that never reached the native runner and
+	// returns the error to report; an ordinary claim keeps its launch intent.
+	refuse := func(err error) error {
+		if claimID == "" || grantID == "" {
+			return err
+		}
+		if _, settleErr := p.settleGrantClaim(scope, lens, claimID, grantID, err, false); settleErr != nil {
+			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: rearm grant settlement failed")
+			return fmt.Errorf("review rearm grant settlement failed: %w", settleErr)
+		}
+		return err
+	}
+	if claimID != "" {
+		current, err := p.Forge.GetPR(ctx, p.Repo, pr.Number)
+		if err != nil || current.HeadSHA != pr.HeadSHA {
+			return refuse(fmt.Errorf("review head unverifiable or changed; claim retained"))
+		}
+		statuses, err := p.Forge.CommitStatuses(ctx, p.Repo, pr.HeadSHA)
+		if err != nil {
+			return refuse(fmt.Errorf("review status unverifiable; claim retained"))
+		}
+		for _, st := range statuses {
+			if st.Context == lens.Name() {
+				if st.State == forge.StatusSuccess || st.State == forge.StatusFailure {
+					return refuse(fmt.Errorf("review already settled; claim retained"))
+				}
+				break
+			}
+		}
+	}
+	if err := p.ExecutionPolicy.CheckCurrent(); err != nil {
+		return refuse(err)
+	}
+	if p.ExecutionPolicy.RequireVerifiedRoute {
+		if native, ok := lens.(*NativeClaudeLens); !ok || !native.policy.RequireVerifiedRoute {
+			return refuse(aiexecution.Held("review_transport_unsupported"))
+		}
+	}
+	var output string
+	var err error
+	entered := true
+	accountingPending := false
+	if native, ok := lens.(*NativeClaudeLens); ok {
+		var verdict supervisor.NativeReviewResult
+		verdict, entered, err = native.runClaimed(ctx, prompt, claimID)
+		output, accountingPending = verdict.Output, verdict.AccountingPending && err == nil
+	} else {
+		output, err = lens.Run(ctx, prompt)
+	}
+	if claimID != "" && grantID != "" {
+		recorded, settleErr := p.settleGrantClaim(scope, lens, claimID, grantID, err, entered)
+		if settleErr != nil {
+			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: rearm grant settlement failed")
+			return fmt.Errorf("review rearm grant settlement failed: %w", settleErr)
+		}
+		if !recorded {
+			// Proven hold before any native launch: zero physical requests
+			// were made, so the operator grant stays queued and history is
+			// unchanged.
+			code, _ := typedNativeHold(err)
+			p.logf("%s: operator rearm grant retained; pre-launch hold %q made no native invocation", lens.Name(), code)
+			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: "+code)
+			return fmt.Errorf("run: %w", err)
+		}
+	}
+	if claimID != "" {
+		scope := AttemptScope{p.Repo, pr.Number, pr.HeadSHA, lens.Name()}
+		var saveErr error
+		if accountingPending {
+			saveErr = p.Attempts.FinishAccountingPending(scope, claimID, p.now())
+		} else {
+			saveErr = p.Attempts.Finish(scope, claimID, p.now(), err)
+		}
+		if saveErr != nil {
+			p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review held: receipt persistence failed")
+			return fmt.Errorf("review receipt persistence failed: %w", saveErr)
+		}
+	}
 	if err != nil {
 		p.logf("%s run failed: %v", lens.Name(), err)
-		p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, "review run failed")
+		description := "review run failed"
+		var terminal *GatewayTerminalError
+		if errors.As(err, &terminal) {
+			description = "review held: " + terminal.Code
+		}
+		p.postStatus(ctx, lens.Name(), pr.HeadSHA, forge.StatusError, description)
 		return fmt.Errorf("run: %w", err)
+	}
+	if accountingPending {
+		// The verdict is complete and durable; only the authority's settlement
+		// of the single native attempt is outstanding (#1239). The receipt
+		// stays with the daemon's regular reconcile — posting here never
+		// spends a second attempt. The note keeps that visible on the status.
+		p.logf("%s: verdict complete, native attempt accounting pending; receipt retained for reconcile", lens.Name())
+		truncNote += accountingPendingNote
 	}
 	findings, ok := parseOutput(output)
 	if !ok {
@@ -428,4 +576,18 @@ func (p *Producer) postFinalStatus(ctx context.Context, context, sha string, sta
 	}
 	p.logf("%s: status %s on %s", context, state, sha)
 	return nil
+}
+
+// settleGrantClaim settles the grant claim behind claimID once the run has
+// returned (or was refused before the native runner was entered). recorded
+// reports whether the attempt stays in history for Finish to settle.
+func (p *Producer) settleGrantClaim(scope AttemptScope, lens Lens, claimID, grantID string, runErr error, entered bool) (bool, error) {
+	native, _ := lens.(*NativeClaudeLens)
+	projectID := ""
+	var preflight rearmPreflight
+	if native != nil {
+		projectID = native.projectID
+		preflight = native.preflight(p.Attempts.StateDir)
+	}
+	return p.settleRearmAttempt(scope, claimID, grantID, projectID, runErr, entered, preflight)
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"io"
 	"net/http"
 	"strings"
@@ -18,6 +19,7 @@ import (
 // bash producer's direct `claude -p` opus branch is being retired (#1162).
 // The caller injects the base URL and key from config (*_env indirection).
 type ChatLens struct {
+	ExecutionPolicy aiexecution.Policy
 	// Stream is the status context / stream name, e.g. "llm-review-opus".
 	Stream string
 	// BaseURL is the API root, e.g. "http://127.0.0.1:23020"; the lens posts
@@ -62,6 +64,12 @@ func (l *ChatLens) timeout() time.Duration {
 
 // Run posts one single-shot chat completion and returns the model's text.
 func (l *ChatLens) Run(ctx context.Context, prompt string) (string, error) {
+	if err := l.ExecutionPolicy.CheckCurrent(); err != nil {
+		return "", err
+	}
+	if l.ExecutionPolicy.RequireVerifiedRoute {
+		return "", aiexecution.Held("chat_transport_unsupported")
+	}
 	ctx, cancel := context.WithTimeout(ctx, l.timeout())
 	defer cancel()
 
@@ -86,21 +94,35 @@ func (l *ChatLens) Run(ctx context.Context, prompt string) (string, error) {
 	if httpc == nil {
 		httpc = &http.Client{}
 	}
-	resp, err := httpc.Do(req)
+	// Never follow redirects with inference credentials or replay a POST.
+	client := *httpc
+	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	resp, err := client.Do(req)
 	if err != nil {
-		return "", fmt.Errorf("chat completion: %w", err)
+		code := "transport_unknown"
+		if ctx.Err() != nil {
+			code = "cancelled"
+		}
+		return "", &GatewayTerminalError{Code: code}
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 16<<20))
+	limit := int64(16 << 20)
+	if resp.StatusCode < 200 || resp.StatusCode > 299 {
+		limit = maxErrorBody
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return "", fmt.Errorf("read response: %w", err)
+		return "", &GatewayTerminalError{Code: "response_incomplete", HTTPStatus: resp.StatusCode, ResponseSHA256: digest(body)}
+	}
+	truncated := int64(len(body)) > limit
+	if truncated {
+		body = body[:limit]
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		excerpt := strings.TrimSpace(string(body))
-		if len(excerpt) > 512 {
-			excerpt = excerpt[:512]
-		}
-		return "", fmt.Errorf("chat completion: HTTP %d: %s", resp.StatusCode, excerpt)
+		return "", terminalError(resp.StatusCode, body, truncated)
+	}
+	if truncated {
+		return "", &GatewayTerminalError{Code: "response_too_large", HTTPStatus: resp.StatusCode, ResponseSHA256: digest(body), ResponseTruncated: true}
 	}
 	var parsed struct {
 		Choices []struct {

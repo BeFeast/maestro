@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"slices"
 	"strings"
 	"time"
 
@@ -35,19 +36,55 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 		if !strings.HasPrefix(sv.Name, "llm-review-") {
 			continue
 		}
-		if sv.Observed || sv.LookupFailed {
+		if sv.LookupFailed || sv.Passed {
 			continue
+		}
+		if sv.Observed {
+			store := &review.AttemptStore{StateDir: o.cfg.StateDir}
+			if !store.Due(review.AttemptScope{Repo: o.repo, PR: prNumber, Head: headSHA, Lens: sv.Name}, time.Now(), o.cfg.ReviewProducer.EffectiveMaxAttempts()) {
+				continue
+			}
 		}
 		missing = append(missing, sv.Name)
 	}
 	if len(missing) == 0 {
 		return
 	}
+	o.startReviewProduction(prNumber, headSHA, missing)
+}
 
-	// One run per PR (not per head): the producer reviews the PR's CURRENT
-	// head regardless of the head this cycle observed, so a head-keyed guard
-	// would let a run kicked on the old head race a second one kicked on the
-	// new — two full model passes over the same commit.
+// Only a verified, unspent native operator grant may bypass the ordinary
+// success/pending trigger. This does not change merge gates or automatic retries.
+func (o *Orchestrator) maybeProduceAuthorizedReview(prNumber int, headSHA string) bool {
+	if o.cfg == nil || !o.cfg.ReviewProducer.Enabled || !o.cfg.ReviewProducer.NativeOpus || headSHA == "" || !slices.Contains(o.cfg.EffectiveReviewGateStreams(), "llm-review-opus") {
+		return false
+	}
+	const stream = "llm-review-opus"
+	queued := o.reviewRearmQueuedFn
+	if queued == nil {
+		queued = func(pr int, head, lens string) bool {
+			return (&review.AttemptStore{StateDir: o.cfg.StateDir}).NativeRearmQueued(o.cfg, review.AttemptScope{Repo: o.repo, PR: pr, Head: head, Lens: lens}, time.Now())
+		}
+	}
+	if !queued(prNumber, headSHA, stream) {
+		return false
+	}
+	verdict, err := o.prReviewGateVerdict(prNumber)
+	if err != nil {
+		return false
+	}
+	for _, sv := range verdict.Streams {
+		if sv.Name == stream && sv.Observed && !sv.LookupFailed && !sv.Passed && o.prGateHeadMatches(prNumber, headSHA) {
+			o.startReviewProduction(prNumber, headSHA, []string{stream})
+			return true
+		}
+	}
+	return false
+}
+
+func (o *Orchestrator) startReviewProduction(prNumber int, headSHA string, missing []string) {
+	// One run per PR, including while an older head's dispatch is still
+	// settling. The producer separately rejects a changed head before work.
 	o.reviewProduceMu.Lock()
 	if o.reviewProduceInFlight == nil {
 		o.reviewProduceInFlight = make(map[int]bool)
@@ -61,12 +98,15 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 
 	produce := o.reviewProduceFn
 	if produce == nil {
-		produce = o.produceReviewStreams
+		stateDir := o.cfg.StateDir
+		produce = func(pr int, head string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
+			o.produceReviewStreamsWithState(pr, head, streams, rp, fc, stateDir)
+		}
 	}
 	// Snapshot the config on this goroutine: the orchestrator loop owns both
 	// this call and the hot-reload writes, so reading o.cfg here is
 	// race-free, while the spawned goroutine below must never touch it.
-	rp := o.cfg.ReviewProducer
+	rp := snapshotReviewExecution(o.cfg, o.cfg.ReviewProducer)
 	fc := o.cfg.Forge
 	go func() {
 		defer func() {
@@ -76,6 +116,22 @@ func (o *Orchestrator) maybeProduceMissingReview(prNumber int, headSHA string, v
 		}()
 		produce(prNumber, headSHA, missing, rp, fc)
 	}()
+}
+
+func snapshotReviewExecution(cfg *config.Config, rp config.ReviewProducerConfig) config.ReviewProducerConfig {
+	rp.RuntimeExecutionPolicy = cfg.AIExecution
+	nativeCfg := *cfg
+	nativeCfg.Model = cloneModelConfig(cfg.Model)
+	if cfg.Supervisor.NativeSessionRegistration != nil {
+		registration := *cfg.Supervisor.NativeSessionRegistration
+		if registration.AuthorityUID != nil {
+			uid := *registration.AuthorityUID
+			registration.AuthorityUID = &uid
+		}
+		nativeCfg.Supervisor.NativeSessionRegistration = &registration
+	}
+	rp.RuntimeNativeConfig = &nativeCfg
+	return rp
 }
 
 // reviewProducerRunTimeout bounds one full producer pass (all lenses on one
@@ -95,24 +151,32 @@ func reviewLenses(streams []string, rp config.ReviewProducerConfig) []review.Len
 	for _, stream := range streams {
 		switch stream {
 		case "llm-review-opus":
+			if rp.NativeOpus {
+				model := rp.EffectiveOpusModel()
+				lenses = append(lenses, review.NewNativeClaudeLens(stream, model, rp.RuntimeNativeConfig))
+				continue
+			}
 			lenses = append(lenses, &review.ChatLens{
-				Stream:  stream,
-				BaseURL: rp.ChatBaseURL,
-				APIKey:  os.Getenv(rp.EffectiveChatAPIKeyEnv()),
-				Model:   rp.EffectiveOpusModel(),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				BaseURL:         rp.ChatBaseURL,
+				APIKey:          os.Getenv(rp.EffectiveChatAPIKeyEnv()),
+				Model:           rp.EffectiveOpusModel(),
 			})
 		case "llm-review-terra":
 			lenses = append(lenses, &review.ChatLens{
-				Stream:  stream,
-				BaseURL: rp.ChatBaseURL,
-				APIKey:  os.Getenv(rp.EffectiveChatAPIKeyEnv()),
-				Model:   rp.EffectiveTerraModel(),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				BaseURL:         rp.ChatBaseURL,
+				APIKey:          os.Getenv(rp.EffectiveChatAPIKeyEnv()),
+				Model:           rp.EffectiveTerraModel(),
 			})
 		case "llm-review-cursor":
 			lenses = append(lenses, &review.CursorLens{
-				Stream: stream,
-				Model:  rp.EffectiveCursorModel(),
-				APIKey: os.Getenv(rp.EffectiveCursorAPIKeyEnv()),
+				ExecutionPolicy: rp.RuntimeExecutionPolicy,
+				Stream:          stream,
+				Model:           rp.EffectiveCursorModel(),
+				APIKey:          os.Getenv(rp.EffectiveCursorAPIKeyEnv()),
 			})
 		}
 	}
@@ -142,6 +206,11 @@ func reviewForge(fc config.ForgeConfig) (forge.Client, error) {
 // itself is forge-agnostic. Runs on the producer goroutine: everything it
 // needs arrives by value.
 func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig) {
+	rp = snapshotReviewExecution(o.cfg, rp)
+	o.produceReviewStreamsWithState(prNumber, headSHA, streams, rp, fc, o.cfg.StateDir)
+}
+
+func (o *Orchestrator) produceReviewStreamsWithState(prNumber int, headSHA string, streams []string, rp config.ReviewProducerConfig, fc config.ForgeConfig, stateDir string) {
 	lenses := reviewLenses(streams, rp)
 	if len(lenses) == 0 {
 		return
@@ -152,8 +221,12 @@ func (o *Orchestrator) produceReviewStreams(prNumber int, headSHA string, stream
 		return
 	}
 	p := &review.Producer{
+		ExecutionPolicy:   rp.RuntimeExecutionPolicy,
+		Attempts:          &review.AttemptStore{StateDir: stateDir},
+		MaxAttempts:       rp.EffectiveMaxAttempts(),
 		Forge:             fg,
 		Repo:              o.repo,
+		ExpectedHead:      headSHA,
 		Lenses:            lenses,
 		PendingStaleAfter: rp.EffectivePendingStale(),
 		MaxDiffBytes:      rp.EffectiveMaxDiffBytes(),

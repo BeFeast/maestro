@@ -3,8 +3,8 @@ package worker
 import (
 	"errors"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
@@ -130,6 +130,12 @@ func ValidateCleanupLease(lease WorktreeCleanupLease, current *state.Session, pr
 func validateCleanupIdentity(lease WorktreeCleanupLease, current *state.Session, policy CleanupPolicy) error {
 	if current == nil {
 		return fmt.Errorf("%w: slot %s no longer holds a session", ErrCleanupLeaseChanged, lease.Slot)
+	}
+	if current.NativeRegistrationHold != "" {
+		return fmt.Errorf("%w: slot %s has unresolved native generation", ErrCleanupLeaseChanged, lease.Slot)
+	}
+	if err := nativeWorkerDestructiveOutcome(nil, lease.Slot, current); err != nil {
+		return fmt.Errorf("%w: native physical outcome unresolved", ErrCleanupLeaseChanged)
 	}
 	if current.IssueNumber != lease.IssueNumber {
 		return fmt.Errorf("%w: slot %s issue changed #%d->#%d", ErrCleanupLeaseChanged, lease.Slot, lease.IssueNumber, current.IssueNumber)
@@ -360,7 +366,7 @@ func worktreeUsable(path string) bool {
 	if strings.TrimSpace(path) == "" {
 		return false
 	}
-	out, err := exec.Command("git", "-C", path, "rev-parse", "--is-inside-work-tree").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", path, "rev-parse", "--is-inside-work-tree").CombinedOutput()
 	return err == nil && strings.TrimSpace(string(out)) == "true"
 }
 

@@ -6,6 +6,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"github.com/befeast/maestro/internal/aiexecution"
 	"log"
 	"os"
 	"os/exec"
@@ -70,7 +71,7 @@ func WorktreeDirty(worktree string) (bool, error) {
 	if strings.TrimSpace(worktree) == "" {
 		return false, nil
 	}
-	out, err := exec.Command("git", "-C", worktree, "status", "--porcelain=v1", "--untracked-files=all").CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", worktree, "status", "--porcelain=v1", "--untracked-files=all").CombinedOutput()
 	if err != nil {
 		return false, fmt.Errorf("inspect worktree before recovery: %w: %s", err, strings.TrimSpace(string(out)))
 	}
@@ -78,7 +79,7 @@ func WorktreeDirty(worktree string) (bool, error) {
 }
 
 func resolvedGitPath(repo, field string) (string, error) {
-	out, err := exec.Command("git", "-C", repo, "rev-parse", field).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", repo, "rev-parse", field).CombinedOutput()
 	if err != nil {
 		return "", err
 	}
@@ -109,6 +110,12 @@ func sameFile(pathA, pathB string) bool {
 // `git -C worktree` walks up through parent directories, and an unrelated
 // repository can also occupy the canonical path.
 func isGitWorktreeForRepo(localPath, worktree string) bool {
+	if isNativeCloneForRepo(localPath, worktree) {
+		return true
+	}
+	if aiexecution.NativeGitRegistered(worktree) {
+		return false
+	}
 	root, err := resolvedGitPath(worktree, "--show-toplevel")
 	if err != nil || !sameFile(worktree, root) {
 		return false
@@ -134,13 +141,13 @@ func EnsureWorktreeBranch(worktree, branch string) error {
 	if worktree == "" || branch == "" {
 		return fmt.Errorf("ensure worktree branch: worktree and branch are required")
 	}
-	currentOut, err := exec.Command("git", "-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
+	currentOut, err := aiexecution.NativeGitCommand("-C", worktree, "symbolic-ref", "--short", "HEAD").CombinedOutput()
 	current := strings.TrimSpace(string(currentOut))
 	if err != nil {
 		// A valid retained checkout may be detached after an interrupted
 		// rebase/gate repair. Treat that as a branch mismatch, not as proof the
 		// worktree is unusable. Dirty state still fails closed below.
-		if insideOut, insideErr := exec.Command("git", "-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput(); insideErr != nil || strings.TrimSpace(string(insideOut)) != "true" {
+		if insideOut, insideErr := aiexecution.NativeGitCommand("-C", worktree, "rev-parse", "--is-inside-work-tree").CombinedOutput(); insideErr != nil || strings.TrimSpace(string(insideOut)) != "true" {
 			return fmt.Errorf("inspect retained worktree branch: %w: %s", err, strings.TrimSpace(string(currentOut)))
 		}
 		current = "detached HEAD"
@@ -155,7 +162,7 @@ func EnsureWorktreeBranch(worktree, branch string) error {
 	if dirty {
 		return fmt.Errorf("retained worktree is dirty on branch %q; refusing to switch to canonical branch %q", current, branch)
 	}
-	out, err := exec.Command("git", "-C", worktree, "switch", branch).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", worktree, "switch", branch).CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("switch retained worktree from %q to canonical branch %q: %w: %s", current, branch, err, strings.TrimSpace(string(out)))
 	}
@@ -177,8 +184,7 @@ func UniqueBranchCommits(localPath, canonicalBranch, siblingBranch string) ([]st
 	if canonicalBranch == siblingBranch {
 		return nil, nil
 	}
-	out, err := exec.Command(
-		"git", "-C", localPath, "log", "--format=%H", "--cherry-pick", "--right-only", "--no-merges",
+	out, err := aiexecution.NativeGitCommand("-C", localPath, "log", "--format=%H", "--cherry-pick", "--right-only", "--no-merges",
 		canonicalBranch+"..."+siblingBranch,
 	).CombinedOutput()
 	if err != nil {
@@ -193,6 +199,14 @@ func UniqueBranchCommits(localPath, canonicalBranch, siblingBranch string) ([]st
 // a branch, reset a ref, or choose a different path: recovery must preserve the
 // original slot/branch identity and its committed work.
 func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch string) error {
+	// A full clone owns refs and unpushed objects independently. Recreating it
+	// from the parent linked-worktree branch would silently lose that state.
+	if aiexecution.NativeGitRegistered(worktree) {
+		if isNativeCloneForRepo(localPath, worktree) {
+			return EnsureWorktreeBranch(worktree, branch)
+		}
+		return aiexecution.Held("native_clone_recovery_requires_preserved_clone")
+	}
 	localPath = strings.TrimSpace(localPath)
 	worktreeBase = strings.TrimSpace(worktreeBase)
 	slotName = strings.TrimSpace(slotName)
@@ -235,7 +249,7 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	}
 
 	ref := "refs/heads/" + branch
-	if out, err := exec.Command("git", "-C", localPath, "show-ref", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
+	if out, err := aiexecution.NativeGitCommand("-C", localPath, "show-ref", "--verify", "--quiet", ref).CombinedOutput(); err != nil {
 		return fmt.Errorf("restore missing worktree: recorded local branch %q is unavailable: %w: %s", branch, err, strings.TrimSpace(string(out)))
 	}
 	if err := os.MkdirAll(filepath.Dir(actual), 0o755); err != nil {
@@ -243,10 +257,10 @@ func RestoreMissingWorktree(localPath, worktreeBase, slotName, worktree, branch 
 	}
 	// Clear only stale administrative records for paths Git already considers
 	// missing. This never deletes a working tree or branch.
-	if out, err := exec.Command("git", "-C", localPath, "worktree", "prune", "--expire", "now").CombinedOutput(); err != nil {
+	if out, err := aiexecution.NativeGitCommand("-C", localPath, "worktree", "prune", "--expire", "now").CombinedOutput(); err != nil {
 		return fmt.Errorf("prune stale worktree metadata before restore: %w: %s", err, strings.TrimSpace(string(out)))
 	}
-	out, err := exec.Command("git", "-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
+	out, err := aiexecution.NativeGitCommand("-C", localPath, "worktree", "add", actual, branch).CombinedOutput()
 	if err != nil {
 		if backup != "" {
 			if _, statErr := os.Stat(actual); errors.Is(statErr, os.ErrNotExist) {
@@ -291,7 +305,7 @@ func rotateWorkerAttemptLog(logFile string) error {
 // runs with KillMode=mixed, so any survivor keeps the unit deactivating in the
 // unit cgroup until the TimeoutStopSec backstop.
 func checkpointGitCommand(ctx context.Context, args ...string) *exec.Cmd {
-	cmd := exec.CommandContext(ctx, "git", args...)
+	cmd := aiexecution.NativeGitCommandContext(ctx, args...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -372,7 +386,7 @@ func SaveCheckpointContext(ctx context.Context, sess *state.Session) (string, er
 
 	content := strings.Join(sections, "\n")
 	checkpointPath := filepath.Join(sess.Worktree, "CHECKPOINT.md")
-	if err := os.WriteFile(checkpointPath, []byte(content+"\n"), 0644); err != nil {
+	if err := aiexecution.WriteWorkspaceFile(checkpointPath, []byte(content+"\n"), 0644); err != nil {
 		return "", fmt.Errorf("write checkpoint: %w", err)
 	}
 
@@ -383,7 +397,11 @@ func SaveCheckpointContext(ctx context.Context, sess *state.Session) (string, er
 // RespawnInPlace stops the current worker and restarts it in the same worktree
 // with checkpoint context included in the prompt. Unlike Respawn, this preserves
 // the existing worktree with all committed and staged code.
-func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) error {
+func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, repo string, issue github.Issue, promptBase string, backendName string) (resultErr error) {
+	defer func() { stampNativeHold(slotName, sess, resultErr) }()
+	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.WorkerNativeSessionRegistration != nil {
+		return &NativeRegistrationHold{Code: "harness_unsupported", Slot: slotName}
+	}
 	if cfg != nil && cfg.RemoteRunner.Enabled && cfg.Pipeline.Enabled {
 		return fmt.Errorf("remote runner v1 does not support phase-pipeline respawns")
 	}
@@ -391,6 +409,47 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// issue_number before killing the current worker, so a slot-suffix-derived
 	// number can never respawn a mis-scoped worker in the preserved worktree.
 	if err := assertCanonicalIssue(slotName, sess, issue); err != nil {
+		return err
+	}
+
+	// Determine backend
+	if backendName == "" {
+		backendName = cfg.Model.Default
+	}
+	backendDef, ok := cfg.Model.Backends[backendName]
+	if !ok {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_unknown", Slot: slotName}
+		}
+		backendName = cfg.Model.Default
+		backendDef, ok = cfg.Model.Backends[backendName]
+		if !ok {
+			return fmt.Errorf("backend %q (default) not found in config", backendName)
+		}
+	}
+	backendCfg := workerBackendConfig(backendDef)
+	backendCfg.TokenBudget = cfg.WorkerMaxTokens
+	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
+		if cfg.WorkerNativeSessionRegistration != nil {
+			return &NativeRegistrationHold{Code: "backend_configuration_invalid", Slot: slotName}
+		}
+		return err
+	}
+	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
+
+	// Prove and record the projected generation's exact termination before any
+	// successor identity is registered (pre-launch wedge fence).
+	if err := ensureNativeGenerationTerminalBeforeSuccessor(cfg, slotName, sess); err != nil {
+		return err
+	}
+	nextGeneration := sess.WorkerGeneration + 1
+	native, err := prepareNativeWorker(cfg, sess, slotName, backendName, backendCfg, nextGeneration, sess.IssueNumber, sess.Worktree, sess.Branch)
+	if err != nil {
+		return err
+	}
+	defer native.close()
+	defer native.finishError(&resultErr)
+	if adopted, err := native.adoptSession(cfg, slotName, sess); adopted {
 		return err
 	}
 
@@ -417,29 +476,10 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// Read checkpoint content if it exists
 	checkpointContext := ""
 	if sess.CheckpointFile != "" {
-		if data, err := os.ReadFile(sess.CheckpointFile); err == nil {
+		if data, err := aiexecution.ReadWorkspaceFile(sess.CheckpointFile); err == nil {
 			checkpointContext = sanitizePromptUTF8(string(data))
 		}
 	}
-
-	// Determine backend
-	if backendName == "" {
-		backendName = cfg.Model.Default
-	}
-	backendDef, ok := cfg.Model.Backends[backendName]
-	if !ok {
-		backendName = cfg.Model.Default
-		backendDef, ok = cfg.Model.Backends[backendName]
-		if !ok {
-			return fmt.Errorf("backend %q (default) not found in config", backendName)
-		}
-	}
-	backendCfg := workerBackendConfig(backendDef)
-	backendCfg.TokenBudget = cfg.WorkerMaxTokens
-	if err := validateLiveTokenBudget(backendName, backendCfg); err != nil {
-		return err
-	}
-	executionWorktree := workerExecutionWorktree(cfg, slotName, sess.Worktree)
 
 	hookSetup, err := setupWorkerToolHooks(cfg.StateDir, sess.Worktree, resolveBackendKind(backendName, backendCfg), cfg.Hooks)
 	if err != nil {
@@ -456,6 +496,9 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	}
 	prompt += subagentHintPromptSection(backendDef.SubagentHint)
 	prompt += workerToolHookPromptSection(cfg.Hooks, backendName, hookSetup)
+	if cfg.AIExecution.RequireVerifiedRoute {
+		prompt += "\n\nNative delivery: push the assigned feat/ branch over the canonical HTTPS origin. To create the PR, pipe a JSON object with title, body, head (the assigned branch), and base=main to /runtime/maestro _native-forgejo-pr. The scoped credential is already configured; never print it. Agent/Task delegation, merge, server administration, and direct provider access are unavailable.\n"
+	}
 	prompt = withCanonicalIssueBinding(prompt, cfg.Repo, issue)
 	if err := assertCanonicalPrompt(slotName, sess.IssueNumber, prompt); err != nil {
 		return err
@@ -483,9 +526,15 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 		return fmt.Errorf("build worker cmd: %w", err)
 	}
 
+	if err := native.command(workerCmd); err != nil {
+		return err
+	}
+
 	// Write runner script
 	runnerPath := filepath.Join(cfg.StateDir, slotName+"-run.sh")
-	nextGeneration := sess.WorkerGeneration + 1
+	if err := prepareWorkerExecutionProof(cfg, native, workerCmd, runnerPath); err != nil {
+		return err
+	}
 	split := streamSplitForBackend(backendName, backendCfg, logFile, nextGeneration)
 	if err := writeConfiguredWorkerRunnerScript(cfg, slotName, sess.Branch, promptFile, runnerPath, workerCmd.Args, stdinFile, logFile, sess.Worktree, split); err != nil {
 		return err
@@ -505,7 +554,19 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// pane PID, and worktree. A command transport error may arrive after tmux
 	// created the runner; observing that exact session adopts it instead of
 	// replaying the runner command and creating two live workers.
+	if err := native.beginLaunch(logFile); err != nil {
+		return err
+	}
 	pid, lease, err := launchWorkerProcessLease(cfg, slotName, tmuxName, sess.Worktree, runnerPath, nextGeneration, sess.PID, "in_place_respawn")
+	if native != nil && err != nil {
+		return err
+	}
+	if err == nil {
+		err = native.complete(pid, lease)
+	}
+	if native != nil && err != nil {
+		return err
+	}
 	if err != nil {
 		if lease.Unit != "" {
 			sess.WorkerGeneration = nextGeneration
@@ -524,6 +585,7 @@ func RespawnInPlace(cfg *config.Config, slotName string, sess *state.Session, re
 	// worktree/session identity and cumulative attribution history.
 	beginSessionAttempt(cfg, sess, backendName, "in_place_respawn", "in_place_respawn", time.Now())
 	setSessionProcessLease(sess, lease)
+	native.stamp(sess)
 	sess.NotifiedCIFail = false
 	sess.LastNotifiedStatus = ""
 	sess.LastOutputHash = ""
@@ -659,7 +721,7 @@ func assemblePromptWithCheckpointSource(base string, issue github.Issue, executi
 
 // readTailLines reads the last n lines from a file.
 func readTailLines(path string, n int) (string, error) {
-	data, err := os.ReadFile(path)
+	data, err := aiexecution.ReadWorkspaceFile(path)
 	if err != nil {
 		return "", err
 	}

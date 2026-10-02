@@ -48,6 +48,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	cfg := proj.Cfg()
 	if cfg != nil {
 		cfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+		cfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+		cfg.AIExecution = cfg.AIExecution.BindController(cfg.AIExecution, cfg.StateDir)
+		if err := cfg.AIExecution.CheckCurrent(); err != nil {
+			log.Printf("[%s] AI execution held: controller revision initialization failed: %v", storeName, err)
+		}
 		if d.spawnLimiter != nil {
 			d.spawnLimiter.RegisterProject(cfg.StateDir, cfg.Repo, d.opts.SuperviseInterval)
 		}
@@ -113,6 +118,11 @@ func (d *Daemon) startFlow(parent context.Context, storeName string, proj server
 	go func() {
 		defer wg.Done()
 		defer recoverFlow(flow, "supervise")
+		// #1232: one-shot reconcile of consultations a previous daemon abandoned
+		// under this project's auxiliary receipt roots, independent of pause or
+		// supervisor.enabled. It runs synchronously before the first supervise
+		// cycle so the two never contend for the consultation store lock.
+		reconcileAbandonedAuxiliaryConsultations(fctx, cfg, flow.name)
 		// flow.name is the unique fleet display name; the supervise loop keys
 		// its decision/cycle logs on it so two same-basename repos are
 		// distinguishable in the journal, matching the watchdog (#764). It reads
@@ -207,6 +217,11 @@ func (d *Daemon) stopFlow(key string) {
 	if !ok {
 		return
 	}
+	if flow.cfg != nil {
+		if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+			log.Printf("[%s] controller lease revoked; durable invalidation failed: %v", flow.name, err)
+		}
+	}
 	flow.cancel()
 	<-flow.done
 	if d.spawnLimiter != nil && flow.cfg != nil {
@@ -243,6 +258,11 @@ func (d *Daemon) stopAllUntil(deadline time.Time) {
 	d.mu.Unlock()
 
 	for _, flow := range flows {
+		if flow.cfg != nil {
+			if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+				log.Printf("[%s] controller lease revoked; durable invalidation failed: %v", flow.name, err)
+			}
+		}
 		flow.cancel()
 	}
 	if len(flows) == 0 {
@@ -340,10 +360,19 @@ func (d *Daemon) runReloadPump(ctx context.Context, flow *projectFlow, watchCh <
 			// the diff-loop handles as a fresh flow); hot-reloadable edits still
 			// apply (#768, Codex).
 			if identityChanged(flow.cfg, newCfg) {
+				if err := flow.cfg.AIExecution.Invalidate(); err != nil {
+					log.Printf("[%s] controller lease revoked; config reload held after durable invalidation failure: %v", flow.name, err)
+				}
 				log.Printf("[%s] config reload: restart-required field (repo/state_dir/session_prefix/local_path/forge) changed — restart required, live reload skipped", flow.name)
 				continue
 			}
 			newCfg.RuntimeSuperviseIntervalSeconds = runtimeIntervalSeconds(d.opts.SuperviseInterval)
+			newCfg.RuntimeAuxiliaryLimiter = d.spawnLimiter
+			newCfg.AIExecution = flow.cfg.AIExecution.BindController(newCfg.AIExecution, newCfg.StateDir)
+			if err := newCfg.AIExecution.CheckCurrent(); err != nil {
+				log.Printf("[%s] config reload held: controller revision not durably applied: %v", flow.name, err)
+				continue
+			}
 			// Holder first, so the supervise loop's next cycle and the updated
 			// dashboard snapshot below both observe the new config.
 			flow.holder.Store(newCfg)
@@ -454,6 +483,7 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	// reload event, not just the latest value.
 	orchCfg := *cfg
 	orch := orchestrator.New(&orchCfg)
+	orch.SetNativePrelaunchRecoveries(d.takeNativePrelaunchRecoveries(cfg.ProjectID))
 	orch.SetBinaryVersion(opts.Version)
 	// #866: let the orchestrator's standing repair-approval reconciler mirror a
 	// moot-approval stale transition into the same SQLite approval store the
@@ -474,6 +504,9 @@ func (d *Daemon) runOrchestrator(ctx context.Context, cfg *config.Config, opts O
 	orch.SetSpawnResourceHold(d.tmpfsSpawnHold)
 	orch.SetFleetSpawnReserve(func() (func(string), func(), bool) {
 		return d.reserveFleetSpawn(orchCfg.StateDir)
+	})
+	orch.SetFleetNativeRecoveryReserve(func(slot, nativeID string) (func(string), func(), bool) {
+		return d.spawnLimiter.ReserveNativeRecovery(orchCfg.StateDir, slot, nativeID)
 	})
 	// Mirror-first reads (#826): serve the orchestrator's high-volume poll reads
 	// from the shared mirror when github_mirror.source is mirror-first, falling

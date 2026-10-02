@@ -30,7 +30,7 @@ func TestSessionInfoSurfacesAdvisorGateState(t *testing.T) {
 			PlanVersion: 2, ReviewRound: 2, Backend: "advisor", Model: "review-model", Verdict: "PLAN_REVISE", Findings: "exact unresolved finding", ReviewedAt: now,
 		}},
 	}
-	info := makeSessionInfo("owner/repo", "slot-advisor", sess)
+	info := makeSessionInfo(&config.Config{Repo: "owner/repo"}, "slot-advisor", sess)
 	if info.Phase != "advisor" || info.PlanVersion != 2 || info.AdvisorReviewRound != 2 || info.AdvisorBackend != "advisor" || info.AdvisorModel != "review-model" || len(info.AdvisorReviews) != 1 {
 		t.Fatalf("session info = %+v", info)
 	}
