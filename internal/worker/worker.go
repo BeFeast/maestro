@@ -18,6 +18,7 @@ import (
 	"github.com/befeast/maestro/internal/pipeline"
 	"github.com/befeast/maestro/internal/repopolicy"
 	"github.com/befeast/maestro/internal/state"
+	"github.com/befeast/maestro/internal/termguard"
 	"github.com/befeast/maestro/internal/tmuxsession"
 )
 
@@ -777,7 +778,12 @@ func StopProcess(slotName string, sess *state.Session) error {
 	// processes still parented to the pane shell; worker grandchildren that
 	// reparent away (notably headless Chrome + its crashpad handler) survive a
 	// plain pane-PID kill, so signal the recorded PID's full descendant tree.
-	if sess != nil && sess.PID > 0 && IsAlive(sess.PID) {
+	//
+	// The termination guard is consulted before the liveness probe so a test
+	// fixture carrying a literal PID is refused deterministically, whether or
+	// not an unrelated process currently owns that number (#1252). Production
+	// installs no guard, so Check is always nil here.
+	if sess != nil && sess.PID > 0 && termguard.Check(termguard.Attempt{Op: termguard.OpKillProcessTree, PID: sess.PID}) == nil && IsAlive(sess.PID) {
 		KillProcessTree(sess.PID)
 	}
 	return nil

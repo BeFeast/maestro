@@ -8,6 +8,7 @@ package orchestrator
 
 import (
 	"fmt"
+	"reflect"
 	"testing"
 	"time"
 
@@ -346,6 +347,7 @@ func TestReconcilePushedBranch_BranchAlreadyMerged_SettlesCodeLanded(t *testing.
 
 func TestReconcilePushedBranch_IssueClosed_SettlesDone(t *testing.T) {
 	created := false
+	var stopped []string
 	o := &Orchestrator{
 		cfg:                  &config.Config{Repo: "owner/repo"},
 		pidAliveFn:           func(pid int) bool { return false },
@@ -357,6 +359,13 @@ func TestReconcilePushedBranch_IssueClosed_SettlesDone(t *testing.T) {
 		createPRFn: func(title, body, base, head string) (int, error) {
 			created = true
 			return 137, nil
+		},
+		// The fixture PID and tmux name are literals: the real worker.Stop
+		// would signal whatever host process owns PID 4242 and kill a
+		// same-name tmux session (#1252). Record the teardown instead.
+		workerStopFn: func(_ *config.Config, slot string, sess *state.Session) error {
+			stopped = append(stopped, fmt.Sprintf("%s pid=%d tmux=%s", slot, sess.PID, sess.TmuxSession))
+			return nil
 		},
 	}
 
@@ -374,6 +383,9 @@ func TestReconcilePushedBranch_IssueClosed_SettlesDone(t *testing.T) {
 
 	if created {
 		t.Fatal("reconcile must NOT auto-create a PR for a closed issue")
+	}
+	if want := []string{"ok-player-1 pid=4242 tmux=maestro-ok-player-1"}; !reflect.DeepEqual(stopped, want) {
+		t.Fatalf("worker teardown = %v, want %v", stopped, want)
 	}
 	sess := s.Sessions["ok-player-1"]
 	if sess.Status != state.StatusDone {

@@ -1016,18 +1016,28 @@ func (o *Orchestrator) closeIssue(number int, comment string) error {
 	return err
 }
 
+// Process-termination fallbacks for an Orchestrator without an injected
+// workerStopFn / workerStopProcessFn. Production always uses the worker
+// implementations. The package's TestMain replaces them so a fixture that
+// carries a literal PID or tmux name and forgets its fake fails loudly instead
+// of tearing down a real process (#1252).
+var (
+	defaultWorkerStop        = worker.Stop
+	defaultWorkerStopProcess = worker.StopProcess
+)
+
 func (o *Orchestrator) stopWorker(slotName string, sess *state.Session) error {
 	if o.workerStopFn != nil {
 		return o.workerStopFn(o.cfg, slotName, sess)
 	}
-	return worker.Stop(o.cfg, slotName, sess)
+	return defaultWorkerStop(o.cfg, slotName, sess)
 }
 
 func (o *Orchestrator) stopWorkerProcess(slotName string, sess *state.Session) error {
 	if o.workerStopProcessFn != nil {
 		return o.workerStopProcessFn(slotName, sess)
 	}
-	return worker.StopProcess(slotName, sess)
+	return defaultWorkerStopProcess(slotName, sess)
 }
 
 func (o *Orchestrator) getIssue(number int) (github.Issue, error) {
