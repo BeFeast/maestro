@@ -41,14 +41,14 @@ type fleetSpawnLimiter struct {
 	recoveryReservations  map[string]struct{}
 	auxiliaryReservations map[string]struct{}
 	auxiliaryStateDirs    map[string]struct{}
-	auxiliaryStore        auxiliaryReceiptIndex
+	auxiliaryStore        AuxiliaryReceiptIndex
 	nextID                uint64
 	loadState             func(string) (*state.State, error)
 }
 
 func newFleetSpawnLimiter(store ConfigLoader) *fleetSpawnLimiter {
 	loader, _ := store.(fleetConcurrencySettingsLoader)
-	index, _ := store.(auxiliaryReceiptIndex)
+	index, _ := store.(AuxiliaryReceiptIndex)
 	return &fleetSpawnLimiter{
 		settings:              loader,
 		auxiliaryStore:        index,

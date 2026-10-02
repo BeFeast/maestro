@@ -2,16 +2,23 @@ package daemon
 
 import (
 	"context"
+	"fmt"
+	"log"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
+	"time"
 
 	"github.com/befeast/maestro/internal/aiexecution"
 	"github.com/befeast/maestro/internal/supervisor"
 	"github.com/google/uuid"
 )
 
-type auxiliaryReceiptIndex interface {
+// AuxiliaryReceiptIndex is the durable index of every project state dir that
+// ever reserved auxiliary capacity (maestro.db auxiliary_receipt_roots). It
+// outlives project removal so an abandoned launch keeps counting (#1232).
+type AuxiliaryReceiptIndex interface {
 	RememberAuxiliaryStateDir(context.Context, string) error
 	AuxiliaryStateDirs(context.Context) ([]string, error)
 }
@@ -53,16 +60,18 @@ func (l *fleetSpawnLimiter) ReserveAuxiliary(stateDir, roleRunID string) (func()
 		l.auxiliaryStateDirs[dir] = struct{}{}
 	}
 	occupied := map[string]struct{}{}
+	var durable []supervisor.AuxiliaryOccupant
 	for dir := range l.auxiliaryStateDirs {
 		if _, err := os.Stat(dir); err != nil {
 			return nil, aiexecution.Held("auxiliary_receipt_root_unavailable")
 		}
-		pending, err := supervisor.PendingAuxiliaryRuns(dir)
+		occupants, err := supervisor.PendingAuxiliaryOccupancy(dir)
 		if err != nil {
 			return nil, err
 		}
-		for _, id := range pending {
-			occupied[id] = struct{}{}
+		for _, o := range occupants {
+			occupied[o.Key()] = struct{}{}
+			durable = append(durable, o)
 		}
 	}
 	for id := range l.auxiliaryReservations {
@@ -73,6 +82,9 @@ func (l *fleetSpawnLimiter) ReserveAuxiliary(stateDir, roleRunID string) (func()
 		return nil, aiexecution.Held("auxiliary_identity_in_use")
 	}
 	if len(occupied) >= settings.MaxAuxiliaryRuns {
+		// #1232: name what holds the ceiling so an abandoned durable marker is
+		// diagnosable from the journal instead of looking like a live run.
+		log.Printf("[daemon] auxiliary capacity exhausted for %s (%d/%d occupied): %s", projectDir, len(occupied), settings.MaxAuxiliaryRuns, describeAuxiliaryOccupancy(durable, l.auxiliaryReservations, time.Now()))
 		return nil, aiexecution.Held("auxiliary_capacity_exhausted")
 	}
 	l.auxiliaryReservations[key] = struct{}{}
@@ -93,4 +105,28 @@ func (l *fleetSpawnLimiter) ReconcileAuxiliary(stateDir, roleRunID string) error
 	}
 	delete(l.auxiliaryReservations, filepath.Clean(stateDir)+"\x00"+roleRunID)
 	return nil
+}
+
+func describeAuxiliaryOccupancy(durable []supervisor.AuxiliaryOccupant, reserved map[string]struct{}, now time.Time) string {
+	parts := make([]string, 0, len(durable)+len(reserved))
+	for _, o := range durable {
+		age := "age=unknown"
+		if !o.Since.IsZero() {
+			age = "age=" + now.Sub(o.Since).Truncate(time.Second).String()
+		}
+		intent := ""
+		if o.Intent != "" {
+			intent = " intent=" + o.Intent
+		}
+		parts = append(parts, fmt.Sprintf("durable{root=%s identity=%s source=%s%s %s}", o.Root, o.Identity, o.Source, intent, age))
+	}
+	for key := range reserved {
+		root, id, _ := strings.Cut(key, "\x00")
+		parts = append(parts, fmt.Sprintf("reserved{root=%s identity=%s}", root, id))
+	}
+	sort.Strings(parts)
+	if len(parts) == 0 {
+		return "(no occupants recorded)"
+	}
+	return strings.Join(parts, "; ")
 }

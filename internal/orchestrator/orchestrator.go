@@ -3290,7 +3290,7 @@ func (o *Orchestrator) RunOnce() error {
 		for slot, sess := range s.Sessions {
 			if sess != nil && sess.NativeRegistrationHold == "unresolved_launch" {
 				if err := worker.ReconcileNativeWorkerRuntime(o.cfg, s, slot); err != nil {
-					log.Printf("[orch] exact native runtime reconciliation held for %s: %v", slot, err)
+					log.Printf("[orch] exact native runtime reconciliation held for %s: %v%s", slot, err, nativeWorkerExecHoldSuffix(sess))
 				}
 			}
 		}
