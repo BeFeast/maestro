@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -416,5 +417,45 @@ func TestStartNewWorkers_ResumesLaneHeldRegisteredFirstSpawnWhenReady(t *testing
 	o.startNewWorkers(s, 1)
 	if len(resumed) != 1 || resumed[0] != "slot-1=exact-native-id" || s.Sessions["slot-2"].NativeRegistrationHold != "setup_failed" {
 		t.Fatalf("resumed=%v", resumed)
+	}
+}
+
+// An operator pause or drain returns before the managed-lane probe: such a
+// cycle observes no lane readiness and journals only its own reason, never a
+// "native lane not ready" line that would read as the cause of the stall.
+func TestStartNewWorkers_PauseAndDrainReturnBeforeLaneProbe(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		stop func(*state.State)
+		want string
+	}{
+		{"paused", func(s *state.State) { s.SetPaused(time.Now().UTC()) }, ""},
+		{"drained", func(s *state.State) { s.SetSpawnDrain(time.Now().UTC()) }, "drain active"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			buf := captureOrchestratorLog(t)
+			cfg := cfgWithBackends("claude", "claude")
+			cfg.WorkerNativeSessionRegistration = &config.NativeSessionRegistrationConfig{}
+			lane := &fakeLaneReadiness{err: aiexecution.Held("binding_route_unserved")}
+			cfg.RuntimeNativeLaneReadiness = lane
+			issues := []github.Issue{makeIssue(1256, "ready issue")}
+			o, started, _ := newStartWorkersOrchestrator(cfg, issues)
+			listed := 0
+			o.listOpenIssuesFn = func([]string) ([]github.Issue, error) { listed++; return issues, nil }
+			s := state.NewState()
+			tc.stop(s)
+
+			o.startNewWorkers(s, 5)
+			out := buf.String()
+			if lane.calls != 0 || listed != 0 || len(*started) != 0 {
+				t.Fatalf("%s cycle probed the lane %d time(s), listed=%d started=%v", tc.name, lane.calls, listed, *started)
+			}
+			if strings.Contains(out, "native lane not ready") {
+				t.Fatalf("%s cycle journaled a lane reason:\n%s", tc.name, out)
+			}
+			if tc.want != "" && !strings.Contains(out, tc.want) {
+				t.Fatalf("%s cycle did not journal its own reason %q:\n%s", tc.name, tc.want, out)
+			}
+		})
 	}
 }

@@ -10770,12 +10770,6 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 			return
 		}
 	}
-	// Managed-lane readiness: the same kind of pause, before listing, routing
-	// or any claim, so a lane that is not ready costs no router call either.
-	if hold, code := o.nativeLaneHold(); hold {
-		log.Printf("[orch] spawn paused: native lane not ready: %s — retrying next cycle", code)
-		return
-	}
 	// Graceful drain (#541): while a drain is requested, refuse to claim new
 	// issues or spawn new workers. In-flight workers keep running; the
 	// operator runs `maestro drain` before a restart so a `systemctl restart`
@@ -10798,6 +10792,15 @@ func (o *Orchestrator) startNewWorkers(s *state.State, slots int) {
 	// RunOnce journals the pause once per cycle (journalPauseDeferrals), and
 	// counts these held dispatches there, even on cycles with no free slot.
 	if s.PauseActive() {
+		return
+	}
+	// Managed-lane readiness: the same kind of pause, before listing, routing
+	// or any claim, so a lane that is not ready costs no router call either.
+	// It runs after the drain and pause returns: a cycle that dispatches
+	// nothing anyway makes no lane observation, and its journal names only
+	// the operator's reason.
+	if hold, code := o.nativeLaneHold(); hold {
+		log.Printf("[orch] spawn paused: native lane not ready: %s — retrying next cycle", code)
 		return
 	}
 	// The lane was just observed ready: first spawns that a binding hold
