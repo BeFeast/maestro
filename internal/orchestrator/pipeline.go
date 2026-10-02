@@ -125,7 +125,7 @@ func (o *Orchestrator) startAdvisorPhase(st *state.State, cfg *config.Config, sl
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "prompt_build_failed", err.Error())
 	}
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "advisor_start_failed", err.Error())
@@ -205,7 +205,7 @@ func (o *Orchestrator) handleAdvisorComplete(slotName string, sess *state.Sessio
 		promptContent := pipeline.PlannerRevisionPrompt(cfg, issue, sess.Worktree, sess.Branch, sess)
 		backendName := pipeline.BackendForPhase(cfg, state.PhasePlan)
 		if startErr := o.startPhase(cfg, slotName, sess, promptContent, backendName); startErr != nil {
-			if retainNativeWorkerHold(sess, startErr) {
+			if o.retainNativeWorkerHold(slotName, sess, startErr) {
 				return true
 			}
 			return o.finishAdvisorGate(cfg, slotName, sess, pipeline.AdvisorVerdictInvalid, "planner_revision_start_failed", startErr.Error())
@@ -241,7 +241,7 @@ func (o *Orchestrator) startImplementPhase(cfg *config.Config, slotName string, 
 	promptContent := o.buildImplementerPrompt(sess, issue)
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start implement phase for %s: %v — marking dead", slotName, err)
@@ -414,7 +414,7 @@ func (o *Orchestrator) handleImplementComplete(slotName string, sess *state.Sess
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseValidate)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start validate phase for %s: %v — marking dead", slotName, err)
@@ -484,7 +484,7 @@ func (o *Orchestrator) handleValidateComplete(slotName string, sess *state.Sessi
 	backendName := pipeline.BackendForPhase(cfg, state.PhaseImplement)
 
 	if err := o.startPhase(cfg, slotName, sess, promptContent, backendName); err != nil {
-		if retainNativeWorkerHold(sess, err) {
+		if o.retainNativeWorkerHold(slotName, sess, err) {
 			return true
 		}
 		log.Printf("[pipeline] start implement retry for %s: %v — marking dead", slotName, err)

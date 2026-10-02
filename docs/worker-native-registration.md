@@ -104,6 +104,41 @@ deduplicates adoption and keeps unresolved launch capacity across daemon restart
 The live-worker floor still counts actual running projections, excluding holds;
 an uncertain receipt cannot hide a floor alert.
 
+Before a respawn, in-place continuation, phase transition or repair registers a
+successor, the termination fence requires the projected generation's
+`.terminated` receipt. When the session no longer owns that generation's lease,
+the fence proves, seals and records the termination itself, or holds
+`native_process_identity_missing` until it can. When the projected generation's
+own receipts cannot be trusted, the fence holds the slot instead of failing the
+session:
+
+- `projected_receipt_missing`: the projected `generation-<n>.json` receipt does
+  not exist.
+- `projected_receipt_undecodable`: the receipt or its `.terminated` marker
+  exists but cannot be read, or the marker is not valid JSON.
+- `receipt_invalid`: the receipt fails strict validation, or the marker is not
+  an owner-only regular file of bounded size (the receipt's own integrity
+  check).
+- `native_identity_conflict`: the marker decodes but records a different role
+  run, native session, generation or OS lease.
+
+These holds are launch-uncertain: the slot keeps its capacity and issue claim,
+and the session keeps its status, retry counts and generation. No
+reconciliation clears them, so the slot stays parked (no respawn, retry, phase
+transition or repair) until an operator inspects the receipt directory
+`state_dir/worker-native-sessions/<slot>/`. The orchestrator sends one operator
+notification when it first retains a launch-uncertain hold with one of these
+codes for a slot's generation; later cycles stay silent. The operator compares
+the projected receipt and marker with the session's role-run UUID, native UUID,
+generation and process lease, and finds the cause: a deleted or truncated file,
+a restore or copy that changed owner or mode, a marker from another generation,
+or a second writer on the same state directory. Restore files only from
+authoritative copies, owner-only and owned by the daemon user. Never hand-write
+or edit a receipt or marker to satisfy the fence: the marker is the local proof
+that the projected process ended, and a forged one lets a successor run beside a
+live predecessor. Repairing the files does not release the slot by itself;
+resuming it remains an explicit operator decision.
+
 Native holds remain attached to the canonical session/issue claim. They retain
 retry counts, feedback, prior phase, Advisor rounds and generation identity;
 they do not trigger provider fallback or generic worker-failure handling. The

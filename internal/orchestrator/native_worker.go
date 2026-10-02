@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"encoding/json"
+	"fmt"
 	"github.com/befeast/maestro/internal/config"
 	"github.com/befeast/maestro/internal/state"
 	"github.com/befeast/maestro/internal/worker"
@@ -16,14 +17,59 @@ func nativeWorkerConfig(cfg *config.Config, role, parent string) *config.Config 
 	copy.WorkerLaunchContext = &config.WorkerLaunchContext{Role: role, ParentRoleRunID: parent}
 	return &copy
 }
-func retainNativeWorkerHold(sess *state.Session, err error) bool {
+func (o *Orchestrator) retainNativeWorkerHold(slot string, sess *state.Session, err error) bool {
 	hold, ok := worker.NativeHold(err)
 	if !ok {
 		return false
 	}
 	sess.NativeRegistrationHold = hold.Code
 	log.Printf("[orch] native worker generation held: %s%s", hold.Code, nativeWorkerExecHoldSuffix(sess))
+	if hold.LaunchUncertain && nativeParkedHold(hold.Code) {
+		o.notifyParkedNativeHold(slot, sess, hold.Code)
+	}
 	return true
+}
+
+// nativeParkedHold reports whether a launch-uncertain native hold parks its
+// slot until an operator acts. No cycle-start reconciliation routes these codes
+// (nativeRuntimeReconcileHold) and no reconciliation clears them, while every
+// respawn, retry, phase and repair path skips a held session, so the slot keeps
+// its capacity and issue claim with no further automatic attempt. The
+// termination fence reports these when the projected generation's receipt is
+// absent, unreadable or undecodable, its terminal marker fails the receipt
+// integrity check, or the marker names another identity.
+func nativeParkedHold(code string) bool {
+	switch code {
+	case "projected_receipt_missing", "projected_receipt_undecodable", "receipt_invalid", "native_identity_conflict":
+		return true
+	}
+	return false
+}
+
+// notifyParkedNativeHold tells the operator once that a slot is parked on a
+// native hold. Before these holds existed the same receipt faults failed the
+// respawn with a "respawn failed" notification; the hold keeps the session but
+// must not make the stall silent. The notification fires on the first
+// retention of a hold for the slot's projected generation and stays silent on
+// every later retention of the same hold; a held session is not re-attempted
+// by later cycles, so a daemon restart does not repeat it either.
+func (o *Orchestrator) notifyParkedNativeHold(slot string, sess *state.Session, code string) {
+	if o == nil || sess == nil {
+		return
+	}
+	identity := fmt.Sprintf("%s/%s/%d", code, sess.NativeRoleRunID, sess.WorkerGeneration)
+	if o.parkedNativeHoldNotified[slot] == identity {
+		return
+	}
+	if o.parkedNativeHoldNotified == nil {
+		o.parkedNativeHoldNotified = make(map[string]string)
+	}
+	o.parkedNativeHoldNotified[slot] = identity
+	if o.notifier == nil {
+		return
+	}
+	o.notifier.Sendf("⚠️ maestro: worker %s (issue #%d: %s) is parked on native hold %s for generation %d; no respawn, retry, phase transition or repair runs until an operator inspects the slot's native receipt directory (docs/worker-native-registration.md)",
+		slot, sess.IssueNumber, sess.IssueTitle, code, sess.WorkerGeneration)
 }
 
 // nativeRuntimeReconcileHold reports whether a native hold is resolved by the

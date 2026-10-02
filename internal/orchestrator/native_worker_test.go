@@ -1,8 +1,14 @@
 package orchestrator
 
 import (
+	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -127,5 +133,106 @@ func TestNativeRuntimeReconcileHoldRoutesPrelaunchWedge(t *testing.T) {
 		if got := nativeRuntimeReconcileHold(code); got != want {
 			t.Fatalf("nativeRuntimeReconcileHold(%q)=%v want %v", code, got, want)
 		}
+	}
+}
+
+// parkedHoldMessages captures operator notifications and returns the ones that
+// report a parked native hold.
+func parkedHoldMessages(t *testing.T) (*notify.Notifier, func() []string) {
+	t.Helper()
+	var mu sync.Mutex
+	var messages []string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		var payload struct {
+			Message string `json:"message"`
+		}
+		_ = json.Unmarshal(b, &payload)
+		mu.Lock()
+		messages = append(messages, payload.Message)
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	return notify.New(server.URL, "fixture-target"), func() []string {
+		mu.Lock()
+		defer mu.Unlock()
+		var parked []string
+		for _, m := range messages {
+			if strings.Contains(m, "parked on native hold") {
+				parked = append(parked, m)
+			}
+		}
+		return parked
+	}
+}
+
+// A launch-uncertain hold that no reconciliation clears parks the slot: every
+// later cycle skips the held session. Before these holds the same receipt
+// faults failed the respawn with a notification, so the first retention must
+// tell the operator, once, and neither the next cycle nor a repeated retention
+// of the same hold may repeat it.
+func TestNativeWorkerParkedHoldNotifiesOperatorOnce(t *testing.T) {
+	for _, code := range []string{"projected_receipt_missing", "projected_receipt_undecodable", "receipt_invalid", "native_identity_conflict"} {
+		t.Run(code, func(t *testing.T) {
+			notifier, parked := parkedHoldMessages(t)
+			cfg := &config.Config{Repo: "fixture/repo", StateDir: t.TempDir(), MaxRetryBackoffMs: 300000, MaxRuntimeMinutes: 999, WorkerNativeSessionRegistration: &config.NativeSessionRegistrationConfig{}}
+			hold := &worker.NativeRegistrationHold{Code: code, LaunchUncertain: true, Slot: "fixture-1"}
+			calls := 0
+			o := &Orchestrator{cfg: cfg, notifier: notifier, promptBase: "fixture task", getIssueFn: func(n int) (github.Issue, error) { return makeIssue(n, "fixture issue"), nil },
+				respawnWorkerFn: func(_ *config.Config, _ string, _ *state.Session, _ string, _ github.Issue, _ string, _ string) error {
+					calls++
+					return hold
+				}}
+			past := time.Now().UTC().Add(-time.Second)
+			s := state.NewState()
+			sess := &state.Session{IssueNumber: 1249, IssueTitle: "fixture issue", Status: state.StatusDead, RetryCount: 1, NextRetryAt: &past, WorkerGeneration: 3, NativeRoleRunID: "00000000-0000-4000-8000-000000000003", Branch: "fixture"}
+			s.Sessions["fixture-1"] = sess
+			o.respawnDueRetries(s, 10)
+			if calls != 1 || sess.NativeRegistrationHold != code || sess.Status != state.StatusDead || sess.RetryCount != 1 || sess.WorkerGeneration != 3 {
+				t.Fatalf("parked hold not retained: calls=%d %+v", calls, sess)
+			}
+			got := parked()
+			if len(got) != 1 || !strings.Contains(got[0], "fixture-1") || !strings.Contains(got[0], "#1249") || !strings.Contains(got[0], code) || !strings.Contains(got[0], "generation 3") {
+				t.Fatalf("parked hold notifications = %q, want one naming slot, issue, code and generation", got)
+			}
+			o.respawnDueRetries(s, 10)
+			if !o.retainNativeWorkerHold("fixture-1", sess, hold) {
+				t.Fatal("hold not retained")
+			}
+			if calls != 1 || len(parked()) != 1 {
+				t.Fatalf("parked hold re-attempted or re-notified: calls=%d notifications=%q", calls, parked())
+			}
+		})
+	}
+}
+
+// Only a launch-uncertain parked code notifies, and only once per slot and
+// projected generation: holds the cycle-start reconciliation resolves, or a
+// non-uncertain hold, stay log-only, while a later generation parked on the
+// same slot is a new condition.
+func TestNativeWorkerParkedHoldNotificationScope(t *testing.T) {
+	notifier, parked := parkedHoldMessages(t)
+	o := &Orchestrator{cfg: &config.Config{}, notifier: notifier}
+	sess := &state.Session{IssueNumber: 1249, WorkerGeneration: 3, NativeRoleRunID: "00000000-0000-4000-8000-000000000003"}
+	for _, hold := range []*worker.NativeRegistrationHold{
+		{Code: "native_process_identity_missing", LaunchUncertain: true},
+		{Code: "previous_outcome_unknown"},
+		{Code: "unresolved_launch", LaunchUncertain: true},
+		{Code: "native_identity_conflict"},
+	} {
+		o.retainNativeWorkerHold("fixture-1", sess, hold)
+	}
+	if got := parked(); len(got) != 0 {
+		t.Fatalf("non-parked holds notified: %q", got)
+	}
+	parkedHold := &worker.NativeRegistrationHold{Code: "projected_receipt_missing", LaunchUncertain: true}
+	o.retainNativeWorkerHold("fixture-1", sess, parkedHold)
+	o.retainNativeWorkerHold("fixture-1", sess, parkedHold)
+	o.retainNativeWorkerHold("fixture-2", sess, parkedHold)
+	sess.WorkerGeneration, sess.NativeRoleRunID = 4, "00000000-0000-4000-8000-000000000004"
+	o.retainNativeWorkerHold("fixture-1", sess, parkedHold)
+	if got := parked(); len(got) != 3 {
+		t.Fatalf("parked hold notifications = %q, want one per slot and generation", got)
 	}
 }

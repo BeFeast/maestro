@@ -576,10 +576,10 @@ func reconcileAbandonedNativeLaunch(cfg *config.Config, s *state.State, slot str
 // every cycle and clears the hold once the generation is sealed and terminal,
 // so a transient failure is never sticky. Only an identity conflict and an
 // authority settlement that denies a next generation are reported as such.
-// An absent projected receipt (projected_receipt_missing), or a receipt or
-// terminal marker that cannot be read or decoded (projected_receipt_undecodable),
-// is likewise a hold, never a plain error: the callers' error path records a
-// failed respawn, which this gap is not.
+// A projected receipt or terminal marker that is absent, unreadable, fails its
+// integrity check or names another identity is likewise a hold, never a plain
+// error: the callers' error path records a failed respawn, which this gap is
+// not (projectedGenerationReceiptHold).
 func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot string, sess *state.Session) error {
 	if cfg == nil || sess == nil || sess.NativeRoleRunID == "" || cfg.WorkerNativeSessionRegistration == nil || sess.WorkerGeneration == 0 {
 		return nil
@@ -591,21 +591,7 @@ func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot stri
 	}
 	terminal, err := NativeSessionProcessTerminal(cfg.StateDir, slot, sess)
 	if err != nil {
-		if hold, ok := NativeHold(err); ok {
-			return &NativeRegistrationHold{Code: hold.Code, LaunchUncertain: hold.LaunchUncertain, Slot: slot, cause: err}
-		}
-		// The projected generation's receipt is absent, or the receipt or its
-		// terminal marker cannot be read or decoded. No successor exists yet,
-		// so this is not a failure of the successor launch but an unproven
-		// projected generation: hold the slot, so the daemon retains the
-		// session and re-inspects the receipt directory every cycle, instead
-		// of returning an error the callers record as a failed respawn.
-		code := "projected_receipt_undecodable"
-		if errors.Is(err, os.ErrNotExist) {
-			code = "projected_receipt_missing"
-		}
-		log.Printf("[worker] native generation %d of %s has no readable projected receipt before its successor: %v", sess.WorkerGeneration, slot, err)
-		return &NativeRegistrationHold{Code: code, LaunchUncertain: true, Slot: slot, cause: err}
+		return projectedGenerationReceiptHold(slot, sess, err)
 	}
 	if terminal {
 		return nil
@@ -630,6 +616,43 @@ func ensureNativeGenerationTerminalBeforeSuccessor(cfg *config.Config, slot stri
 		return missing(err)
 	}
 	return nil
+}
+
+// projectedGenerationReceiptHold classifies a failure to read the projected
+// generation's receipt or terminal marker in the termination fence. No
+// successor exists yet, so this is not a failure of the successor launch but an
+// unproven projected generation: it always becomes a launch-uncertain hold
+// attributed to the slot, never a plain error the callers record as a failed
+// respawn. None of these codes is cleared by automatic reconciliation; the
+// orchestrator parks the slot and notifies the operator once.
+//
+//   - a hold already reported by the receipt read (receipt_invalid,
+//     native_identity_conflict, ...) passes through with the slot attached;
+//   - a marker that decodes but names a different identity is
+//     native_identity_conflict, the code an identity mismatch between the
+//     session and its receipt already uses;
+//   - a marker that is not an owner-only regular file of bounded size is
+//     receipt_invalid: it fails the same integrity check readNativeWorkerReceipt
+//     applies to the receipt itself, so it is the same class of fault and the
+//     same remedy, not an undecodable file;
+//   - an absent receipt is projected_receipt_missing;
+//   - anything else (an I/O error on the receipt or marker, a marker that is
+//     not valid JSON) is projected_receipt_undecodable.
+func projectedGenerationReceiptHold(slot string, sess *state.Session, err error) *NativeRegistrationHold {
+	if hold, ok := NativeHold(err); ok {
+		return &NativeRegistrationHold{Code: hold.Code, LaunchUncertain: hold.LaunchUncertain, Slot: slot, cause: err}
+	}
+	code := "projected_receipt_undecodable"
+	switch {
+	case errors.Is(err, errNativeTerminalIdentityConflict):
+		code = "native_identity_conflict"
+	case errors.Is(err, errNativeTerminalMarkerInvalid):
+		code = "receipt_invalid"
+	case errors.Is(err, os.ErrNotExist):
+		code = "projected_receipt_missing"
+	}
+	log.Printf("[worker] native generation %d of %s has no trustworthy projected receipt before its successor (%s): %v", sess.WorkerGeneration, slot, code, err)
+	return &NativeRegistrationHold{Code: code, LaunchUncertain: true, Slot: slot, cause: err}
 }
 
 // sealNativeGenerationTerminationLocked proves, seals and records the exact OS

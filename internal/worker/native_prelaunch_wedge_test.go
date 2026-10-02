@@ -835,14 +835,17 @@ func TestTerminationFenceLeavesSessionProjectionUntouched(t *testing.T) {
 }
 
 // The fence must hold, never fail, when the projected generation's receipt is
-// absent or the receipt or its terminal marker cannot be decoded: the daemon
-// records a non-hold respawn error as a failed session with a notification,
-// while a hold retains the session and re-inspects the receipt directory every
-// cycle. Nothing is observed, sealed or minted meanwhile.
+// absent, or the receipt or its terminal marker cannot be trusted: the daemon
+// records a non-hold respawn error as a failed session, while a hold retains
+// the session and parks the slot for the operator. Each fault keeps its own
+// code: a marker that decodes but names another identity is the existing
+// native_identity_conflict, a marker failing the receipt integrity check is the
+// existing receipt_invalid, and only an unreadable or undecodable file is
+// projected_receipt_undecodable. Nothing is observed, sealed or minted meanwhile.
 func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testing.T) {
-	for _, mode := range []string{"receipt_missing", "receipt_undecodable", "terminal_marker_undecodable"} {
+	for _, mode := range []string{"receipt_missing", "receipt_undecodable", "terminal_marker_undecodable", "terminal_marker_identity_conflict", "terminal_marker_invalid_mode"} {
 		t.Run(mode, func(t *testing.T) {
-			f, _, _ := cleanExitWithoutMarker(t)
+			f, parent, _ := cleanExitWithoutMarker(t)
 			sess := f.st.Sessions[f.slot]
 			dir := sess.NativeReceiptDir
 			previousNativeGenerationOutcome = persistedNativeGenerationOutcome
@@ -873,6 +876,28 @@ func TestTerminationFenceHoldsWhenProjectedReceiptMissingOrUndecodable(t *testin
 					t.Fatal(err)
 				}
 				want = "projected_receipt_undecodable"
+			case "terminal_marker_identity_conflict":
+				// A well-formed marker for another native session of the same
+				// generation is not proof that this generation ended.
+				other := terminationFor(parent)
+				other.NativeSessionID = uuid.NewString()
+				b, _ := json.Marshal(other)
+				if err := os.WriteFile(filepath.Join(dir, nativeReceiptName(1)+".terminated"), b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				want = "native_identity_conflict"
+			case "terminal_marker_invalid_mode":
+				// The exact marker, but not owner-only: the receipt integrity
+				// check fails, as it would for the receipt itself.
+				path := filepath.Join(dir, nativeReceiptName(1)+".terminated")
+				b, _ := json.Marshal(terminationFor(parent))
+				if err := os.WriteFile(path, b, 0600); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Chmod(path, 0644); err != nil {
+					t.Fatal(err)
+				}
+				want = "receipt_invalid"
 			}
 			before := *sess
 			err := ensureNativeGenerationTerminalBeforeSuccessor(f.cfg, f.slot, sess)

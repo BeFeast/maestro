@@ -833,6 +833,20 @@ type nativeTermination struct {
 func terminationFor(r *NativeWorkerReceipt) nativeTermination {
 	return nativeTermination{r.RoleRunID, r.Request.NativeSessionID, r.Generation, r.ProcessLeaseUnit, r.ProcessLeaseManager}
 }
+
+// Terminal marker failures stay plain errors: most callers only need "not
+// proven terminal". The termination fence before a successor matches these
+// sentinels to report the precise hold (ensureNativeGenerationTerminalBeforeSuccessor).
+var (
+	// errNativeTerminalMarkerInvalid: the marker is not an owner-only regular
+	// file of bounded size, the same integrity check the receipt itself fails
+	// with receipt_invalid.
+	errNativeTerminalMarkerInvalid = errors.New("invalid native terminal receipt")
+	// errNativeTerminalIdentityConflict: the marker decodes but records a
+	// different role run, native session, generation or OS lease.
+	errNativeTerminalIdentityConflict = errors.New("native terminal identity conflict")
+)
+
 func nativeWorkerTerminated(dir string, r *NativeWorkerReceipt) (bool, error) {
 	path := filepath.Join(dir, nativeReceiptName(r.Generation)+".terminated")
 	info, err := os.Lstat(path)
@@ -843,15 +857,20 @@ func nativeWorkerTerminated(dir string, r *NativeWorkerReceipt) (bool, error) {
 		return false, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm()&0077 != 0 || !nativeOwned(info) || info.Size() > 4096 {
-		return false, fmt.Errorf("invalid native terminal receipt")
+		return false, errNativeTerminalMarkerInvalid
 	}
 	b, err := os.ReadFile(path)
 	if err != nil {
-		return false, err
+		// Not wrapped: a marker that vanished after Lstat must not read as an
+		// absent projected receipt.
+		return false, fmt.Errorf("unreadable native terminal receipt: %v", err)
 	}
 	var t nativeTermination
-	if json.Unmarshal(b, &t) != nil || t != terminationFor(r) {
-		return false, fmt.Errorf("native terminal identity conflict")
+	if err := json.Unmarshal(b, &t); err != nil {
+		return false, errors.New("undecodable native terminal receipt")
+	}
+	if t != terminationFor(r) {
+		return false, errNativeTerminalIdentityConflict
 	}
 	return true, nil
 }
