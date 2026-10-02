@@ -113,13 +113,25 @@ cannot be replaced by hashing the existing broad administrator credential.
 Auto-merge reads the same pinned attestations before a merge call (#1247).
 When one is bound to its profile, unexpired, names the project's repository,
 carries the digest of the exact Forgejo token auto-merge acts with, and says
-`merge_denied=true`, the merge API is not called: the PR is parked behind a
-`merge-denied:<worker_login>` operator gate with one journal line and one
-notification. Independently, a Forgejo 405 "User not allowed to merge PR"
-latches the refused head for that credential, so the merge is attempted once
-per head and credential instead of every cycle. Missing, unreadable or unbound
-evidence changes nothing, and every other merge refusal keeps its existing
-handling.
+`merge_denied=true`, the merge API is not called: the PR head is latched for
+that credential and the PR is parked behind a `merge-denied:<worker_login>`
+operator gate. Independently, a Forgejo 405 "User not allowed to merge PR"
+latches the refused head for that credential. A hold is journaled and notified
+once per PR, head and credential, whichever source raised it.
+
+A latch is released for exactly one fresh attempt when the credential changes,
+or when the head moves while no evidence declares the denial. An
+evidence-derived latch is also released when the bound evidence explicitly says
+`merge_denied=false` for the same credential; a forge-derived latch is not,
+because the forge itself refused that head. Evidence that turns unreadable,
+unverifiable or silent about the credential releases nothing, so evidence
+flapping between denied and unavailable neither re-opens the merge loop nor
+re-notifies. On a PR without a latch, missing, unreadable or unbound evidence
+changes nothing, and every other merge refusal keeps its existing handling.
+
+The gate is active in every merge strategy (parallel and sequential) and every
+delivery-approval setting; it only fires on that exact actor refusal or on
+bound evidence, and a held PR does not occupy the sequential merge slot.
 
 ## Validation and remaining operational acceptance
 

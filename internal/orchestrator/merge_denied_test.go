@@ -183,9 +183,9 @@ func (h *mergeDeniedHarness) assertHeld(t *testing.T, gate string) {
 
 func (h *mergeDeniedHarness) assertNotHeld(t *testing.T) {
 	t.Helper()
-	if h.sess.OperatorGateName != "" || h.sess.MergeDeniedHeadSHA != "" || h.sess.MergeDeniedActor != "" || h.sess.MergeDeniedSurfaced != "" {
-		t.Fatalf("merge-denied state not clear: gate=%q head=%q actor=%q surfaced=%q",
-			h.sess.OperatorGateName, h.sess.MergeDeniedHeadSHA, h.sess.MergeDeniedActor, h.sess.MergeDeniedSurfaced)
+	if h.sess.OperatorGateName != "" || h.sess.MergeDeniedHeadSHA != "" || h.sess.MergeDeniedActor != "" || h.sess.MergeDeniedSource != "" || h.sess.MergeDeniedLogin != "" || h.sess.MergeDeniedSurfaced != "" {
+		t.Fatalf("merge-denied state not clear: gate=%q head=%q actor=%q source=%q login=%q surfaced=%q",
+			h.sess.OperatorGateName, h.sess.MergeDeniedHeadSHA, h.sess.MergeDeniedActor, h.sess.MergeDeniedSource, h.sess.MergeDeniedLogin, h.sess.MergeDeniedSurfaced)
 	}
 }
 
@@ -200,8 +200,8 @@ func TestAutoMergePRs_ForgeRefusedActorLatchesHeadAfterOneCall(t *testing.T) {
 	if got := h.forge.calls(); len(got) != 1 || got[0] != mergeDeniedHeadA {
 		t.Fatalf("forge merge calls = %v, want exactly one call at head %s", got, mergeDeniedHeadA)
 	}
-	if h.sess.MergeDeniedHeadSHA != mergeDeniedHeadA || h.sess.MergeDeniedActor == "" {
-		t.Fatalf("latch = head %q actor %q, want head %s and a credential fingerprint", h.sess.MergeDeniedHeadSHA, h.sess.MergeDeniedActor, mergeDeniedHeadA)
+	if h.sess.MergeDeniedHeadSHA != mergeDeniedHeadA || h.sess.MergeDeniedActor == "" || h.sess.MergeDeniedSource != mergeDeniedSourceForge {
+		t.Fatalf("latch = head %q actor %q source %q, want a forge latch at head %s with a credential fingerprint", h.sess.MergeDeniedHeadSHA, h.sess.MergeDeniedActor, h.sess.MergeDeniedSource, mergeDeniedHeadA)
 	}
 	if strings.Contains(h.sess.MergeDeniedActor, mergeDeniedToken) {
 		t.Fatal("the latch must not persist the credential itself")
@@ -231,7 +231,7 @@ func TestAutoMergePRs_ForgeRefusedActorLatchesHeadAfterOneCall(t *testing.T) {
 	if err := json.Unmarshal(b, &restored); err != nil {
 		t.Fatal(err)
 	}
-	if restored.MergeDeniedHeadSHA != h.sess.MergeDeniedHeadSHA || restored.MergeDeniedActor != h.sess.MergeDeniedActor || restored.MergeDeniedSurfaced != h.sess.MergeDeniedSurfaced {
+	if restored.MergeDeniedHeadSHA != h.sess.MergeDeniedHeadSHA || restored.MergeDeniedActor != h.sess.MergeDeniedActor || restored.MergeDeniedSource != h.sess.MergeDeniedSource || restored.MergeDeniedSurfaced != h.sess.MergeDeniedSurfaced {
 		t.Fatalf("latch lost in JSON round trip: %+v", restored)
 	}
 }
@@ -359,6 +359,14 @@ func boundEvidence(login, repo, token string, mergeDenied bool) func(aiexecution
 	}
 }
 
+func evidenceUnavailable(aiexecution.Policy) (aiexecution.NativeForgejoAuthorizationReport, error) {
+	return aiexecution.NativeForgejoAuthorizationReport{}, aiexecution.Held("manifest_drift")
+}
+
+func evidenceUnverified(aiexecution.Policy) (aiexecution.NativeForgejoAuthorizationReport, error) {
+	return aiexecution.NativeForgejoAuthorizationReport{Unverified: []string{"worker"}}, nil
+}
+
 func withManifest(h *mergeDeniedHarness) {
 	h.o.cfg.AIExecution = aiexecution.Policy{ManifestPath: "/etc/maestro/test-manifest.json", ManifestSHA256: strings.Repeat("a", 64)}
 }
@@ -380,14 +388,21 @@ func TestAutoMergePRs_EvidenceMergeDeniedMakesZeroMergeCalls(t *testing.T) {
 		t.Fatalf("notifications = %d, want exactly one", got)
 	}
 	h.assertHeld(t, "merge-denied:native-worker")
-	if h.sess.Status != state.StatusPROpen || h.sess.RetryCount != 0 || h.sess.MergeDeniedHeadSHA != "" {
+	if h.sess.Status != state.StatusPROpen || h.sess.RetryCount != 0 || h.sess.LastNotifiedStatus != "" {
 		t.Fatalf("session mutated beyond the hold: %+v", h.sess)
 	}
-	// A head move does not matter: the evidence speaks for the credential.
+	if h.sess.MergeDeniedHeadSHA != mergeDeniedHeadA || h.sess.MergeDeniedSource != mergeDeniedSourceEvidence || h.sess.MergeDeniedLogin != "native-worker" {
+		t.Fatalf("latch = head %q source %q login %q, want an evidence latch at head %s", h.sess.MergeDeniedHeadSHA, h.sess.MergeDeniedSource, h.sess.MergeDeniedLogin, mergeDeniedHeadA)
+	}
+	// A head move still makes no merge call (the evidence speaks for the
+	// credential), but it is a new head, so the hold surfaces once more.
 	h.head = mergeDeniedHeadB
 	h.cycles(2)
-	if got := h.forge.calls(); len(got) != 0 || h.journalLines() != 1 {
-		t.Fatalf("calls = %v journal = %d after a head move, want zero calls and no new line", got, h.journalLines())
+	if got := h.forge.calls(); len(got) != 0 || h.journalLines() != 2 || h.notifier.Buffered() != 2 {
+		t.Fatalf("calls = %v journal = %d notifications = %d after a head move, want zero calls and one more surface", got, h.journalLines(), h.notifier.Buffered())
+	}
+	if h.sess.MergeDeniedHeadSHA != mergeDeniedHeadB {
+		t.Fatalf("latched head = %q, want %s", h.sess.MergeDeniedHeadSHA, mergeDeniedHeadB)
 	}
 
 	// The evidence no longer declares the credential merge-denied: the hold
@@ -516,7 +531,8 @@ func TestAutoMergePRs_MergeDeniedLatchDoesNotHoldSequentialSlot(t *testing.T) {
 	h.o.ghPRMergeStatusFn = func(int) (string, string, error) { return "MERGEABLE", "clean", nil }
 	h.sess.MergeDeniedHeadSHA = mergeDeniedHeadA
 	h.sess.MergeDeniedActor = h.o.mergeActorFingerprint()
-	h.sess.MergeDeniedSurfaced = mergeDeniedHeadKey(mergeDeniedHeadA, h.sess.MergeDeniedActor)
+	h.sess.MergeDeniedSource = mergeDeniedSourceForge
+	h.sess.MergeDeniedSurfaced = mergeDeniedSurfaceKey(20, h.sess.MergeDeniedActor, mergeDeniedHeadA)
 
 	older := github.PR{Number: 20, HeadRefName: "feat/native"}
 	younger := github.PR{Number: 21, HeadRefName: "feat/other"}
@@ -536,5 +552,166 @@ func TestAutoMergePRs_MergeDeniedLatchDoesNotHoldSequentialSlot(t *testing.T) {
 	h.assertHeld(t, "merge-denied:forge-actor")
 	if h.journalLines() != 0 {
 		t.Fatalf("an already-surfaced latch must not journal again\n%s", h.logs.String())
+	}
+}
+
+// Evidence that flaps between "denied" and "unavailable" (unreadable manifest,
+// unverifiable profile) must neither re-open the merge loop nor re-notify on
+// every flip: the hold surfaces once per PR, head and credential, whichever
+// source raised it.
+func TestAutoMergePRs_EvidenceFlapSurfacesOnceWithoutExtraMergeCalls(t *testing.T) {
+	denied := boundEvidence("native-worker", mergeDeniedRepo, mergeDeniedToken, true)
+	type read = func(aiexecution.Policy) (aiexecution.NativeForgejoAuthorizationReport, error)
+	cases := []struct {
+		name      string
+		sequence  []read
+		wantCalls int
+	}{
+		// The evidence denies first: the merge API is never called.
+		{"denied first", []read{denied, evidenceUnavailable, denied, evidenceUnverified, denied, evidenceUnavailable, denied, evidenceUnavailable}, 0},
+		// The evidence is unavailable first: today's single merge attempt
+		// meets the forge refusal, and nothing after it asks again.
+		{"unavailable first", []read{evidenceUnavailable, denied, evidenceUnavailable, denied, evidenceUnverified, denied, evidenceUnavailable, denied}, 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newMergeDeniedHarness(t, forgejoForge())
+			withManifest(h)
+
+			for i, read := range tc.sequence {
+				h.o.nativeForgejoAuthorizationsFn = read
+				h.cycles(1)
+				if !strings.HasPrefix(h.sess.OperatorGateName, mergeDeniedGatePrefix) {
+					t.Fatalf("cycle %d: operator gate = %q, want the merge-denied hold to stand", i+1, h.sess.OperatorGateName)
+				}
+			}
+
+			if got := h.forge.calls(); len(got) != tc.wantCalls {
+				t.Fatalf("forge merge calls = %v, want %d across %d flapping cycles", got, tc.wantCalls, len(tc.sequence))
+			}
+			if got := h.journalLines(); got != 1 {
+				t.Fatalf("journal lines = %d, want exactly one %q\n%s", got, mergeDeniedSummary, h.logs.String())
+			}
+			if got := h.notifier.Buffered(); got != 1 {
+				t.Fatalf("notifications = %d, want exactly one", got)
+			}
+			if h.sess.MergeDeniedHeadSHA != mergeDeniedHeadA || h.sess.Status != state.StatusPROpen || h.sess.RetryCount != 0 {
+				t.Fatalf("session = %+v, want the hold at head %s and nothing else changed", h.sess, mergeDeniedHeadA)
+			}
+		})
+	}
+}
+
+// An explicit merge_denied=false for the same credential releases an
+// evidence-derived hold for one fresh attempt. A forge-derived latch stays:
+// the forge itself refused that head, so only a head or credential change
+// releases it.
+func TestAutoMergePRs_EvidenceAllowanceReleasesOnlyEvidenceDerivedHold(t *testing.T) {
+	h := newMergeDeniedHarness(t, forgejoForge())
+	withManifest(h)
+	denied := boundEvidence("native-worker", mergeDeniedRepo, mergeDeniedToken, true)
+	allowed := boundEvidence("native-worker", mergeDeniedRepo, mergeDeniedToken, false)
+
+	h.o.nativeForgejoAuthorizationsFn = denied
+	h.cycles(2)
+	h.o.nativeForgejoAuthorizationsFn = evidenceUnavailable
+	h.cycles(2)
+	// An allowance for another credential does not speak for this one.
+	h.o.nativeForgejoAuthorizationsFn = boundEvidence("native-worker", mergeDeniedRepo, "some-other-token", false)
+	h.cycles(1)
+	if got := h.forge.calls(); len(got) != 0 {
+		t.Fatalf("forge merge calls = %v, want none while only the denial is bound", got)
+	}
+	h.assertHeld(t, "merge-denied:native-worker")
+
+	// The evidence now says merge_denied=false for this credential: exactly
+	// one fresh attempt. The forge still refuses, so the head is latched by
+	// the forge — the same PR, head and credential, so no second surface.
+	h.o.nativeForgejoAuthorizationsFn = allowed
+	h.cycles(3)
+	if got := h.forge.calls(); len(got) != 1 || got[0] != mergeDeniedHeadA {
+		t.Fatalf("forge merge calls = %v, want exactly one fresh attempt at head %s", got, mergeDeniedHeadA)
+	}
+	if h.sess.MergeDeniedSource != mergeDeniedSourceForge || h.sess.MergeDeniedHeadSHA != mergeDeniedHeadA {
+		t.Fatalf("latch = source %q head %q, want a forge latch at head %s", h.sess.MergeDeniedSource, h.sess.MergeDeniedHeadSHA, mergeDeniedHeadA)
+	}
+	h.assertHeld(t, "merge-denied:forge-actor")
+
+	// The forge-derived latch survives the evidence flipping back and forth.
+	h.o.nativeForgejoAuthorizationsFn = denied
+	h.cycles(1)
+	h.o.nativeForgejoAuthorizationsFn = allowed
+	h.cycles(2)
+	if got := h.forge.calls(); len(got) != 1 {
+		t.Fatalf("forge merge calls = %v, want the forge-refused head not asked again", got)
+	}
+	if h.sess.MergeDeniedSource != mergeDeniedSourceForge {
+		t.Fatalf("latch source = %q, want the forge refusal kept", h.sess.MergeDeniedSource)
+	}
+	if got, notes := h.journalLines(), h.notifier.Buffered(); got != 1 || notes != 1 {
+		t.Fatalf("journal lines = %d notifications = %d, want one surface for one PR, head and credential\n%s", got, notes, h.logs.String())
+	}
+
+	// A new head releases the forge latch for one attempt; the forge now
+	// accepts and the hold is gone.
+	h.forge.answer(http.StatusOK, ``)
+	h.head = mergeDeniedHeadB
+	h.cycles(1)
+	if got := h.forge.calls(); len(got) != 2 || got[1] != mergeDeniedHeadB || !h.sess.PRMerged {
+		t.Fatalf("calls = %v merged = %v, want one more attempt at head %s that merges", got, h.sess.PRMerged, mergeDeniedHeadB)
+	}
+	h.assertNotHeld(t)
+}
+
+// While no evidence declares the denial, an evidence-derived hold behaves like
+// a forge latch: a new head gets exactly one fresh attempt.
+func TestAutoMergePRs_EvidenceHoldReleasesOnHeadMoveOnlyWithoutDenial(t *testing.T) {
+	h := newMergeDeniedHarness(t, forgejoForge())
+	withManifest(h)
+	h.o.nativeForgejoAuthorizationsFn = boundEvidence("native-worker", mergeDeniedRepo, mergeDeniedToken, true)
+	h.cycles(1)
+
+	h.o.nativeForgejoAuthorizationsFn = evidenceUnavailable
+	h.cycles(2)
+	if got := h.forge.calls(); len(got) != 0 {
+		t.Fatalf("forge merge calls = %v, want none at the held head", got)
+	}
+
+	h.head = mergeDeniedHeadB
+	h.cycles(3)
+	if got := h.forge.calls(); len(got) != 1 || got[0] != mergeDeniedHeadB {
+		t.Fatalf("forge merge calls = %v, want exactly one fresh attempt at head %s", got, mergeDeniedHeadB)
+	}
+	if h.sess.MergeDeniedSource != mergeDeniedSourceForge || h.sess.MergeDeniedHeadSHA != mergeDeniedHeadB {
+		t.Fatalf("latch = source %q head %q, want a forge latch at head %s", h.sess.MergeDeniedSource, h.sess.MergeDeniedHeadSHA, mergeDeniedHeadB)
+	}
+	if got := h.notifier.Buffered(); got != 2 {
+		t.Fatalf("notifications = %d, want one per held head", got)
+	}
+}
+
+func TestMergeDeniedAlreadySurfaced(t *testing.T) {
+	key := mergeDeniedSurfaceKey(20, "actor", mergeDeniedHeadA)
+	for _, tc := range []struct {
+		name     string
+		surfaced string
+		pr       int
+		actor    string
+		head     string
+		want     bool
+	}{
+		{"same hold", key, 20, "actor", mergeDeniedHeadA, true},
+		{"head case-insensitive", key, 20, "actor", strings.ToUpper(mergeDeniedHeadA), true},
+		{"unknown current head", key, 20, "actor", "", true},
+		{"unknown surfaced head", mergeDeniedSurfaceKey(20, "actor", ""), 20, "actor", mergeDeniedHeadB, true},
+		{"head moved", key, 20, "actor", mergeDeniedHeadB, false},
+		{"credential changed", key, 20, "other", mergeDeniedHeadA, false},
+		{"another PR", key, 2, "actor", mergeDeniedHeadA, false},
+		{"another PR sharing a prefix", key, 200, "actor", mergeDeniedHeadA, false},
+		{"nothing surfaced", "", 20, "actor", mergeDeniedHeadA, false},
+	} {
+		if got := mergeDeniedAlreadySurfaced(tc.surfaced, tc.pr, tc.actor, tc.head); got != tc.want {
+			t.Errorf("%s: mergeDeniedAlreadySurfaced = %v, want %v", tc.name, got, tc.want)
+		}
 	}
 }
