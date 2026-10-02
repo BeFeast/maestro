@@ -195,6 +195,9 @@ type Engine struct {
 	preflight         PreflightRunner
 	enroller          ProjectEnroller
 	enrollmentTracker enrollmentTracker
+	// promotionJournal dedups the "withholding add_ready_label" journal line
+	// to once per issue and hold kind across cycles (#1240).
+	promotionJournal promotionHoldJournal
 
 	// emergencyLLMHalt, when true, forces Decide down the deterministic-only
 	// path — decideWithLLM (and therefore any supervisor backend invocation) is
@@ -219,6 +222,7 @@ func NewEngine(cfg *config.Config, reader Reader) *Engine {
 		lookPath:          exec.LookPath,
 		preflight:         defaultPreflightRunner,
 		enrollmentTracker: defaultEnrollmentTracker,
+		promotionJournal:  defaultPromotionHoldJournal,
 	}
 	if enroller, ok := reader.(ProjectEnroller); ok {
 		eng.enroller = enroller
@@ -1041,10 +1045,11 @@ func (e *Engine) decideDeterministic(st *state.State) (state.SupervisorDecision,
 		}
 	}
 
-	candidate, err := e.firstQueueActionCandidate(st, candidates)
+	candidate, promotionHolds, err := e.firstQueueActionCandidate(st, candidates, issues, policyRule)
 	if err != nil {
 		return state.SupervisorDecision{}, err
 	}
+	baseReasons = appendReasons(baseReasons, promotionHolds...)
 	if candidate != nil {
 		if analysis.SelectedCandidate == nil {
 			analysis.SelectedCandidate = supervisorIssueCandidate(candidate.issue)
@@ -2546,7 +2551,7 @@ func (e *Engine) dynamicWaveSkipReason(st *state.State, issue github.Issue, issu
 	if e.cfg.Missions.Enabled && mission.IsMissionIssue(issue, e.cfg.Missions.Labels) && !st.IsMissionChild(issue.Number) {
 		return heldMetaSkipReason("mission issue awaits decomposition"), dynamicSkipHeldMeta, nil
 	}
-	if titleLooksEpic(issue.Title) {
+	if titleMarksEpic(issue.Title) {
 		return heldMetaSkipReason("title indicates epic"), dynamicSkipHeldMeta, nil
 	}
 	if label, ok := firstMatchingIssueLabel(issue, heldMetaLabels()); ok {
@@ -2757,13 +2762,31 @@ func allQueueMutationsAllowed(cfg *config.Config, mutations []state.SupervisorMu
 	return true
 }
 
-func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issue) (*queueActionCandidate, error) {
+// firstQueueActionCandidate picks the first issue that needs a safe queue
+// label mutation under the ordered-queue or default policy. It also returns
+// decision notes for ready-label promotions the guard withheld (#1240).
+//
+// Under the default policy add_ready_label is planned only when
+// supervisor.auto_promote_ready is set; an ordered queue drives promotion of
+// its own head. On every path an issue with an excluded label or an
+// epic/parent title is never promoted.
+//
+// A held issue becomes a candidate only for a blocked-label removal that is
+// itself a whitelisted safe action and only when the hold is not a content
+// hold. Anything else would leave a mutation-less label_issue_ready decision,
+// which RunOnce turns into a pending approval whose execution adds the ready
+// label to the very issue the guard held.
+func (e *Engine) firstQueueActionCandidate(st *state.State, issues, openIssues []github.Issue, policyRule string) (*queueActionCandidate, []string, error) {
 	readyLabel := e.readyLabel()
 	blockedLabel := e.blockedLabel()
 	if readyLabel == "" && blockedLabel == "" {
-		return nil, nil
+		return nil, nil, nil
 	}
+	promotionAllowed := e.defaultQueuePromotionAllowed(policyRule)
+	removeBlockedAllowed := queueMutationAllowed(e.cfg, state.SupervisorMutation{Type: MutationRemoveBlockedLabel})
 
+	var holds []string
+	withheldWhileDisabled := false
 	for _, issue := range issues {
 		hasReadyLabel := readyLabel == "" || github.HasLabel(issue, []string{readyLabel})
 		hasBlockedLabel := blockedLabel != "" && github.HasLabel(issue, []string{blockedLabel})
@@ -2774,27 +2797,49 @@ func (e *Engine) firstQueueActionCandidate(st *state.State, issues []github.Issu
 			addReady = false
 		}
 		removeBlocked := hasBlockedLabel && !supervisorMutationSucceeded(st, issue.Number, MutationRemoveBlockedLabel, blockedLabel)
-		candidate := queueActionCandidate{
+		if !addReady && !removeBlocked {
+			continue
+		}
+
+		// The promotion guard is pure in-memory work, so it runs before the
+		// per-issue dispatch guards (which may read blocker issues): a held
+		// issue with nothing left to do never costs a forge read.
+		if addReady {
+			liftedLabel := ""
+			if removeBlocked && removeBlockedAllowed {
+				liftedLabel = blockedLabel
+			}
+			if hold := e.queuePromotionHold(issue, openIssues, readyLabel, liftedLabel, policyRule); hold != nil {
+				addReady = false
+				// With promotion disabled nothing on this path is promoted,
+				// so explaining the first withheld promotion is enough.
+				if promotionAllowed || !withheldWhileDisabled {
+					e.journalPromotionHold(issue, *hold)
+					holds = append(holds, promotionHoldNote(issue.Number, *hold))
+					withheldWhileDisabled = !promotionAllowed
+				}
+				if !heldIssueKeepsBlockedRemoval(*hold, removeBlocked, removeBlockedAllowed) {
+					continue
+				}
+			}
+		}
+
+		reason, err := e.issueQueueSkipReason(st, issue, blockedLabel)
+		if err != nil {
+			return nil, nil, err
+		}
+		if reason != "" {
+			continue
+		}
+		return &queueActionCandidate{
 			issue:         issue,
 			readyLabel:    readyLabel,
 			blockedLabel:  blockedLabel,
 			addReady:      addReady,
 			removeBlocked: removeBlocked,
-		}
-		if !candidate.addReady && !candidate.removeBlocked {
-			continue
-		}
-
-		reason, err := e.issueQueueSkipReason(st, issue, blockedLabel)
-		if err != nil {
-			return nil, err
-		}
-		if reason != "" {
-			continue
-		}
-		return &candidate, nil
+		}, summarizePromotionHoldNotes(holds), nil
 	}
-	return nil, nil
+	return nil, summarizePromotionHoldNotes(holds), nil
 }
 
 func (e *Engine) dynamicQueueActionCandidate(st *state.State, selected github.Issue, openIssues []github.Issue) *queueActionCandidate {
@@ -2808,6 +2853,16 @@ func (e *Engine) dynamicQueueActionCandidate(st *state.State, selected github.Is
 	// #851: require_lint_pass withholds the ready label until spec-lint passes.
 	if addReady && !e.specLintAllowsReady(st, selected) {
 		addReady = false
+	}
+	// #1240: dynamic wave drives promotion, but an excluded label or an
+	// epic/parent title still never receives the ready label. A held
+	// selection plans no queue mutation at all, so owns_ready_label cannot
+	// strip the label from other issues on its behalf.
+	if addReady {
+		if hold := e.promotionContentHold(selected, ""); hold != nil {
+			e.journalPromotionHold(selected, *hold)
+			return nil
+		}
 	}
 	candidate := queueActionCandidate{
 		issue:      selected,
@@ -4305,6 +4360,9 @@ func (e *Engine) policySummaryReason() string {
 		if e.cfg.Supervisor.DynamicWave.OwnsReadyLabel {
 			parts = append(parts, "owns_ready_label=true")
 		}
+	}
+	if e.cfg.Supervisor.AutoPromoteReady {
+		parts = append(parts, "auto_promote_ready=true")
 	}
 	if excludedLabels := e.policyExcludedLabels(); len(excludedLabels) > 0 {
 		parts = append(parts, "excluded_labels="+strings.Join(excludedLabels, ","))

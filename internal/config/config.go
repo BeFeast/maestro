@@ -1170,6 +1170,17 @@ type SupervisorConfig struct {
 	// per-token cost explicitly.
 	AllowMeteredBackend bool `yaml:"allow_metered_backend" json:"allow_metered_backend,omitempty"`
 
+	// AutoPromoteReady lets the default queue policy (no supervisor.ordered_queue
+	// and no supervisor.dynamic_wave) add the ready label to an open issue that
+	// lacks it (#1240). Default false: under the default policy the supervisor
+	// only dispatches issues an operator already labelled ready, and promotion is
+	// driven solely by an explicit ordered_queue or dynamic_wave. Even when set,
+	// an issue carrying an exclude label or an epic/parent title is never
+	// promoted, nor is one whose priority label ranks below open ready work.
+	// add_ready_label must still be listed in safe_actions to apply without an
+	// approval.
+	AutoPromoteReady bool `yaml:"auto_promote_ready" json:"auto_promote_ready,omitempty"`
+
 	// SpecGroom configures the issue-grooming agent + spec-lint quality gate
 	// (#851). Off by default: the supervisor only lints ready-candidate issues
 	// and answers `@maestro groom` mentions when SpecGroom.Enabled is set. All
@@ -3378,6 +3389,9 @@ func parse(data []byte) (*Config, error) {
 	if err := normalizeSupervisorPolicy(&cfg.Supervisor); err != nil {
 		return nil, err
 	}
+	if err := validateSupervisorAutoPromoteLabel(cfg); err != nil {
+		return nil, err
+	}
 	if err := cfg.Outcome.Validate(); err != nil {
 		return nil, fmt.Errorf("config: %w", err)
 	}
@@ -3522,6 +3536,9 @@ func loadSupervisorPolicyFile(configPath string, cfg *Config) error {
 			return fmt.Errorf("load supervisor policy %s: %w", path, err)
 		}
 		cfg.Supervisor = policy
+		if err := validateSupervisorAutoPromoteLabel(cfg); err != nil {
+			return fmt.Errorf("load supervisor policy %s: %w", path, err)
+		}
 		return nil
 	}
 	return nil
@@ -3652,10 +3669,48 @@ func validateSupervisorPolicy(policy SupervisorConfig) error {
 			return fmt.Errorf("config: supervisor.ordered_queue.done_issues[%d] must be a positive issue number", i)
 		}
 	}
+	if err := validateSupervisorAutoPromotePolicy(policy); err != nil {
+		return err
+	}
 	if err := validateSupervisorActions("safe_actions", policy.SafeActions); err != nil {
 		return err
 	}
 	return validateSupervisorActions("approval_required", policy.ApprovalRequired)
+}
+
+// validateSupervisorAutoPromotePolicy rejects auto_promote_ready combined with
+// a queue policy that already owns promotion (#1240). The switch only governs
+// the default issue-label queue; ordered_queue and dynamic_wave select and label
+// their own issues, so the combination would be silently inert.
+func validateSupervisorAutoPromotePolicy(policy SupervisorConfig) error {
+	if !policy.AutoPromoteReady {
+		return nil
+	}
+	if policy.OrderedQueueActive() {
+		return fmt.Errorf("config: supervisor.auto_promote_ready applies only to the default queue policy and cannot be combined with supervisor.ordered_queue, which already drives promotion")
+	}
+	if policy.DynamicWave.Active() {
+		return fmt.Errorf("config: supervisor.auto_promote_ready applies only to the default queue policy and cannot be combined with supervisor.dynamic_wave, which already drives promotion")
+	}
+	return nil
+}
+
+// validateSupervisorAutoPromoteLabel requires a ready label to promote with
+// when supervisor.auto_promote_ready is set (#1240): supervisor.ready_label, or
+// the first issue_labels entry the supervisor falls back to.
+func validateSupervisorAutoPromoteLabel(cfg *Config) error {
+	if cfg == nil || !cfg.Supervisor.AutoPromoteReady {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Supervisor.ReadyLabel) != "" {
+		return nil
+	}
+	for _, label := range cfg.IssueLabels {
+		if strings.TrimSpace(label) != "" {
+			return nil
+		}
+	}
+	return fmt.Errorf("config: supervisor.auto_promote_ready requires supervisor.ready_label or issue_labels to name the ready label")
 }
 
 func validateSupervisorActions(field string, actions []string) error {
